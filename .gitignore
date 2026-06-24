@@ -1,0 +1,39 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Generated runtime and evaluation outputs
+artifacts/
+*.log
+*.pid
+
+# Downloaded tools and model/checkpoint payloads
+tools/
+models/
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.onnx
+
+# Local secrets and overrides
+.env
+.env.*
+!.env.example
+config/local/
+config/*secret*
+
+# IDE and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

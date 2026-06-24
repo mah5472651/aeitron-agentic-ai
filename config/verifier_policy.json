@@ -1,0 +1,72 @@
+{
+  "profiles": {
+    "fast": {
+      "name": "fast",
+      "description": "Local fast verifier: rules + secrets, fixture-aware.",
+      "run_rule_security": true,
+      "run_secret_scan": true,
+      "run_multilang_security": false,
+      "run_semgrep": false,
+      "run_codeql": false,
+      "run_sandbox": false,
+      "semgrep_config": "auto",
+      "codeql_language": "python",
+      "codeql_suite": "codeql/python-queries",
+      "sandbox_command": "python3 -m pytest -q",
+      "fail_on_medium": true,
+      "max_files": 600,
+      "exclude_patterns": []
+    },
+    "security": {
+      "name": "security",
+      "description": "Semgrep + Phase 38 multi-language security gate.",
+      "run_rule_security": true,
+      "run_secret_scan": true,
+      "run_multilang_security": true,
+      "run_semgrep": true,
+      "run_codeql": false,
+      "run_sandbox": false,
+      "semgrep_config": "auto",
+      "codeql_language": "python",
+      "codeql_suite": "codeql/python-queries",
+      "sandbox_command": "python3 -m pytest -q",
+      "fail_on_medium": false,
+      "max_files": 600,
+      "exclude_patterns": []
+    },
+    "release": {
+      "name": "release",
+      "description": "Strict release gate.",
+      "run_rule_security": true,
+      "run_secret_scan": true,
+      "run_multilang_security": true,
+      "run_semgrep": true,
+      "run_codeql": false,
+      "run_sandbox": true,
+      "semgrep_config": "auto",
+      "codeql_language": "python",
+      "codeql_suite": "codeql/python-queries",
+      "sandbox_command": "python3 -m pytest -q",
+      "fail_on_medium": true,
+      "max_files": 600,
+      "exclude_patterns": []
+    },
+    "codeql-python": {
+      "name": "codeql-python",
+      "description": "CodeQL Python deep scan.",
+      "run_rule_security": true,
+      "run_secret_scan": true,
+      "run_multilang_security": false,
+      "run_semgrep": false,
+      "run_codeql": true,
+      "run_sandbox": false,
+      "semgrep_config": "auto",
+      "codeql_language": "python",
+      "codeql_suite": "codeql/python-queries",
+      "sandbox_command": "python3 -m pytest -q",
+      "fail_on_medium": true,
+      "max_files": 600,
+      "exclude_patterns": []
+    }
+  }
+}

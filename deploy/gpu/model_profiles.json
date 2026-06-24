@@ -1,0 +1,89 @@
+[
+  {
+    "name": "qwen2.5-coder-7b",
+    "family": "qwen",
+    "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "revision": "c03e6d358207e414f1eca0bb1891e29f1db0e242",
+    "size_class": "7B",
+    "role": "first serious coding/security baseline",
+    "recommended_tp_size": 1,
+    "max_model_len": 32768,
+    "bf16_inference_vram_gb": 24,
+    "awq_inference_vram_gb": 10,
+    "qlora_training_vram_gb": 24,
+    "preferred_training": "QLoRA SFT first, then GRPO on verified tasks",
+    "notes": [
+      "Best first GPU target.",
+      "Single 24GB GPU can be enough for QLoRA experiments."
+    ]
+  },
+  {
+    "name": "qwen2.5-coder-14b",
+    "family": "qwen",
+    "model_id": "Qwen/Qwen2.5-Coder-14B-Instruct",
+    "revision": "aedcc2d42b622764e023cf882b6652e646b95671",
+    "size_class": "14B",
+    "role": "higher quality coding/security baseline",
+    "recommended_tp_size": 1,
+    "max_model_len": 32768,
+    "bf16_inference_vram_gb": 40,
+    "awq_inference_vram_gb": 18,
+    "qlora_training_vram_gb": 48,
+    "preferred_training": "QLoRA SFT on 48GB GPU or multi-GPU ZeRO",
+    "notes": [
+      "Better quality target after 7B pipeline is green."
+    ]
+  },
+  {
+    "name": "qwen2.5-coder-32b",
+    "family": "qwen",
+    "model_id": "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "revision": "381fc969f78efac66bc87ff7ddeadb7e73c218a7",
+    "size_class": "32B",
+    "role": "strong local lab target before 50B-100B",
+    "recommended_tp_size": 2,
+    "max_model_len": 32768,
+    "bf16_inference_vram_gb": 96,
+    "awq_inference_vram_gb": 40,
+    "qlora_training_vram_gb": 96,
+    "preferred_training": "Multi-GPU QLoRA/SFT, then GRPO with strict verifier gating",
+    "notes": [
+      "Use tensor parallel serving.",
+      "Treat as pre-50B quality target."
+    ]
+  },
+  {
+    "name": "deepseek-coder-6.7b",
+    "family": "deepseek",
+    "model_id": "deepseek-ai/deepseek-coder-6.7b-instruct",
+    "revision": "e5d64addd26a6a1db0f9b863abf6ee3141936807",
+    "size_class": "7B",
+    "role": "alternative coding baseline",
+    "recommended_tp_size": 1,
+    "max_model_len": 16384,
+    "bf16_inference_vram_gb": 24,
+    "awq_inference_vram_gb": 10,
+    "qlora_training_vram_gb": 24,
+    "preferred_training": "QLoRA SFT and comparison scorecard",
+    "notes": [
+      "Good alternate baseline for head-to-head evaluation."
+    ]
+  },
+  {
+    "name": "deepseek-coder-v2-lite",
+    "family": "deepseek",
+    "model_id": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+    "revision": "e434a23f91ba5b4923cf6c9d9a238eb4a08e3a11",
+    "size_class": "16B MoE-lite",
+    "role": "MoE-style practical research baseline",
+    "recommended_tp_size": 1,
+    "max_model_len": 16384,
+    "bf16_inference_vram_gb": 40,
+    "awq_inference_vram_gb": 18,
+    "qlora_training_vram_gb": 48,
+    "preferred_training": "Experiment after dense 7B baseline is stable",
+    "notes": [
+      "Useful for future MoE thinking without full 500B infrastructure."
+    ]
+  }
+]

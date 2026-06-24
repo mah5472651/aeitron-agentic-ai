@@ -1,0 +1,40 @@
+{
+  "profile": {
+    "name": "qwen-cpu-smoke",
+    "kind": "local",
+    "family": "qwen",
+    "size_class": "0.5B",
+    "backend": "openai_compatible",
+    "model_name": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+    "endpoint": "http://127.0.0.1:8016/v1",
+    "model_id": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+    "revision": "local_or_cached",
+    "requires_cuda": false,
+    "recommended_tp_size": 1,
+    "max_model_len": 32768,
+    "notes": [
+      "Current local behavior-check profile.",
+      "Not the final target model."
+    ],
+    "commands": {}
+  },
+  "env": {
+    "MYTHOS_ACTIVE_PROFILE": "qwen-cpu-smoke",
+    "PHASE11_BACKEND": "openai_compatible",
+    "PHASE11_MODEL_ENDPOINT": "http://127.0.0.1:8016/v1",
+    "PHASE11_MODEL_NAME": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+    "PHASE24_BACKEND": "openai_compatible",
+    "PHASE24_MODEL_ENDPOINT": "http://127.0.0.1:8016/v1",
+    "PHASE24_MODEL_NAME": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+    "PHASE40_BACKEND": "openai_compatible",
+    "PHASE40_MODEL_ENDPOINT": "http://127.0.0.1:8016/v1",
+    "PHASE40_MODEL_NAME": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+    "SCORECARD_BACKEND": "openai_compatible",
+    "SCORECARD_MODEL_ENDPOINT": "http://127.0.0.1:8016/v1",
+    "SCORECARD_MODEL_NAME": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+    "PHASE16_AGENT_MAX_NEW_TOKENS": "220",
+    "PHASE40_AGENT_BACKEND_MODE": "auto"
+  },
+  "updated_at_unix": 1781807525.6665092,
+  "run_id": "phase42-audit"
+}
