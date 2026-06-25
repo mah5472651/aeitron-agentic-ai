@@ -1767,3 +1767,32 @@ Command:
 ```powershell
 .\scripts\run_phase51_high_stability.ps1
 ```
+
+## Mythos Architecture V1 Productization
+
+This is not Phase 52. It consolidates the existing phases into one product
+control plane with Phase 40 as the main runtime.
+
+Location:
+
+- `src/mythos_v1/capability_registry.py`
+- `src/mythos_v1/backend_comparison.py`
+- `src/mythos_v1/training_preflight.py`
+- `src/mythos_v1/release_gate.py`
+- `docs/mythos_v1_productization.md`
+
+Main guarantees:
+
+- Eight capability owners and measurable quality signals.
+- One-command release decision with exact golden and regression suites.
+- Mock architecture and real model quality are measured separately.
+- Serious API requests enforce strict reasoning, verifier, and security gates.
+- Memory is isolated by project and deduplicated before persistence.
+- UI streams real planning, memory, agent, critic, and verifier events.
+- Training assets are validated now; actual training waits for reviewed data and CUDA.
+
+Command:
+
+```powershell
+.\scripts\run_mythos_v1_release.ps1
+```

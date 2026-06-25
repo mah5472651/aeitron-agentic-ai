@@ -54,7 +54,32 @@
         <button id="clearButton" class="icon-button" type="button" title="Clear conversation">Clear</button>
       </header>
 
-      <div id="messages" class="messages" aria-live="polite"></div>
+      <div class="workspace-grid">
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <aside class="activity" aria-label="Agent activity">
+          <header class="activity-header">
+            <span class="eyebrow">Runtime</span>
+            <strong id="activityState">Idle</strong>
+          </header>
+          <section>
+            <h3>Plan</h3>
+            <ol id="planList" class="activity-list"></ol>
+          </section>
+          <section>
+            <h3>Memory</h3>
+            <ul id="memoryList" class="activity-list"></ul>
+          </section>
+          <section>
+            <h3>Agents &amp; Tools</h3>
+            <ul id="toolList" class="activity-list"></ul>
+          </section>
+          <section>
+            <h3>Verification</h3>
+            <ul id="verificationList" class="activity-list"></ul>
+          </section>
+        </aside>
+      </div>
 
       <form id="composer" class="composer">
         <textarea id="prompt" placeholder="Build a secure API, debug an error, or review this repo"></textarea>

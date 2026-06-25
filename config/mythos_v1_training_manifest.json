@@ -1,0 +1,34 @@
+{
+  "version": "1.0.0",
+  "tokenizer": "artifacts/mvp/code_bpe_tokenizer/tokenizer.json",
+  "reviewed_sft_sources": [
+    "artifacts/phase29/train-ready.jsonl"
+  ],
+  "grpo_sources": [
+    "artifacts/phase36/grpo-candidates.jsonl"
+  ],
+  "schemas": {
+    "sft": "data/training/sft_record.schema.json",
+    "grpo": "data/training/grpo_record.schema.json"
+  },
+  "required_control_tokens": [
+    "<|thought_start|>",
+    "<|thought_end|>",
+    "<|patch_start|>",
+    "<|patch_end|>",
+    "<|compile_error|>",
+    "<|timeout|>"
+  ],
+  "training_entrypoints": {
+    "qlora_sft": "src/phase17/qlora_sft_training.py",
+    "grpo": "src/phase7/grpo_training_loop.py"
+  },
+  "launch_configs": [
+    "deploy/gpu/deepspeed_zero2.json",
+    "deploy/gpu/accelerate_zero2.yaml",
+    "deploy/gpu/qlora_defaults.json",
+    "deploy/gpu/model_profiles.json"
+  ],
+  "checkpoint_gate": "src/phase39/checkpoint_rollback.py"
+}
+

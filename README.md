@@ -1,4 +1,18 @@
-# AI Architecture Build - Phase 1
+# AI Architecture Build - Mythos V1
+
+## Mythos V1 Release Gate
+
+The architecture is consolidated around Phase 40 as the main runtime. Run the
+local product release gate before accepting architecture changes:
+
+```powershell
+.\scripts\run_mythos_v1_release.ps1
+```
+
+The gate checks compilation, static security, strict reasoning and memory,
+integrated agent execution, 400 regression tasks, the exact 90-task golden
+scorecard, and GPU-training architecture readiness. See
+`docs/mythos_v1_productization.md` for full and real-backend modes.
 
 Foundation data ingestion and tokenizer setup for a deliberative LLM pipeline.
 

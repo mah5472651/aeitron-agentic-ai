@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -120,6 +120,7 @@ class IntegratedAgentApiRequest(BaseModel):
     hierarchical_memory: bool = True
     reasoning_review: bool = True
     strict_stability: bool = True
+    policy_mode: str = Field(default="strict", pattern="^(strict|development)$")
     moe_routing: bool = True
     vector_memory: bool = True
     rebuild_vector_memory: bool = False
@@ -301,7 +302,23 @@ async def latest_quality() -> dict[str, Any]:
         "phase49": latest_named_report(ROOT / "artifacts" / "phase49", "multimodal-expert-latest.json"),
         "phase50": latest_named_report(ROOT / "artifacts" / "phase50", "moe-router-latest.json"),
         "phase51": latest_named_report(ROOT / "artifacts" / "phase51", "high-stability-reasoning-memory-latest.json"),
+        "mythos_v1": {
+            "release_gate": latest_named_report(ROOT / "artifacts" / "mythos_v1", "release-gate-latest.json"),
+            "training_preflight": latest_named_report(ROOT / "artifacts" / "mythos_v1", "training-preflight-latest.json"),
+            "backend_comparison": latest_named_report(ROOT / "artifacts" / "mythos_v1", "backend-comparison-latest.json"),
+            "capability_registry": latest_named_report(ROOT / "artifacts" / "mythos_v1", "capability-registry-latest.json"),
+        },
         "readiness": latest_report_payload(ROOT / "artifacts" / "phase10"),
+    }
+
+
+@app.get("/v1/mythos-v1/latest")
+async def mythos_v1_latest() -> dict[str, Any]:
+    return {
+        "release_gate": latest_named_report(ROOT / "artifacts" / "mythos_v1", "release-gate-latest.json"),
+        "training_preflight": latest_named_report(ROOT / "artifacts" / "mythos_v1", "training-preflight-latest.json"),
+        "backend_comparison": latest_named_report(ROOT / "artifacts" / "mythos_v1", "backend-comparison-latest.json"),
+        "capability_registry": latest_named_report(ROOT / "artifacts" / "mythos_v1", "capability-registry-latest.json"),
     }
 
 
@@ -534,6 +551,7 @@ async def run_agent(request: IntegratedAgentApiRequest) -> dict[str, Any]:
             hierarchical_memory=request.hierarchical_memory,
             reasoning_review=request.reasoning_review,
             strict_stability=request.strict_stability,
+            policy_mode=request.policy_mode,
             moe_routing=request.moe_routing,
             vector_memory=request.vector_memory,
             rebuild_vector_memory=request.rebuild_vector_memory,
@@ -558,31 +576,57 @@ async def run_agent_stream(request: IntegratedAgentApiRequest) -> StreamingRespo
         from src.phase40.integrated_agent import IntegratedAgentRequest, IntegratedAgentRuntime, write_report
 
         backend = require_backend()
-        yield sse_json("status", {"stage": "phase40_start"})
-        report = await IntegratedAgentRuntime(backend).run(
-            IntegratedAgentRequest(
-                prompt=request.prompt,
-                workspace=request.workspace,
-                meta_planning=request.meta_planning,
-                hierarchical_memory=request.hierarchical_memory,
-                reasoning_review=request.reasoning_review,
-                strict_stability=request.strict_stability,
-                moe_routing=request.moe_routing,
-                vector_memory=request.vector_memory,
-                rebuild_vector_memory=request.rebuild_vector_memory,
-                run_verifier=request.run_verifier,
-                run_security=request.run_security,
-                verifier_profile=request.verifier_profile,
-                use_model_critic=request.use_model_critic,
-                agent_backend_mode=request.agent_backend_mode,
-                max_agent_nodes=request.max_agent_nodes,
-                max_security_files=request.max_security_files,
-                metadata=request.metadata,
-            )
-        )
-        write_report(report, ROOT / "artifacts" / "phase40")
-        yield sse_json("report", report.model_dump())
-        yield sse_json("done", {"run_id": report.run_id, "status": report.status})
+        queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
+
+        async def event_sink(stage: str, payload: dict[str, Any]) -> None:
+            await queue.put(("stage", {"stage": stage, **payload}))
+
+        async def producer() -> None:
+            try:
+                report = await IntegratedAgentRuntime(backend).run(
+                    IntegratedAgentRequest(
+                        prompt=request.prompt,
+                        workspace=request.workspace,
+                        meta_planning=request.meta_planning,
+                        hierarchical_memory=request.hierarchical_memory,
+                        reasoning_review=request.reasoning_review,
+                        strict_stability=request.strict_stability,
+                        policy_mode=request.policy_mode,
+                        moe_routing=request.moe_routing,
+                        vector_memory=request.vector_memory,
+                        rebuild_vector_memory=request.rebuild_vector_memory,
+                        run_verifier=request.run_verifier,
+                        run_security=request.run_security,
+                        verifier_profile=request.verifier_profile,
+                        use_model_critic=request.use_model_critic,
+                        agent_backend_mode=request.agent_backend_mode,
+                        max_agent_nodes=request.max_agent_nodes,
+                        max_security_files=request.max_security_files,
+                        metadata=request.metadata,
+                    ),
+                    event_sink=event_sink,
+                )
+                write_report(report, ROOT / "artifacts" / "phase40")
+                await queue.put(("report", report.model_dump()))
+                await queue.put(("done", {"run_id": report.run_id, "status": report.status}))
+            except Exception as exc:
+                await queue.put(("error", {"error": f"{type(exc).__name__}: {exc}"}))
+            finally:
+                await queue.put(None)
+
+        producer_task = asyncio.create_task(producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                event_name, payload = item
+                yield sse_json(event_name, payload)
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await producer_task
 
     return StreamingResponse(events(), media_type="text/event-stream")
 

@@ -19,6 +19,7 @@ import json
 import math
 import re
 import sys
+import threading
 import time
 from enum import Enum
 from pathlib import Path
@@ -29,6 +30,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from src.phase11.persistent_memory import HashEmbedding, MemoryRecord, PersistentMemoryGateway, cosine_similarity
+from src.phase37.vector_memory import build_embedder
 
 
 class StrictModel(BaseModel):
@@ -563,14 +567,24 @@ class QualityMetadata(StrictModel):
     success_rate: float = Field(ge=0.0, le=1.0)
     last_used: float = Field(default_factory=time.time)
     usage_count: int = Field(default=0, ge=0)
+    retrieval_count: int = Field(default=0, ge=0)
+    retrieval_score_sum: float = Field(default=0.0, ge=0.0)
+
+    @property
+    def average_retrieval_score(self) -> float:
+        return self.retrieval_score_sum / self.retrieval_count if self.retrieval_count else 0.0
 
 
 class MemoryEntry(StrictModel):
     entry_id: str
+    project_id: str = "default"
     layer: MemoryLayer
     kind: MemoryKind
     text: str
     payload: dict[str, Any]
+    content_hash: str = ""
+    embedding: list[float] = Field(default_factory=list)
+    verification_status: str = Field(default="verified", pattern="^(verified|reviewed)$")
     quality: QualityMetadata
     created_at_unix: float = Field(default_factory=time.time)
 
@@ -614,10 +628,26 @@ class MemoryRetrievalReport(StrictModel):
 class UnifiedMemoryManager:
     """Four-tier memory manager with anti-pollution gates and ranking."""
 
-    def __init__(self, root: Path | None = None, *, session_id: str | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        *,
+        session_id: str | None = None,
+        project_id: str = "default",
+        embedding_dimensions: int = 384,
+        strict_embeddings: bool = False,
+    ) -> None:
         self.root = root or (ROOT / "artifacts" / "phase51" / "memory")
         self.root.mkdir(parents=True, exist_ok=True)
         self.session_id = session_id or stable_id("session", time.time_ns())
+        self.project_id = self._safe_project_id(project_id)
+        self.project_root = self.root / "projects" / self.project_id
+        self.project_root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self.embedder, self.embedding_backend, self.embedding_dimensions = build_embedder(
+            embedding_dimensions,
+            strict_external=strict_embeddings,
+        )
         self.working_memory: dict[str, Any] = {}
         self.knowledge_graph = self._load_graph()
 
@@ -701,26 +731,32 @@ class UnifiedMemoryManager:
         parsed_layer = MemoryLayer(layer)
         parsed_kind = MemoryKind(kind)
         self._validate_ingestion(parsed_kind, payload, text)
+        content_hash = hashlib.sha256(stable_json({"text": text, "payload": payload}).encode("utf-8")).hexdigest()
         entry = MemoryEntry(
-            entry_id=stable_id(parsed_layer.value, parsed_kind.value, text, stable_json(payload)),
+            entry_id=stable_id(self.project_id, parsed_layer.value, parsed_kind.value, content_hash),
+            project_id=self.project_id,
             layer=parsed_layer,
             kind=parsed_kind,
             text=text,
             payload=payload,
+            content_hash=content_hash,
+            embedding=self.embedder.embed(text),
             quality=QualityMetadata(relevance=relevance, success_rate=success_rate),
         )
         if parsed_layer == MemoryLayer.WORKING:
-            self._write_jsonl(self._session_path(), entry)
+            self._upsert_jsonl(self._session_path(), entry)
         else:
-            self._write_jsonl(self._path(parsed_layer), entry)
+            self._upsert_jsonl(self._path(parsed_layer), entry)
         return entry
 
     def retrieve(self, query: str, *, limit: int = 8, layers: list[MemoryLayer | str] | None = None) -> MemoryRetrievalReport:
         entries = self._load_entries(layers=layers)
         hits: list[RankedMemoryHit] = []
         now = time.time()
+        query_embedding = self.embedder.embed(query)
         for entry in entries:
-            vector = lexical_similarity(query, entry.text)
+            entry_embedding = entry.embedding or self.embedder.embed(entry.text)
+            vector = max(0.0, min(1.0, cosine_similarity(query_embedding, entry_embedding)))
             recent = recency_weight(entry.quality.last_used, now=now)
             usage = usage_count_weight(entry.quality.usage_count)
             # Required exact formula:
@@ -739,31 +775,68 @@ class UnifiedMemoryManager:
             )
         hits.sort(key=lambda hit: (hit.final_score, hit.entry.quality.relevance, hit.entry.created_at_unix), reverse=True)
         selected = hits[:limit]
-        self._mark_used([hit.entry.entry_id for hit in selected])
+        self._mark_used({hit.entry.entry_id: hit.final_score for hit in selected})
         return MemoryRetrievalReport(
             query=query,
             hits=selected,
             formula="Final Score = (0.4 * Vector Similarity) + (0.3 * Success Rate) + (0.2 * Recency Weight) + (0.1 * Usage Count Weight)",
         )
 
-    def archive_low_quality(self, *, threshold: float = 0.35, min_usage: int = 3) -> dict[str, Any]:
+    def archive_low_quality(self, *, threshold: float = 0.35, min_observations: int = 3) -> dict[str, Any]:
         archived: list[str] = []
         retained_by_layer: dict[MemoryLayer, list[MemoryEntry]] = {layer: [] for layer in MemoryLayer if layer != MemoryLayer.WORKING}
         for layer in retained_by_layer:
             for entry in self._read_jsonl(self._path(layer)):
-                quality_score = (
+                base_quality = (
                     0.55 * entry.quality.success_rate
                     + 0.35 * entry.quality.relevance
                     + 0.10 * usage_count_weight(entry.quality.usage_count)
                 )
-                if quality_score < threshold and entry.quality.usage_count >= min_usage:
+                observed_quality = entry.quality.average_retrieval_score
+                consistently_low = entry.quality.retrieval_count >= min_observations and observed_quality < threshold
+                if consistently_low and base_quality < max(0.5, threshold):
                     archived.append(entry.entry_id)
-                    self._write_jsonl(self.root / "cold_storage.jsonl", entry)
+                    self._write_jsonl(self.project_root / "cold_storage.jsonl", entry)
                 else:
                     retained_by_layer[layer].append(entry)
         for layer, entries in retained_by_layer.items():
             self._rewrite_jsonl(self._path(layer), entries)
-        return {"archived": archived, "archived_count": len(archived), "threshold": threshold, "min_usage": min_usage}
+        return {
+            "archived": archived,
+            "archived_count": len(archived),
+            "threshold": threshold,
+            "min_observations": min_observations,
+        }
+
+    async def sync_external(self) -> dict[str, Any]:
+        """Mirror verified project memory to configured Postgres/Qdrant sinks."""
+        entries = self._load_entries(layers=[MemoryLayer.PROJECT, MemoryLayer.EXPERIENCE, MemoryLayer.KNOWLEDGE_GRAPH])
+        records = [
+            MemoryRecord(
+                record_id=entry.entry_id,
+                workspace=self.project_id,
+                source=f"phase51:{entry.layer.value}:{entry.kind.value}",
+                content=entry.text,
+                embedding=entry.embedding or self.embedder.embed(entry.text),
+                metadata=entry.model_dump(exclude={"embedding"}),
+                created_at_ms=int(entry.created_at_unix * 1000),
+            )
+            for entry in entries
+            if entry.verification_status in {"verified", "reviewed"}
+        ]
+        gateway = PersistentMemoryGateway(
+            workspace=self.project_id,
+            qdrant_url=__import__("os").environ.get("PHASE51_QDRANT_URL") or __import__("os").environ.get("PHASE11_QDRANT_URL"),
+            postgres_dsn=__import__("os").environ.get("PHASE51_POSTGRES_DSN") or __import__("os").environ.get("PHASE11_POSTGRES_DSN"),
+            qdrant_collection="phase51_unified_memory",
+            embedding_dimensions=self.embedding_dimensions,
+        )
+        try:
+            initialized = await gateway.initialize()
+            result = await gateway.upsert(records)
+            return {"project_id": self.project_id, "records": len(records), "initialize": initialized, "upsert": result}
+        finally:
+            await gateway.aclose()
 
     def clear_working_memory(self) -> None:
         self.working_memory = {}
@@ -798,10 +871,10 @@ class UnifiedMemoryManager:
                 entries.extend(self._read_jsonl(self._path(layer)))
         return entries
 
-    def _mark_used(self, entry_ids: list[str]) -> None:
-        if not entry_ids:
+    def _mark_used(self, scores: dict[str, float]) -> None:
+        if not scores:
             return
-        wanted = set(entry_ids)
+        wanted = set(scores)
         for layer in [MemoryLayer.PROJECT, MemoryLayer.EXPERIENCE, MemoryLayer.KNOWLEDGE_GRAPH]:
             path = self._path(layer)
             entries = []
@@ -811,6 +884,10 @@ class UnifiedMemoryManager:
                         update={
                             "quality": entry.quality.model_copy(
                                 update={"last_used": time.time(), "usage_count": entry.quality.usage_count + 1}
+                                | {
+                                    "retrieval_count": entry.quality.retrieval_count + 1,
+                                    "retrieval_score_sum": entry.quality.retrieval_score_sum + scores[entry.entry_id],
+                                }
                             )
                         }
                     )
@@ -824,7 +901,7 @@ class UnifiedMemoryManager:
         return node
 
     def _load_graph(self) -> KnowledgeGraphStore:
-        path = self.root / "knowledge_graph.json"
+        path = self.project_root / "knowledge_graph.json"
         if not path.exists():
             return KnowledgeGraphStore()
         try:
@@ -833,28 +910,53 @@ class UnifiedMemoryManager:
             return KnowledgeGraphStore()
 
     def _save_graph(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / "knowledge_graph.json").write_text(
+        self.project_root.mkdir(parents=True, exist_ok=True)
+        (self.project_root / "knowledge_graph.json").write_text(
             json.dumps(self.knowledge_graph.model_dump(), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
     def _path(self, layer: MemoryLayer) -> Path:
-        return self.root / f"{layer.value}.jsonl"
+        return self.project_root / f"{layer.value}.jsonl"
 
     def _session_path(self) -> Path:
-        return self.root / f"working_{self.session_id}.jsonl"
+        return self.project_root / f"working_{self.session_id}.jsonl"
+
+    def _safe_project_id(self, project_id: str) -> str:
+        normalized = re.sub(r"[^a-zA-Z0-9_.-]+", "-", project_id.strip()).strip("-.")
+        return normalized[:100] or "default"
 
     def _write_jsonl(self, path: Path, entry: MemoryEntry) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry.model_dump(), ensure_ascii=False) + "\n")
 
+    def _upsert_jsonl(self, path: Path, entry: MemoryEntry) -> None:
+        with self._lock:
+            existing = {item.entry_id: item for item in self._read_jsonl(path)}
+            previous = existing.get(entry.entry_id)
+            if previous is not None:
+                entry = entry.model_copy(
+                    update={
+                        "created_at_unix": previous.created_at_unix,
+                        "quality": previous.quality.model_copy(
+                            update={
+                                "relevance": max(previous.quality.relevance, entry.quality.relevance),
+                                "success_rate": max(previous.quality.success_rate, entry.quality.success_rate),
+                            }
+                        ),
+                    }
+                )
+            existing[entry.entry_id] = entry
+            self._rewrite_jsonl(path, list(existing.values()))
+
     def _rewrite_jsonl(self, path: Path, entries: list[MemoryEntry]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
             for entry in entries:
                 handle.write(json.dumps(entry.model_dump(), ensure_ascii=False) + "\n")
+        temporary.replace(path)
 
     def _read_jsonl(self, path: Path) -> list[MemoryEntry]:
         if not path.exists():
@@ -875,6 +977,7 @@ class Phase51SmokeReport(StrictModel):
     reasoning: ReasoningTrace
     reflection_contract: ReasoningTrace
     retrieval: MemoryRetrievalReport
+    memory_lifecycle: dict[str, Any]
     rejected_memory: bool
     archive: dict[str, Any]
     schemas: dict[str, dict[str, Any]]
@@ -908,9 +1011,18 @@ def run_smoke(prompt: str, *, run_id: str, output_dir: Path) -> Phase51SmokeRepo
         "underspecified task with missing evidence",
         run_id=f"{run_id}-reflection-contract",
     )
-    memory = UnifiedMemoryManager(output_dir / "memory", session_id=run_id)
+    memory = UnifiedMemoryManager(output_dir / "memory", session_id=run_id, project_id="phase51-smoke-project")
     memory.set_working_memory(project="AI_Architecture_Build", current_feature="high-stability reasoning memory")
-    memory.save_project_memory(module_name="Phase 51", path="src/phase51/high_stability_reasoning_memory.py", tech_stack="Python + Pydantic")
+    project_entry = memory.save_project_memory(
+        module_name="Phase 51",
+        path="src/phase51/high_stability_reasoning_memory.py",
+        tech_stack="Python + Pydantic",
+    )
+    duplicate_entry = memory.save_project_memory(
+        module_name="Phase 51",
+        path="src/phase51/high_stability_reasoning_memory.py",
+        tech_stack="Python + Pydantic",
+    )
     memory.save_experience_memory(
         failure="planner and critic role mixing polluted context",
         fix="strict schemas plus role contract checks",
@@ -930,12 +1042,25 @@ def run_smoke(prompt: str, *, run_id: str, output_dir: Path) -> Phase51SmokeRepo
     except MemoryIngestionRejected:
         rejected = True
     retrieval = memory.retrieve("strict planner memory security session", limit=5)
+    isolated_memory = UnifiedMemoryManager(output_dir / "memory", session_id=f"{run_id}-isolated", project_id="isolated-project")
+    isolated_hits = isolated_memory.retrieve("Phase 51 strict planner", limit=5).hits
+    project_records = memory._read_jsonl(memory._path(MemoryLayer.PROJECT))
+    working_path = memory._session_path()
+    memory.clear_working_memory()
+    lifecycle = {
+        "project_id": memory.project_id,
+        "embedding_backend": memory.embedding_backend,
+        "deduplicated": project_entry.entry_id == duplicate_entry.entry_id and len(project_records) == 1,
+        "cross_project_isolated": not isolated_hits,
+        "session_cleared": not working_path.exists(),
+    }
     archive = memory.archive_low_quality()
     return Phase51SmokeReport(
         run_id=run_id,
         reasoning=reasoning,
         reflection_contract=reflection_contract,
         retrieval=retrieval,
+        memory_lifecycle=lifecycle,
         rejected_memory=rejected,
         archive=archive,
         schemas={

@@ -117,7 +117,7 @@ Already built locally:
 - Defensive Git/Semgrep/CodeQL/browser tool adapters
 - Scorecard failure exporter for SFT/GRPO data candidates
 - Local real Qwen backend connected through an OpenAI-compatible API
-- Main chat API is currently connected to Qwen/Qwen2.5-Coder-0     5B-Instruct
+- Main chat API is currently connected to Qwen/Qwen2.5-Coder-0.5B-Instruct
 - Qwen model revision is pinned for safer reproducible local loading
 - Semgrep is available through the official Docker image
 - CodeQL CLI is installed locally under tools/codeql
@@ -167,6 +167,8 @@ Already built locally:
 - Phase 51 adds strict no-role-mixing reasoning contracts, schema-validated Planner/Executor/Critic/Verifier outputs, forced reflection below critic confidence `0.6`, and a four-tier unified memory manager with anti-pollution gates
 - Phase 51 is now wired into Phase 40 as an active strict-stability guardrail, not only a standalone module
 - Chat API now exposes Phase 51 in `/v1/quality/latest`
+- Mythos V1 productization now adds a capability registry, release gate, real-backend comparison runner, GPU/training preflight, schema-validated SFT/GRPO record contracts, and chat activity streaming.
+- The V1 release gate currently passes locally in full mode with a release decision; the only warning is that the real Qwen endpoint is unavailable during the local CPU startup window.
 
 Main gaps:
 
@@ -185,7 +187,7 @@ Main gaps:
 - Observability is local-file/in-process today; production should scrape `/metrics` and ship JSONL logs to a log pipeline.
 - Multimodal support is currently metadata/schema level only; OCR, vision encoders, and document extraction adapters are future work.
 - The MoE router is currently a software router, not a trained neural router; later 50B-100B/MoE serving can attach to the same routing contract.
-- Phase 51 memory similarity is deterministic lexical similarity locally; production should swap in embedding vectors while preserving the exact ranking formula.
+- Phase 51 memory retrieval now uses deterministic hash embeddings locally and can use semantic embeddings/Qdrant/pgvector in production while preserving the exact ranking formula.
 - 50B-100B training/serving still needs Linux CUDA hardware, not this Windows CPU setup.
 
 ## Immediate Build Order
@@ -208,6 +210,8 @@ Main gaps:
 16. Expand verifier coverage with SWE-Bench/CyberSecEval-style tasks and repo-scale regression tasks.
 17. Sync this Git repository to a remote and use commits/checkpoints before risky architecture changes.
 18. On Linux CUDA hardware, run the prepared 7B profile first, then 14B/32B; reserve 50B-100B for later multi-GPU infrastructure.
+19. Run `scripts/run_mythos_v1_release.ps1 -Mode full -IncludeRealBackend` before calling an architecture checkpoint production-ready.
+20. Run `scripts/run_mythos_v1_training_preflight.ps1` after every dataset or training-script change so GPU arrival is not the first time we find broken contracts.
 
 ## What We Need Next To Make It Stronger
 

@@ -170,6 +170,7 @@ async def run_e2e(prompt: str, *, run_id: str, include_phase40: bool) -> Phase43
                 IntegratedAgentRequest(
                     prompt=prompt,
                     workspace=str(ROOT),
+                    policy_mode="development",
                     meta_planning=True,
                     vector_memory=False,
                     run_verifier=False,

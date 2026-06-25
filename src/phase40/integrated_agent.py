@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -65,6 +66,7 @@ class IntegratedAgentRequest(StrictModel):
     hierarchical_memory: bool = True
     reasoning_review: bool = True
     strict_stability: bool = True
+    policy_mode: str = Field(default="strict", pattern="^(strict|development)$")
     moe_routing: bool = True
     vector_memory: bool = True
     rebuild_vector_memory: bool = False
@@ -86,6 +88,7 @@ class IntegratedAgentReport(StrictModel):
     prompt: str
     workspace: str
     route: dict[str, Any]
+    enforcement: dict[str, Any]
     moe_route: dict[str, Any] | None
     meta_plan: dict[str, Any] | None
     hierarchical_memory: dict[str, Any] | None
@@ -161,11 +164,34 @@ class IntegratedAgentRuntime:
     def __init__(self, backend: ModelBackend) -> None:
         self.backend = backend
 
-    async def run(self, request: IntegratedAgentRequest) -> IntegratedAgentReport:
+    async def run(
+        self,
+        request: IntegratedAgentRequest,
+        *,
+        event_sink: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None = None,
+    ) -> IntegratedAgentReport:
         started = time.time()
         run_id = f"phase40-{time.time_ns()}"
         workspace = safe_workspace(request.workspace)
         route = classify_intent(request.prompt, requested_profile=request.verifier_profile, use_model_critic=request.use_model_critic)
+        serious_intent = route.intent in {"coding", "debugging", "security", "release"}
+        strict_required = request.policy_mode == "strict" and serious_intent
+        strict_stability_enabled = request.strict_stability or strict_required
+        verifier_enabled = request.run_verifier or strict_required
+        security_enabled = request.run_security or (strict_required and route.run_multilang_security)
+        enforcement = {
+            "policy_mode": request.policy_mode,
+            "serious_intent": serious_intent,
+            "strict_stability_required": strict_required,
+            "strict_stability_enabled": strict_stability_enabled,
+            "verifier_enabled": verifier_enabled,
+            "security_enabled": security_enabled,
+        }
+        await self._emit(
+            event_sink,
+            "route",
+            {"status": "complete", "intent": route.intent, "verifier_profile": route.verifier_profile, "enforcement": enforcement},
+        )
         moe_payload: dict[str, Any] | None = None
         meta_plan_payload: dict[str, Any] | None = None
         hierarchical_payload: dict[str, Any] | None = None
@@ -185,6 +211,7 @@ class IntegratedAgentRuntime:
                 f"- execution_hint={moe_report.execution_hint}\n"
                 + "\n".join(f"- {expert.expert}: {expert.reason} score={expert.score}" for expert in moe_report.routes)
             )
+            await self._emit(event_sink, "expert_routing", {"status": "complete", "primary_expert": moe_report.primary_expert, "routes": [item.expert for item in moe_report.routes]})
 
         if request.meta_planning:
             meta_plan = create_meta_plan(request.prompt, run_id=f"{run_id}-metaplan")
@@ -206,6 +233,7 @@ class IntegratedAgentRuntime:
                     for lane in meta_plan.execution_lanes
                 )
             )
+            await self._emit(event_sink, "planning", {"status": "complete", "goal": meta_plan.goal, "lanes": [lane.lane for lane in meta_plan.execution_lanes]})
 
         if request.hierarchical_memory:
             memory_report = HierarchicalMemory(ROOT / "artifacts" / "phase46").run(
@@ -223,9 +251,14 @@ class IntegratedAgentRuntime:
                     f"{memory_report.context_block}\n\n"
                     "Prefer decisions that align with durable project memory and known failure outcomes."
                 )
+            await self._emit(event_sink, "hierarchical_memory", {"status": "complete", "hits": len(memory_report.hits), "layers": memory_report.layers})
 
-        if request.strict_stability:
-            strict_memory = UnifiedMemoryManager(ROOT / "artifacts" / "phase51" / "memory", session_id=run_id)
+        if strict_stability_enabled:
+            strict_memory = UnifiedMemoryManager(
+                ROOT / "artifacts" / "phase51" / "memory",
+                session_id=run_id,
+                project_id=workspace.name,
+            )
             strict_memory.set_working_memory(project=workspace.name, current_feature=request.prompt[:160])
             strict_memory.save_project_memory(
                 module_name="Phase 40 Integrated Agent",
@@ -263,6 +296,7 @@ class IntegratedAgentRuntime:
                     + "\n\n"
                     f"Ranking formula: {retrieval.formula}"
                 )
+            await self._emit(event_sink, "strict_memory", {"status": "complete", "hits": len(retrieval.hits), "project_id": strict_memory.project_id, "embedding_backend": strict_memory.embedding_backend})
 
         if request.vector_memory:
             vector_memory = VectorExperienceMemory(workspace="mythos")
@@ -281,7 +315,9 @@ class IntegratedAgentRuntime:
                     f"{vector_report.context_block}\n\n"
                     "Use this memory to avoid repeated planning, security, and verification mistakes."
                 )
+            await self._emit(event_sink, "vector_memory", {"status": "complete", "hits": len(vector_report.hits), "backend": vector_report.embedding_backend})
 
+        await self._emit(event_sink, "agent_execution", {"status": "running"})
         agent_backend = self.agent_backend_for_request(request)
         agent_report = await MainAgentV2(agent_backend).run(
             MainAgentV2Request(
@@ -296,7 +332,18 @@ class IntegratedAgentRuntime:
             )
         )
         write_phase24_report(agent_report, ROOT / "artifacts" / "phase24")
+        taskgraph_artifacts = agent_report.taskgraph_report.get("artifacts") if isinstance(agent_report.taskgraph_report, dict) else []
+        await self._emit(
+            event_sink,
+            "agent_execution",
+            {
+                "status": "complete",
+                "agent_status": agent_report.status,
+                "artifacts": len(taskgraph_artifacts) if isinstance(taskgraph_artifacts, list) else 0,
+            },
+        )
 
+        await self._emit(event_sink, "critic", {"status": "running"})
         critic = await review_artifact(
             prompt=request.prompt,
             artifact=agent_report.final_answer,
@@ -312,6 +359,7 @@ class IntegratedAgentRuntime:
             mode="model" if route.use_model_critic else "heuristic",
             backend=self.backend if route.use_model_critic else None,
         )
+        await self._emit(event_sink, "critic", {"status": "complete", "accepted": critic.ok, "confidence": critic.confidence, "issues": len(critic.issues)})
 
         if request.reasoning_review:
             reasoning_report = ReasoningEngine().run(
@@ -320,8 +368,9 @@ class IntegratedAgentRuntime:
             )
             write_phase47_report(reasoning_report, ROOT / "artifacts" / "phase47")
             reasoning_payload = reasoning_report.model_dump()
+            await self._emit(event_sink, "reasoning_review", {"status": "complete", "accepted": reasoning_report.accepted, "confidence": reasoning_report.confidence})
 
-        if request.strict_stability:
+        if strict_stability_enabled:
             strict_trace = StrictReasoningEngine().run(
                 f"{request.prompt}\n\nCandidate answer:\n{agent_report.final_answer[:3000]}",
                 run_id=f"{run_id}-strict-stability",
@@ -337,9 +386,11 @@ class IntegratedAgentRuntime:
                 },
             }
             self._write_strict_stability_report(run_id, strict_stability_payload)
+            await self._emit(event_sink, "strict_stability", {"status": "complete", "accepted": strict_trace.accepted, "confidence": strict_trace.confidence, "reflections": len(strict_trace.reflections)})
 
         verifier_payload: dict[str, Any] | None = None
-        if request.run_verifier:
+        if verifier_enabled:
+            await self._emit(event_sink, "verifier", {"status": "running", "profile": route.verifier_profile})
             policy_file = ROOT / "config" / "verifier_policy.json"
             if not policy_file.exists():
                 write_default_policy(policy_file)
@@ -351,9 +402,11 @@ class IntegratedAgentRuntime:
                 output_dir=ROOT / "artifacts" / "phase27",
             )
             verifier_payload = verifier_report.model_dump()
+            await self._emit(event_sink, "verifier", {"status": "complete", "result": verifier_report.status, "score": verifier_report.score, "findings": len(verifier_report.findings)})
 
         security_payload: dict[str, Any] | None = None
-        if request.run_security and route.run_multilang_security:
+        if security_enabled and route.run_multilang_security:
+            await self._emit(event_sink, "security", {"status": "running"})
             security_report = await asyncio.to_thread(
                 MultiLanguageSecurityEngine().analyze_workspace,
                 workspace,
@@ -363,6 +416,7 @@ class IntegratedAgentRuntime:
             security_report = security_report.model_copy(update={"run_id": f"{run_id}-security"})
             write_phase38_report(security_report, ROOT / "artifacts" / "phase38")
             security_payload = security_report.model_dump()
+            await self._emit(event_sink, "security", {"status": "complete", "result": security_report.status, "score": security_report.score, "findings": len(security_report.findings)})
 
         status, failure_event = self._status_and_failure(
             run_id=run_id,
@@ -379,6 +433,8 @@ class IntegratedAgentRuntime:
             self._write_failure_event(failure_event)
             self._promote_failure(failure_event)
 
+        await self._emit(event_sink, "complete", {"status": status, "run_id": run_id})
+
         return IntegratedAgentReport(
             run_id=run_id,
             status=status,
@@ -387,6 +443,7 @@ class IntegratedAgentRuntime:
             prompt=request.prompt,
             workspace=str(workspace),
             route=route.model_dump(),
+            enforcement=enforcement,
             moe_route=moe_payload,
             meta_plan=meta_plan_payload,
             hierarchical_memory=hierarchical_payload,
@@ -402,6 +459,18 @@ class IntegratedAgentRuntime:
             duration_ms=(time.time() - started) * 1000,
             created_at_unix=started,
         )
+
+    async def _emit(
+        self,
+        event_sink: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None,
+        stage: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if event_sink is None:
+            return
+        result = event_sink(stage, {"stage": stage, "timestamp_unix": time.time(), **payload})
+        if inspect.isawaitable(result):
+            await result
 
     def _status_and_failure(
         self,
@@ -589,6 +658,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-hierarchical-memory", action="store_true")
     parser.add_argument("--no-reasoning-review", action="store_true")
     parser.add_argument("--no-strict-stability", action="store_true")
+    parser.add_argument("--policy-mode", choices=["strict", "development"], default="development")
     parser.add_argument("--no-moe-routing", action="store_true")
     parser.add_argument("--no-vector-memory", action="store_true")
     parser.add_argument("--rebuild-vector-memory", action="store_true")
@@ -611,6 +681,7 @@ async def async_main() -> int:
                 hierarchical_memory=not args.no_hierarchical_memory,
                 reasoning_review=not args.no_reasoning_review,
                 strict_stability=not args.no_strict_stability,
+                policy_mode=args.policy_mode,
                 moe_routing=not args.no_moe_routing,
                 vector_memory=not args.no_vector_memory,
                 rebuild_vector_memory=args.rebuild_vector_memory,
