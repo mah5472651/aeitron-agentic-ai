@@ -1,5 +1,84 @@
 # AI Architecture Build - Mythos V1
 
+# Mythos AI
+
+> A next-generation Agentic AI Architecture for Coding, Cybersecurity, Reasoning, Memory, and Autonomous Execution.
+
+Mythos AI is an advanced AI systems architecture inspired by Cursor, Claude Code, DeepSeek-R1, and modern agentic AI research.
+
+The goal is to build a scalable AI platform capable of:
+
+* Multi-Agent Collaboration
+* Autonomous Planning & Execution
+* Hierarchical Memory Systems
+* Long-Context Reasoning
+* Cybersecurity Analysis
+* Verification & Self-Correction
+* Knowledge Graph Integration
+* Future 7B–100B+ Model Deployment
+
+---
+
+## Architecture Overview
+
+User
+→ Intent Engine
+→ Meta Planner
+→ Task Graph
+→ Agent Orchestrator
+→ Memory Layer
+→ Reasoning Engine
+→ Critic
+→ Verifier
+→ Final Response
+
+---
+
+## Core Capabilities
+
+✅ Multi-Agent Runtime
+
+✅ Hierarchical Memory
+
+✅ Thinker → Critic → Verifier Pipeline
+
+✅ Security Analysis Framework
+
+✅ Vector Memory Retrieval
+
+✅ Knowledge Graph
+
+✅ Long Context Processing
+
+✅ MoE Routing System
+
+✅ Evaluation & Benchmarking
+
+✅ Training Data Flywheel
+
+---
+
+## Current Status
+
+* 51+ architecture modules implemented
+* Local Qwen backend integration completed
+* Vector memory and reasoning layers operational
+* Security verification workflows integrated
+* GPU-ready 7B–32B deployment path prepared
+
+---
+
+## Long-Term Vision
+
+Build a world-class AI platform capable of competing with modern coding and reasoning systems while maintaining strong security, verification, and memory capabilities.
+
+Target Scale:
+
+* 7B Models
+* 14B Models
+* 32B Models
+* Future 50B–100B+ Research Systems
+
 ## Mythos V1 Release Gate
 
 The architecture is consolidated around Phase 40 as the main runtime. Run the
