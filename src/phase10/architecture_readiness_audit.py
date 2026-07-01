@@ -643,7 +643,7 @@ def check_phase40_42_integrated_runtime() -> AuditItem:
             "80",
         ],
         [sys.executable, "src/phase41/regression_pack.py", "--run-id", "phase41-audit", "--smoke-limit", "10"],
-        [sys.executable, "src/phase42/profile_switcher.py", "--profile", "qwen-cpu-smoke", "--activate", "--run-id", "phase42-audit"],
+        [sys.executable, "src/phase42/profile_switcher.py", "--profile", "tiny-llama-cpu-smoke", "--activate", "--run-id", "phase42-audit"],
     ]
     results = [run_command(command, timeout_s=180) for command in commands]
     failed = [result for result in results if result.exit_code != 0 or result.timed_out]

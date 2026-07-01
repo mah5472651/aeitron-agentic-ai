@@ -80,7 +80,28 @@ def local_profiles() -> list[RuntimeProfile]:
             endpoint="http://127.0.0.1:8016/v1",
             model_id="Qwen/Qwen2.5-Coder-0.5B-Instruct",
             revision="local_or_cached",
-            notes=["Current local behavior-check profile.", "Not the final target model."],
+            notes=[
+                "Target local Qwen behavior-check profile.",
+                "On some Windows CPU Torch/Transformers stacks this checkpoint can crash natively while loading.",
+                "Use tiny-llama-cpu-smoke when the local Qwen checkpoint is unstable.",
+                "Not the final target model.",
+            ],
+        ),
+        RuntimeProfile(
+            name="tiny-llama-cpu-smoke",
+            kind="local",
+            family="llama",
+            size_class="tiny",
+            backend="openai_compatible",
+            model_name="hf-internal-testing/tiny-random-LlamaForCausalLM",
+            endpoint="http://127.0.0.1:8016/v1",
+            model_id="hf-internal-testing/tiny-random-LlamaForCausalLM",
+            revision="9fb191250dd56d0ba7ec9785a025ed29c03d5998",
+            notes=[
+                "Stable real Hugging Face/OpenAI-compatible plumbing profile for Windows CPU smoke tests.",
+                "Measures backend connectivity and architecture routing, not final reasoning quality.",
+                "Use 7B-32B Qwen/DeepSeek/Llama profiles on Linux CUDA for real quality.",
+            ],
         ),
     ]
 
@@ -158,7 +179,7 @@ def env_for_profile(profile: RuntimeProfile) -> dict[str, str]:
         "SCORECARD_MODEL_ENDPOINT": profile.endpoint,
         "SCORECARD_MODEL_NAME": profile.model_name,
     }
-    if profile.name == "qwen-cpu-smoke":
+    if profile.name in {"qwen-cpu-smoke", "tiny-llama-cpu-smoke"}:
         env["PHASE16_AGENT_MAX_NEW_TOKENS"] = "220"
         env["PHASE40_AGENT_BACKEND_MODE"] = "auto"
     elif profile.kind == "gpu_vllm":

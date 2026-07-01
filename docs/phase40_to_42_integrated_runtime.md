@@ -29,7 +29,8 @@ Run:
 
 Local CPU behavior:
 
-- `qwen-cpu-smoke` keeps chat/model behavior connected to the local Qwen endpoint.
+- `tiny-llama-cpu-smoke` is the default stable Windows CPU real-backend plumbing profile.
+- `qwen-cpu-smoke` remains the target local Qwen quality-smoke profile, but this Windows CPU Torch/Transformers stack can crash natively while loading that checkpoint.
 - Phase 40 uses `agent_backend_mode=auto`, so multi-agent orchestration uses mock plumbing on CPU unless forced with `-AgentBackendMode active`.
 - GPU/vLLM profiles switch Phase 40 to active model orchestration.
 
@@ -83,7 +84,7 @@ artifacts/phase41/regression-pack-latest.json
 
 Purpose:
 
-- Switch between local mock, local CPU Qwen smoke, and future GPU/vLLM profiles through one contract.
+- Switch between local mock, stable tiny CPU smoke, local CPU Qwen smoke, and future GPU/vLLM profiles through one contract.
 - Generate active env config for Phase 11, Phase 24, Phase 40, and scorecard runners.
 - Keep GPU profiles ready without pretending this CPU machine can run them.
 
@@ -100,6 +101,14 @@ List profiles:
 ```
 
 Activate current local profile:
+
+```powershell
+.\scripts\run_phase42_profile_switcher.ps1 -Profile tiny-llama-cpu-smoke
+```
+
+The tiny profile is revision-pinned and is for endpoint stability, routing, scorecard plumbing, and API testing only. Its model quality is intentionally not meaningful.
+
+Activate local Qwen profile when the runtime can load it safely:
 
 ```powershell
 .\scripts\run_phase42_profile_switcher.ps1 -Profile qwen-cpu-smoke

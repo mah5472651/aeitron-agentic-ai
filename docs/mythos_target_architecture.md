@@ -116,9 +116,9 @@ Already built locally:
 - ExperienceMemory failure/fix/outcome promotion
 - Defensive Git/Semgrep/CodeQL/browser tool adapters
 - Scorecard failure exporter for SFT/GRPO data candidates
-- Local real Qwen backend connected through an OpenAI-compatible API
-- Main chat API is currently connected to Qwen/Qwen2.5-Coder-0.5B-Instruct
-- Qwen model revision is pinned for safer reproducible local loading
+- Local real OpenAI-compatible backend path is connected and stable through a pinned tiny HF model for Windows CPU plumbing checks
+- Main chat API can be pointed at `tiny-llama-cpu-smoke`, `qwen-cpu-smoke`, or future 7B-32B GPU/vLLM profiles through Phase 42
+- Qwen and tiny HF model revisions are pinned for safer reproducible local loading
 - Semgrep is available through the official Docker image
 - CodeQL CLI is installed locally under tools/codeql
 - CodeQL Python, JavaScript, and C/C++ query packs are installed
@@ -168,12 +168,12 @@ Already built locally:
 - Phase 51 is now wired into Phase 40 as an active strict-stability guardrail, not only a standalone module
 - Chat API now exposes Phase 51 in `/v1/quality/latest`
 - Mythos V1 productization now adds a capability registry, release gate, real-backend comparison runner, GPU/training preflight, schema-validated SFT/GRPO record contracts, and chat activity streaming.
-- The V1 release gate currently passes locally in full mode with a release decision; the only warning is that the real Qwen endpoint is unavailable during the local CPU startup window.
+- The V1 release gate passes locally with the pinned tiny HF endpoint reachable; Phase 18 correctly reports that this tiny random model is not a deployable reasoning backend.
 
 Main gaps:
 
-- Current live local backend is a small CPU Qwen model for immediate UI/API behavior checks; the 7B-32B GPU backend/training path is now prepared but cannot be executed on this Windows CPU machine.
-- The exact scorecard loop is implemented for Qwen; it should be run regularly in quick mode on CPU and full mode on a stronger GPU/vLLM backend.
+- Current stable local backend is a pinned tiny HF model for immediate UI/API behavior checks; the 7B-32B GPU backend/training path is prepared but cannot be executed on this Windows CPU machine.
+- The exact scorecard loop is implemented for OpenAI-compatible Qwen/DeepSeek/Llama endpoints; it should be run regularly in quick mode locally and full mode on a stronger GPU/vLLM backend.
 - Critic service can call a real model, but no dedicated trained critic checkpoint exists yet.
 - Verifier layer now exists, but needs broader benchmark coverage: SWE-Bench-style coding tasks, CyberSecEval-style security tasks, and repo-scale regression suites.
 - Semgrep/CodeQL wrappers and verifier gates exist; Phase 19/27 now can call Phase 38 multi-language security directly, but deeper SARIF severity calibration and language benchmark tuning should continue.
@@ -215,7 +215,7 @@ Main gaps:
 
 ## What We Need Next To Make It Stronger
 
-- A stronger real model than the 0.5B CPU Qwen smoke model: practical next target is Qwen/DeepSeek/Llama coder class 7B-14B, then 32B.
+- A stronger real model than the tiny CPU smoke backend: practical next target is Qwen/DeepSeek/Llama coder class 7B-14B, then 32B.
 - A real critic backend trained or prompted specifically to find coding, security, planning, and verification mistakes.
 - More golden tasks with hard short prompts, multi-file repos, failing tests, and security patch cases.
 - A production memory promotion loop: failure -> fix -> outcome -> embedding -> retrieval during planning. Phase 37 now provides the retrieval layer; next step is making it default in every planner run.

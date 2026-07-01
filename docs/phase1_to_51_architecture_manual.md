@@ -1273,7 +1273,7 @@ How it works:
 - Runs Phase 27 verifier policy.
 - Runs Phase 38 multi-language security scan for coding/security/debug/release tasks.
 - Promotes failures into experience memory.
-- On `qwen-cpu-smoke`, Phase 40 uses mock orchestration by default so local
+- On `tiny-llama-cpu-smoke` and `qwen-cpu-smoke`, Phase 40 uses mock orchestration by default so local
   agent calls stay responsive; GPU profiles use active model orchestration.
 
 When to use:
@@ -1666,7 +1666,7 @@ python src\phase41\regression_pack.py --smoke-limit 25
 Activate model profile:
 
 ```powershell
-python src\phase42\profile_switcher.py --profile qwen-cpu-smoke --activate
+python src\phase42\profile_switcher.py --profile tiny-llama-cpu-smoke --activate
 ```
 
 ## Latest Debug Status
@@ -1717,7 +1717,7 @@ Known remaining constraints:
 - `deepspeed` and `autoawq` remain Linux CUDA path items.
 - The workspace is now initialized as a local Git repository; full remote sync,
   branch policy, and commit discipline are still needed for production work.
-- Current live model is a small CPU Qwen smoke backend, not the final 7B-32B or
+- Current stable live model is a pinned tiny CPU HF smoke backend, not the final 7B-32B or
   50B-100B target.
 
 ## Phase 51: High-Stability Reasoning And Unified Memory

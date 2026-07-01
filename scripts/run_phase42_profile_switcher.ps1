@@ -1,5 +1,5 @@
 param(
-  [string]$Profile = "qwen-cpu-smoke",
+  [string]$Profile = "tiny-llama-cpu-smoke",
   [switch]$List
 )
 

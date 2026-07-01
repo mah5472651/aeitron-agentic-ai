@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
+import argparse
 import os
 import sys
 import time
@@ -53,11 +53,17 @@ def load_model() -> None:
     if state.model is not None and state.tokenizer is not None:
         return
     dtype = torch.float16 if state.device.startswith("cuda") else torch.float32
-    state.tokenizer = AutoTokenizer.from_pretrained(state.model_id, revision=state.revision, trust_remote_code=False)
+    if state.revision in {"", "main", "master", "latest"} and not Path(state.model_id).exists():
+        raise ValueError("PHASE16_HF_REVISION must be pinned to an immutable commit hash for remote Hugging Face models.")
+    state.tokenizer = AutoTokenizer.from_pretrained(
+        state.model_id,
+        revision=state.revision,
+        trust_remote_code=False,
+    )
     state.model = AutoModelForCausalLM.from_pretrained(
         state.model_id,
         revision=state.revision,
-        torch_dtype=dtype,
+        dtype=dtype,
         low_cpu_mem_usage=True,
         trust_remote_code=False,
     )
@@ -119,6 +125,11 @@ def generate_sync(request: ChatCompletionRequest) -> str:
         prompt = "\n".join(f"{item['role'].upper()}: {item['content']}" for item in messages) + "\nASSISTANT:"
     inputs = state.tokenizer(prompt, return_tensors="pt").to(state.device)
     do_sample = request.temperature > 0.0
+    pad_token_id = state.tokenizer.eos_token_id
+    if pad_token_id is None or int(pad_token_id) < 0:
+        pad_token_id = state.tokenizer.pad_token_id
+    if pad_token_id is None or int(pad_token_id) < 0:
+        pad_token_id = 0
     with torch.inference_mode():
         output = state.model.generate(
             **inputs,
@@ -126,7 +137,7 @@ def generate_sync(request: ChatCompletionRequest) -> str:
             do_sample=do_sample,
             temperature=max(request.temperature, 0.01),
             top_p=request.top_p,
-            pad_token_id=state.tokenizer.eos_token_id,
+            pad_token_id=int(pad_token_id),
         )
     generated = output[0, inputs["input_ids"].shape[-1] :]
     return state.tokenizer.decode(generated, skip_special_tokens=True).strip()
@@ -147,7 +158,7 @@ def main() -> None:
     state.model_id = args.model_id
     state.revision = args.revision
     state.device = args.device
-    uvicorn.run("src.phase16.local_hf_openai_server:app", host=args.host, port=args.port, reload=False)
+    uvicorn.run(app, host=args.host, port=args.port, reload=False)
 
 
 if __name__ == "__main__":

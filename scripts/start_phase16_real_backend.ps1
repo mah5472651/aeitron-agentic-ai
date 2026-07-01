@@ -6,12 +6,24 @@ $runtimeDir = "artifacts\runtime"
 New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
 
 $port = if ($env:PHASE16_REAL_PORT) { [int]$env:PHASE16_REAL_PORT } else { 8016 }
-$modelId = if ($env:PHASE16_HF_MODEL_ID) { $env:PHASE16_HF_MODEL_ID } else { "Qwen/Qwen2.5-Coder-0.5B-Instruct" }
-$revision = if ($env:PHASE16_HF_REVISION) { $env:PHASE16_HF_REVISION } else { "ea3f2471cf1b1f0db85067f1ef93848e38e88c25" }
+$activeProfilePath = "config\active_model_profile.json"
+$activeProfile = $null
+if (Test-Path $activeProfilePath) {
+    try {
+        $activeProfile = Get-Content $activeProfilePath -Raw | ConvertFrom-Json
+    } catch {
+        $activeProfile = $null
+    }
+}
+$profileModelId = if ($activeProfile -and $activeProfile.profile.model_id) { [string]$activeProfile.profile.model_id } else { $null }
+$profileRevision = if ($activeProfile -and $activeProfile.profile.revision) { [string]$activeProfile.profile.revision } else { $null }
+$modelId = if ($env:PHASE16_HF_MODEL_ID) { $env:PHASE16_HF_MODEL_ID } elseif ($profileModelId) { $profileModelId } else { "Qwen/Qwen2.5-Coder-0.5B-Instruct" }
+$revision = if ($env:PHASE16_HF_REVISION) { $env:PHASE16_HF_REVISION } elseif ($profileRevision -and $profileRevision -ne "local_or_cached") { $profileRevision } else { "ea3f2471cf1b1f0db85067f1ef93848e38e88c25" }
 $device = if ($env:PHASE16_HF_DEVICE) { $env:PHASE16_HF_DEVICE } else { "cpu" }
 $pidPath = Join-Path $runtimeDir "phase16_real_backend.pid"
 $outLog = Join-Path $runtimeDir "phase16_real_backend.out.log"
 $errLog = Join-Path $runtimeDir "phase16_real_backend.err.log"
+$pythonExe = (python -c "import sys; print(sys.executable)").Trim()
 
 if (Test-Path $pidPath) {
     $existingPid = Get-Content $pidPath -Raw
@@ -30,7 +42,7 @@ $argsList = @(
     "--device", "$device"
 )
 
-$process = Start-Process -FilePath "python" -ArgumentList $argsList -WorkingDirectory (Get-Location) -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -WindowStyle Hidden
+$process = Start-Process -FilePath $pythonExe -ArgumentList $argsList -WorkingDirectory (Get-Location) -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -WindowStyle Hidden
 Set-Content -Path $pidPath -Value $process.Id -Encoding ASCII
 
 $deadline = (Get-Date).AddMinutes(20)

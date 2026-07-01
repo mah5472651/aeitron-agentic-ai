@@ -599,7 +599,7 @@ class IntegratedAgentRuntime:
     def default_agent_node_cap(self) -> int | None:
         active_profile = os.environ.get("MYTHOS_ACTIVE_PROFILE", "")
         model_name = getattr(self.backend, "model_name", "")
-        if active_profile in {"qwen-cpu-smoke", "mock-local"}:
+        if active_profile in {"qwen-cpu-smoke", "tiny-llama-cpu-smoke", "mock-local"}:
             return 3
         if "0.5B" in model_name or "0.5b" in model_name.lower():
             return 3
@@ -613,7 +613,7 @@ class IntegratedAgentRuntime:
             return self.backend
         active_profile = os.environ.get("MYTHOS_ACTIVE_PROFILE", "")
         model_name = getattr(self.backend, "model_name", "")
-        if active_profile in {"qwen-cpu-smoke", "mock-local"} or "0.5B" in model_name or "0.5b" in model_name.lower():
+        if active_profile in {"qwen-cpu-smoke", "tiny-llama-cpu-smoke", "mock-local"} or "0.5B" in model_name or "0.5b" in model_name.lower():
             return build_backend("mock")
         return self.backend
 

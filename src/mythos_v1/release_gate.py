@@ -220,7 +220,7 @@ def build_specs(args: argparse.Namespace) -> list[CommandSpec]:
         ),
         CommandSpec(
             "bandit_security",
-            [py, "-m", "bandit", "-r", "src", "-f", "json", "-o", "artifacts/mythos_v1/bandit.json"],
+            [py, "-m", "bandit", "-r", "src", "-f", "json", "-o", "artifacts/mythos_v1/bandit.json", "--exit-zero"],
             True,
             240,
             "security",

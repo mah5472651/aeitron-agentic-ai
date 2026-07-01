@@ -49,6 +49,16 @@ $env:MYTHOS_COMPARE_REAL = "1"
 .\scripts\run_mythos_v1_release.ps1
 ```
 
+Current local Windows CPU backend:
+
+- Default stable profile: `tiny-llama-cpu-smoke`
+- Model: `hf-internal-testing/tiny-random-LlamaForCausalLM`
+- Revision: `9fb191250dd56d0ba7ec9785a025ed29c03d5998`
+- Purpose: prove OpenAI-compatible serving, routing, release gate, scorecard, and failure promotion work end to end.
+- Limitation: this is a random tiny model, so Phase 18 correctly reports low model quality. Do not use its score as Titan/Mythos reasoning quality.
+
+The `qwen-cpu-smoke` profile remains documented, but the local Windows CPU stack currently exits with a native Torch access violation while loading that checkpoint. Use Linux CUDA/vLLM or a compatible Torch/Python stack for 7B-32B quality runs.
+
 The release gate blocks on:
 
 - missing capability modules,
@@ -95,4 +105,3 @@ Preflight:
 
 Training remains blocked until reviewed data and Linux CUDA hardware exist.
 After training, Phase 39 checkpoint comparison is mandatory before promotion.
-
