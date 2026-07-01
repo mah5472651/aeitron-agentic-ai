@@ -2,7 +2,7 @@
 
 This is the single source-of-truth manual for the Mythos/Titan AI architecture repository. It consolidates the target architecture, Mythos V1 productization notes, Phase 1-51 implementation manual, runtime guides, model/backend notes, training/evaluation plans, and production hardening blueprints into one file.
 
-Generated locally from `docs/*.md` on 2026-07-02. The original docs remain in the repository for focused editing, but this file is the easiest place to read the whole architecture end to end.
+Generated locally from the previous `docs/*.md` set on 2026-07-02. The older split docs were consolidated into this one manual and removed to keep the repository clean. Source file names below are historical labels so you can still see where each section came from.
 
 ## Current Ground Truth
 

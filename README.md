@@ -101,7 +101,7 @@ local product release gate before accepting architecture changes:
 The gate checks compilation, static security, strict reasoning and memory,
 integrated agent execution, 400 regression tasks, the exact 90-task golden
 scorecard, and GPU-training architecture readiness. See
-`docs/mythos_v1_productization.md` for full and real-backend modes.
+`docs/mythos_complete_architecture_manual.md` for full and real-backend modes.
 
 Foundation data ingestion and tokenizer setup for a deliberative LLM pipeline.
 
@@ -222,7 +222,7 @@ Foundation data ingestion and tokenizer setup for a deliberative LLM pipeline.
   - Serves a separate static chat UI from `src/phase11/static` with workspace
     logo support through `/brand/logo`.
   - Tracks the six architecture areas as twenty build steps in
-    `docs/phase11_20_step_architecture_plan.md`.
+    `docs/mythos_complete_architecture_manual.md`.
   - Runs locally with a deterministic mock backend now, and can later swap in a
     trained PyTorch checkpoint or vLLM/OpenAI-compatible model endpoint.
 

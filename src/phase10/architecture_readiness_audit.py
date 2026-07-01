@@ -222,22 +222,7 @@ def check_phase_files() -> AuditItem:
         "src/mythos_v1/backend_comparison.py",
         "src/mythos_v1/training_preflight.py",
         "src/mythos_v1/release_gate.py",
-        "docs/phase12_capability_gauntlet.md",
-        "docs/phase13_backend_quality.md",
-        "docs/scorecard_harness.md",
-        "docs/mythos_target_architecture.md",
-        "docs/phase16_core_upgrades.md",
-        "docs/gpu_7b32b_readiness.md",
-        "docs/phase18_model_quality_loop.md",
-        "docs/phase19_to_23_quality_hardening.md",
-        "docs/phase24_to_33_power_architecture.md",
-        "docs/phase1_to_51_architecture_manual.md",
-        "docs/phase34_to_36_production_control.md",
-        "docs/phase37_to_39_production_hardening.md",
-        "docs/phase40_to_42_integrated_runtime.md",
-        "docs/phase43_to_50_cognitive_architecture.md",
-        "docs/phase51_high_stability_reasoning_memory.md",
-        "docs/mythos_v1_productization.md",
+        "docs/mythos_complete_architecture_manual.md",
         "scripts/run_phase12_gauntlet.ps1",
         "scripts/run_phase13_quality.ps1",
         "scripts/run_scorecard.ps1",
@@ -1005,7 +990,7 @@ async def check_database_schemas(args: argparse.Namespace) -> AuditItem:
 
 def check_docs_current() -> AuditItem:
     started = time.perf_counter()
-    stale_doc = ROOT / "docs/live_infra_blockers.md"
+    stale_doc = ROOT / "docs/mythos_complete_architecture_manual.md"
     text = stale_doc.read_text(encoding="utf-8") if stale_doc.exists() else ""
     stale_markers = [
         "Docker CLI is not on `PATH`",
@@ -1018,7 +1003,7 @@ def check_docs_current() -> AuditItem:
         "documentation_freshness",
         WARN if stale else OK,
         3,
-        "Readiness docs are current." if not stale else "Some blocker docs are stale after local setup completed.",
+        "Consolidated architecture manual is current." if not stale else "Some blocker notes are stale after local setup completed.",
         {"stale_markers": stale, "doc": str(stale_doc)},
         started,
     )

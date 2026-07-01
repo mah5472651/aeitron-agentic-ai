@@ -158,8 +158,8 @@ def build_blueprint(run_id: str) -> ArchitectureBlueprint:
                 "src/phase17/gpu_readiness.py",
                 "deploy/gpu/model_profiles.json",
             ],
-            status="local_qwen_connected_gpu_profiles_ready",
-            gap="Local Qwen 0.5B CPU backend proves real integration; 7B-32B profiles/configs are ready but require Linux CUDA to execute.",
+            status="local_openai_compatible_connected_gpu_profiles_ready",
+            gap="Pinned tiny HF CPU backend proves real OpenAI-compatible integration; Qwen/7B-32B profiles/configs are ready but require a compatible runtime or Linux CUDA to execute.",
             priority="critical",
             next_build=[
                 "Run scorecard against connected Qwen baseline",
@@ -170,7 +170,7 @@ def build_blueprint(run_id: str) -> ArchitectureBlueprint:
         TargetComponent(
             name="Future MoE 50B-100B+",
             target="Future 50B-100B dense or MoE route; long-term 500B total / 64B active / top-8 routing is research scale.",
-            current_assets=["docs/phase7_grpo_blueprint.md", "src/phase7/grpo_training_loop.py"],
+            current_assets=["docs/mythos_complete_architecture_manual.md", "src/phase7/grpo_training_loop.py"],
             status="research_roadmap",
             gap="No distributed training stack yet; needs Linux CUDA cluster, DeepSpeed/Megatron/Ray/Kubernetes.",
             priority="later",
