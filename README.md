@@ -19,6 +19,16 @@ The goal is to build a scalable AI platform capable of:
 
 ---
 
+## Complete Architecture Manual
+
+Read the full architecture in one place:
+
+`docs/mythos_complete_architecture_manual.md`
+
+This consolidated manual includes the Mythos target architecture, Mythos V1 productization, Phase 1-51 implementation map, runtime/backend notes, training/evaluation plans, memory/security systems, and production hardening docs.
+
+---
+
 ## Architecture Overview
 
 User
