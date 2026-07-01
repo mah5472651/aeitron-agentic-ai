@@ -130,6 +130,59 @@ class MythosMvpFoundationTest(unittest.TestCase):
                 graph_response = client.get(f"/v1/taskgraphs/{task_graph_id}")
                 self.assertEqual(graph_response.status_code, 200, graph_response.text)
                 self.assertEqual(len(graph_response.json()["nodes"]), 6)
+
+                failing = client.post(
+                    "/v1/tools/execute",
+                    json={
+                        "project_id": project_id,
+                        "run_id": run_response.json()["run_id"],
+                        "tool": "test",
+                        "command": ["python", "-c", "import auth; raise SystemExit(0 if auth.login_user('admin', 'secret') else 1)"],
+                    },
+                )
+                self.assertEqual(failing.status_code, 200, failing.text)
+                self.assertEqual(failing.json()["status"], "ok")
+
+                patch_response = client.post(
+                    "/v1/patches/preview",
+                    json={
+                        "project_id": project_id,
+                        "run_id": run_response.json()["run_id"],
+                        "edits": [
+                            {
+                                "path": "auth.py",
+                                "new_content": (
+                                    "def login_user(username, password):\n"
+                                    "    return username == 'admin' and bool(password)\n"
+                                ),
+                            }
+                        ],
+                    },
+                )
+                self.assertEqual(patch_response.status_code, 200, patch_response.text)
+                patch_id = patch_response.json()["patch_id"]
+                self.assertIn("-    return username == 'admin' and password == 'secret'", patch_response.json()["diff"])
+
+                apply_response = client.post(f"/v1/patches/{patch_id}/apply")
+                self.assertEqual(apply_response.status_code, 200, apply_response.text)
+                self.assertEqual(apply_response.json()["status"], "applied")
+
+                verifier_response = client.post(
+                    "/v1/verifier/run",
+                    json={
+                        "project_id": project_id,
+                        "run_id": run_response.json()["run_id"],
+                        "patch_id": patch_id,
+                        "commands": [["python", "-c", "import auth; raise SystemExit(0 if auth.login_user('admin', 'changed') else 1)"]],
+                        "run_secret_scan": True,
+                    },
+                )
+                self.assertEqual(verifier_response.status_code, 200, verifier_response.text)
+                self.assertEqual(verifier_response.json()["verdict"], "accept")
+
+                rollback_response = client.post(f"/v1/patches/{patch_id}/rollback")
+                self.assertEqual(rollback_response.status_code, 200, rollback_response.text)
+                self.assertEqual(rollback_response.json()["status"], "rolled_back")
             finally:
                 replacement_store.close()
                 gateway_api.STORE = original_store

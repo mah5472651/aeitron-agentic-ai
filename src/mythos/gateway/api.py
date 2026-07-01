@@ -12,9 +12,12 @@ from src.phase34.auth_quota import auth_status, create_jwt, install_auth_quota
 from src.mythos.db import LocalStore
 from src.mythos.indexing import ContextBuilder, RepositoryIndexer
 from src.mythos.model_ops.backends import active_model_health, list_model_profiles
+from src.mythos.patches import PatchPreviewRequest, PatchService
 from src.mythos.runtime.engine import MythosRuntime
 from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskGraphRuntime
 from src.mythos.shared.schemas import MythosRunRequest, MythosRunReport
+from src.mythos.tools import ToolExecuteRequest, ToolRuntime
+from src.mythos.verifier import VerificationRequest, VerifierRuntime
 
 app = FastAPI(title="Mythos Consolidated Gateway", version="2.0.0")
 AUTH_CONFIG = install_auth_quota(app)
@@ -186,6 +189,54 @@ async def build_context(request: ContextBuildRequest) -> dict[str, Any]:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project not found") from exc
     return report.model_dump()
+
+
+@app.post("/v1/tools/execute")
+async def execute_tool(request: ToolExecuteRequest) -> dict[str, Any]:
+    try:
+        return ToolRuntime(STORE).execute(request).model_dump()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/patches/preview")
+async def preview_patch(request: PatchPreviewRequest) -> dict[str, Any]:
+    try:
+        return PatchService(STORE).preview(request).model_dump()
+    except (KeyError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/patches/{patch_id}/apply")
+async def apply_patch(patch_id: str) -> dict[str, Any]:
+    try:
+        return PatchService(STORE).apply(patch_id).model_dump()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/patches/{patch_id}/rollback")
+async def rollback_patch(patch_id: str) -> dict[str, Any]:
+    try:
+        return PatchService(STORE).rollback(patch_id).model_dump()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/verifier/run")
+async def run_verifier(request: VerificationRequest) -> dict[str, Any]:
+    try:
+        return VerifierRuntime(STORE).run(request).model_dump()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
 
 
 @app.post("/v1/agent/run", response_model=MythosRunReport)

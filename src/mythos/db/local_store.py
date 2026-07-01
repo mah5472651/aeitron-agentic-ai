@@ -399,6 +399,65 @@ class LocalStore:
         row = self.connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return row_to_dict(row)
 
+    def create_patch_record(
+        self,
+        *,
+        project_id: str,
+        run_id: str | None,
+        status: str,
+        diff: str,
+        files_changed: list[str],
+        backup: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.get_project(project_id) is None:
+            raise KeyError(f"unknown project: {project_id}")
+        patch_id = new_id()
+        timestamp = now_unix()
+        self.connection.execute(
+            """
+            INSERT INTO patches(id, project_id, run_id, status, diff, files_changed_json, backup_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                patch_id,
+                project_id,
+                run_id,
+                status,
+                diff,
+                json.dumps(files_changed, sort_keys=True),
+                json.dumps(backup, sort_keys=True),
+                timestamp,
+            ),
+        )
+        self.connection.commit()
+        patch = self.get_patch(patch_id)
+        if patch is None:
+            raise RuntimeError("patch insert did not round-trip")
+        return patch
+
+    def get_patch(self, patch_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM patches WHERE id = ?", (patch_id,)).fetchone()
+        data = row_to_dict(row)
+        if data is None:
+            return None
+        data["files_changed"] = json.loads(data.pop("files_changed_json") or "[]")
+        data["backup"] = json.loads(data.pop("backup_json") or "{}")
+        return data
+
+    def update_patch_status(self, patch_id: str, status: str, *, applied: bool = False, rolled_back: bool = False) -> None:
+        timestamp = now_unix()
+        self.connection.execute(
+            """
+            UPDATE patches
+            SET status = ?,
+                applied_at = CASE WHEN ? THEN ? ELSE applied_at END,
+                rolled_back_at = CASE WHEN ? THEN ? ELSE rolled_back_at END
+            WHERE id = ?
+            """,
+            (status, applied, timestamp, rolled_back, timestamp, patch_id),
+        )
+        self.connection.commit()
+
     def clear_index(self, project_id: str) -> None:
         self.connection.execute("DELETE FROM code_chunks WHERE project_id = ?", (project_id,))
         self.connection.execute("DELETE FROM workspace_files WHERE project_id = ?", (project_id,))
