@@ -8,6 +8,8 @@ Generated locally from the previous `docs/*.md` set on 2026-07-02. The older spl
 
 - Repository: `AI_Architecture_Build`
 - Remote: `https://github.com/mah5472651/mythos-agentic-ai.git`
+- Production-facing package: `src/mythos`
+- Legacy phase packages: `src/phase1` through `src/phase51` remain as implementation sources and adapters until each capability is fully migrated.
 - Latest stable local backend profile: `tiny-llama-cpu-smoke`
 - Stable local model: `hf-internal-testing/tiny-random-LlamaForCausalLM`
 - Stable local model revision: `9fb191250dd56d0ba7ec9785a025ed29c03d5998`
@@ -15,6 +17,49 @@ Generated locally from the previous `docs/*.md` set on 2026-07-02. The older spl
 - Quality boundary: tiny backend is not a reasoning-quality model; Phase 18 correctly marks it `needs_improvement`.
 - Qwen CPU note: `qwen-cpu-smoke` remains a target local profile, but this Windows CPU Torch stack can crash natively while loading the 0.5B Qwen checkpoint.
 - Future quality target: Qwen/DeepSeek/Llama coder-class 7B, 14B, 32B, then 50B-100B+ on Linux CUDA/vLLM infrastructure.
+
+## Consolidated Runtime Status
+
+The current executable product surface is the consolidated `src/mythos` package. It exposes the 12-module architecture as stable imports while delegating mature functionality to the older phase implementations. New code should depend on `src/mythos/*`, not directly on `src/phase*/*`, unless it is actively migrating a legacy capability.
+
+Implemented consolidated modules:
+
+- `src/mythos/gateway`: FastAPI-facing gateway shell for runtime, health, model profiles, evaluation, and learning hooks.
+- `src/mythos/planning`: Intent expansion and planner facade over the meta-planner and intent-expansion phases.
+- `src/mythos/runtime`: Single run entrypoint that coordinates planning, model backend selection, and the integrated agent runtime.
+- `src/mythos/agents`: Worker-pool/router facade over the parallel-agent phase.
+- `src/mythos/tools`: Tool execution facade for sandbox, shell-safe execution, Semgrep, CodeQL, and Git/browser style tool wrappers.
+- `src/mythos/context`: Workspace index and context-builder facade over long-context packing and call-graph tooling.
+- `src/mythos/memory`: Unified memory facade over vector, hierarchical, experience, and strict memory layers.
+- `src/mythos/guardrails`: Critic, verifier, policy, security, and strict-stability facade.
+- `src/mythos/patches`: Patch preview/apply/rollback facade.
+- `src/mythos/evaluation`: Scorecard, release gate, quality loop, and regression gate facade.
+- `src/mythos/learning`: Dataset gate, data flywheel, and checkpoint rollback facade.
+- `src/mythos/model_ops`: Backend profile, active backend, and runtime health facade.
+
+Consolidated smoke test:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_mythos_consolidated_smoke.ps1
+```
+
+Equivalent direct command:
+
+```powershell
+python -m src.mythos.cli --prompt "build secure login api" --workspace . --policy-mode development --agent-backend-mode mock --max-agent-nodes 2 --no-verifier --no-security
+```
+
+Expected current behavior:
+
+- Runs end-to-end through the consolidated runtime facade.
+- Uses mock agent reasoning by default so the architecture can be tested without GPU hardware.
+- Produces `artifacts/mythos/consolidated-smoke.json`.
+- Confirms control-plane plumbing, not final model quality.
+- Gateway auth/quota is wired through Phase 34 middleware. Local default is disabled; production should set `PHASE34_AUTH_ENABLED=1`, `PHASE34_JWT_SECRET`, and optionally `PHASE34_QUOTA_ENABLED=1`.
+
+Important boundary:
+
+- This is Phase A architecture consolidation, not a full deletion migration. Old phase modules are intentionally still present as legacy adapters. Physical deletion should happen only after the equivalent `src/mythos` module has tests, docs, and release-gate coverage.
 
 ## Most Important Seven Pillars
 

@@ -1,0 +1,2 @@
+"""Patch manager facade."""
+
