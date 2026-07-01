@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from src.mythos.db import LocalStore
 from src.mythos.gateway import api as gateway_api
 from src.mythos.indexing import ContextBuilder, RepositoryIndexer
+from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskGraphRuntime
 
 
 class MythosMvpFoundationTest(unittest.TestCase):
@@ -55,6 +56,20 @@ class MythosMvpFoundationTest(unittest.TestCase):
                 self.assertTrue(any(chunk.path == "src/auth.py" for chunk in context.chunks))
                 self.assertIn("login_user", context.prompt_context)
 
+                run = TaskGraphRuntime(store).create_agent_run(
+                    AgentRunCreateRequest(
+                        project_id=project["id"],
+                        prompt="fix login password hashing bug",
+                        mode="debug",
+                    )
+                )
+                self.assertEqual(run.status, "queued")
+                graph = store.get_task_graph(run.task_graph_id)
+                self.assertIsNotNone(graph)
+                self.assertEqual(len(graph["nodes"]), 6)
+                self.assertEqual(graph["nodes"][0]["kind"], "understand")
+                self.assertEqual(graph["nodes"][-1]["kind"], "summarize")
+
     def test_gateway_project_index_and_context_contract(self) -> None:
         with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:
             workspace = Path(workspace_dir)
@@ -92,6 +107,29 @@ class MythosMvpFoundationTest(unittest.TestCase):
                 payload = context_response.json()
                 self.assertIn("login_user", payload["prompt_context"])
                 self.assertTrue(payload["chunks"])
+
+                session_response = client.post(
+                    "/v1/sessions",
+                    json={"project_id": project_id, "title": "debug auth"},
+                )
+                self.assertEqual(session_response.status_code, 200, session_response.text)
+                session_id = session_response.json()["id"]
+
+                run_response = client.post(
+                    "/v1/agent/runs",
+                    json={
+                        "project_id": project_id,
+                        "session_id": session_id,
+                        "prompt": "fix login auth password bug",
+                        "mode": "debug",
+                    },
+                )
+                self.assertEqual(run_response.status_code, 200, run_response.text)
+                task_graph_id = run_response.json()["task_graph_id"]
+
+                graph_response = client.get(f"/v1/taskgraphs/{task_graph_id}")
+                self.assertEqual(graph_response.status_code, 200, graph_response.text)
+                self.assertEqual(len(graph_response.json()["nodes"]), 6)
             finally:
                 replacement_store.close()
                 gateway_api.STORE = original_store

@@ -82,6 +82,33 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_graphs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+  goal TEXT NOT NULL,
+  status TEXT NOT NULL,
+  graph_json TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  task_graph_id TEXT NOT NULL REFERENCES task_graphs(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL,
+  depends_on_json TEXT NOT NULL DEFAULT '[]',
+  input_json TEXT NOT NULL DEFAULT '{}',
+  output_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT,
+  started_at REAL,
+  finished_at REAL,
+  created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS patches (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -142,6 +169,8 @@ CREATE TABLE IF NOT EXISTS learning_candidates (
 CREATE INDEX IF NOT EXISTS idx_workspace_files_project_path ON workspace_files(project_id, path);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_project_path ON code_chunks(project_id, path);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_project_symbol ON code_chunks(project_id, symbol_name);
+CREATE INDEX IF NOT EXISTS idx_runs_project_status ON runs(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_graph_status ON tasks(task_graph_id, status);
 """
 
 
@@ -223,6 +252,152 @@ class LocalStore:
             (status, indexed_at, now_unix(), project_id),
         )
         self.connection.commit()
+
+    def create_session(self, *, project_id: str, title: str) -> dict[str, Any]:
+        if self.get_project(project_id) is None:
+            raise KeyError(f"unknown project: {project_id}")
+        session_id = new_id()
+        timestamp = now_unix()
+        self.connection.execute(
+            """
+            INSERT INTO sessions(id, project_id, title, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_id, project_id, title, timestamp, timestamp),
+        )
+        self.connection.commit()
+        row = self.connection.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        result = row_to_dict(row)
+        if result is None:
+            raise RuntimeError("session insert did not round-trip")
+        return result
+
+    def create_run(
+        self,
+        *,
+        project_id: str,
+        session_id: str | None,
+        prompt: str,
+        mode: str,
+        model_profile: str,
+        status: str = "queued",
+    ) -> dict[str, Any]:
+        if self.get_project(project_id) is None:
+            raise KeyError(f"unknown project: {project_id}")
+        run_id = new_id()
+        timestamp = now_unix()
+        self.connection.execute(
+            """
+            INSERT INTO runs(id, project_id, session_id, prompt, mode, status, model_profile, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (run_id, project_id, session_id, prompt, mode, status, model_profile, timestamp),
+        )
+        self.connection.commit()
+        row = self.connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        result = row_to_dict(row)
+        if result is None:
+            raise RuntimeError("run insert did not round-trip")
+        return result
+
+    def update_run_status(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        summary: str | None = None,
+        confidence: float | None = None,
+        finished_at: float | None = None,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE runs
+            SET status = ?,
+                summary = COALESCE(?, summary),
+                confidence = COALESCE(?, confidence),
+                finished_at = COALESCE(?, finished_at)
+            WHERE id = ?
+            """,
+            (status, summary, confidence, finished_at, run_id),
+        )
+        self.connection.commit()
+
+    def create_task_graph(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        goal: str,
+        status: str,
+        graph: dict[str, Any],
+    ) -> dict[str, Any]:
+        graph_id = str(graph["task_graph_id"])
+        timestamp = now_unix()
+        self.connection.execute(
+            """
+            INSERT INTO task_graphs(id, project_id, run_id, goal, status, graph_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (graph_id, project_id, run_id, goal, status, json.dumps(graph, sort_keys=True), timestamp, timestamp),
+        )
+        for node in graph.get("nodes", []):
+            self.connection.execute(
+                """
+                INSERT INTO tasks(
+                  id, task_graph_id, run_id, kind, title, status, depends_on_json,
+                  input_json, output_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    node["node_id"],
+                    graph_id,
+                    run_id,
+                    node["kind"],
+                    node["title"],
+                    node["status"],
+                    json.dumps(node.get("depends_on", []), sort_keys=True),
+                    json.dumps(node.get("inputs", {}), sort_keys=True),
+                    json.dumps(node.get("outputs", {}), sort_keys=True),
+                    timestamp,
+                ),
+            )
+        self.connection.commit()
+        result = self.get_task_graph(graph_id)
+        if result is None:
+            raise RuntimeError("task graph insert did not round-trip")
+        return result
+
+    def get_task_graph(self, task_graph_id: str) -> dict[str, Any] | None:
+        graph_row = self.connection.execute("SELECT * FROM task_graphs WHERE id = ?", (task_graph_id,)).fetchone()
+        graph = row_to_dict(graph_row)
+        if graph is None:
+            return None
+        graph_payload = json.loads(graph["graph_json"])
+        task_rows = self.connection.execute(
+            "SELECT * FROM tasks WHERE task_graph_id = ? ORDER BY created_at, rowid",
+            (task_graph_id,),
+        ).fetchall()
+        graph_payload["nodes"] = [
+            {
+                "node_id": row["id"],
+                "kind": row["kind"],
+                "title": row["title"],
+                "status": row["status"],
+                "depends_on": json.loads(row["depends_on_json"]),
+                "inputs": json.loads(row["input_json"]),
+                "outputs": json.loads(row["output_json"]),
+                "error": row["error"],
+                "started_at": row["started_at"],
+                "finished_at": row["finished_at"],
+            }
+            for row in task_rows
+        ]
+        return graph_payload
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return row_to_dict(row)
 
     def clear_index(self, project_id: str) -> None:
         self.connection.execute("DELETE FROM code_chunks WHERE project_id = ?", (project_id,))

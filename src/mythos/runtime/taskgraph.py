@@ -1,0 +1,157 @@
+"""Durable MVP TaskGraph runtime."""
+
+from __future__ import annotations
+
+import time
+import uuid
+from typing import Any
+
+from pydantic import Field
+
+from src.mythos.db import LocalStore
+from src.mythos.shared.schemas import StrictModel
+
+
+TASK_NODE_ORDER = [
+    ("understand", "Understand request and repository target"),
+    ("retrieve_context", "Retrieve ranked repository context"),
+    ("edit", "Generate patch proposal"),
+    ("test", "Run targeted tests"),
+    ("verify", "Verify patch and security constraints"),
+    ("summarize", "Return final answer and evidence"),
+]
+
+
+class TaskNode(StrictModel):
+    node_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    kind: str
+    title: str
+    instructions: str
+    status: str = "queued"
+    depends_on: list[str] = Field(default_factory=list)
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    attempt: int = 0
+    max_attempts: int = 2
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
+class TaskGraph(StrictModel):
+    task_graph_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    project_id: str
+    run_id: str
+    goal: str
+    status: str = "queued"
+    nodes: list[TaskNode]
+    edges: list[dict[str, str]]
+    success_criteria: list[str]
+    created_at_unix: float = Field(default_factory=time.time)
+    updated_at_unix: float = Field(default_factory=time.time)
+
+
+class AgentRunCreateRequest(StrictModel):
+    project_id: str
+    session_id: str | None = None
+    prompt: str = Field(min_length=1)
+    mode: str = Field(default="code_edit", pattern="^(code_edit|debug|explain|security_review)$")
+    max_steps: int = Field(default=12, ge=1, le=50)
+    apply_patch: bool = False
+    model_profile: str = "mock"
+
+
+class AgentRunCreateResponse(StrictModel):
+    run_id: str
+    project_id: str
+    session_id: str | None
+    status: str
+    task_graph_id: str
+
+
+class TaskGraphRuntime:
+    def __init__(self, store: LocalStore | None = None) -> None:
+        self.store = store or LocalStore()
+
+    def create_agent_run(self, request: AgentRunCreateRequest) -> AgentRunCreateResponse:
+        run = self.store.create_run(
+            project_id=request.project_id,
+            session_id=request.session_id,
+            prompt=request.prompt,
+            mode=request.mode,
+            model_profile=request.model_profile,
+            status="queued",
+        )
+        graph = self.build_graph(
+            project_id=request.project_id,
+            run_id=run["id"],
+            prompt=request.prompt,
+            mode=request.mode,
+            max_steps=request.max_steps,
+            apply_patch=request.apply_patch,
+        )
+        self.store.create_task_graph(
+            project_id=request.project_id,
+            run_id=run["id"],
+            goal=graph.goal,
+            status=graph.status,
+            graph=graph.model_dump(),
+        )
+        return AgentRunCreateResponse(
+            run_id=run["id"],
+            project_id=request.project_id,
+            session_id=request.session_id,
+            status=run["status"],
+            task_graph_id=graph.task_graph_id,
+        )
+
+    def build_graph(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        prompt: str,
+        mode: str,
+        max_steps: int,
+        apply_patch: bool,
+    ) -> TaskGraph:
+        nodes: list[TaskNode] = []
+        previous_id: str | None = None
+        for kind, title in TASK_NODE_ORDER:
+            node = TaskNode(
+                kind=kind,
+                title=title,
+                instructions=self.instructions_for(kind, prompt=prompt, mode=mode, apply_patch=apply_patch),
+                depends_on=[previous_id] if previous_id else [],
+                inputs={"prompt": prompt, "mode": mode, "max_steps": max_steps} if kind == "understand" else {},
+            )
+            nodes.append(node)
+            previous_id = node.node_id
+        edges = [
+            {"from": nodes[index].node_id, "to": nodes[index + 1].node_id, "condition": "success"}
+            for index in range(len(nodes) - 1)
+        ]
+        return TaskGraph(
+            project_id=project_id,
+            run_id=run_id,
+            goal=f"Complete Mythos agent request: {prompt}",
+            nodes=nodes,
+            edges=edges,
+            success_criteria=[
+                "context is relevant to the prompt",
+                "patch is previewed before apply",
+                "tests or verification commands complete",
+                "failed patches are rejected or rolled back",
+            ],
+        )
+
+    def instructions_for(self, kind: str, *, prompt: str, mode: str, apply_patch: bool) -> str:
+        instructions = {
+            "understand": "Classify intent, target files, risks, and expected verification evidence.",
+            "retrieve_context": "Build a ranked context pack from indexed repository chunks.",
+            "edit": "Generate minimal file edits as structured patch operations.",
+            "test": "Run targeted tests and capture stdout, stderr, exit code, and duration.",
+            "verify": "Accept only if patch applies cleanly and verification passes.",
+            "summarize": "Return concise final answer with changed files and verification evidence.",
+        }
+        base = instructions[kind]
+        return f"{base} mode={mode}; apply_patch={apply_patch}; prompt={prompt}"

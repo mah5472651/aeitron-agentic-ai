@@ -13,6 +13,7 @@ from src.mythos.db import LocalStore
 from src.mythos.indexing import ContextBuilder, RepositoryIndexer
 from src.mythos.model_ops.backends import active_model_health, list_model_profiles
 from src.mythos.runtime.engine import MythosRuntime
+from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskGraphRuntime
 from src.mythos.shared.schemas import MythosRunRequest, MythosRunReport
 
 app = FastAPI(title="Mythos Consolidated Gateway", version="2.0.0")
@@ -45,6 +46,11 @@ class ContextBuildRequest(BaseModel):
     token_budget: int = Field(default=24_000, ge=1_000, le=200_000)
     pinned_files: list[str] = Field(default_factory=list)
     max_chunks: int = Field(default=24, ge=1, le=100)
+
+
+class SessionCreateRequest(BaseModel):
+    project_id: str = Field(min_length=1)
+    title: str = Field(default="Mythos Session", min_length=1, max_length=200)
 
 
 @app.get("/health/ready")
@@ -107,6 +113,14 @@ async def get_project(project_id: str) -> dict[str, Any]:
     return project
 
 
+@app.post("/v1/sessions")
+async def create_session(request: SessionCreateRequest) -> dict[str, Any]:
+    try:
+        return STORE.create_session(project_id=request.project_id, title=request.title)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
+
+
 @app.post("/v1/projects/{project_id}/index")
 async def index_project(project_id: str, request: IndexProjectRequest) -> dict[str, Any]:
     project = STORE.get_project(project_id)
@@ -125,6 +139,30 @@ async def index_project(project_id: str, request: IndexProjectRequest) -> dict[s
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return report.model_dump()
+
+
+@app.post("/v1/agent/runs")
+async def create_agent_run(request: AgentRunCreateRequest) -> dict[str, Any]:
+    try:
+        return TaskGraphRuntime(STORE).create_agent_run(request).model_dump()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project or session not found") from exc
+
+
+@app.get("/v1/agent/runs/{run_id}")
+async def get_agent_run(run_id: str) -> dict[str, Any]:
+    run = STORE.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
+
+
+@app.get("/v1/taskgraphs/{task_graph_id}")
+async def get_task_graph(task_graph_id: str) -> dict[str, Any]:
+    graph = STORE.get_task_graph(task_graph_id)
+    if graph is None:
+        raise HTTPException(status_code=404, detail="task graph not found")
+    return graph
 
 
 @app.get("/v1/projects/{project_id}/index/status")
