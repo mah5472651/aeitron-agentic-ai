@@ -67,6 +67,958 @@ $env:PHASE18_MODEL_NAME='hf-internal-testing/tiny-random-LlamaForCausalLM'
 .\scripts\run_phase18_model_quality.ps1
 ```
 
+## Chief Architect Migration Plan: 51 Phases To 12 Core Modules
+
+This is the executable consolidation plan. The goal is to stop treating phases as product modules. Phases become historical implementation sources. The production system should be operated through 12 core modules.
+
+### Target Core Modules
+
+1. Gateway Layer
+2. Intent & Planning Engine
+3. TaskGraph Runtime
+4. Agent Router & Worker Pool
+5. Tool Execution Layer
+6. Workspace Index & Context Builder
+7. Unified Memory System
+8. Critic / Verifier / Guardrails
+9. Patch Manager
+10. Evaluation Service
+11. Learning Pipeline
+12. Model Ops & Serving
+
+### Phase Migration Table
+
+| Current Phase | Action | New Module | Reason |
+|---|---|---|---|
+| Phase 1: Data Ingestion And Code Tokenizer | Merge | Workspace Index & Context Builder; Learning Pipeline | Code parsing/call graphs belong to repo indexing. Tokenizer training belongs to training assets, not runtime control. |
+| Phase 2: Docker Sandbox Engine | Keep | Tool Execution Layer | This is a core capability for safe execution, tests, and verification. |
+| Phase 3: Rejection Sampling Pipeline | Merge | Learning Pipeline | Dataset generation should be one path fed by eval failures and verifier-approved traces. |
+| Phase 4: Dynamic Swarm Orchestrator | Replace | Agent Router & Worker Pool | Superseded by consolidated runtime. Keep ideas, remove separate orchestrator control plane. |
+| Phase 5: Self-Healing Runtime | Merge | Learning Pipeline; TaskGraph Runtime | Runtime repair should be an execution policy, while successful traces feed learning. |
+| Phase 6: Redis Regenerative Quota Engine | Keep | Gateway Layer | Quota/rate limiting belongs at API edge. |
+| Phase 7: GRPO Training Loop | Keep | Learning Pipeline | Critical later, but inactive until eval rewards are reliable. |
+| Phase 8: Serving Stack | Merge | Model Ops & Serving; Gateway Layer | vLLM belongs to Model Ops; FastAPI gateway belongs to Gateway Layer. |
+| Phase 9: Evaluation Harness | Merge | Evaluation Service | Keep benchmark logic but unify with all other scorecards. |
+| Phase 10: Deployment Smoke And Readiness Audit | Keep | Model Ops & Serving; Evaluation Service | Keep as release/readiness gate, but no separate product phase. |
+| Phase 11: PyTorch AI Core And Chat Interface | Merge | Gateway Layer; Model Ops & Serving | Backend abstraction remains. Chat API moves to gateway. PyTorch skeleton is archived until real training. |
+| Phase 12: Capability Gauntlet | Merge | Evaluation Service | Architecture plumbing tests are one evaluation suite. |
+| Phase 13: Backend Quality Harness | Merge | Evaluation Service; Model Ops & Serving | Model/backend quality comparison becomes an eval suite. |
+| Phase 14: Exact Scorecard Harness | Keep | Evaluation Service | This is the main architecture scorecard seed. |
+| Phase 15: Target Architecture Blueprint | Archive | Documentation / Architecture Records | Useful history, not runtime code. |
+| Phase 16: Core Architecture Upgrades | Merge | TaskGraph Runtime; Agent Router; Tool Execution; Learning Pipeline | Contains durable pieces that must be absorbed into fewer modules. |
+| Phase 17: GPU 7B-32B Readiness | Merge | Model Ops & Serving | GPU profiles and launch configs belong to model ops. |
+| Phase 18: Real Model Quality Loop | Merge | Evaluation Service; Learning Pipeline | Real model eval and failure export should be one evaluation-to-learning path. |
+| Phase 19: Unified Verifier Registry | Merge | Critic / Verifier / Guardrails | Verification registry is part of one guardrail service. |
+| Phase 20: TaskGraph Runtime | Keep | TaskGraph Runtime | This should become the single execution state machine. |
+| Phase 21: Experience Promotion | Merge | Unified Memory System; Learning Pipeline | Experience records are memory entries and training candidates. |
+| Phase 22: Critic Service | Merge | Critic / Verifier / Guardrails | Merge with Phase 47 and Phase 51 strict review. |
+| Phase 23: Model Quality Profiles | Merge | Model Ops & Serving; Evaluation Service | Profiles live in model ops; quality runs live in evaluation. |
+| Phase 24: Main Agent V2 | Replace | TaskGraph Runtime; Agent Router & Worker Pool | Superseded by the consolidated Phase 40 path. |
+| Phase 25: Experience Retrieval | Merge | Unified Memory System | Retrieval belongs inside memory, not a separate phase. |
+| Phase 26: Patch Manager | Keep | Patch Manager | Critical isolated function: preview, diff, backup, rollback. |
+| Phase 27: Verifier Policy Engine | Merge | Critic / Verifier / Guardrails | Policy profiles belong to the verifier/guardrail engine. |
+| Phase 28: Security Expert Workflow | Merge | Critic / Verifier / Guardrails; Agent Router | Security agent is a worker role; security checks are guardrails. |
+| Phase 29: Dataset Review Gate | Keep | Learning Pipeline | Critical quality gate to prevent bad synthetic data entering training. |
+| Phase 30: Expanded Golden Benchmark | Merge | Evaluation Service | Benchmark generation and storage belong to eval service. |
+| Phase 31: Long Context Packer | Keep | Workspace Index & Context Builder | Context packing is central to coding performance. |
+| Phase 32: Critic Endpoint Contract | Merge | Critic / Verifier / Guardrails; Model Ops | Endpoint contract is config/health for critic model. |
+| Phase 33: GPU Backend Contract | Merge | Model Ops & Serving | Model deployment contract belongs to model ops. |
+| Phase 34: Auth And Quota Control | Keep | Gateway Layer | Critical for production exposure. |
+| Phase 35: Observability | Keep | Gateway Layer; all services | Metrics/logging/tracing are cross-cutting, configured at gateway and service layer. |
+| Phase 36: Data Flywheel | Merge | Learning Pipeline | Failure-to-data automation belongs to learning pipeline. |
+| Phase 37: Production Vector Memory | Merge | Unified Memory System | Vector memory is one storage backend of unified memory. |
+| Phase 38: Multi-Language Security Engine | Merge | Critic / Verifier / Guardrails | Static multi-language checks belong to guardrails. |
+| Phase 39: Training Checkpoint Rollback Gate | Keep | Learning Pipeline; Model Ops & Serving | Critical for model promotion safety. |
+| Phase 40: Integrated Default Agent Runtime | Keep | TaskGraph Runtime | Becomes the main runtime shell after removing duplicate paths. |
+| Phase 41: Real Task Regression Pack | Merge | Evaluation Service | Regression pack becomes an eval suite. |
+| Phase 42: Production Profile Switcher | Keep | Model Ops & Serving | One profile switcher is useful. Keep and simplify. |
+| Phase 43: Meta Planner | Merge | Intent & Planning Engine | Merge with Phase 44. |
+| Phase 44: Intent Expansion Engine | Merge | Intent & Planning Engine | Merge with Phase 43. |
+| Phase 45: Parallel Agent Runtime | Merge | Agent Router & Worker Pool | Merge with Phase 50 routing. |
+| Phase 46: Hierarchical Memory | Merge | Unified Memory System | Merge with vector memory, experience memory, and knowledge graph. |
+| Phase 47: Reasoning Engine | Merge | Critic / Verifier / Guardrails | Merge with critic and strict reasoning contracts. |
+| Phase 48: Knowledge Graph | Merge | Unified Memory System | Knowledge graph is memory metadata, not a standalone control plane. |
+| Phase 49: Multimodal Expert | Archive | Agent Router & Worker Pool | Keep contract for future. Do not keep in core until coding agent is strong. |
+| Phase 50: MoE Router Layer | Replace | Agent Router & Worker Pool | Rename software MoE to router. Real MoE later belongs to model architecture, not orchestration. |
+| Phase 51: High-Stability Reasoning And Unified Memory | Merge | Unified Memory System; Critic / Verifier / Guardrails | Keep strict contracts, but split memory and review responsibilities into their target modules. |
+
+### Final Module Contracts
+
+#### Gateway Layer
+
+Responsibilities:
+
+- HTTP/API entrypoint for chat, agent runs, eval runs, memory lookup, and admin status.
+- Authentication, API keys/JWT, Redis quota, request policy, request tracing, and SSE streaming.
+- Public contract stability so internal modules can change without breaking clients.
+
+Internal components:
+
+- FastAPI app.
+- Auth middleware.
+- Quota middleware.
+- Request router.
+- SSE event streamer.
+- Structured logging and Prometheus metrics.
+
+APIs:
+
+- `POST /v1/chat`
+- `POST /v1/agent/run`
+- `POST /v1/agent/run/stream`
+- `GET /v1/quality/latest`
+- `GET /health/live`
+- `GET /health/ready`
+- `GET /metrics`
+
+Inputs:
+
+- User prompt, workspace ID, files/project metadata, selected model profile, policy flags.
+
+Outputs:
+
+- Final answer, streamed events, tool traces, quality reports, quota headers.
+
+Dependencies:
+
+- TaskGraph Runtime, Model Ops, Unified Memory, Evaluation Service, Redis, observability.
+
+#### Intent & Planning Engine
+
+Responsibilities:
+
+- Convert vague user intent into an executable task graph.
+- Expand short prompts.
+- Identify risks, success criteria, required tools, relevant files, and verification plan.
+- Never execute tools directly.
+
+Internal components:
+
+- Intent classifier.
+- Prompt expander.
+- Requirement extractor.
+- TaskGraph planner.
+- Risk and security planner.
+- Plan schema validator.
+
+APIs:
+
+- `plan(request) -> TaskGraph`
+- `expand_intent(prompt, workspace_context) -> ExpandedIntent`
+- `estimate_complexity(prompt, repo_context) -> ComplexityScore`
+
+Inputs:
+
+- User prompt, workspace context, retrieved memories, repo index summaries.
+
+Outputs:
+
+- Validated TaskGraph, success criteria, risk list, tool plan, context requirements.
+
+Dependencies:
+
+- Workspace Index & Context Builder, Unified Memory, Model Ops.
+
+#### TaskGraph Runtime
+
+Responsibilities:
+
+- Single source of truth for execution state.
+- Execute TaskGraph nodes in order or parallel where safe.
+- Persist run state, retries, errors, artifacts, and final report.
+- Enforce max iterations and stop conditions.
+
+Internal components:
+
+- DAG executor.
+- Run state store.
+- Event bus.
+- Retry/correction policy.
+- Artifact registry.
+- Final aggregation.
+
+APIs:
+
+- `run(task_graph) -> AgentRunReport`
+- `resume(run_id) -> AgentRunReport`
+- `cancel(run_id) -> RunStatus`
+- `events(run_id) -> AsyncIterator[RunEvent]`
+
+Inputs:
+
+- TaskGraph, policy profile, model profile, workspace ID.
+
+Outputs:
+
+- Run report, artifacts, events, failure traces, patch candidates.
+
+Dependencies:
+
+- Agent Router, Tool Execution, Patch Manager, Critic/Verifier, Unified Memory.
+
+#### Agent Router & Worker Pool
+
+Responsibilities:
+
+- Route task nodes to specialist workers.
+- Maintain a small, explicit worker set.
+- Avoid spawning agents unless the task benefits from role separation.
+
+Internal components:
+
+- Router policy.
+- Worker registry.
+- Coder worker.
+- Debugger worker.
+- Security auditor worker.
+- Tester worker.
+- Research worker.
+- Reviewer worker.
+
+APIs:
+
+- `route(task_node, context) -> WorkerAssignment`
+- `execute(worker_assignment) -> WorkerArtifact`
+- `review_peer(artifact) -> ReviewResult`
+
+Inputs:
+
+- Task node, context pack, tool permissions, model profile.
+
+Outputs:
+
+- Code artifacts, analysis artifacts, test plans, security findings, peer reviews.
+
+Dependencies:
+
+- Model Ops, Tool Execution, Critic/Verifier, Workspace Index.
+
+#### Tool Execution Layer
+
+Responsibilities:
+
+- Safely run shell commands, tests, Docker sandbox jobs, Git operations, browser tasks, Semgrep, CodeQL, database probes, and future MCP/code-mode tools.
+- Keep tool outputs compact and structured.
+- Enforce permissions and resource limits.
+
+Internal components:
+
+- Docker sandbox.
+- Shell runner.
+- Git adapter.
+- Static analysis adapters.
+- Browser/visual QA adapter.
+- Database adapter.
+- Tool output trimmer.
+- Permission gate.
+
+APIs:
+
+- `execute_tool(tool_call) -> ToolResult`
+- `run_sandbox(files, command, policy) -> SandboxResult`
+- `run_static_scan(workspace, policy) -> SecurityResult`
+
+Inputs:
+
+- Tool call schema, workspace, command, files, security policy.
+
+Outputs:
+
+- Structured stdout/stderr, exit code, metrics, summarized findings, artifacts.
+
+Dependencies:
+
+- Docker, Git, Semgrep, CodeQL, browser automation, databases.
+
+#### Workspace Index & Context Builder
+
+Responsibilities:
+
+- Maintain repo index and code understanding.
+- Build context packs under token budget.
+- Combine AST/call graph, semantic search, file summaries, symbols, diffs, and test history.
+
+Internal components:
+
+- Incremental file index.
+- AST/call graph extractor.
+- Symbol graph.
+- Embedding index.
+- Merkle/hash change detector.
+- Context packer.
+- Token budget allocator.
+
+APIs:
+
+- `index_workspace(workspace_id) -> IndexReport`
+- `retrieve(query, filters, budget) -> ContextPack`
+- `pack(task_graph, memory_hits, budget) -> ModelContext`
+
+Inputs:
+
+- Workspace path, changed files, query, task graph, memory hits.
+
+Outputs:
+
+- Ranked code chunks, symbol graph, call graph slices, context pack.
+
+Dependencies:
+
+- Unified Memory, embedding model, tokenizer, filesystem.
+
+#### Unified Memory System
+
+Responsibilities:
+
+- Store and retrieve session, project, experience, and knowledge graph memory.
+- Prevent context pollution.
+- Promote only verified fixes, passed benchmarks, security findings, and successful plans.
+
+Internal components:
+
+- Session memory.
+- Project memory.
+- Experience memory.
+- Knowledge graph.
+- Vector store.
+- Memory ingestion gate.
+- Retrieval ranker.
+- Cold archive.
+
+APIs:
+
+- `remember(entry, policy) -> MemoryWriteResult`
+- `retrieve(query, project_id, limit) -> MemoryHits`
+- `promote_failure_fix(trace) -> ExperienceRecord`
+- `archive_low_quality() -> ArchiveReport`
+
+Inputs:
+
+- Verified run traces, project metadata, bug/fix/outcome records, queries.
+
+Outputs:
+
+- Ranked memory hits, promotion reports, graph relationships.
+
+Dependencies:
+
+- Qdrant/pgvector, Postgres, Redis cache, Workspace Index.
+
+#### Critic / Verifier / Guardrails
+
+Responsibilities:
+
+- Validate plans, outputs, patches, security posture, format, and release readiness.
+- Separate critique from execution.
+- Apply deterministic checks before model judgment.
+
+Internal components:
+
+- Schema validator.
+- Policy engine.
+- Static security verifier.
+- Test verifier.
+- Critic model adapter.
+- Strict role-contract checker.
+- Safety and permission guardrails.
+
+APIs:
+
+- `verify_artifact(artifact, criteria) -> VerificationResult`
+- `critic_review(artifact, context) -> CriticResult`
+- `security_review(workspace, patch) -> SecurityResult`
+- `release_gate(run_id) -> ReleaseDecision`
+
+Inputs:
+
+- Plans, patches, tool results, test results, security scan results.
+
+Outputs:
+
+- Pass/fail decision, confidence, flaws, required fixes, release decision.
+
+Dependencies:
+
+- Tool Execution, Model Ops, Evaluation Service.
+
+#### Patch Manager
+
+Responsibilities:
+
+- Apply, preview, revert, and review file changes.
+- Protect user changes and support rollback.
+
+Internal components:
+
+- Diff generator.
+- Patch applier.
+- Backup store.
+- Conflict detector.
+- Rollback manager.
+
+APIs:
+
+- `preview_patch(patch) -> Diff`
+- `apply_patch(patch, policy) -> PatchResult`
+- `rollback(patch_id) -> RollbackResult`
+
+Inputs:
+
+- Patch artifact, workspace, policy.
+
+Outputs:
+
+- Diff, applied files, backup IDs, rollback status.
+
+Dependencies:
+
+- Git, filesystem, Critic/Verifier.
+
+#### Evaluation Service
+
+Responsibilities:
+
+- Run all architecture, coding, security, regression, and model-quality evaluations.
+- Store comparable results.
+- Drive failure analysis and learning candidates.
+
+Internal components:
+
+- Architecture smoke suite.
+- Golden scorecard.
+- SWE-bench/SWE-bench Lite/SWE-bench Verified adapter.
+- HumanEval/MBPP adapter.
+- CyberSecEval/custom security suite.
+- Regression tracker.
+- Report generator.
+
+APIs:
+
+- `run_eval(suite, model_profile) -> EvalReport`
+- `compare_runs(current, baseline) -> RegressionReport`
+- `export_failures(run_id) -> LearningCandidates`
+
+Inputs:
+
+- Model profile, workspace, benchmark suite, policy.
+
+Outputs:
+
+- Scores, pass rates, category deltas, failure clusters, candidate data.
+
+Dependencies:
+
+- Tool Execution, Model Ops, Learning Pipeline, Postgres.
+
+#### Learning Pipeline
+
+Responsibilities:
+
+- Convert verified traces and eval failures into reviewed SFT/GRPO data.
+- Run SFT/QLoRA and GRPO.
+- Gate model promotion with rollback.
+
+Internal components:
+
+- Rejection sampler.
+- Dataset review gate.
+- SFT/QLoRA trainer.
+- GRPO trainer.
+- Reward model/rule rewards.
+- Checkpoint comparator.
+- Promotion and rollback gate.
+
+APIs:
+
+- `queue_candidate(trace) -> CandidateId`
+- `review_candidate(candidate_id) -> ReviewDecision`
+- `train_sft(config) -> TrainingRun`
+- `train_grpo(config) -> TrainingRun`
+- `promote_checkpoint(checkpoint_id) -> PromotionDecision`
+
+Inputs:
+
+- Verified traces, failure clusters, approved examples, model configs.
+
+Outputs:
+
+- Datasets, checkpoints, eval reports, promotion decisions.
+
+Dependencies:
+
+- Evaluation Service, Model Ops, Postgres, object storage, GPU cluster.
+
+#### Model Ops & Serving
+
+Responsibilities:
+
+- Manage model profiles, serving, inference, tokenizer assets, quantization, health, and scaling.
+- Provide one model API to all modules.
+
+Internal components:
+
+- OpenAI-compatible client.
+- vLLM server config.
+- Profile switcher.
+- Quantization pipeline.
+- Checkpoint registry.
+- Health probes.
+- Load test runner.
+
+APIs:
+
+- `generate(request, profile) -> ModelResponse`
+- `list_profiles() -> ModelProfiles`
+- `activate_profile(profile) -> ActivationReport`
+- `health(profile) -> HealthReport`
+
+Inputs:
+
+- Prompt/context, generation config, model profile.
+
+Outputs:
+
+- Model response, token usage, latency, health status.
+
+Dependencies:
+
+- vLLM, CUDA hosts, checkpoint storage, tokenizer storage.
+
+### Final Folder Structure
+
+```text
+src/mythos/
+  gateway/
+    api.py
+    auth.py
+    quota.py
+    streaming.py
+    observability.py
+  planning/
+    intent.py
+    planner.py
+    schemas.py
+  runtime/
+    taskgraph.py
+    executor.py
+    events.py
+    state_store.py
+  agents/
+    router.py
+    workers.py
+    prompts.py
+  tools/
+    sandbox.py
+    shell.py
+    git.py
+    security.py
+    browser.py
+    databases.py
+  context/
+    indexer.py
+    callgraph.py
+    embeddings.py
+    packer.py
+  memory/
+    store.py
+    ranker.py
+    graph.py
+    promotion.py
+  guardrails/
+    critic.py
+    verifier.py
+    security.py
+    policies.py
+  patches/
+    manager.py
+    diff.py
+    rollback.py
+  evaluation/
+    suites.py
+    swebench.py
+    cybersec.py
+    regression.py
+    reports.py
+  learning/
+    datasets.py
+    rejection_sampling.py
+    sft.py
+    grpo.py
+    checkpoint_gate.py
+  model_ops/
+    backends.py
+    profiles.py
+    serving.py
+    quantization.py
+    health.py
+  shared/
+    config.py
+    schemas.py
+    errors.py
+    telemetry.py
+legacy/
+  phase1/
+  ...
+  phase51/
+docs/
+  mythos_complete_architecture_manual.md
+```
+
+Rule: new code goes into `src/mythos/*`. Existing `src/phase*` becomes compatibility/legacy until migrated. Do not add Phase 52.
+
+### Final Service Architecture
+
+```text
+Client / IDE / CLI
+  -> Gateway API
+      -> TaskGraph Runtime
+          -> Intent & Planning Engine
+          -> Workspace Index & Context Builder
+          -> Unified Memory System
+          -> Agent Router & Worker Pool
+              -> Model Ops & Serving
+              -> Tool Execution Layer
+              -> Patch Manager
+          -> Critic / Verifier / Guardrails
+          -> Evaluation Service
+          -> Learning Pipeline
+```
+
+Deployment units:
+
+- `mythos-gateway`: FastAPI API, auth, quota, streaming, metrics.
+- `mythos-runtime`: TaskGraph execution and event state.
+- `mythos-worker`: agent workers and tool calls.
+- `mythos-indexer`: repo indexing and embeddings.
+- `mythos-evaluator`: scorecards and benchmarks.
+- `mythos-learning`: dataset review, SFT/GRPO jobs, checkpoint gates.
+- `mythos-model`: vLLM/OpenAI-compatible serving profile.
+
+### Final Database Architecture
+
+Postgres:
+
+- `runs`: agent runs and status.
+- `task_nodes`: TaskGraph nodes and dependencies.
+- `artifacts`: code/test/security artifacts.
+- `eval_runs`: benchmark/eval results.
+- `learning_candidates`: SFT/GRPO candidate rows.
+- `checkpoints`: checkpoint metadata and promotion state.
+- `memory_entries`: durable memory metadata.
+- `audit_events`: user/tool/security audit logs.
+
+Redis:
+
+- Quota buckets.
+- Short-lived run locks.
+- Event stream buffers.
+- Hot memory cache.
+- Rate limits and idempotency keys.
+
+Qdrant or pgvector:
+
+- Code chunk embeddings.
+- Experience memory embeddings.
+- Project knowledge embeddings.
+
+Object storage or filesystem artifact store:
+
+- Run logs.
+- Sandbox workspaces.
+- Diffs and patches.
+- Dataset shards.
+- Checkpoints.
+- Evaluation reports.
+
+### Final Memory Architecture
+
+```text
+Working Memory
+  -> current run only; cleared after run
+Session Memory
+  -> conversation/session scoped
+Project Memory
+  -> repo facts, architecture decisions, known conventions
+Experience Memory
+  -> verified failure/fix/outcome records
+Knowledge Graph
+  -> relationships among files, symbols, dependencies, bugs, fixes
+Vector Index
+  -> semantic retrieval over code and experience
+Cold Archive
+  -> low-use or low-score records
+```
+
+Retrieval policy:
+
+1. Determine task intent and workspace.
+2. Retrieve project facts and relevant code chunks.
+3. Retrieve experience records only if verified.
+4. Retrieve knowledge graph neighbors for symbols/files.
+5. Rank by vector similarity, success rate, recency, and usage.
+6. Pack context under token budget.
+7. Never inject raw thoughts or failed guesses.
+
+### Final Evaluation Architecture
+
+Evaluation Service owns every score.
+
+Suites:
+
+- `architecture_smoke`: compile, imports, API, sandbox, memory.
+- `golden_scorecard`: short prompt, debugging, security, patching, long-context tasks.
+- `regression_pack`: fixed project-specific regression tasks.
+- `humaneval_mbpp`: coding sanity.
+- `swebench_lite`: first serious repo-level coding gate.
+- `swebench_verified`: production-grade coding benchmark.
+- `cybersec_eval`: insecure code, vulnerability detection, patch correctness.
+- `head_to_head`: old model vs new model.
+
+Metrics:
+
+- pass@1, pass@5, pass@10.
+- first-pass compile/test success.
+- patch acceptance rate.
+- insecure code rate.
+- regression count.
+- average tool calls.
+- token cost per solved task.
+- wall-clock time per solved task.
+- human-review acceptance rate.
+
+### Final Training Pipeline Architecture
+
+```text
+Evaluation failures + successful verified runs
+  -> Learning candidate queue
+  -> Dataset review gate
+  -> SFT data
+  -> QLoRA SFT
+  -> Evaluation Service
+  -> Checkpoint gate
+  -> GRPO candidate pool
+  -> GRPO training
+  -> Evaluation Service
+  -> Promotion or rollback
+```
+
+Rules:
+
+- No training on unreviewed synthetic data.
+- No GRPO before reliable verifier rewards.
+- Every checkpoint must beat baseline on coding, security, and regression.
+- If security score drops, automatic rollback.
+- If SWE-bench score improves but insecure-code rate worsens, do not promote.
+
+### Final Deployment Architecture
+
+Local development:
+
+- Gateway + runtime + tiny model profile.
+- Docker sandbox.
+- Redis/Postgres/Qdrant dev compose.
+- Mock/low-quality model allowed only for plumbing.
+
+GPU staging:
+
+- vLLM 7B/14B profile.
+- Real scorecards.
+- SWE-bench Lite subset.
+- Security scans.
+- Dataset candidate export.
+
+Production:
+
+- Gateway behind Nginx/ingress.
+- Redis quota and event streams.
+- Postgres primary.
+- Qdrant/pgvector.
+- Runtime worker pool.
+- Tool sandbox pool.
+- vLLM model servers.
+- Prometheus/Grafana/log pipeline.
+- Human approval for risky tools.
+
+### File Disposition
+
+Delete immediately:
+
+- Split docs already consolidated and removed from `docs/`.
+- Any future standalone phase docs. Add content to this manual instead.
+
+Merge into new modules:
+
+- `src/phase43` + `src/phase44` -> `src/mythos/planning`.
+- `src/phase45` + `src/phase50` -> `src/mythos/agents`.
+- `src/phase46` + `src/phase48` + `src/phase37` + memory pieces of `src/phase51` -> `src/mythos/memory`.
+- `src/phase22` + `src/phase47` + review pieces of `src/phase51` + `src/phase19` + `src/phase27` + `src/phase38` -> `src/mythos/guardrails`.
+- `src/phase12` + `src/phase13` + `src/phase14` + `src/phase18` + `src/phase30` + `src/phase41` -> `src/mythos/evaluation`.
+- `src/phase3` + `src/phase5` + `src/phase7` + `src/phase21` + `src/phase29` + `src/phase36` + `src/phase39` -> `src/mythos/learning`.
+- `src/phase8` + `src/phase17` + `src/phase23` + `src/phase33` + `src/phase42` + model backend pieces of `src/phase11` -> `src/mythos/model_ops`.
+
+Archive after migration:
+
+- `src/phase4`
+- `src/phase15`
+- `src/phase24`
+- `src/phase49`
+- Old phase runner scripts after replacement scripts exist.
+
+Critical and must remain until replacements pass:
+
+- `src/phase2/docker_sandbox_engine.py`
+- `src/phase10/architecture_readiness_audit.py`
+- `src/phase11/chat_api.py`
+- `src/phase11/model_backends.py`
+- `src/phase14/scorecard_harness.py`
+- `src/phase20/taskgraph_runtime.py`
+- `src/phase26/patch_manager.py`
+- `src/phase34/auth_quota.py`
+- `src/phase35/observability.py`
+- `src/phase40/integrated_agent.py`
+- `src/phase42/profile_switcher.py`
+- `src/mythos_v1/release_gate.py`
+
+### Phased Execution Roadmap
+
+#### Phase A: Architecture Consolidation
+
+Goal: replace 51-phase mental model with 12 modules.
+
+Deliverables:
+
+- Create `src/mythos/*` folders.
+- Add facade imports from old phases.
+- Move no behavior at first; wrap old implementations.
+- Replace public docs with this migration plan.
+- One command: `python -m src.mythos.evaluation.release_gate`.
+
+Exit criteria:
+
+- Existing release gate still passes.
+- `/v1/agent/run` still works.
+- No new phase directories.
+
+#### Phase B: Real Model Integration: Qwen 7B / 14B
+
+Goal: stop measuring quality with tiny random model.
+
+Deliverables:
+
+- Linux CUDA host.
+- vLLM serving profile for Qwen2.5-Coder 7B first, 14B second.
+- Real model scorecard run.
+- Baseline latency/cost profile.
+
+Exit criteria:
+
+- 7B endpoint stable.
+- Phase 18/Evaluation Service reports real scores.
+- Tiny model used only for local plumbing.
+
+#### Phase C: Cursor-Class Repository Indexing
+
+Goal: make repo context retrieval a competitive advantage.
+
+Deliverables:
+
+- Incremental file hashing.
+- AST/symbol chunking.
+- Embedding index.
+- Context packer with diff/test/symbol awareness.
+- Re-index only changed files.
+
+Exit criteria:
+
+- Large repo can be indexed incrementally.
+- Context packs cite files/symbols.
+- Retrieval improves golden scorecard.
+
+#### Phase D: SWE-Bench & CyberSecEval
+
+Goal: evaluate like a real coding/security system.
+
+Deliverables:
+
+- SWE-bench Lite adapter.
+- SWE-bench Verified staging adapter.
+- CyberSecEval/custom security suite.
+- Regression storage in Postgres.
+
+Exit criteria:
+
+- Every model/profile has comparable eval report.
+- Failures export to learning queue.
+
+#### Phase E: SFT + QLoRA
+
+Goal: improve model on verified coding/security traces.
+
+Deliverables:
+
+- Reviewed dataset.
+- QLoRA SFT config.
+- Checkpoint gate.
+- Baseline comparison.
+
+Exit criteria:
+
+- SFT checkpoint beats base on target evals.
+- No security regression.
+
+#### Phase F: GRPO
+
+Goal: optimize outcome-based coding/security performance.
+
+Prerequisite:
+
+- Reliable sandbox/test/security rewards.
+
+Deliverables:
+
+- GRPO rollout generator.
+- Reward component calibration.
+- KL/reference model tracking.
+- Rollback gate.
+
+Exit criteria:
+
+- GRPO improves pass rates without reward hacking.
+- Security and format scores do not degrade.
+
+#### Phase G: 32B Scaling
+
+Goal: production-quality reasoning and repo-scale coding.
+
+Deliverables:
+
+- 32B vLLM deployment.
+- Tensor parallel config.
+- Longer context.
+- Larger eval suite.
+
+Exit criteria:
+
+- 32B beats 14B enough to justify cost.
+- Latency acceptable for agent runs.
+
+#### Phase H: 70B Scaling
+
+Goal: high-end competitive coding/security model.
+
+Deliverables:
+
+- Multi-GPU serving.
+- Larger context and better retrieval.
+- Distillation path into smaller models.
+- Production workload tests.
+
+Exit criteria:
+
+- 70B improves hard repo/security tasks.
+- Cost per solved task is economically viable.
+- 100B+ only considered after this is proven.
+
 ## Consolidated Table Of Contents
 
 1. [Mythos Target Architecture](#source-1-mythos-target-architecture) - `mythos_target_architecture.md`
