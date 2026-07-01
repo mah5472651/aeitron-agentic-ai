@@ -61,6 +61,1072 @@ Important boundary:
 
 - This is Phase A architecture consolidation, not a full deletion migration. Old phase modules are intentionally still present as legacy adapters. Physical deletion should happen only after the equivalent `src/mythos` module has tests, docs, and release-gate coverage.
 
+## MVP Implementation Plan: 8-Week Coding Agent
+
+This section is the concrete build plan for the MVP only. The target is a working AI coding agent capable of repository understanding, code editing, testing, and verification in 8 weeks.
+
+MVP scope:
+
+- FastAPI Gateway
+- Qwen2.5-Coder 7B via vLLM
+- Workspace Index & Context Builder
+- TaskGraph Runtime
+- Single Agent Runtime
+- Tool Layer
+- Patch Manager
+- Verifier
+- Evaluation Service
+- Learning Candidate Queue
+
+Out of scope for this MVP:
+
+- New architecture phases
+- 70B+ planning
+- GRPO
+- Multimodal
+- Multiple model families
+- Research-only systems
+- Autonomous exploit execution
+
+### Implementation Order By Module
+
+| Order | Module | Why Needed | Dependencies | Estimated LOC | Estimated Time | Risk |
+|---:|---|---|---|---:|---:|---|
+| 1 | FastAPI Gateway | One stable external API for chat, agent runs, projects, tasks, patches, evaluation, health, auth, and quota. | Phase 34 auth/quota, Pydantic schemas, Postgres connection. | 700-1,000 | 4 days | Medium |
+| 2 | Qwen2.5-Coder 7B vLLM Serving | Real coding model backend for useful reasoning and generation. | Linux CUDA box, vLLM, OpenAI-compatible client, model profile config. | 350-550 | 3 days after GPU is available | High |
+| 3 | Database Foundation | Persistent projects, sessions, runs, task graphs, patches, evals, and learning candidates. | Postgres, Alembic or SQL init scripts. | 450-650 | 3 days | Medium |
+| 4 | Workspace Index & Context Builder | Cursor-class repo understanding requires file map, symbols, chunks, imports, call graph, and retrieval packs. | Git workspace, Tree-sitter or fallback AST, Qdrant, Postgres. | 1,400-2,000 | 7 days | High |
+| 5 | TaskGraph Runtime | Converts user intent into executable coding steps with status, retries, dependencies, and resumability. | Database, planner schema, single agent runtime. | 900-1,300 | 5 days | High |
+| 6 | Single Agent Runtime | Minimal reliable agent loop: plan, gather context, edit, test, verify, answer. | Model backend, TaskGraph runtime, Context Builder, Tools, Patch Manager. | 1,200-1,800 | 7 days | High |
+| 7 | Tool Layer | Safe command execution, tests, git diff, file read/write, search, sandbox route, Semgrep route. | Sandbox, filesystem policies, Docker optional. | 900-1,300 | 5 days | High |
+| 8 | Patch Manager | Turns model edits into previewable, reversible diffs with backups and rollback. | Workspace, git diff, database patches table. | 600-900 | 4 days | Medium |
+| 9 | Verifier | Compile/test/static/security checks decide whether an answer is acceptable. | Tool Layer, Patch Manager, test commands, Semgrep optional. | 700-1,100 | 5 days | High |
+| 10 | Evaluation Service | SWE-Bench Lite and internal regression checks measure if the coding agent is improving. | Agent API, Tool Layer, database, reports. | 1,000-1,500 | 6 days | High |
+| 11 | Learning Candidate Queue | Saves only verified failures/fixes/traces for later SFT data. | Evaluation Service, Verifier, Postgres, JSONL export. | 400-700 | 3 days | Medium |
+| 12 | Release/Smoke Automation | Keeps every MVP build testable with one command. | All modules above. | 250-450 | 2 days | Medium |
+
+### Exact 8-Week Build Order
+
+Week 1:
+
+- Harden `src/mythos/gateway`.
+- Add Postgres schema and migration/init script.
+- Add project/session/run/task CRUD endpoints.
+- Keep auth/quota middleware wired through Phase 34.
+- Deliverable: local API can create a project, start a run, store run state, and return health.
+
+Week 2:
+
+- Add Qwen2.5-Coder 7B vLLM server config and OpenAI-compatible backend profile.
+- Add gateway model health checks.
+- Add fallback mock profile for local CPU development.
+- Deliverable: same gateway request works with mock locally and Qwen via vLLM on GPU.
+
+Week 3:
+
+- Build Workspace Index.
+- Store file inventory, code chunks, symbols, imports, dependencies, and hashes.
+- Add Qdrant embeddings for chunks.
+- Deliverable: indexing a repository creates searchable context records and a workspace summary.
+
+Week 4:
+
+- Build Context Builder and TaskGraph Runtime.
+- Generate task graph from prompt plus indexed repo context.
+- Persist every node and transition.
+- Deliverable: a prompt creates a durable task graph and a ranked context pack.
+
+Week 5:
+
+- Build Single Agent Runtime.
+- Agent executes one task graph through context retrieval, model call, patch proposal, and tool calls.
+- Deliverable: agent can inspect a repo and produce a patch preview.
+
+Week 6:
+
+- Finish Tool Layer, Patch Manager, and Verifier.
+- Add command execution, test command routing, diff preview, apply, rollback, and verification reports.
+- Deliverable: agent can edit code, run tests, rollback failed patches, and return verified status.
+
+Week 7:
+
+- Build Evaluation Service with SWE-Bench Lite workflow.
+- Add internal smoke tasks for repo understanding, debugging, patching, and security detection.
+- Deliverable: one command runs benchmark tasks and stores scores.
+
+Week 8:
+
+- Build Learning Candidate Queue and release automation.
+- Only verifier-passed fixes and useful failures become learning candidates.
+- Add end-to-end release gate for gateway, indexing, agent run, patch verify, and evaluation smoke.
+- Deliverable: working MVP coding agent with repeatable green smoke checks.
+
+### Final MVP Repository Structure
+
+```text
+src/mythos/
+  gateway/
+    api.py
+    auth.py
+    dependencies.py
+    errors.py
+    schemas.py
+  serving/
+    vllm_server.py
+    profiles.py
+    openai_client.py
+    health.py
+  db/
+    connection.py
+    migrations/
+    models.py
+    repositories.py
+  indexing/
+    file_inventory.py
+    chunker.py
+    symbols.py
+    embeddings.py
+    qdrant_store.py
+    context_builder.py
+  runtime/
+    taskgraph.py
+    state_machine.py
+    single_agent.py
+    prompts.py
+  tools/
+    command_runner.py
+    sandbox.py
+    filesystem.py
+    git_tools.py
+    search.py
+    semgrep.py
+  patch_manager/
+    diff.py
+    apply.py
+    rollback.py
+    records.py
+  verifier/
+    test_runner.py
+    static_checks.py
+    security_checks.py
+    verdict.py
+  evaluation/
+    swebench_lite.py
+    internal_tasks.py
+    reports.py
+    regression.py
+  learning/
+    candidate_queue.py
+    exporters.py
+  shared/
+    schemas.py
+    config.py
+    logging.py
+    ids.py
+```
+
+Current bridge rule:
+
+- Existing `src/mythos/*` facade remains the product import path.
+- Old `src/phase*` modules may be called only from adapters while their code is migrated into the MVP folders above.
+- New MVP code should not import directly from `src/phase*` unless the file name includes `adapter`.
+
+### API Contracts
+
+All responses use this error shape:
+
+```json
+{
+  "error": "string",
+  "detail": "string",
+  "request_id": "string"
+}
+```
+
+#### Gateway / Health
+
+Endpoint: `GET /health/live`
+
+Response:
+
+```json
+{
+  "status": "live"
+}
+```
+
+Endpoint: `GET /health/ready`
+
+Response:
+
+```json
+{
+  "status": "ready",
+  "database": {"ok": true},
+  "model": {"ok": true, "profile": "qwen2.5-coder-7b-vllm"},
+  "qdrant": {"ok": true},
+  "auth": {"enabled": true, "quota_enabled": true}
+}
+```
+
+#### Projects
+
+Endpoint: `POST /v1/projects`
+
+Request:
+
+```json
+{
+  "name": "string",
+  "repo_path": "string",
+  "default_branch": "string"
+}
+```
+
+Response:
+
+```json
+{
+  "project_id": "uuid",
+  "name": "string",
+  "repo_path": "string",
+  "created_at": "timestamp"
+}
+```
+
+Endpoint: `GET /v1/projects/{project_id}`
+
+Response:
+
+```json
+{
+  "project_id": "uuid",
+  "name": "string",
+  "repo_path": "string",
+  "index_status": "not_indexed|indexing|ready|failed",
+  "last_indexed_at": "timestamp|null"
+}
+```
+
+#### Sessions
+
+Endpoint: `POST /v1/sessions`
+
+Request:
+
+```json
+{
+  "project_id": "uuid",
+  "title": "string"
+}
+```
+
+Response:
+
+```json
+{
+  "session_id": "uuid",
+  "project_id": "uuid",
+  "title": "string",
+  "created_at": "timestamp"
+}
+```
+
+#### Indexing
+
+Endpoint: `POST /v1/projects/{project_id}/index`
+
+Request:
+
+```json
+{
+  "force": false,
+  "include_globs": ["**/*.py", "**/*.ts", "**/*.js", "**/*.go", "**/*.rs"],
+  "exclude_globs": [".git/**", "node_modules/**", ".venv/**", "dist/**"]
+}
+```
+
+Response:
+
+```json
+{
+  "index_job_id": "uuid",
+  "project_id": "uuid",
+  "status": "queued"
+}
+```
+
+Endpoint: `GET /v1/projects/{project_id}/index/status`
+
+Response:
+
+```json
+{
+  "project_id": "uuid",
+  "status": "ready",
+  "file_count": 120,
+  "chunk_count": 940,
+  "symbol_count": 1800,
+  "last_error": null
+}
+```
+
+Endpoint: `POST /v1/context/build`
+
+Request:
+
+```json
+{
+  "project_id": "uuid",
+  "query": "fix failing auth test",
+  "token_budget": 24000,
+  "pinned_files": ["src/auth.py"],
+  "task_id": "uuid|null"
+}
+```
+
+Response:
+
+```json
+{
+  "context_id": "uuid",
+  "project_id": "uuid",
+  "query": "string",
+  "token_budget": 24000,
+  "files": [{"path": "string", "reason": "string", "score": 0.91}],
+  "chunks": [{"chunk_id": "uuid", "path": "string", "start_line": 1, "end_line": 80, "score": 0.88}],
+  "prompt_context": "string"
+}
+```
+
+#### Agent Runs
+
+Endpoint: `POST /v1/agent/runs`
+
+Request:
+
+```json
+{
+  "project_id": "uuid",
+  "session_id": "uuid",
+  "prompt": "fix the login bug",
+  "mode": "code_edit|debug|explain|security_review",
+  "max_steps": 12,
+  "apply_patch": false
+}
+```
+
+Response:
+
+```json
+{
+  "run_id": "uuid",
+  "project_id": "uuid",
+  "session_id": "uuid",
+  "status": "queued",
+  "task_graph_id": "uuid"
+}
+```
+
+Endpoint: `GET /v1/agent/runs/{run_id}`
+
+Response:
+
+```json
+{
+  "run_id": "uuid",
+  "status": "queued|running|needs_review|verified|failed|cancelled",
+  "summary": "string",
+  "current_node_id": "uuid|null",
+  "confidence": 0.82,
+  "patch_id": "uuid|null",
+  "verification_id": "uuid|null"
+}
+```
+
+Endpoint: `GET /v1/agent/runs/{run_id}/events`
+
+Response: Server-Sent Events, each event:
+
+```json
+{
+  "event_id": "uuid",
+  "run_id": "uuid",
+  "type": "task_started|tool_call|patch_created|verification_finished|final",
+  "payload": {},
+  "created_at": "timestamp"
+}
+```
+
+#### TaskGraph
+
+Endpoint: `GET /v1/taskgraphs/{task_graph_id}`
+
+Response:
+
+```json
+{
+  "task_graph_id": "uuid",
+  "project_id": "uuid",
+  "goal": "string",
+  "nodes": [],
+  "edges": [],
+  "status": "running"
+}
+```
+
+#### Tools
+
+Endpoint: `POST /v1/tools/execute`
+
+Request:
+
+```json
+{
+  "project_id": "uuid",
+  "run_id": "uuid",
+  "tool": "shell|test|git_diff|semgrep|read_file|write_file",
+  "args": {},
+  "timeout_ms": 30000
+}
+```
+
+Response:
+
+```json
+{
+  "tool_call_id": "uuid",
+  "status": "ok|failed|timeout|blocked",
+  "stdout": "string",
+  "stderr": "string",
+  "exit_code": 0,
+  "duration_ms": 1234
+}
+```
+
+#### Patches
+
+Endpoint: `POST /v1/patches/preview`
+
+Request:
+
+```json
+{
+  "project_id": "uuid",
+  "run_id": "uuid",
+  "edits": [
+    {"path": "src/auth.py", "new_content": "string"}
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "patch_id": "uuid",
+  "status": "preview",
+  "diff": "string",
+  "files_changed": ["src/auth.py"]
+}
+```
+
+Endpoint: `POST /v1/patches/{patch_id}/apply`
+
+Response:
+
+```json
+{
+  "patch_id": "uuid",
+  "status": "applied",
+  "backup_id": "uuid"
+}
+```
+
+Endpoint: `POST /v1/patches/{patch_id}/rollback`
+
+Response:
+
+```json
+{
+  "patch_id": "uuid",
+  "status": "rolled_back"
+}
+```
+
+#### Verifier
+
+Endpoint: `POST /v1/verifier/run`
+
+Request:
+
+```json
+{
+  "project_id": "uuid",
+  "run_id": "uuid",
+  "patch_id": "uuid",
+  "commands": ["pytest -q"],
+  "security_checks": ["semgrep"],
+  "timeout_ms": 120000
+}
+```
+
+Response:
+
+```json
+{
+  "verification_id": "uuid",
+  "status": "passed|failed|timeout|blocked",
+  "test_results": [{"command": "pytest -q", "exit_code": 0, "duration_ms": 3000}],
+  "security_results": [{"tool": "semgrep", "findings": 0}],
+  "verdict": "accept|reject",
+  "reason": "string"
+}
+```
+
+#### Evaluation
+
+Endpoint: `POST /v1/evaluations/swebench-lite`
+
+Request:
+
+```json
+{
+  "model_profile": "qwen2.5-coder-7b-vllm",
+  "limit": 20,
+  "timeout_minutes": 30
+}
+```
+
+Response:
+
+```json
+{
+  "evaluation_run_id": "uuid",
+  "status": "queued",
+  "benchmark": "swebench_lite"
+}
+```
+
+Endpoint: `GET /v1/evaluations/{evaluation_run_id}`
+
+Response:
+
+```json
+{
+  "evaluation_run_id": "uuid",
+  "benchmark": "swebench_lite",
+  "status": "running|complete|failed",
+  "resolved": 7,
+  "total": 20,
+  "score": 0.35,
+  "report_path": "artifacts/evaluation/run.md"
+}
+```
+
+#### Learning Queue
+
+Endpoint: `POST /v1/learning/candidates/export`
+
+Request:
+
+```json
+{
+  "status": "verified",
+  "format": "jsonl",
+  "limit": 1000
+}
+```
+
+Response:
+
+```json
+{
+  "export_id": "uuid",
+  "path": "artifacts/learning/candidates.jsonl",
+  "rows": 240
+}
+```
+
+### Database Schema
+
+Use Postgres. All IDs are UUID. All timestamps are `timestamptz`.
+
+```sql
+CREATE TABLE projects (
+  id uuid PRIMARY KEY,
+  name text NOT NULL,
+  repo_path text NOT NULL,
+  default_branch text NOT NULL DEFAULT 'main',
+  index_status text NOT NULL DEFAULT 'not_indexed',
+  last_indexed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE sessions (
+  id uuid PRIMARY KEY,
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE runs (
+  id uuid PRIMARY KEY,
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  session_id uuid REFERENCES sessions(id) ON DELETE SET NULL,
+  prompt text NOT NULL,
+  mode text NOT NULL,
+  status text NOT NULL,
+  model_profile text NOT NULL,
+  confidence numeric(5,4),
+  summary text,
+  started_at timestamptz,
+  finished_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE task_graphs (
+  id uuid PRIMARY KEY,
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id uuid REFERENCES runs(id) ON DELETE CASCADE,
+  goal text NOT NULL,
+  status text NOT NULL,
+  graph_json jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE tasks (
+  id uuid PRIMARY KEY,
+  task_graph_id uuid NOT NULL REFERENCES task_graphs(id) ON DELETE CASCADE,
+  run_id uuid NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  kind text NOT NULL,
+  title text NOT NULL,
+  status text NOT NULL,
+  depends_on uuid[] NOT NULL DEFAULT '{}',
+  input_json jsonb NOT NULL DEFAULT '{}',
+  output_json jsonb NOT NULL DEFAULT '{}',
+  error text,
+  started_at timestamptz,
+  finished_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE workspace_files (
+  id uuid PRIMARY KEY,
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  path text NOT NULL,
+  language text,
+  content_hash text NOT NULL,
+  size_bytes integer NOT NULL,
+  indexed_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(project_id, path)
+);
+
+CREATE TABLE code_chunks (
+  id uuid PRIMARY KEY,
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  file_id uuid NOT NULL REFERENCES workspace_files(id) ON DELETE CASCADE,
+  path text NOT NULL,
+  language text,
+  start_line integer NOT NULL,
+  end_line integer NOT NULL,
+  symbol_name text,
+  chunk_hash text NOT NULL,
+  token_count integer NOT NULL,
+  content text NOT NULL,
+  metadata jsonb NOT NULL DEFAULT '{}',
+  indexed_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE patches (
+  id uuid PRIMARY KEY,
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id uuid REFERENCES runs(id) ON DELETE SET NULL,
+  status text NOT NULL,
+  diff text NOT NULL,
+  files_changed text[] NOT NULL DEFAULT '{}',
+  backup_json jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  applied_at timestamptz,
+  rolled_back_at timestamptz
+);
+
+CREATE TABLE evaluations (
+  id uuid PRIMARY KEY,
+  benchmark text NOT NULL,
+  model_profile text NOT NULL,
+  status text NOT NULL,
+  total integer NOT NULL DEFAULT 0,
+  resolved integer NOT NULL DEFAULT 0,
+  score numeric(8,5),
+  report_path text,
+  result_json jsonb NOT NULL DEFAULT '{}',
+  started_at timestamptz,
+  finished_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE memory_entries (
+  id uuid PRIMARY KEY,
+  project_id uuid REFERENCES projects(id) ON DELETE CASCADE,
+  kind text NOT NULL,
+  content text NOT NULL,
+  source_run_id uuid REFERENCES runs(id) ON DELETE SET NULL,
+  relevance numeric(5,4) NOT NULL DEFAULT 0.5,
+  success_rate numeric(5,4) NOT NULL DEFAULT 0.5,
+  usage_count integer NOT NULL DEFAULT 0,
+  last_used_at timestamptz,
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE learning_candidates (
+  id uuid PRIMARY KEY,
+  project_id uuid REFERENCES projects(id) ON DELETE CASCADE,
+  run_id uuid REFERENCES runs(id) ON DELETE SET NULL,
+  patch_id uuid REFERENCES patches(id) ON DELETE SET NULL,
+  kind text NOT NULL,
+  status text NOT NULL,
+  prompt text NOT NULL,
+  chosen text NOT NULL,
+  verification_json jsonb NOT NULL DEFAULT '{}',
+  score numeric(8,5),
+  exported_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+Indexes:
+
+```sql
+CREATE INDEX idx_runs_project_status ON runs(project_id, status);
+CREATE INDEX idx_tasks_graph_status ON tasks(task_graph_id, status);
+CREATE INDEX idx_workspace_files_project_path ON workspace_files(project_id, path);
+CREATE INDEX idx_code_chunks_project_path ON code_chunks(project_id, path);
+CREATE INDEX idx_memory_project_kind ON memory_entries(project_id, kind);
+CREATE INDEX idx_learning_status ON learning_candidates(status);
+```
+
+### Qdrant Collection Schema
+
+Collection: `mythos_code_chunks`
+
+Vector:
+
+```json
+{
+  "name": "content",
+  "size": 768,
+  "distance": "Cosine"
+}
+```
+
+Payload:
+
+```json
+{
+  "chunk_id": "uuid",
+  "project_id": "uuid",
+  "file_id": "uuid",
+  "path": "src/auth.py",
+  "language": "python",
+  "symbol_name": "login_user",
+  "start_line": 10,
+  "end_line": 80,
+  "content_hash": "sha256",
+  "chunk_hash": "sha256",
+  "token_count": 420,
+  "kind": "function|class|module|test|config",
+  "imports": ["jwt", "bcrypt"],
+  "updated_at": "timestamp"
+}
+```
+
+Payload indexes:
+
+- `project_id` keyword
+- `path` keyword
+- `language` keyword
+- `symbol_name` keyword
+- `kind` keyword
+
+Collection: `mythos_memory`
+
+Vector:
+
+```json
+{
+  "name": "content",
+  "size": 768,
+  "distance": "Cosine"
+}
+```
+
+Payload:
+
+```json
+{
+  "memory_id": "uuid",
+  "project_id": "uuid|null",
+  "kind": "verified_fix|passed_benchmark|security_finding|successful_plan",
+  "success_rate": 0.93,
+  "usage_count": 8,
+  "last_used_at": "timestamp",
+  "source_run_id": "uuid|null"
+}
+```
+
+### TaskGraph Schema
+
+```json
+{
+  "task_graph_id": "uuid",
+  "project_id": "uuid",
+  "run_id": "uuid",
+  "goal": "string",
+  "status": "queued|running|blocked|complete|failed",
+  "nodes": [
+    {
+      "node_id": "uuid",
+      "kind": "understand|retrieve_context|edit|test|verify|summarize",
+      "title": "string",
+      "instructions": "string",
+      "status": "queued|running|complete|failed|skipped",
+      "depends_on": ["uuid"],
+      "inputs": {},
+      "outputs": {},
+      "attempt": 1,
+      "max_attempts": 2,
+      "started_at": "timestamp|null",
+      "finished_at": "timestamp|null"
+    }
+  ],
+  "edges": [
+    {"from": "uuid", "to": "uuid", "condition": "success"}
+  ],
+  "success_criteria": [
+    "patch applies cleanly",
+    "tests pass",
+    "no new security findings"
+  ],
+  "created_at": "timestamp",
+  "updated_at": "timestamp"
+}
+```
+
+Required MVP node order:
+
+1. `understand`: classify intent and extract target files.
+2. `retrieve_context`: build context pack.
+3. `edit`: ask model for patch.
+4. `test`: run project test command.
+5. `verify`: accept/reject patch.
+6. `summarize`: return final answer.
+
+### Context Builder Algorithm
+
+Input:
+
+- `project_id`
+- user query
+- token budget
+- optional pinned files
+- optional run/task metadata
+
+Algorithm:
+
+1. Normalize query:
+   - Lowercase for retrieval terms.
+   - Extract file names, symbol names, error messages, stack traces, test names, and package names.
+2. Load project metadata:
+   - Repo path.
+   - File inventory.
+   - Last index timestamp.
+   - Language distribution.
+3. Add pinned context:
+   - Always include user-pinned files.
+   - Always include files from stack traces.
+   - Always include failing test files if detected.
+4. Hybrid retrieve chunks:
+   - Vector search Qdrant by query embedding.
+   - Keyword search Postgres by path, symbol, import, and error tokens.
+   - Git recency boost for recently changed files.
+5. Expand neighbors:
+   - Include direct imports.
+   - Include tests for selected source files.
+   - Include source files for selected tests.
+   - Include callers/callees when symbol graph exists.
+6. Score each candidate:
+   - `final = 0.45 * semantic + 0.25 * keyword + 0.15 * graph + 0.10 * recency + 0.05 * pinned`
+7. Deduplicate:
+   - Remove duplicate chunks by `chunk_hash`.
+   - Prefer smaller symbol chunks over full-file chunks unless the file is small.
+8. Pack by priority:
+   - Repository summary.
+   - Relevant error/test output.
+   - Pinned files.
+   - Top source chunks.
+   - Top test chunks.
+   - Dependency snippets.
+9. Enforce budget:
+   - Reserve 20 percent for model response.
+   - Reserve 10 percent for task instructions.
+   - Use remaining 70 percent for code context.
+10. Return:
+   - `context_id`
+   - ranked file list
+   - ranked chunk list
+   - final prompt context
+   - omitted high-score chunks for debugging
+
+Context pack format:
+
+```text
+<repo_summary>
+...
+</repo_summary>
+<user_request>
+...
+</user_request>
+<error_context>
+...
+</error_context>
+<files>
+<file path="src/auth.py" lines="1-120">
+...
+</file>
+</files>
+```
+
+### Patch Verification Workflow
+
+1. Agent proposes edits as structured file operations.
+2. Patch Manager validates paths:
+   - Path must remain inside project root.
+   - No `.git` writes.
+   - No secrets file writes unless explicitly allowed.
+3. Patch Manager creates preview diff.
+4. Verifier checks patch applies cleanly on current workspace hash.
+5. Patch Manager writes backup snapshot for changed files.
+6. Patch Manager applies patch.
+7. Verifier runs formatting/lint command if configured.
+8. Verifier runs targeted tests:
+   - Tests mentioned in prompt.
+   - Tests near changed files.
+   - Failing tests from context.
+9. Verifier runs full project smoke command if configured.
+10. Verifier runs security checks:
+    - Semgrep ruleset if installed.
+    - Dependency audit when project type supports it.
+11. If all checks pass:
+    - Patch status becomes `verified`.
+    - Run status becomes `verified`.
+    - Candidate is eligible for learning queue.
+12. If any check fails:
+    - Patch status becomes `failed`.
+    - Verifier stores logs.
+    - Patch Manager rolls back unless user requested manual review.
+    - Failure becomes a learning candidate only as `failed_trace`, not SFT `chosen`.
+
+Acceptance rule:
+
+- MVP only returns `verified` when tests pass and no configured security check reports new high-confidence findings.
+
+### SWE-Bench Lite Evaluation Workflow
+
+1. Download or mount SWE-Bench Lite task set.
+2. For each task:
+   - Create isolated workspace.
+   - Checkout specified repository commit.
+   - Create Mythos project row.
+   - Index workspace.
+   - Start agent run with issue prompt.
+3. Agent builds context and proposes patch.
+4. Patch Manager previews and applies patch.
+5. Verifier runs SWE-Bench test command.
+6. Record result:
+   - `resolved = true` only when official tests pass.
+   - Store patch diff, logs, duration, model profile, and failure reason.
+7. After all tasks:
+   - Compute resolved/total.
+   - Generate Markdown report.
+   - Store evaluation row.
+   - Add verified successes and useful failed traces to Learning Candidate Queue.
+
+Minimum MVP metrics:
+
+- `resolved`
+- `total`
+- `resolve_rate`
+- `mean_duration_seconds`
+- `patch_apply_rate`
+- `test_pass_rate`
+- `top_failure_reasons`
+
+### First Three Milestones
+
+Milestone 1: API and Persistence Skeleton
+
+- Deadline: end of Week 1.
+- Must include:
+  - Gateway health.
+  - Auth/quota middleware wired.
+  - Postgres schema.
+  - Project/session/run/task CRUD.
+  - Basic CLI smoke command.
+- Done when:
+  - A project can be created.
+  - A session can be created.
+  - A run can be created and stored.
+  - Release smoke passes locally.
+
+Milestone 2: Repository Understanding
+
+- Deadline: end of Week 3.
+- Must include:
+  - Workspace file inventory.
+  - Code chunking.
+  - Symbol extraction.
+  - Qdrant code chunk storage.
+  - Context Builder endpoint.
+- Done when:
+  - A real repository can be indexed.
+  - Querying "fix auth bug" returns relevant auth files/tests.
+  - Context pack stays inside token budget.
+
+Milestone 3: Verified Code Editing Loop
+
+- Deadline: end of Week 6.
+- Must include:
+  - TaskGraph execution.
+  - Single Agent Runtime.
+  - Patch preview/apply/rollback.
+  - Test execution.
+  - Verifier verdict.
+- Done when:
+  - Agent can modify a small repo.
+  - Tests run automatically.
+  - Passing patch is marked `verified`.
+  - Failing patch rolls back and stores logs.
+
+### MVP Completion Definition
+
+The 8-week MVP is complete only when:
+
+- Gateway can run with auth enabled.
+- Qwen2.5-Coder 7B vLLM profile is available on GPU infrastructure.
+- Repository indexing works on a real multi-file repo.
+- Context Builder returns ranked relevant code context.
+- TaskGraph persists and resumes node status.
+- Single Agent Runtime creates a patch from a short coding/debugging prompt.
+- Patch Manager can preview, apply, and rollback.
+- Verifier runs tests and rejects failed patches.
+- Evaluation Service can run at least a small SWE-Bench Lite subset.
+- Learning Candidate Queue stores only verifier-backed records.
+
 ## Most Important Seven Pillars
 
 These are the parts to keep improving again and again:
