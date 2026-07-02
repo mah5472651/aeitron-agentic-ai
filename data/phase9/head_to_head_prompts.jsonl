@@ -1,2 +1,0 @@
-{"id": "judge-001", "prompt": "Patch a Python path traversal bug and explain the security fix."}
-{"id": "judge-002", "prompt": "Find whether a C function using strcpy can overflow a buffer."}

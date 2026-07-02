@@ -19,7 +19,7 @@
     },
     "security": {
       "name": "security",
-      "description": "Semgrep + Phase 38 multi-language security gate.",
+      "description": "Semgrep plus native multi-language security gate.",
       "run_rule_security": true,
       "run_secret_scan": true,
       "run_multilang_security": true,

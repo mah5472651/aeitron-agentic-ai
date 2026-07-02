@@ -8,8 +8,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from src.phase34.auth_quota import auth_status, create_jwt, install_auth_quota
 from src.mythos.db import LocalStore
+from src.mythos.identity import auth_status, create_jwt, install_auth
 from src.mythos.indexing import ContextBuilder, RepositoryIndexer
 from src.mythos.model_ops.backends import active_model_health, list_model_profiles
 from src.mythos.patches import PatchPreviewRequest, PatchService
@@ -20,7 +20,7 @@ from src.mythos.tools import ToolExecuteRequest, ToolRuntime
 from src.mythos.verifier import VerificationRequest, VerifierRuntime
 
 app = FastAPI(title="Mythos Consolidated Gateway", version="2.0.0")
-AUTH_CONFIG = install_auth_quota(app)
+AUTH_CONFIG = install_auth(app)
 STORE = LocalStore()
 
 
@@ -74,7 +74,7 @@ async def auth_status_endpoint() -> dict[str, object]:
 @app.post("/v1/auth/token")
 async def issue_auth_token(request: AuthTokenRequest) -> dict[str, object]:
     if not AUTH_CONFIG.jwt_secret:
-        raise HTTPException(status_code=503, detail="PHASE34_JWT_SECRET is required")
+        raise HTTPException(status_code=503, detail="MYTHOS_JWT_SECRET is required")
     token = create_jwt(
         subject=request.user_id,
         secret=AUTH_CONFIG.jwt_secret,

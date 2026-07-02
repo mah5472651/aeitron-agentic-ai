@@ -1,41 +1,23 @@
 {
   "profile": {
-    "name": "tiny-llama-cpu-smoke",
+    "name": "mock-local",
     "kind": "local",
-    "family": "llama",
-    "size_class": "tiny",
-    "backend": "openai_compatible",
-    "model_name": "hf-internal-testing/tiny-random-LlamaForCausalLM",
-    "endpoint": "http://127.0.0.1:8016/v1",
-    "model_id": "hf-internal-testing/tiny-random-LlamaForCausalLM",
-    "revision": "9fb191250dd56d0ba7ec9785a025ed29c03d5998",
+    "family": "mock",
+    "size_class": "mock",
+    "backend": "mock",
+    "model_name": "mock",
+    "endpoint": "",
     "requires_cuda": false,
-    "recommended_tp_size": 1,
-    "max_model_len": 32768,
     "notes": [
-      "Stable real Hugging Face/OpenAI-compatible plumbing profile for Windows CPU smoke tests.",
-      "Measures backend connectivity and architecture routing, not final reasoning quality.",
-      "Use 7B-32B Qwen/DeepSeek/Llama profiles on Linux CUDA for real quality."
-    ],
-    "commands": {}
+      "Stable local plumbing profile.",
+      "Use Qwen2.5-Coder 7B via vLLM on Linux CUDA for real quality."
+    ]
   },
   "env": {
-    "MYTHOS_ACTIVE_PROFILE": "tiny-llama-cpu-smoke",
-    "PHASE11_BACKEND": "openai_compatible",
-    "PHASE11_MODEL_ENDPOINT": "http://127.0.0.1:8016/v1",
-    "PHASE11_MODEL_NAME": "hf-internal-testing/tiny-random-LlamaForCausalLM",
-    "PHASE24_BACKEND": "openai_compatible",
-    "PHASE24_MODEL_ENDPOINT": "http://127.0.0.1:8016/v1",
-    "PHASE24_MODEL_NAME": "hf-internal-testing/tiny-random-LlamaForCausalLM",
-    "PHASE40_BACKEND": "openai_compatible",
-    "PHASE40_MODEL_ENDPOINT": "http://127.0.0.1:8016/v1",
-    "PHASE40_MODEL_NAME": "hf-internal-testing/tiny-random-LlamaForCausalLM",
-    "SCORECARD_BACKEND": "openai_compatible",
-    "SCORECARD_MODEL_ENDPOINT": "http://127.0.0.1:8016/v1",
-    "SCORECARD_MODEL_NAME": "hf-internal-testing/tiny-random-LlamaForCausalLM",
-    "PHASE16_AGENT_MAX_NEW_TOKENS": "220",
-    "PHASE40_AGENT_BACKEND_MODE": "auto"
+    "MYTHOS_ACTIVE_PROFILE": "mock-local",
+    "MYTHOS_MODEL_BACKEND": "mock",
+    "MYTHOS_MODEL_ENDPOINT": "",
+    "MYTHOS_MODEL_NAME": "mock"
   },
-  "updated_at_unix": 1782599037.3937628,
-  "run_id": "phase42-1782599030"
+  "run_id": "mythos-profile-local"
 }

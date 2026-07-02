@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from src.phase26.patch_manager import PatchManager
+from src.mythos.patches.service import PatchService as PatchManager
 
 __all__ = ["PatchManager"]
-

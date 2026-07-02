@@ -18,5 +18,5 @@ if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
     Write-Warning "nvidia-smi not found. Local orchestration can run, but real GRPO/vLLM GPU workloads need a CUDA Linux/GPU machine."
 }
 
-Write-Host "`n=== Phase 10 Offline Smoke ==="
-python src\phase10\e2e_smoke_runner.py --offline --run-id runtime-check-offline
+Write-Host "`n=== Mythos MVP Foundation Smoke ==="
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_mythos_mvp_foundation.ps1

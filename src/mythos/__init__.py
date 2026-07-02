@@ -1,8 +1,6 @@
-"""Consolidated Mythos production-facing architecture.
+"""Final consolidated Mythos architecture package.
 
-The old ``src/phase*`` modules remain as legacy implementation sources. New
-runtime code should import through ``src.mythos`` so the public architecture is
-12 modules instead of 51 phases.
+All production code lives under this package.
 """
 
 __all__ = [
@@ -20,4 +18,3 @@ __all__ = [
     "model_ops",
     "shared",
 ]
-

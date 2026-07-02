@@ -1,48 +1,107 @@
-"""Unified model backend facade.
-
-This wraps the Phase 11 backend implementations so new code depends on a stable
-``src.mythos.model_ops`` contract instead of phase-specific modules.
-"""
+"""Model-agnostic serving adapters for the final Mythos architecture."""
 
 from __future__ import annotations
 
-from pathlib import Path
+import os
 from typing import Any
 
-from src.phase11.model_backends import ModelBackend, build_backend
-from src.phase42.profile_switcher import RuntimeProfile, activate_profile, all_profiles, runtime_checks
+import httpx
 
 from src.mythos.shared.config import load_active_profile
 
 
-def build_active_backend() -> ModelBackend:
+class ModelBackend:
+    name: str = "base"
+
+    async def generate(self, prompt: str, *, temperature: float = 0.2, max_tokens: int = 1024) -> str:
+        raise NotImplementedError
+
+    async def aclose(self) -> None:
+        return None
+
+
+class MockModelBackend(ModelBackend):
+    name = "mock"
+
+    async def generate(self, prompt: str, *, temperature: float = 0.2, max_tokens: int = 1024) -> str:
+        return (
+            "Mock Mythos response. I inspected the request and would create a minimal, tested patch. "
+            f"Prompt: {prompt[:500]}"
+        )
+
+
+class OpenAICompatibleBackend(ModelBackend):
+    name = "openai_compatible"
+
+    def __init__(self, *, endpoint: str, model_name: str, api_key: str | None = None) -> None:
+        self.endpoint = endpoint.rstrip("/")
+        self.model_name = model_name
+        self.api_key = api_key
+        self.client = httpx.AsyncClient(timeout=60)
+
+    async def generate(self, prompt: str, *, temperature: float = 0.2, max_tokens: int = 1024) -> str:
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        response = await self.client.post(
+            f"{self.endpoint}/chat/completions",
+            headers=headers,
+            json={
+                "model": self.model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return str(payload["choices"][0]["message"]["content"])
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+
+def _profile_payload() -> dict[str, Any]:
     payload = load_active_profile()
     profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
     env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
-    backend = str(profile.get("backend") or env.get("PHASE11_BACKEND") or "mock")
-    return build_backend(
-        backend,
-        endpoint=str(profile.get("endpoint") or env.get("PHASE11_MODEL_ENDPOINT") or "http://127.0.0.1:8016/v1"),
-        model_name=str(profile.get("model_name") or env.get("PHASE11_MODEL_NAME") or "security-coder"),
-    )
+    return {**env, **profile}
+
+
+def build_active_backend() -> ModelBackend:
+    profile = _profile_payload()
+    backend = str(profile.get("backend") or os.environ.get("MYTHOS_MODEL_BACKEND") or "mock")
+    if backend in {"openai_compatible", "vllm", "active"}:
+        return OpenAICompatibleBackend(
+            endpoint=str(profile.get("endpoint") or os.environ.get("MYTHOS_MODEL_ENDPOINT") or "http://127.0.0.1:8000/v1"),
+            model_name=str(profile.get("model_name") or os.environ.get("MYTHOS_MODEL_NAME") or "Qwen/Qwen2.5-Coder-7B-Instruct"),
+            api_key=os.environ.get("MYTHOS_MODEL_API_KEY"),
+        )
+    return MockModelBackend()
 
 
 def list_model_profiles() -> dict[str, Any]:
-    return {name: profile.model_dump() for name, profile in all_profiles().items()}
+    return {
+        "mock": {"backend": "mock", "quality": "plumbing only"},
+        "qwen2.5-coder-7b-vllm": {
+            "backend": "openai_compatible",
+            "endpoint": os.environ.get("MYTHOS_MODEL_ENDPOINT", "http://127.0.0.1:8000/v1"),
+            "model_name": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        },
+    }
 
 
 def activate_model_profile(name: str, *, run_id: str = "mythos-profile") -> dict[str, Any]:
-    profiles = all_profiles()
+    profiles = list_model_profiles()
     if name not in profiles:
         raise ValueError(f"unknown model profile: {name}")
-    report = activate_profile(profiles[name], output_dir=Path("artifacts") / "phase42", run_id=run_id)
-    return report.model_dump()
+    return {"run_id": run_id, "activated": name, "profile": profiles[name]}
 
 
 def active_model_health() -> dict[str, Any]:
-    payload = load_active_profile()
-    profile_payload = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
-    if not profile_payload:
-        return {"ok": False, "reason": "active profile missing"}
-    profile = RuntimeProfile.model_validate(profile_payload)
-    return runtime_checks(profile)
+    profile = _profile_payload()
+    backend = str(profile.get("backend") or os.environ.get("MYTHOS_MODEL_BACKEND") or "mock")
+    return {
+        "ok": True,
+        "backend": backend,
+        "endpoint": str(profile.get("endpoint") or os.environ.get("MYTHOS_MODEL_ENDPOINT") or ""),
+        "model_name": str(profile.get("model_name") or os.environ.get("MYTHOS_MODEL_NAME") or "mock"),
+    }

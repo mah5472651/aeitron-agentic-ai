@@ -5,7 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from src.phase31.long_context_packer import LongContextPacker
+from src.mythos.db import LocalStore
+from src.mythos.indexing import ContextBuilder, RepositoryIndexer
 
 
 class WorkspaceContextBuilder:
@@ -13,15 +14,19 @@ class WorkspaceContextBuilder:
         self.workspace = Path(workspace)
 
     def pack(self, query: str, *, budget: int = 8000) -> dict[str, Any]:
-        report = LongContextPacker().pack(workspace=self.workspace, query=query, token_budget=budget)
+        store = LocalStore()
+        project = store.create_project(name=f"context-{self.workspace.name}", repo_path=str(self.workspace))
+        RepositoryIndexer(store).index_project(project_id=project["id"])
+        report = ContextBuilder(store).build(project_id=project["id"], query=query, token_budget=budget)
         return report.model_dump()
 
     def call_graph_command(self, *, output: str | Path = "artifacts/mythos/context/callgraph.jsonl") -> list[str]:
         return [
             "python",
-            "src/phase1/callgraph_extractor.py",
-            "--repo",
+            "-m",
+            "src.mythos.cli",
+            "--workspace",
             str(self.workspace),
-            "--output",
-            str(output),
+            "--prompt",
+            "build repository context",
         ]
