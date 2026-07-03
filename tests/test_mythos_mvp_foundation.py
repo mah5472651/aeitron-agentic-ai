@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from src.mythos.db import LocalStore
 from src.mythos.gateway import api as gateway_api
 from src.mythos.indexing import ContextBuilder, RepositoryIndexer
+from src.mythos.indexing.context_builder import query_terms
 from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskGraphRuntime
 
 
@@ -55,6 +56,15 @@ class MythosMvpFoundationTest(unittest.TestCase):
                 self.assertGreater(context.estimated_tokens, 1)
                 self.assertTrue(any(chunk.path == "src/auth.py" for chunk in context.chunks))
                 self.assertIn("login_user", context.prompt_context)
+                auth_chunks = store.list_chunks(project["id"])
+                login_chunk = next(chunk for chunk in auth_chunks if chunk.get("symbol_name") == "login_user")
+                self.assertIn("hash_password", login_chunk["metadata"]["calls"])
+                self.assertIn("hashlib", login_chunk["metadata"]["imports"])
+                scored_login = ContextBuilder(store).score_chunk(login_chunk, query_terms("hash_password"), set())
+                self.assertIn("dependency", scored_login["reason"])
+
+                hash_chunk = next(chunk for chunk in auth_chunks if chunk.get("symbol_name") == "hash_password")
+                self.assertEqual(hash_chunk["metadata"]["signature"], "def hash_password(password: str) -> str")
 
                 run = TaskGraphRuntime(store).create_agent_run(
                     AgentRunCreateRequest(
@@ -93,6 +103,11 @@ class MythosMvpFoundationTest(unittest.TestCase):
                 index_response = client.post(f"/v1/projects/{project_id}/index", json={"force": True})
                 self.assertEqual(index_response.status_code, 200, index_response.text)
                 self.assertEqual(index_response.json()["status"], "ready")
+
+                symbols_response = client.get(f"/v1/projects/{project_id}/symbols")
+                self.assertEqual(symbols_response.status_code, 200, symbols_response.text)
+                self.assertEqual(symbols_response.json()["symbol_count"], 1)
+                self.assertEqual(symbols_response.json()["symbols"][0]["symbol_name"], "login_user")
 
                 context_response = client.post(
                     "/v1/context/build",

@@ -13,6 +13,7 @@ architecture has been removed.
 - Model-agnostic backend adapter
 - Project and session APIs
 - Repository indexing
+- AST-aware Python symbol, call, import, and mutation metadata
 - Context building
 - Durable TaskGraph runtime
 - Tool command execution
@@ -63,6 +64,14 @@ python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
 
 ```powershell
 python -m src.mythos.cli --prompt "fix auth bug" --workspace . --agent-backend-mode mock --no-verifier --no-security
+```
+
+## Repository Intelligence API
+
+After indexing a project, inspect symbols and dependencies:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8090/v1/projects/<project_id>/symbols
 ```
 
 ## Real Model Serving

@@ -30,6 +30,8 @@ No legacy numbered modules are part of the final architecture.
 - Create sessions.
 - Index repository files.
 - Extract Python symbols and general code chunks.
+- Extract Python AST signatures, imports, calls, dependencies, decorators, docstrings, and state mutations.
+- Extract common import/dependency hints for JavaScript, TypeScript, Go, Rust, Java, C/C++, and Bash.
 - Build ranked context packs.
 - Create durable agent runs.
 - Persist six-node TaskGraphs:
@@ -95,6 +97,7 @@ python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
 - `POST /v1/sessions`
 - `POST /v1/projects/{project_id}/index`
 - `GET /v1/projects/{project_id}/index/status`
+- `GET /v1/projects/{project_id}/symbols`
 - `POST /v1/context/build`
 - `POST /v1/agent/runs`
 - `GET /v1/agent/runs/{run_id}`

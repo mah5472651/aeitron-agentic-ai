@@ -176,6 +176,44 @@ async def project_index_status(project_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="project not found") from exc
 
 
+@app.get("/v1/projects/{project_id}/symbols")
+async def project_symbols(project_id: str) -> dict[str, Any]:
+    project = STORE.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    symbols: list[dict[str, Any]] = []
+    dependencies: dict[str, set[str]] = {}
+    for chunk in STORE.list_chunks(project_id):
+        metadata = chunk.get("metadata") or {}
+        path = str(chunk.get("path") or "")
+        dependency_values = metadata.get("dependencies", [])
+        if not isinstance(dependency_values, list):
+            dependency_values = [dependency_values] if dependency_values else []
+        if path:
+            dependencies.setdefault(path, set()).update(str(item) for item in dependency_values if item)
+        if not chunk.get("symbol_name"):
+            continue
+        symbols.append(
+            {
+                "path": path,
+                "language": chunk.get("language"),
+                "symbol_name": chunk["symbol_name"],
+                "kind": chunk["kind"],
+                "start_line": chunk["start_line"],
+                "end_line": chunk["end_line"],
+                "signature": metadata.get("signature", ""),
+                "calls": metadata.get("calls", []),
+                "state_mutations": metadata.get("state_mutations", []),
+            }
+        )
+    return {
+        "project_id": project_id,
+        "symbol_count": len(symbols),
+        "symbols": symbols,
+        "dependencies": {path: sorted(values) for path, values in sorted(dependencies.items())},
+    }
+
+
 @app.post("/v1/context/build")
 async def build_context(request: ContextBuildRequest) -> dict[str, Any]:
     try:

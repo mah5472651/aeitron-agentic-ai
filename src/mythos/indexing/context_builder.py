@@ -48,6 +48,14 @@ def query_terms(query: str) -> Counter[str]:
 
 
 def chunk_terms(chunk: dict[str, Any]) -> Counter[str]:
+    metadata = chunk.get("metadata") or {}
+    metadata_terms: list[str] = []
+    for key in ["signature", "imports", "calls", "dependencies", "state_mutations", "decorators", "docstring"]:
+        value = metadata.get(key)
+        if isinstance(value, list):
+            metadata_terms.extend(str(item) for item in value)
+        elif value:
+            metadata_terms.append(str(value))
     text = " ".join(
         str(value or "")
         for value in [
@@ -56,6 +64,7 @@ def chunk_terms(chunk: dict[str, Any]) -> Counter[str]:
             chunk.get("symbol_name"),
             chunk.get("kind"),
             chunk.get("content"),
+            " ".join(metadata_terms),
         ]
     )
     return query_terms(text)
@@ -144,16 +153,30 @@ class ContextBuilder:
         path = str(chunk.get("path") or "")
         symbol = str(chunk.get("symbol_name") or "").lower()
         path_lower = path.lower()
+        metadata = chunk.get("metadata") or {}
+        dependency_blob = " ".join(
+            str(item).lower()
+            for key in ["imports", "calls", "dependencies", "state_mutations", "signature"]
+            for item in (metadata.get(key) if isinstance(metadata.get(key), list) else [metadata.get(key)])
+            if item
+        )
         keyword_hits = sum(1 for term in terms if term in path_lower or term == symbol)
+        dependency_hits = sum(1 for term in terms if term in dependency_blob)
         keyword = min(1.0, keyword_hits / max(1, len(terms)))
+        dependency = min(1.0, dependency_hits / max(1, len(terms)))
         pinned_score = 1.0 if path in pinned else 0.0
         test_boost = 0.08 if "test" in path_lower or "spec" in path_lower else 0.0
-        score = (0.55 * semantic) + (0.25 * keyword) + (0.15 * pinned_score) + test_boost
+        symbol_boost = 0.08 if symbol and any(term == symbol or term in symbol for term in terms) else 0.0
+        score = (0.48 * semantic) + (0.22 * keyword) + (0.15 * dependency) + (0.12 * pinned_score) + test_boost + symbol_boost
         reason_bits = []
         if semantic > 0:
             reason_bits.append("semantic")
         if keyword > 0:
             reason_bits.append("keyword")
+        if dependency > 0:
+            reason_bits.append("dependency")
+        if symbol_boost:
+            reason_bits.append("symbol")
         if pinned_score:
             reason_bits.append("pinned")
         if test_boost:

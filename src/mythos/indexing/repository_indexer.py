@@ -72,6 +72,24 @@ SYMBOL_REGEX = re.compile(
     re.MULTILINE,
 )
 
+IMPORT_REGEX_BY_LANGUAGE = {
+    "javascript": re.compile(r"^\s*import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]|^\s*const\s+.+?=\s+require\(['\"]([^'\"]+)['\"]\)", re.MULTILINE),
+    "typescript": re.compile(r"^\s*import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]|^\s*const\s+.+?=\s+require\(['\"]([^'\"]+)['\"]\)", re.MULTILINE),
+    "go": re.compile(r"^\s*import\s+(?:\(\s*)?\"([^\"]+)\"", re.MULTILINE),
+    "rust": re.compile(r"^\s*use\s+([^;]+);", re.MULTILINE),
+    "java": re.compile(r"^\s*import\s+([^;]+);", re.MULTILINE),
+    "cpp": re.compile(r"^\s*#\s*include\s+[<\"]([^>\"]+)[>\"]", re.MULTILINE),
+    "c": re.compile(r"^\s*#\s*include\s+[<\"]([^>\"]+)[>\"]", re.MULTILINE),
+    "bash": re.compile(r"^\s*(?:source|\.)\s+(.+)$", re.MULTILINE),
+}
+
+
+@dataclass(frozen=True)
+class PythonModuleFacts:
+    imports: list[str]
+    module_calls: list[str]
+    module_mutations: list[str]
+
 
 class IndexReport(StrictModel):
     project_id: str
@@ -230,6 +248,7 @@ class RepositoryIndexer:
         except SyntaxError:
             return []
         lines = source_file.content.splitlines()
+        facts = self.python_module_facts(tree)
         chunks: list[dict[str, Any]] = []
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -237,6 +256,14 @@ class RepositoryIndexer:
             start = max(1, getattr(node, "lineno", 1))
             end = max(start, getattr(node, "end_lineno", start))
             content = "\n".join(lines[start - 1 : end])
+            signature = self.python_signature(node)
+            calls = self.python_calls(node)
+            mutations = self.python_mutations(node)
+            decorators = [
+                self.safe_unparse(decorator)
+                for decorator in getattr(node, "decorator_list", [])
+                if self.safe_unparse(decorator)
+            ]
             chunks.append(
                 {
                     "start_line": start,
@@ -244,7 +271,16 @@ class RepositoryIndexer:
                     "symbol_name": node.name,
                     "kind": "class" if isinstance(node, ast.ClassDef) else "function",
                     "content": content,
-                    "metadata": {"parser": "python_ast"},
+                    "metadata": {
+                        "parser": "python_ast",
+                        "signature": signature,
+                        "imports": facts.imports,
+                        "calls": calls,
+                        "dependencies": sorted(set(facts.imports + calls)),
+                        "state_mutations": mutations,
+                        "decorators": decorators,
+                        "docstring": ast.get_docstring(node) or "",
+                    },
                 }
             )
         return sorted(chunks, key=lambda item: (item["start_line"], item["end_line"]))
@@ -253,6 +289,7 @@ class RepositoryIndexer:
         lines = source_file.content.splitlines()
         if not lines:
             return
+        file_imports = self.generic_imports(source_file.language, source_file.content)
         for start_index in range(0, len(lines), max_chunk_lines):
             end_index = min(len(lines), start_index + max_chunk_lines)
             content = "\n".join(lines[start_index:end_index])
@@ -263,8 +300,122 @@ class RepositoryIndexer:
                 "symbol_name": symbol_match.group(1) if symbol_match else None,
                 "kind": "module" if start_index == 0 else "chunk",
                 "content": content,
-                "metadata": {"parser": "line_chunker"},
+                "metadata": {
+                    "parser": "line_chunker",
+                    "imports": file_imports,
+                    "dependencies": file_imports,
+                    "signature": self.first_symbol_line(content),
+                },
             }
+
+    def python_module_facts(self, tree: ast.AST) -> PythonModuleFacts:
+        imports: list[str] = []
+        calls: list[str] = []
+        mutations: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                module = "." * node.level + (node.module or "")
+                imports.extend(f"{module}.{alias.name}".strip(".") for alias in node.names)
+            elif isinstance(node, ast.Call):
+                call = self.call_name(node.func)
+                if call:
+                    calls.append(call)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                mutations.extend(self.assignment_targets(node))
+        return PythonModuleFacts(
+            imports=sorted(set(imports)),
+            module_calls=sorted(set(calls)),
+            module_mutations=sorted(set(mutations)),
+        )
+
+    def python_signature(self, node: ast.AST) -> str:
+        if isinstance(node, ast.ClassDef):
+            bases = [self.safe_unparse(base) for base in node.bases if self.safe_unparse(base)]
+            return f"class {node.name}({', '.join(bases)})" if bases else f"class {node.name}"
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            args = self.safe_unparse(node.args)
+            returns = f" -> {self.safe_unparse(node.returns)}" if node.returns is not None else ""
+            return f"{prefix} {node.name}({args}){returns}"
+        return ""
+
+    def python_calls(self, node: ast.AST) -> list[str]:
+        calls: set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                call = self.call_name(child.func)
+                if call:
+                    calls.add(call)
+        return sorted(calls)
+
+    def python_mutations(self, node: ast.AST) -> list[str]:
+        mutations: set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                mutations.update(self.assignment_targets(child))
+            elif isinstance(child, ast.For):
+                mutations.update(self.target_names(child.target))
+            elif isinstance(child, ast.With):
+                for item in child.items:
+                    if item.optional_vars is not None:
+                        mutations.update(self.target_names(item.optional_vars))
+        return sorted(mutations)
+
+    def assignment_targets(self, node: ast.AST) -> list[str]:
+        if isinstance(node, ast.Assign):
+            return [name for target in node.targets for name in self.target_names(target)]
+        if isinstance(node, ast.AnnAssign):
+            return self.target_names(node.target)
+        if isinstance(node, ast.AugAssign):
+            return self.target_names(node.target)
+        return []
+
+    def target_names(self, target: ast.AST) -> list[str]:
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, ast.Attribute):
+            owner = self.safe_unparse(target.value)
+            return [f"{owner}.{target.attr}" if owner else target.attr]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [name for item in target.elts for name in self.target_names(item)]
+        return []
+
+    def call_name(self, node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = self.call_name(node.value)
+            return f"{parent}.{node.attr}" if parent else node.attr
+        if isinstance(node, ast.Call):
+            return self.call_name(node.func)
+        return None
+
+    def safe_unparse(self, node: ast.AST | None) -> str:
+        if node is None:
+            return ""
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return ""
+
+    def generic_imports(self, language: str, content: str) -> list[str]:
+        pattern = IMPORT_REGEX_BY_LANGUAGE.get(language)
+        if pattern is None:
+            return []
+        imports: set[str] = set()
+        for match in pattern.finditer(content):
+            for group in match.groups():
+                if group:
+                    imports.add(group.strip())
+        return sorted(imports)
+
+    def first_symbol_line(self, content: str) -> str:
+        for line in content.splitlines():
+            if SYMBOL_REGEX.match(line):
+                return line.strip()
+        return ""
 
     def chunk_payload(
         self,
