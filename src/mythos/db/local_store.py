@@ -395,6 +395,76 @@ class LocalStore:
         ]
         return graph_payload
 
+    def update_task_graph_status(self, task_graph_id: str, status: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE task_graphs
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, now_unix(), task_graph_id),
+        )
+        self.connection.commit()
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        data = row_to_dict(row)
+        if data is None:
+            return None
+        data["depends_on"] = json.loads(data.pop("depends_on_json") or "[]")
+        data["inputs"] = json.loads(data.pop("input_json") or "{}")
+        data["outputs"] = json.loads(data.pop("output_json") or "{}")
+        return data
+
+    def list_tasks(self, task_graph_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM tasks WHERE task_graph_id = ? ORDER BY created_at, rowid",
+            (task_graph_id,),
+        ).fetchall()
+        tasks: list[dict[str, Any]] = []
+        for row in rows:
+            data = row_to_dict(row) or {}
+            data["depends_on"] = json.loads(data.pop("depends_on_json") or "[]")
+            data["inputs"] = json.loads(data.pop("input_json") or "{}")
+            data["outputs"] = json.loads(data.pop("output_json") or "{}")
+            tasks.append(data)
+        return tasks
+
+    def update_task_state(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        outputs: dict[str, Any] | None = None,
+        error: str | None = None,
+        started: bool = False,
+        finished: bool = False,
+    ) -> None:
+        timestamp = now_unix()
+        self.connection.execute(
+            """
+            UPDATE tasks
+            SET status = ?,
+                output_json = CASE WHEN ? IS NULL THEN output_json ELSE ? END,
+                error = ?,
+                started_at = CASE WHEN ? THEN COALESCE(started_at, ?) ELSE started_at END,
+                finished_at = CASE WHEN ? THEN ? ELSE finished_at END
+            WHERE id = ?
+            """,
+            (
+                status,
+                None if outputs is None else 1,
+                json.dumps(outputs or {}, sort_keys=True),
+                error,
+                started,
+                timestamp,
+                finished,
+                timestamp,
+                task_id,
+            ),
+        )
+        self.connection.commit()
+
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return row_to_dict(row)

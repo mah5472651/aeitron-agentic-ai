@@ -11,7 +11,8 @@ from pydantic import Field
 
 from src.mythos.db import LocalStore
 from src.mythos.shared.schemas import StrictModel
-from src.mythos.tools import ToolExecuteRequest, ToolRuntime
+from src.mythos.tools import SecurityScanner, ToolExecuteRequest, ToolRuntime
+from src.mythos.tools.runtime import project_root
 
 
 SECRET_PATTERNS = [
@@ -27,6 +28,10 @@ class VerificationRequest(StrictModel):
     patch_id: str | None = None
     commands: list[list[str]] = Field(default_factory=list)
     run_secret_scan: bool = True
+    run_semgrep: bool = False
+    run_codeql: bool = False
+    codeql_database: str | None = None
+    fail_on_tool_unavailable: bool = False
     timeout_ms: int = Field(default=60_000, ge=1_000, le=300_000)
 
 
@@ -62,10 +67,27 @@ class VerifierRuntime:
                 )
             )
             test_results.append(result.model_dump())
-        security_results = [self.secret_scan(request.project_id)] if request.run_secret_scan else []
+        security_results = []
+        if request.run_secret_scan:
+            security_results.append(self.secret_scan(request.project_id))
+        scanner = SecurityScanner(project_root(self.store, request.project_id))
+        if request.run_semgrep:
+            security_results.append(scanner.run_semgrep(timeout_ms=request.timeout_ms).model_dump())
+        if request.run_codeql:
+            security_results.append(
+                scanner.run_codeql(
+                    database=request.codeql_database,
+                    timeout_ms=request.timeout_ms,
+                ).model_dump()
+            )
         failed_tests = [item for item in test_results if item["status"] != "ok"]
         failed_security = [item for item in security_results if item["status"] == "failed"]
-        status = "passed" if not failed_tests and not failed_security else "failed"
+        unavailable_security = [
+            item
+            for item in security_results
+            if item["status"] in {"skipped", "timeout"} and request.fail_on_tool_unavailable
+        ]
+        status = "passed" if not failed_tests and not failed_security and not unavailable_security else "failed"
         return VerificationResponse(
             project_id=request.project_id,
             run_id=request.run_id,

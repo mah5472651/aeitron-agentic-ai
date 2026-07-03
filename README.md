@@ -16,7 +16,9 @@ architecture has been removed.
 - AST-aware Python symbol, call, import, and mutation metadata
 - Context building
 - Durable TaskGraph runtime
+- TaskGraph state machine: advance, complete, fail
 - Tool command execution
+- Defensive Semgrep/CodeQL verifier hooks
 - Patch preview/apply/rollback
 - Verifier runtime
 - Native MVP tests
@@ -72,6 +74,14 @@ After indexing a project, inspect symbols and dependencies:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8090/v1/projects/<project_id>/symbols
+```
+
+## TaskGraph Execution API
+
+```powershell
+Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/taskgraphs/<task_graph_id>/advance
+Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/tasks/<task_id>/complete -Body '{"outputs":{}}' -ContentType 'application/json'
+Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/tasks/<task_id>/fail -Body '{"error":"reason"}' -ContentType 'application/json'
 ```
 
 ## Real Model Serving

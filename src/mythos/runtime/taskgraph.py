@@ -68,6 +68,24 @@ class AgentRunCreateResponse(StrictModel):
     task_graph_id: str
 
 
+class TaskAdvanceResponse(StrictModel):
+    task_graph_id: str
+    status: str
+    active_task: dict[str, Any] | None = None
+    ready_task_count: int
+    completed_task_count: int
+    failed_task_count: int
+
+
+class TaskCompleteRequest(StrictModel):
+    outputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskFailRequest(StrictModel):
+    error: str = Field(min_length=1)
+    outputs: dict[str, Any] = Field(default_factory=dict)
+
+
 class TaskGraphRuntime:
     def __init__(self, store: LocalStore | None = None) -> None:
         self.store = store or LocalStore()
@@ -155,3 +173,79 @@ class TaskGraphRuntime:
         }
         base = instructions[kind]
         return f"{base} mode={mode}; apply_patch={apply_patch}; prompt={prompt}"
+
+    def advance(self, task_graph_id: str) -> TaskAdvanceResponse:
+        graph = self.store.get_task_graph(task_graph_id)
+        if graph is None:
+            raise KeyError(f"unknown task graph: {task_graph_id}")
+        tasks = self.store.list_tasks(task_graph_id)
+        failed = [task for task in tasks if task["status"] == "failed"]
+        if failed:
+            self.store.update_task_graph_status(task_graph_id, "failed")
+            return self.advance_report(task_graph_id, "failed", None, tasks)
+        running = [task for task in tasks if task["status"] == "running"]
+        if running:
+            return self.advance_report(task_graph_id, "running", running[0], tasks)
+        ready = self.ready_tasks(tasks)
+        if ready:
+            task = ready[0]
+            self.store.update_task_state(task["id"], status="running", started=True)
+            self.store.update_task_graph_status(task_graph_id, "running")
+            started = self.store.get_task(task["id"])
+            return self.advance_report(task_graph_id, "running", started, self.store.list_tasks(task_graph_id))
+        if tasks and all(task["status"] == "completed" for task in tasks):
+            self.store.update_task_graph_status(task_graph_id, "completed")
+            return self.advance_report(task_graph_id, "completed", None, tasks)
+        return self.advance_report(task_graph_id, str(graph.get("status") or "queued"), None, tasks)
+
+    def complete_task(self, task_id: str, request: TaskCompleteRequest | None = None) -> TaskAdvanceResponse:
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"unknown task: {task_id}")
+        self.store.update_task_state(
+            task_id,
+            status="completed",
+            outputs=(request.outputs if request else {}),
+            error=None,
+            finished=True,
+        )
+        return self.advance(task["task_graph_id"])
+
+    def fail_task(self, task_id: str, request: TaskFailRequest) -> TaskAdvanceResponse:
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"unknown task: {task_id}")
+        self.store.update_task_state(
+            task_id,
+            status="failed",
+            outputs=request.outputs,
+            error=request.error,
+            finished=True,
+        )
+        self.store.update_task_graph_status(task["task_graph_id"], "failed")
+        return self.advance(task["task_graph_id"])
+
+    def ready_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        completed = {task["id"] for task in tasks if task["status"] == "completed"}
+        return [
+            task
+            for task in tasks
+            if task["status"] == "queued" and all(dependency in completed for dependency in task["depends_on"])
+        ]
+
+    def advance_report(
+        self,
+        task_graph_id: str,
+        status: str,
+        active_task: dict[str, Any] | None,
+        tasks: list[dict[str, Any]],
+    ) -> TaskAdvanceResponse:
+        ready = self.ready_tasks(tasks)
+        return TaskAdvanceResponse(
+            task_graph_id=task_graph_id,
+            status=status,
+            active_task=active_task,
+            ready_task_count=len(ready),
+            completed_task_count=sum(1 for task in tasks if task["status"] == "completed"),
+            failed_task_count=sum(1 for task in tasks if task["status"] == "failed"),
+        )

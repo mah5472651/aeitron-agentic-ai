@@ -10,7 +10,8 @@ from src.mythos.db import LocalStore
 from src.mythos.gateway import api as gateway_api
 from src.mythos.indexing import ContextBuilder, RepositoryIndexer
 from src.mythos.indexing.context_builder import query_terms
-from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskGraphRuntime
+from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskCompleteRequest, TaskGraphRuntime
+from src.mythos.verifier import VerificationRequest, VerifierRuntime
 
 
 class MythosMvpFoundationTest(unittest.TestCase):
@@ -79,6 +80,28 @@ class MythosMvpFoundationTest(unittest.TestCase):
                 self.assertEqual(len(graph["nodes"]), 6)
                 self.assertEqual(graph["nodes"][0]["kind"], "understand")
                 self.assertEqual(graph["nodes"][-1]["kind"], "summarize")
+                runtime = TaskGraphRuntime(store)
+                advance = runtime.advance(run.task_graph_id)
+                self.assertEqual(advance.status, "running")
+                self.assertEqual(advance.active_task["kind"], "understand")
+                after_complete = runtime.complete_task(
+                    advance.active_task["id"],
+                    TaskCompleteRequest(outputs={"intent": "debug_auth"}),
+                )
+                self.assertEqual(after_complete.status, "running")
+                self.assertEqual(after_complete.completed_task_count, 1)
+                self.assertEqual(after_complete.active_task["kind"], "retrieve_context")
+
+                verification = VerifierRuntime(store).run(
+                    VerificationRequest(
+                        project_id=project["id"],
+                        commands=[["python", "-c", "print('ok')"]],
+                        run_secret_scan=True,
+                        run_semgrep=True,
+                    )
+                )
+                self.assertEqual(verification.verdict, "accept")
+                self.assertTrue(any(item["tool"] == "semgrep" for item in verification.security_results))
 
     def test_gateway_project_index_and_context_contract(self) -> None:
         with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:
@@ -145,6 +168,18 @@ class MythosMvpFoundationTest(unittest.TestCase):
                 graph_response = client.get(f"/v1/taskgraphs/{task_graph_id}")
                 self.assertEqual(graph_response.status_code, 200, graph_response.text)
                 self.assertEqual(len(graph_response.json()["nodes"]), 6)
+
+                advance_response = client.post(f"/v1/taskgraphs/{task_graph_id}/advance")
+                self.assertEqual(advance_response.status_code, 200, advance_response.text)
+                active_task_id = advance_response.json()["active_task"]["id"]
+                self.assertEqual(advance_response.json()["active_task"]["kind"], "understand")
+
+                complete_response = client.post(
+                    f"/v1/tasks/{active_task_id}/complete",
+                    json={"outputs": {"intent": "code_edit"}},
+                )
+                self.assertEqual(complete_response.status_code, 200, complete_response.text)
+                self.assertEqual(complete_response.json()["completed_task_count"], 1)
 
                 failing = client.post(
                     "/v1/tools/execute",

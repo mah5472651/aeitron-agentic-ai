@@ -36,11 +36,13 @@ No legacy numbered modules are part of the final architecture.
 - Create durable agent runs.
 - Persist six-node TaskGraphs:
   `understand -> retrieve_context -> edit -> test -> verify -> summarize`.
+- Advance TaskGraphs node-by-node with dependency-aware queued/running/completed/failed states.
 - Execute bounded local test/tool commands.
 - Preview patches.
 - Apply patches.
 - Roll back patches.
 - Verify patches with command checks and basic secret scanning.
+- Run optional defensive Semgrep and CodeQL verifier hooks when their CLIs are installed.
 - Run native MVP smoke tests.
 
 ## Source Layout
@@ -102,6 +104,9 @@ python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
 - `POST /v1/agent/runs`
 - `GET /v1/agent/runs/{run_id}`
 - `GET /v1/taskgraphs/{task_graph_id}`
+- `POST /v1/taskgraphs/{task_graph_id}/advance`
+- `POST /v1/tasks/{task_id}/complete`
+- `POST /v1/tasks/{task_id}/fail`
 - `POST /v1/tools/execute`
 - `POST /v1/patches/preview`
 - `POST /v1/patches/{patch_id}/apply`

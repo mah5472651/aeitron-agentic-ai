@@ -14,7 +14,7 @@ from src.mythos.indexing import ContextBuilder, RepositoryIndexer
 from src.mythos.model_ops.backends import active_model_health, list_model_profiles
 from src.mythos.patches import PatchPreviewRequest, PatchService
 from src.mythos.runtime.engine import MythosRuntime
-from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskGraphRuntime
+from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskCompleteRequest, TaskFailRequest, TaskGraphRuntime
 from src.mythos.shared.schemas import MythosRunRequest, MythosRunReport
 from src.mythos.tools import ToolExecuteRequest, ToolRuntime
 from src.mythos.verifier import VerificationRequest, VerifierRuntime
@@ -166,6 +166,30 @@ async def get_task_graph(task_graph_id: str) -> dict[str, Any]:
     if graph is None:
         raise HTTPException(status_code=404, detail="task graph not found")
     return graph
+
+
+@app.post("/v1/taskgraphs/{task_graph_id}/advance")
+async def advance_task_graph(task_graph_id: str) -> dict[str, Any]:
+    try:
+        return TaskGraphRuntime(STORE).advance(task_graph_id).model_dump()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="task graph not found") from exc
+
+
+@app.post("/v1/tasks/{task_id}/complete")
+async def complete_task(task_id: str, request: TaskCompleteRequest) -> dict[str, Any]:
+    try:
+        return TaskGraphRuntime(STORE).complete_task(task_id, request).model_dump()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="task not found") from exc
+
+
+@app.post("/v1/tasks/{task_id}/fail")
+async def fail_task(task_id: str, request: TaskFailRequest) -> dict[str, Any]:
+    try:
+        return TaskGraphRuntime(STORE).fail_task(task_id, request).model_dump()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="task not found") from exc
 
 
 @app.get("/v1/projects/{project_id}/index/status")
