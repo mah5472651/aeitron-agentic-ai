@@ -8,7 +8,7 @@ The old numbered architecture has been removed. New work must live under
 
 1. Gateway Layer: FastAPI app, auth, project/session/run APIs.
 2. Identity & Access Layer: JWT auth middleware and user boundary.
-3. Model Foundation & Serving Layer: scratch architecture contracts plus temporary mock/OpenAI-compatible serving adapters.
+3. Model Foundation & Serving Layer: scratch architecture contracts plus Mythos-owned checkpoint serving adapters.
 4. Repository Intelligence Layer: repository indexing, chunking, symbol extraction.
 5. Context Builder: ranked context packs from indexed code.
 6. TaskGraph Runtime: durable task graph and run records.
@@ -119,9 +119,9 @@ python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
 
 ## Model Foundation & Serving
 
-Mythos is scratch-first. Temporary external model backends are allowed only for
-architecture plumbing and local behavior checks while training hardware is not
-available.
+Mythos is scratch-only. Borrowed-model training and borrowed-model quality
+baselines are not part of the architecture. The `mock` backend exists only as a
+test double for plumbing checks.
 
 Scratch foundation contracts:
 
@@ -135,12 +135,12 @@ Serving adapters:
 
 Supported adapters:
 
-- `mock`: local plumbing backend.
-- `openai_compatible`: vLLM/OpenAI-compatible endpoint.
+- `mock`: local plumbing test double only.
+- `mythos_serving`: private endpoint serving a Mythos-owned scratch checkpoint.
 
 Default real target:
 
-- `Qwen/Qwen2.5-Coder-7B-Instruct`
+- `mythos-scratch`
 - Endpoint env: `MYTHOS_MODEL_ENDPOINT`
 - Model env: `MYTHOS_MODEL_NAME`
 

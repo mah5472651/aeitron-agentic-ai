@@ -2,15 +2,15 @@
   "profile": {
     "name": "mock-local",
     "kind": "local",
-    "family": "mock",
-    "size_class": "mock",
+    "family": "test-double",
+    "size_class": "none",
     "backend": "mock",
     "model_name": "mock",
     "endpoint": "",
     "requires_cuda": false,
     "notes": [
-      "Stable local plumbing profile.",
-      "Use Qwen2.5-Coder 7B via vLLM on Linux CUDA for real quality."
+      "Stable local plumbing test double.",
+      "Not a model strategy and never used for training quality."
     ]
   },
   "env": {

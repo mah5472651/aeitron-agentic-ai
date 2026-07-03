@@ -85,22 +85,23 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/tasks/<task_id>/complete
 Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/tasks/<task_id>/fail -Body '{"error":"reason"}' -ContentType 'application/json'
 ```
 
-## Real Model Serving
+## Mythos Scratch Model Serving
 
 Set:
 
 ```powershell
-$env:MYTHOS_MODEL_BACKEND = "openai_compatible"
+$env:MYTHOS_MODEL_BACKEND = "mythos_serving"
 $env:MYTHOS_MODEL_ENDPOINT = "http://127.0.0.1:8000/v1"
-$env:MYTHOS_MODEL_NAME = "Qwen/Qwen2.5-Coder-7B-Instruct"
+$env:MYTHOS_MODEL_NAME = "mythos-scratch"
 ```
 
-Then run a vLLM OpenAI-compatible server separately on GPU hardware.
+Then serve a Mythos-owned scratch checkpoint on GPU hardware.
 
 ## Scratch Model Foundation
 
-Mythos is scratch-first. External Qwen/DeepSeek/Llama-compatible backends are
-temporary plumbing backends, not the final training assumption.
+Mythos is scratch-only. Borrowed-model training and borrowed-model quality
+baselines are not part of the architecture. The `mock` backend is only a test
+double for plumbing checks.
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8090/v1/model/foundation/status

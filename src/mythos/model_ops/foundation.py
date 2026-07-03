@@ -158,7 +158,8 @@ class PretrainingRunSpec(StrictModel):
             "parameter_estimate": self.architecture.estimate_parameters(),
             "world_size": self.parallelism.world_size,
             "scratch_training": True,
-            "fine_tune": False,
+            "external_model_training": False,
+            "scratch_only": True,
         }
 
 
@@ -277,7 +278,8 @@ def foundation_status() -> dict[str, Any]:
     presets = architecture_presets()
     return {
         "scratch_first": True,
-        "fine_tune_default": False,
+        "scratch_only": True,
+        "external_model_training": False,
         "presets": {name: spec.estimate_parameters() for name, spec in presets.items()},
         "required_before_training": [
             "tokenizer asset",

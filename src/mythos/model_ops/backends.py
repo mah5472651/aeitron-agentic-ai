@@ -1,4 +1,9 @@
-"""Model-agnostic serving adapters for the final Mythos architecture."""
+"""Serving adapters for Mythos-owned model checkpoints.
+
+Mythos is scratch-first. The only production serving backend here targets a
+Mythos checkpoint served locally/privately. The mock backend is a test double
+for plumbing checks and is not a model strategy.
+"""
 
 from __future__ import annotations
 
@@ -30,8 +35,8 @@ class MockModelBackend(ModelBackend):
         )
 
 
-class OpenAICompatibleBackend(ModelBackend):
-    name = "openai_compatible"
+class MythosServingBackend(ModelBackend):
+    name = "mythos_serving"
 
     def __init__(self, *, endpoint: str, model_name: str, api_key: str | None = None) -> None:
         self.endpoint = endpoint.rstrip("/")
@@ -69,10 +74,10 @@ def _profile_payload() -> dict[str, Any]:
 def build_active_backend() -> ModelBackend:
     profile = _profile_payload()
     backend = str(profile.get("backend") or os.environ.get("MYTHOS_MODEL_BACKEND") or "mock")
-    if backend in {"openai_compatible", "vllm", "active"}:
-        return OpenAICompatibleBackend(
+    if backend in {"mythos_serving", "active"}:
+        return MythosServingBackend(
             endpoint=str(profile.get("endpoint") or os.environ.get("MYTHOS_MODEL_ENDPOINT") or "http://127.0.0.1:8000/v1"),
-            model_name=str(profile.get("model_name") or os.environ.get("MYTHOS_MODEL_NAME") or "Qwen/Qwen2.5-Coder-7B-Instruct"),
+            model_name=str(profile.get("model_name") or os.environ.get("MYTHOS_MODEL_NAME") or "mythos-scratch"),
             api_key=os.environ.get("MYTHOS_MODEL_API_KEY"),
         )
     return MockModelBackend()
@@ -80,11 +85,12 @@ def build_active_backend() -> ModelBackend:
 
 def list_model_profiles() -> dict[str, Any]:
     return {
-        "mock": {"backend": "mock", "quality": "plumbing only"},
-        "qwen2.5-coder-7b-vllm": {
-            "backend": "openai_compatible",
+        "mock": {"backend": "mock", "quality": "test double only, not a real model"},
+        "mythos-scratch-local": {
+            "backend": "mythos_serving",
             "endpoint": os.environ.get("MYTHOS_MODEL_ENDPOINT", "http://127.0.0.1:8000/v1"),
-            "model_name": "Qwen/Qwen2.5-Coder-7B-Instruct",
+            "model_name": os.environ.get("MYTHOS_MODEL_NAME", "mythos-scratch"),
+            "checkpoint_policy": "Mythos-owned scratch checkpoint only",
         },
     }
 

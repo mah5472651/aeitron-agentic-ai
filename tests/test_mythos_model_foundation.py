@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from src.mythos.gateway import api as gateway_api
+from src.mythos.model_ops.backends import list_model_profiles
 from src.mythos.model_ops.foundation import (
     CheckpointManifest,
     PretrainingRunSpec,
@@ -21,7 +22,8 @@ class MythosModelFoundationTest(unittest.TestCase):
     def test_architecture_presets_are_valid_scratch_specs(self) -> None:
         status = foundation_status()
         self.assertTrue(status["scratch_first"])
-        self.assertFalse(status["fine_tune_default"])
+        self.assertTrue(status["scratch_only"])
+        self.assertFalse(status["external_model_training"])
         presets = architecture_presets()
         self.assertIn("mythos-7b", presets)
         self.assertIn("mythos-100b", presets)
@@ -43,7 +45,8 @@ class MythosModelFoundationTest(unittest.TestCase):
         self.assertTrue(report["missing_assets"])
         self.assertIn("data contamination check is not complete", report["policy_failures"])
         self.assertTrue(report["scratch_training"])
-        self.assertFalse(report["fine_tune"])
+        self.assertTrue(report["scratch_only"])
+        self.assertFalse(report["external_model_training"])
 
     def test_checkpoint_manifest_hashes_files_and_writes_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -71,6 +74,14 @@ class MythosModelFoundationTest(unittest.TestCase):
         payload = response.json()
         self.assertTrue(payload["scratch_first"])
         self.assertIn("mythos-7b", payload["presets"])
+
+    def test_model_profiles_are_scratch_only_or_test_double(self) -> None:
+        profiles = list_model_profiles()
+        self.assertEqual(set(profiles), {"mock", "mythos-scratch-local"})
+        self.assertEqual(profiles["mythos-scratch-local"]["backend"], "mythos_serving")
+        forbidden = " ".join(str(value) for profile in profiles.values() for value in profile.values()).lower()
+        for term in ["qw" + "en", "deep" + "seek", "lla" + "ma", "openai" + "_compatible"]:
+            self.assertNotIn(term, forbidden)
 
 
 if __name__ == "__main__":

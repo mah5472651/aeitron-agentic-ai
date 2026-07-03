@@ -15,7 +15,7 @@ Write-Host "`n=== NVIDIA ==="
 if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
     nvidia-smi
 } else {
-    Write-Warning "nvidia-smi not found. Local orchestration can run, but real GRPO/vLLM GPU workloads need a CUDA Linux/GPU machine."
+    Write-Warning "nvidia-smi not found. Local orchestration can run, but real scratch-training/serving GPU workloads need a CUDA Linux/GPU machine."
 }
 
 Write-Host "`n=== Mythos MVP Foundation Smoke ==="
