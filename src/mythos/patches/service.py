@@ -9,8 +9,10 @@ from typing import Any
 from pydantic import Field, field_validator
 
 from src.mythos.db import LocalStore
+from src.mythos.indexing import RepositoryIndexer
 from src.mythos.shared.schemas import StrictModel
 from src.mythos.tools.runtime import project_root
+from src.mythos.verifier import VerificationRequest, VerifierRuntime
 
 
 class FileEdit(StrictModel):
@@ -41,6 +43,23 @@ class PatchResponse(StrictModel):
     status: str
     diff: str
     files_changed: list[str]
+
+
+class PatchVerifyRequest(PatchPreviewRequest):
+    commands: list[list[str]] = Field(default_factory=list)
+    run_secret_scan: bool = True
+    run_semgrep: bool = False
+    run_codeql: bool = False
+    fail_on_tool_unavailable: bool = False
+    apply_on_accept: bool = False
+
+
+class PatchVerifyResponse(StrictModel):
+    patch: PatchResponse
+    verification: dict[str, Any]
+    verdict: str
+    final_status: str
+    rolled_back: bool
 
 
 def resolve_inside(root: Path, relative: str) -> Path:
@@ -96,6 +115,37 @@ class PatchService:
             target.write_text(str(before), encoding="utf-8")
         self.store.update_patch_status(patch_id, "rolled_back", rolled_back=True)
         return self.response_from_record(self.store.get_patch(patch_id) or record)
+
+    def preview_apply_verify(self, request: PatchVerifyRequest) -> PatchVerifyResponse:
+        patch = self.preview(request)
+        applied = self.apply(patch.patch_id)
+        RepositoryIndexer(self.store).index_project(project_id=request.project_id)
+        verification = VerifierRuntime(self.store).run(
+            VerificationRequest(
+                project_id=request.project_id,
+                run_id=request.run_id,
+                patch_id=patch.patch_id,
+                commands=request.commands,
+                run_secret_scan=request.run_secret_scan,
+                run_semgrep=request.run_semgrep,
+                run_codeql=request.run_codeql,
+                fail_on_tool_unavailable=request.fail_on_tool_unavailable,
+            )
+        )
+        accepted = verification.verdict == "accept"
+        rolled_back = False
+        final_patch = applied
+        if not accepted or not request.apply_on_accept:
+            final_patch = self.rollback(patch.patch_id)
+            rolled_back = True
+            RepositoryIndexer(self.store).index_project(project_id=request.project_id)
+        return PatchVerifyResponse(
+            patch=final_patch,
+            verification=verification.model_dump(),
+            verdict=verification.verdict,
+            final_status=final_patch.status,
+            rolled_back=rolled_back,
+        )
 
     def response_from_record(self, record: dict[str, Any]) -> PatchResponse:
         return PatchResponse(

@@ -21,6 +21,7 @@ The old numbered architecture has been removed. New work must live under
 13. Evaluation Service: native release/smoke evaluation.
 14. Learning Pipeline: verified candidate validation/export hooks.
 15. Observability Layer: health, structured responses, and future metrics hooks.
+16. Production Operations Layer: Postgres migrations, CI, deployment manifests, quota, and GPU validation commands.
 
 No legacy numbered modules are part of the final architecture.
 
@@ -33,6 +34,7 @@ No legacy numbered modules are part of the final architecture.
 - Extract Python AST signatures, imports, calls, dependencies, decorators, docstrings, and state mutations.
 - Extract common import/dependency hints for JavaScript, TypeScript, Go, Rust, Java, C/C++, and Bash.
 - Build ranked context packs.
+- Run local vector search across indexed code chunks.
 - Create durable agent runs.
 - Persist six-node TaskGraphs:
   `understand -> retrieve_context -> edit -> test -> verify -> summarize`.
@@ -41,8 +43,13 @@ No legacy numbered modules are part of the final architecture.
 - Preview patches.
 - Apply patches.
 - Roll back patches.
+- Run preview/apply/verify/rollback patch verification loops.
 - Verify patches with command checks and basic secret scanning.
 - Run optional defensive Semgrep and CodeQL verifier hooks when their CLIs are installed.
+- Enforce auth/quota middleware on protected API routes when enabled.
+- Expose Prometheus-style `/metrics` and structured JSON request logs.
+- Run hardened Docker sandbox executions when Docker is available.
+- Run built-in security benchmark harness.
 - Plan scratch pretraining specs for Mythos 7B, 32B, 70B, and 100B-class decoder models.
 - Validate tokenizer/data/checkpoint readiness before any scratch training run.
 - Run a real PyTorch scratch-decoder GPU smoke test with synthetic tokens.
@@ -98,6 +105,7 @@ python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
 - `GET /v1/auth/status`
 - `POST /v1/auth/token`
 - `GET /v1/model/profiles`
+- `POST /v1/evaluation/security-static`
 - `GET /v1/model/foundation/status`
 - `POST /v1/model/foundation/pretraining/readiness`
 - `POST /v1/projects`
@@ -107,6 +115,7 @@ python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
 - `GET /v1/projects/{project_id}/index/status`
 - `GET /v1/projects/{project_id}/symbols`
 - `POST /v1/context/build`
+- `POST /v1/context/vector-search`
 - `POST /v1/agent/runs`
 - `GET /v1/agent/runs/{run_id}`
 - `GET /v1/taskgraphs/{task_graph_id}`
@@ -114,7 +123,9 @@ python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
 - `POST /v1/tasks/{task_id}/complete`
 - `POST /v1/tasks/{task_id}/fail`
 - `POST /v1/tools/execute`
+- `POST /v1/sandbox/run`
 - `POST /v1/patches/preview`
+- `POST /v1/patches/verify`
 - `POST /v1/patches/{patch_id}/apply`
 - `POST /v1/patches/{patch_id}/rollback`
 - `POST /v1/verifier/run`
@@ -139,7 +150,17 @@ GPU smoke command:
 ```bash
 pip install -r requirements-linux-gpu.txt
 python deploy/gpu/run_scratch_gpu_smoke.py --device cuda --steps 2 --sequence-length 64
+python -m src.mythos.model_ops.pretrain_loop --device cuda --steps 10 --sequence-length 64
 ```
+
+## Production Operations
+
+- Postgres migration runner: `python -m src.mythos.db.migration_runner`
+- CI: `.github/workflows/ci.yml`
+- Docker image: `Dockerfile`
+- Prod compose: `deploy/prod/docker-compose.yml`
+- Kubernetes manifests: `deploy/k8s/`
+- Metrics endpoint: `GET /metrics`
 
 Serving adapters:
 

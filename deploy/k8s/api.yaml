@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mythos-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mythos-api
+  template:
+    metadata:
+      labels:
+        app: mythos-api
+    spec:
+      containers:
+        - name: api
+          image: mythos-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8090
+          env:
+            - name: MYTHOS_AUTH_ENABLED
+              value: "1"
+            - name: MYTHOS_QUOTA_ENABLED
+              value: "1"
+            - name: MYTHOS_SQLITE_PATH
+              value: /data/mythos.sqlite3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8090
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mythos-api
+spec:
+  selector:
+    app: mythos-api
+  ports:
+    - port: 80
+      targetPort: 8090

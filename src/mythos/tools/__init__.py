@@ -2,6 +2,7 @@
 
 from src.mythos.tools.execution import ExecutionRequest, ExecutionResult, SandboxEngine, SandboxPolicy, SandboxRequest
 from src.mythos.tools.runtime import ToolExecuteRequest, ToolExecuteResponse, ToolRuntime
+from src.mythos.tools.sandbox import DockerSandboxRunner, HardenedSandboxPolicy, SandboxRunRequest, SandboxRunResult
 from src.mythos.tools.security import SecurityScanner, SecurityScanResult
 
 __all__ = [
@@ -11,7 +12,11 @@ __all__ = [
     "SecurityScanResult",
     "SandboxEngine",
     "SandboxPolicy",
+    "SandboxRunRequest",
+    "SandboxRunResult",
     "SandboxRequest",
+    "DockerSandboxRunner",
+    "HardenedSandboxPolicy",
     "ToolExecuteRequest",
     "ToolExecuteResponse",
     "ToolRuntime",

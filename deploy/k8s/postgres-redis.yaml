@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mythos-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mythos-postgres
+  template:
+    metadata:
+      labels:
+        app: mythos-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - name: POSTGRES_USER
+              value: mythos
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mythos-secrets
+                  key: postgres-password
+            - name: POSTGRES_DB
+              value: mythos
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mythos-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mythos-redis
+  template:
+    metadata:
+      labels:
+        app: mythos-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7

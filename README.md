@@ -10,18 +10,24 @@ architecture has been removed.
 
 - FastAPI gateway
 - JWT auth middleware
+- quota enforcement middleware
+- Prometheus-style `/metrics` and structured JSON logs
 - Model-agnostic backend adapter
 - Scratch-first model foundation contracts for 7B/32B/70B/100B planning
 - Project and session APIs
 - Repository indexing
 - AST-aware Python symbol, call, import, and mutation metadata
+- local vector search for repository chunks
 - Context building
 - Durable TaskGraph runtime
 - TaskGraph state machine: advance, complete, fail
 - Tool command execution
 - Defensive Semgrep/CodeQL verifier hooks
+- hardened Docker sandbox contract
 - Patch preview/apply/rollback
+- preview/apply/verify/rollback patch loop
 - Verifier runtime
+- benchmark harness for coding/security tasks
 - Native MVP tests
 
 ## Repository Layout
@@ -116,11 +122,24 @@ pip install -r requirements-linux-gpu.txt
 python deploy/gpu/run_scratch_gpu_smoke.py --device cuda --steps 2 --sequence-length 64
 ```
 
+Run the longer scratch pretraining loop:
+
+```bash
+python -m src.mythos.model_ops.pretrain_loop --device cuda --steps 10 --sequence-length 64
+```
+
 Output:
 
 - `artifacts/mythos/gpu-smoke/gpu_smoke_report.json`
 - `artifacts/mythos/gpu-smoke/checkpoint/model.pt`
 - `artifacts/mythos/gpu-smoke/checkpoint_manifest.json`
+
+## Production Checks
+
+```powershell
+python -m src.mythos.evaluation.release_gate
+python -m src.mythos.db.migration_runner --database-url $env:MYTHOS_DATABASE_URL --dry-run
+```
 
 ## Final Rule
 

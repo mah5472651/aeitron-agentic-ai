@@ -1,0 +1,26 @@
+name: mythos-ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-local-dev.txt
+      - name: Compile
+        run: python -m compileall -q src/mythos tests
+      - name: Release gate
+        run: python -m src.mythos.evaluation.release_gate
+      - name: Scratch CPU smoke
+        run: python -m src.mythos.model_ops.gpu_smoke --device cpu --steps 1 --sequence-length 16 --batch-size 1 --dtype fp32

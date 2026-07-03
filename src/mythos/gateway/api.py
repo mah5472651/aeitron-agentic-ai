@@ -6,22 +6,27 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from src.mythos.db import LocalStore
-from src.mythos.identity import auth_status, create_jwt, install_auth
-from src.mythos.indexing import ContextBuilder, RepositoryIndexer
+from src.mythos.evaluation.benchmarks import BenchmarkHarness, built_in_security_tasks
+from src.mythos.identity import auth_status, create_jwt, install_auth, install_quota
+from src.mythos.indexing import ContextBuilder, LocalVectorIndex, RepositoryIndexer
 from src.mythos.model_ops.backends import active_model_health, list_model_profiles
 from src.mythos.model_ops.foundation import PretrainingRunSpec, foundation_status
-from src.mythos.patches import PatchPreviewRequest, PatchService
+from src.mythos.observability import METRICS, install_observability
+from src.mythos.patches import PatchPreviewRequest, PatchService, PatchVerifyRequest
 from src.mythos.runtime.engine import MythosRuntime
 from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskCompleteRequest, TaskFailRequest, TaskGraphRuntime
 from src.mythos.shared.schemas import MythosRunRequest, MythosRunReport
-from src.mythos.tools import ToolExecuteRequest, ToolRuntime
+from src.mythos.tools import DockerSandboxRunner, SandboxRunRequest, ToolExecuteRequest, ToolRuntime
 from src.mythos.verifier import VerificationRequest, VerifierRuntime
 
 app = FastAPI(title="Mythos Consolidated Gateway", version="2.0.0")
+QUOTA_CONFIG = install_quota(app)
 AUTH_CONFIG = install_auth(app)
+install_observability(app)
 STORE = LocalStore()
 
 
@@ -52,6 +57,12 @@ class ContextBuildRequest(BaseModel):
     max_chunks: int = Field(default=24, ge=1, le=100)
 
 
+class VectorSearchRequest(BaseModel):
+    project_id: str = Field(min_length=1)
+    query: str = Field(min_length=1)
+    top_k: int = Field(default=12, ge=1, le=100)
+
+
 class SessionCreateRequest(BaseModel):
     project_id: str = Field(min_length=1)
     title: str = Field(default="Mythos Session", min_length=1, max_length=200)
@@ -63,8 +74,14 @@ async def health_ready() -> dict[str, object]:
         "status": "ready",
         "model_ops": active_model_health(),
         "auth": auth_status(AUTH_CONFIG),
+        "quota": {"enabled": QUOTA_CONFIG.enabled, "capacity": QUOTA_CONFIG.capacity},
         "database": {"ok": True, "engine": "sqlite-local", "path": str(STORE.path)},
     }
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def metrics() -> str:
+    return METRICS.render_prometheus()
 
 
 @app.get("/v1/auth/status")
@@ -95,6 +112,11 @@ async def issue_auth_token(request: AuthTokenRequest) -> dict[str, object]:
 @app.get("/v1/model/profiles")
 async def model_profiles() -> dict[str, object]:
     return {"profiles": list_model_profiles()}
+
+
+@app.post("/v1/evaluation/security-static")
+async def run_security_static_benchmark() -> dict[str, object]:
+    return BenchmarkHarness().run_static(built_in_security_tasks()).model_dump()
 
 
 @app.get("/v1/model/foundation/status")
@@ -264,6 +286,17 @@ async def build_context(request: ContextBuildRequest) -> dict[str, Any]:
     return report.model_dump()
 
 
+@app.post("/v1/context/vector-search")
+async def vector_search(request: VectorSearchRequest) -> dict[str, Any]:
+    if STORE.get_project(request.project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return LocalVectorIndex(STORE).search(
+        project_id=request.project_id,
+        query=request.query,
+        top_k=request.top_k,
+    ).model_dump()
+
+
 @app.post("/v1/tools/execute")
 async def execute_tool(request: ToolExecuteRequest) -> dict[str, Any]:
     try:
@@ -274,10 +307,25 @@ async def execute_tool(request: ToolExecuteRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/v1/sandbox/run")
+async def run_sandbox(request: SandboxRunRequest) -> dict[str, Any]:
+    return DockerSandboxRunner().run(request).model_dump()
+
+
 @app.post("/v1/patches/preview")
 async def preview_patch(request: PatchPreviewRequest) -> dict[str, Any]:
     try:
         return PatchService(STORE).preview(request).model_dump()
+    except (KeyError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/patches/verify")
+async def verify_patch_loop(request: PatchVerifyRequest) -> dict[str, Any]:
+    try:
+        return PatchService(STORE).preview_apply_verify(request).model_dump()
     except (KeyError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

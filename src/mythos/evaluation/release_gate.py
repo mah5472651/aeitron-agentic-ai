@@ -15,6 +15,7 @@ def main() -> None:
             "unittest",
             "tests.test_mythos_mvp_foundation",
             "tests.test_mythos_model_foundation",
+            "tests.test_mythos_production_hardening",
             "tests.test_mythos_scratch_decoder",
         ],
         capture_output=True,
