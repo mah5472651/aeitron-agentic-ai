@@ -1,0 +1,24 @@
+{
+  "sources": [
+    {
+      "name": "owasp-cheat-sheet-series",
+      "urls": [
+        "https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html"
+      ],
+      "allowed_domains": ["cheatsheetseries.owasp.org"],
+      "license": "cc-by-4.0",
+      "category": "defensive_security"
+    },
+    {
+      "name": "mitre-cwe",
+      "urls": [
+        "https://cwe.mitre.org/data/definitions/89.html",
+        "https://cwe.mitre.org/data/definitions/787.html"
+      ],
+      "allowed_domains": ["cwe.mitre.org"],
+      "license": "unknown-ok",
+      "category": "defensive_security"
+    }
+  ]
+}

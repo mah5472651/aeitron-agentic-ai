@@ -125,7 +125,31 @@ python deploy/gpu/run_scratch_gpu_smoke.py --device cuda --steps 2 --sequence-le
 Run the longer scratch pretraining loop:
 
 ```bash
-python -m src.mythos.model_ops.pretrain_loop --device cuda --steps 10 --sequence-length 64
+python -m src.mythos.model_ops.tokenizer_pipeline \
+  --input data/training/clean.jsonl \
+  --tokenizer-out artifacts/mythos/tokenizer/tokenizer.json \
+  --shards-out artifacts/mythos/shards \
+  --vocab-size 64000 \
+  --sequence-length 128
+
+python -m src.mythos.model_ops.pretrain_loop \
+  --device cuda \
+  --manifest artifacts/mythos/shards/manifest.json \
+  --steps 100 \
+  --batch-size 2 \
+  --sequence-length 128 \
+  --gradient-accumulation-steps 4 \
+  --dtype bf16
+```
+
+Or one command:
+
+```bash
+python deploy/gpu/run_pretraining_pipeline.py \
+  --input data/training/clean.jsonl \
+  --device cuda \
+  --steps 100 \
+  --sequence-length 128
 ```
 
 Output:
@@ -133,6 +157,27 @@ Output:
 - `artifacts/mythos/gpu-smoke/gpu_smoke_report.json`
 - `artifacts/mythos/gpu-smoke/checkpoint/model.pt`
 - `artifacts/mythos/gpu-smoke/checkpoint_manifest.json`
+
+## Defensive Data Pipeline
+
+Allowlisted internet ingestion:
+
+```bash
+python -m src.mythos.learning.web_ingest \
+  --sources config/data_sources.defensive.sample.json \
+  --output data/training/raw_web.jsonl \
+  --max-docs 1000 \
+  --delay-seconds 1.0
+```
+
+Quality gate:
+
+```bash
+python - <<'PY'
+from src.mythos.learning.quality import DatasetQualityGate
+print(DatasetQualityGate().filter_jsonl("data/training/raw_web.jsonl", "data/training/clean.jsonl"))
+PY
+```
 
 ## Production Checks
 

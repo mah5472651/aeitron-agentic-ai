@@ -54,6 +54,10 @@ No legacy numbered modules are part of the final architecture.
 - Run built-in security benchmark harness.
 - Plan scratch pretraining specs for Mythos 7B, 32B, 70B, and 100B-class decoder models.
 - Validate tokenizer/data/checkpoint readiness before any scratch training run.
+- Ingest allowlisted defensive internet data with robots/rate-limit/license metadata.
+- Apply quality gates: deduplication, license policy, PII/secret rejection, defensive/security labels.
+- Train BPE tokenizer and build train/validation token shards.
+- Stream token shards into checkpoint-resumable scratch pretraining with gradient accumulation, mixed precision, loss logs, validation loss, and checkpoint resume.
 - Run a real PyTorch scratch-decoder GPU smoke test with synthetic tokens.
 - Write smoke checkpoints and checkpoint manifests for GPU validation.
 - Run native MVP smoke tests.
@@ -152,7 +156,19 @@ GPU smoke command:
 ```bash
 pip install -r requirements-linux-gpu.txt
 python deploy/gpu/run_scratch_gpu_smoke.py --device cuda --steps 2 --sequence-length 64
-python -m src.mythos.model_ops.pretrain_loop --device cuda --steps 10 --sequence-length 64
+python -m src.mythos.model_ops.tokenizer_pipeline --input data/training/clean.jsonl --tokenizer-out artifacts/mythos/tokenizer/tokenizer.json --shards-out artifacts/mythos/shards --vocab-size 64000 --sequence-length 128
+python -m src.mythos.model_ops.pretrain_loop --device cuda --manifest artifacts/mythos/shards/manifest.json --steps 100 --batch-size 2 --sequence-length 128 --gradient-accumulation-steps 4 --dtype bf16
+python deploy/gpu/run_pretraining_pipeline.py --input data/training/clean.jsonl --device cuda --steps 100 --sequence-length 128
+```
+
+Defensive web corpus pipeline:
+
+```bash
+python -m src.mythos.learning.web_ingest --sources config/data_sources.defensive.sample.json --output data/training/raw_web.jsonl --max-docs 1000 --delay-seconds 1.0
+python - <<'PY'
+from src.mythos.learning.quality import DatasetQualityGate
+print(DatasetQualityGate().filter_jsonl("data/training/raw_web.jsonl", "data/training/clean.jsonl"))
+PY
 ```
 
 ## Production Operations

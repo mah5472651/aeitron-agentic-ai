@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from src.mythos.learning.quality import DatasetQualityGate, QualityGateConfig
+from src.mythos.learning.web_ingest import allowed_url, text_from_html
+from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
+from src.mythos.model_ops.pretrain_loop import run_pretraining_loop
+from src.mythos.model_ops.tokenizer_pipeline import (
+    ShardBuildConfig,
+    TokenizerTrainConfig,
+    build_token_shards,
+    train_bpe_tokenizer,
+)
+
+
+class MythosPretrainingPipelineTest(unittest.TestCase):
+    def test_quality_gate_filters_duplicates_and_secret_like_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw = root / "raw.jsonl"
+            clean = root / "clean.jsonl"
+            good_text = "Secure coding guidance for CWE mitigation. " * 20
+            rows = [
+                {"text": good_text, "license": "mit"},
+                {"text": good_text, "license": "mit"},
+                {"text": "api_key = 'abcdefghijklmnopqrstuvwxyz123456'", "license": "mit"},
+            ]
+            raw.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            report = DatasetQualityGate(QualityGateConfig(min_chars=20)).filter_jsonl(raw, clean)
+            self.assertEqual(report.accepted, 1)
+            self.assertEqual(report.duplicate, 1)
+            self.assertEqual(len(clean.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_web_ingest_helpers_are_allowlist_and_html_safe(self) -> None:
+        self.assertTrue(allowed_url("https://docs.example.org/a", ["example.org"]))
+        self.assertFalse(allowed_url("https://evil.example.net/a", ["example.org"]))
+        self.assertEqual(text_from_html("<html><script>x()</script><body>Hello <b>world</b></body></html>"), "Hello world")
+
+    def test_tokenizer_shards_stream_and_pretrain_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            text = "def secure_login(user, password): assert password CWE mitigation patch " * 200
+            corpus.write_text(json.dumps({"text": text, "license": "mit"}) + "\n", encoding="utf-8")
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            manifest = build_token_shards(
+                input_paths=[corpus],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "shards",
+                config=ShardBuildConfig(shard_token_count=128, sequence_length=16, validation_fraction=0.0),
+            )
+            loaded = load_manifest(root / "shards" / "manifest.json")
+            self.assertTrue(loaded.train_shards)
+            batch = next(TokenShardStream(loaded.train_shards, sequence_length=16, batch_size=1).batches())
+            self.assertEqual(len(batch[0]), 16)
+            report = run_pretraining_loop(
+                output_dir=root / "train",
+                manifest=root / "shards" / "manifest.json",
+                device="cpu",
+                steps=2,
+                batch_size=1,
+                sequence_length=16,
+                gradient_accumulation_steps=1,
+                dtype="fp32",
+                validate_every=0,
+                checkpoint_every=1,
+                resume=False,
+            )
+            self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["steps"], 2)
+            self.assertTrue(Path(report["checkpoint_manifest"]).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
