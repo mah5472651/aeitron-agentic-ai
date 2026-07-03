@@ -12,6 +12,7 @@ from src.mythos.db import LocalStore
 from src.mythos.identity import auth_status, create_jwt, install_auth
 from src.mythos.indexing import ContextBuilder, RepositoryIndexer
 from src.mythos.model_ops.backends import active_model_health, list_model_profiles
+from src.mythos.model_ops.foundation import PretrainingRunSpec, foundation_status
 from src.mythos.patches import PatchPreviewRequest, PatchService
 from src.mythos.runtime.engine import MythosRuntime
 from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskCompleteRequest, TaskFailRequest, TaskGraphRuntime
@@ -94,6 +95,16 @@ async def issue_auth_token(request: AuthTokenRequest) -> dict[str, object]:
 @app.get("/v1/model/profiles")
 async def model_profiles() -> dict[str, object]:
     return {"profiles": list_model_profiles()}
+
+
+@app.get("/v1/model/foundation/status")
+async def model_foundation_status() -> dict[str, object]:
+    return foundation_status()
+
+
+@app.post("/v1/model/foundation/pretraining/readiness")
+async def model_pretraining_readiness(request: PretrainingRunSpec) -> dict[str, object]:
+    return request.readiness_report()
 
 
 @app.post("/v1/projects")

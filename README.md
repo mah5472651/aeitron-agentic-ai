@@ -11,6 +11,7 @@ architecture has been removed.
 - FastAPI gateway
 - JWT auth middleware
 - Model-agnostic backend adapter
+- Scratch-first model foundation contracts for 7B/32B/70B/100B planning
 - Project and session APIs
 - Repository indexing
 - AST-aware Python symbol, call, import, and mutation metadata
@@ -95,6 +96,15 @@ $env:MYTHOS_MODEL_NAME = "Qwen/Qwen2.5-Coder-7B-Instruct"
 ```
 
 Then run a vLLM OpenAI-compatible server separately on GPU hardware.
+
+## Scratch Model Foundation
+
+Mythos is scratch-first. External Qwen/DeepSeek/Llama-compatible backends are
+temporary plumbing backends, not the final training assumption.
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8090/v1/model/foundation/status
+```
 
 ## Final Rule
 

@@ -8,7 +8,7 @@ The old numbered architecture has been removed. New work must live under
 
 1. Gateway Layer: FastAPI app, auth, project/session/run APIs.
 2. Identity & Access Layer: JWT auth middleware and user boundary.
-3. Model Serving Layer: model-agnostic adapters for mock and OpenAI/vLLM-compatible models.
+3. Model Foundation & Serving Layer: scratch architecture contracts plus temporary mock/OpenAI-compatible serving adapters.
 4. Repository Intelligence Layer: repository indexing, chunking, symbol extraction.
 5. Context Builder: ranked context packs from indexed code.
 6. TaskGraph Runtime: durable task graph and run records.
@@ -43,6 +43,8 @@ No legacy numbered modules are part of the final architecture.
 - Roll back patches.
 - Verify patches with command checks and basic secret scanning.
 - Run optional defensive Semgrep and CodeQL verifier hooks when their CLIs are installed.
+- Plan scratch pretraining specs for Mythos 7B, 32B, 70B, and 100B-class decoder models.
+- Validate tokenizer/data/checkpoint readiness before any scratch training run.
 - Run native MVP smoke tests.
 
 ## Source Layout
@@ -94,6 +96,8 @@ python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
 - `GET /v1/auth/status`
 - `POST /v1/auth/token`
 - `GET /v1/model/profiles`
+- `GET /v1/model/foundation/status`
+- `POST /v1/model/foundation/pretraining/readiness`
 - `POST /v1/projects`
 - `GET /v1/projects/{project_id}`
 - `POST /v1/sessions`
@@ -113,7 +117,21 @@ python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
 - `POST /v1/patches/{patch_id}/rollback`
 - `POST /v1/verifier/run`
 
-## Model Serving
+## Model Foundation & Serving
+
+Mythos is scratch-first. Temporary external model backends are allowed only for
+architecture plumbing and local behavior checks while training hardware is not
+available.
+
+Scratch foundation contracts:
+
+- decoder-only architecture presets: `mythos-7b`, `mythos-32b`, `mythos-70b`, `mythos-100b`
+- tokenizer contract with code/reasoning special tokens
+- data manifest readiness contract
+- contamination/license/PII policy gates
+- checkpoint manifest with file hashes
+
+Serving adapters:
 
 Supported adapters:
 

@@ -9,7 +9,13 @@ import sys
 
 def main() -> None:
     completed = subprocess.run(  # nosec B603
-        [sys.executable, "-m", "unittest", "tests.test_mythos_mvp_foundation"],
+        [
+            sys.executable,
+            "-m",
+            "unittest",
+            "tests.test_mythos_mvp_foundation",
+            "tests.test_mythos_model_foundation",
+        ],
         capture_output=True,
         text=True,
         check=False,
