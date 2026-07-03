@@ -107,6 +107,21 @@ double for plumbing checks.
 Invoke-RestMethod http://127.0.0.1:8090/v1/model/foundation/status
 ```
 
+## Colab/Kaggle GPU Smoke
+
+Run a real scratch-decoder forward/backward/checkpoint smoke test:
+
+```bash
+pip install -r requirements-linux-gpu.txt
+python deploy/gpu/run_scratch_gpu_smoke.py --device cuda --steps 2 --sequence-length 64
+```
+
+Output:
+
+- `artifacts/mythos/gpu-smoke/gpu_smoke_report.json`
+- `artifacts/mythos/gpu-smoke/checkpoint/model.pt`
+- `artifacts/mythos/gpu-smoke/checkpoint_manifest.json`
+
 ## Final Rule
 
 All new production code belongs under `src/mythos`.

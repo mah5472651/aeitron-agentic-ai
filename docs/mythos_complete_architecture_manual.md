@@ -45,6 +45,8 @@ No legacy numbered modules are part of the final architecture.
 - Run optional defensive Semgrep and CodeQL verifier hooks when their CLIs are installed.
 - Plan scratch pretraining specs for Mythos 7B, 32B, 70B, and 100B-class decoder models.
 - Validate tokenizer/data/checkpoint readiness before any scratch training run.
+- Run a real PyTorch scratch-decoder GPU smoke test with synthetic tokens.
+- Write smoke checkpoints and checkpoint manifests for GPU validation.
 - Run native MVP smoke tests.
 
 ## Source Layout
@@ -126,10 +128,18 @@ test double for plumbing checks.
 Scratch foundation contracts:
 
 - decoder-only architecture presets: `mythos-7b`, `mythos-32b`, `mythos-70b`, `mythos-100b`
+- executable PyTorch decoder family for scratch training and GPU smoke tests
 - tokenizer contract with code/reasoning special tokens
 - data manifest readiness contract
 - contamination/license/PII policy gates
 - checkpoint manifest with file hashes
+
+GPU smoke command:
+
+```bash
+pip install -r requirements-linux-gpu.txt
+python deploy/gpu/run_scratch_gpu_smoke.py --device cuda --steps 2 --sequence-length 64
+```
 
 Serving adapters:
 
