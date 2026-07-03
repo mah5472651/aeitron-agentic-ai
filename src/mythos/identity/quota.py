@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 from threading import RLock
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -72,23 +72,58 @@ class LocalQuotaStore:
 LOCAL_QUOTA = LocalQuotaStore()
 
 
+class QuotaStore(Protocol):
+    async def consume(self, subject: str, *, now: float, rate: float, capacity: float, cost: float) -> tuple[bool, float]:
+        ...
+
+
+class AsyncLocalQuotaStore:
+    async def consume(self, subject: str, *, now: float, rate: float, capacity: float, cost: float) -> tuple[bool, float]:
+        return LOCAL_QUOTA.consume(subject, now=now, rate=rate, capacity=capacity, cost=cost)
+
+
+class RedisQuotaStore:
+    def __init__(self, redis_url: str) -> None:
+        self.redis_url = redis_url
+        self._client: object | None = None
+
+    async def client(self) -> object:
+        if self._client is None:
+            from redis.asyncio import Redis
+
+            self._client = Redis.from_url(self.redis_url, decode_responses=True)
+        return self._client
+
+    async def consume(self, subject: str, *, now: float, rate: float, capacity: float, cost: float) -> tuple[bool, float]:
+        client = await self.client()
+        key = f"mythos:quota:{subject}"
+        result = await client.eval(QUOTA_LUA, 1, key, now, rate, capacity, cost)
+        allowed = bool(int(result[0]))
+        remaining = float(result[1])
+        return allowed, remaining
+
+
 class QuotaMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: FastAPI, config: QuotaConfig) -> None:
         super().__init__(app)
         self.config = config
+        self.store: QuotaStore = RedisQuotaStore(config.redis_url) if config.redis_url else AsyncLocalQuotaStore()
 
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         if not self.config.enabled or not request.url.path.startswith("/v1") or request.url.path.startswith("/v1/auth/"):
             return await call_next(request)
         subject = str(getattr(request.state, "user_id", "anonymous"))
         cost = request_cost(request)
-        allowed, remaining = LOCAL_QUOTA.consume(
-            subject,
-            now=time.time(),
-            rate=self.config.replenish_rate_per_second,
-            capacity=self.config.capacity,
-            cost=cost,
-        )
+        try:
+            allowed, remaining = await self.store.consume(
+                subject,
+                now=time.time(),
+                rate=self.config.replenish_rate_per_second,
+                capacity=self.config.capacity,
+                cost=cost,
+            )
+        except Exception as exc:
+            return JSONResponse(status_code=503, content={"error": "quota_backend_unavailable", "detail": str(exc)})
         if not allowed:
             return JSONResponse(
                 status_code=429,

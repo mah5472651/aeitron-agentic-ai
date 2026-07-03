@@ -141,6 +141,16 @@ python -m src.mythos.evaluation.release_gate
 python -m src.mythos.db.migration_runner --database-url $env:MYTHOS_DATABASE_URL --dry-run
 ```
 
+Production API hardening requires:
+
+```powershell
+$env:MYTHOS_AUTH_ENABLED = "1"
+$env:MYTHOS_JWT_SECRET = "<long-random-secret>"
+$env:MYTHOS_ALLOW_TOKEN_ISSUE = "0"
+$env:MYTHOS_QUOTA_ENABLED = "1"
+$env:MYTHOS_REDIS_URL = "redis://redis:6379/0"
+```
+
 ## Final Rule
 
 All new production code belongs under `src/mythos`.

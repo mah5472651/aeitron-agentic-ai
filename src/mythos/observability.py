@@ -73,9 +73,9 @@ class MetricsRegistry:
             for key, values in sorted(self.histograms.items()):
                 if not values:
                     continue
-                lines.append(f'{key}{{quantile="avg"}} {sum(values) / len(values):.6f}')
-                lines.append(f'{key}{{quantile="max"}} {max(values):.6f}')
-                lines.append(f"{key}_count {len(values)}")
+                lines.append(f'{self._with_labels(key, {"quantile": "avg"})} {sum(values) / len(values):.6f}')
+                lines.append(f'{self._with_labels(key, {"quantile": "max"})} {max(values):.6f}')
+                lines.append(f"{self._count_key(key)} {len(values)}")
         return "\n".join(lines) + "\n"
 
     def snapshot(self) -> dict[str, Any]:
@@ -90,6 +90,18 @@ class MetricsRegistry:
             return name
         label_text = ",".join(f'{key}="{value}"' for key, value in sorted(labels.items()))
         return f"{name}{{{label_text}}}"
+
+    def _with_labels(self, metric_key: str, labels: dict[str, str]) -> str:
+        extra = ",".join(f'{key}="{value}"' for key, value in sorted(labels.items()))
+        if "{" not in metric_key:
+            return f"{metric_key}{{{extra}}}"
+        return metric_key[:-1] + f",{extra}" + "}"
+
+    def _count_key(self, metric_key: str) -> str:
+        if "{" not in metric_key:
+            return f"{metric_key}_count"
+        name, labels = metric_key.split("{", 1)
+        return f"{name}_count{{{labels}"
 
 
 METRICS = MetricsRegistry()

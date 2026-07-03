@@ -47,6 +47,8 @@ No legacy numbered modules are part of the final architecture.
 - Verify patches with command checks and basic secret scanning.
 - Run optional defensive Semgrep and CodeQL verifier hooks when their CLIs are installed.
 - Enforce auth/quota middleware on protected API routes when enabled.
+- Gate token issuance in production with `MYTHOS_ALLOW_TOKEN_ISSUE` and `MYTHOS_TOKEN_ISSUE_KEY`.
+- Use Redis-backed atomic quota when `MYTHOS_REDIS_URL` is configured, with local fallback only for development.
 - Expose Prometheus-style `/metrics` and structured JSON request logs.
 - Run hardened Docker sandbox executions when Docker is available.
 - Run built-in security benchmark harness.
@@ -161,6 +163,17 @@ python -m src.mythos.model_ops.pretrain_loop --device cuda --steps 10 --sequence
 - Prod compose: `deploy/prod/docker-compose.yml`
 - Kubernetes manifests: `deploy/k8s/`
 - Metrics endpoint: `GET /metrics`
+
+Production auth/quota environment:
+
+```bash
+MYTHOS_AUTH_ENABLED=1
+MYTHOS_JWT_SECRET=<long-random-secret>
+MYTHOS_ALLOW_TOKEN_ISSUE=0
+MYTHOS_TOKEN_ISSUE_KEY=<only-if-token-issue-enabled>
+MYTHOS_QUOTA_ENABLED=1
+MYTHOS_REDIS_URL=redis://redis:6379/0
+```
 
 Serving adapters:
 

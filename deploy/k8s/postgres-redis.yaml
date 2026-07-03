@@ -26,6 +26,17 @@ spec:
             - name: POSTGRES_DB
               value: mythos
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mythos-postgres
+spec:
+  selector:
+    app: mythos-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -43,3 +54,14 @@ spec:
       containers:
         - name: redis
           image: redis:7
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mythos-redis
+spec:
+  selector:
+    app: mythos-redis
+  ports:
+    - port: 6379
+      targetPort: 6379

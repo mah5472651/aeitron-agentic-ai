@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from src.mythos.db import LocalStore
 from src.mythos.evaluation.benchmarks import BenchmarkHarness, built_in_security_tasks
-from src.mythos.identity import auth_status, create_jwt, install_auth, install_quota
+from src.mythos.identity import AuthError, auth_status, create_jwt, install_auth, install_quota, validate_token_issue_request
 from src.mythos.indexing import ContextBuilder, LocalVectorIndex, RepositoryIndexer
 from src.mythos.model_ops.backends import active_model_health, list_model_profiles
 from src.mythos.model_ops.foundation import PretrainingRunSpec, foundation_status
@@ -34,6 +34,7 @@ class AuthTokenRequest(BaseModel):
     user_id: str = Field(default="local-user", min_length=1)
     scopes: list[str] = Field(default_factory=lambda: ["api"])
     ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+    issue_key: str | None = Field(default=None, min_length=1)
 
 
 class ProjectCreateRequest(BaseModel):
@@ -93,6 +94,10 @@ async def auth_status_endpoint() -> dict[str, object]:
 async def issue_auth_token(request: AuthTokenRequest) -> dict[str, object]:
     if not AUTH_CONFIG.jwt_secret:
         raise HTTPException(status_code=503, detail="MYTHOS_JWT_SECRET is required")
+    try:
+        validate_token_issue_request(AUTH_CONFIG, request.issue_key)
+    except AuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     token = create_jwt(
         subject=request.user_id,
         secret=AUTH_CONFIG.jwt_secret,

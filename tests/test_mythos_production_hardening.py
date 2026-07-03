@@ -10,7 +10,8 @@ from src.mythos.db import LocalStore
 from src.mythos.db.migration_runner import expand_psql_includes, load_migrations
 from src.mythos.evaluation.benchmarks import BenchmarkHarness, built_in_security_tasks
 from src.mythos.gateway import api as gateway_api
-from src.mythos.identity.quota import LocalQuotaStore
+from src.mythos.identity.auth import AuthConfig, AuthError, validate_token_issue_request
+from src.mythos.identity.quota import AsyncLocalQuotaStore, LocalQuotaStore
 from src.mythos.indexing import LocalVectorIndex, RepositoryIndexer
 from src.mythos.patches import PatchVerifyRequest
 from src.mythos.patches.service import PatchService
@@ -74,6 +75,7 @@ class MythosProductionHardeningTest(unittest.TestCase):
         metrics = client.get("/metrics")
         self.assertEqual(metrics.status_code, 200)
         self.assertIn("mythos_http_requests_total", metrics.text)
+        self.assertNotIn("}{", metrics.text)
 
     def test_sandbox_policy_is_hardened_by_default(self) -> None:
         request = SandboxRunRequest(command=["python3", "-c", "print(1)"])
@@ -83,6 +85,25 @@ class MythosProductionHardeningTest(unittest.TestCase):
         self.assertTrue(policy.read_only)
         self.assertIn("ALL", policy.cap_drop)
         self.assertIn("/tmp", policy.tmpfs)
+
+    def test_token_issue_is_blocked_when_auth_enabled_without_explicit_permission(self) -> None:
+        config = AuthConfig(enabled=True, jwt_secret="x" * 32, allow_token_issue=False)
+        with self.assertRaises(AuthError):
+            validate_token_issue_request(config, None)
+        allowed = AuthConfig(enabled=True, jwt_secret="x" * 32, allow_token_issue=True, token_issue_key="issue-secret")
+        with self.assertRaises(AuthError):
+            validate_token_issue_request(allowed, "wrong")
+        validate_token_issue_request(allowed, "issue-secret")
+
+    def test_async_local_quota_store_matches_regenerative_contract(self) -> None:
+        async def run_case() -> tuple[bool, float]:
+            return await AsyncLocalQuotaStore().consume("async-u1", now=200.0, rate=1.0, capacity=2.0, cost=1.0)
+
+        import asyncio
+
+        allowed, remaining = asyncio.run(run_case())
+        self.assertTrue(allowed)
+        self.assertAlmostEqual(remaining, 1.0)
 
 
 if __name__ == "__main__":

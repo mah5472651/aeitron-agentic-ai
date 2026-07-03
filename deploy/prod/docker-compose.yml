@@ -8,8 +8,9 @@ services:
     environment:
       MYTHOS_AUTH_ENABLED: "1"
       MYTHOS_QUOTA_ENABLED: "1"
-      MYTHOS_JWT_SECRET: "change-me-in-production"
-      MYTHOS_DATABASE_URL: "postgresql://mythos:mythos@postgres:5432/mythos"
+      MYTHOS_JWT_SECRET: "${MYTHOS_JWT_SECRET:?set MYTHOS_JWT_SECRET}"
+      MYTHOS_ALLOW_TOKEN_ISSUE: "0"
+      MYTHOS_DATABASE_URL: "postgresql://mythos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/mythos"
       MYTHOS_REDIS_URL: "redis://redis:6379/0"
     depends_on:
       - postgres
@@ -18,7 +19,7 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: mythos
-      POSTGRES_PASSWORD: mythos
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
       POSTGRES_DB: mythos
     volumes:
       - postgres-data:/var/lib/postgresql/data

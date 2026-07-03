@@ -25,6 +25,8 @@ class AuthConfig:
     enabled: bool = False
     quota_enabled: bool = False
     jwt_secret: str | None = None
+    allow_token_issue: bool = False
+    token_issue_key: str | None = None
     issuer: str = "mythos-local"
     audience: str = "mythos-api"
     leeway_seconds: int = 30
@@ -47,6 +49,8 @@ class AuthConfig:
             enabled=os.environ.get("MYTHOS_AUTH_ENABLED", "0") == "1",
             quota_enabled=os.environ.get("MYTHOS_QUOTA_ENABLED", "0") == "1",
             jwt_secret=os.environ.get("MYTHOS_JWT_SECRET"),
+            allow_token_issue=os.environ.get("MYTHOS_ALLOW_TOKEN_ISSUE", "0") == "1",
+            token_issue_key=os.environ.get("MYTHOS_TOKEN_ISSUE_KEY"),
             issuer=os.environ.get("MYTHOS_JWT_ISSUER", "mythos-local"),
             audience=os.environ.get("MYTHOS_JWT_AUDIENCE", "mythos-api"),
         )
@@ -179,4 +183,12 @@ def auth_status(config: AuthConfig | None = None) -> dict[str, Any]:
     active = config or AuthConfig.from_env()
     payload = asdict(active)
     payload["jwt_secret"] = bool(active.jwt_secret)
+    payload["token_issue_key"] = bool(active.token_issue_key)
     return payload
+
+
+def validate_token_issue_request(config: AuthConfig, supplied_key: str | None) -> None:
+    if config.enabled and not config.allow_token_issue:
+        raise AuthError("token_issue_disabled", "Token issuance is disabled in production mode.", 403)
+    if config.token_issue_key and not hmac.compare_digest(supplied_key or "", config.token_issue_key):
+        raise AuthError("invalid_token_issue_key", "Token issuance key is invalid.", 403)

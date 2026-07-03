@@ -23,8 +23,20 @@ spec:
               value: "1"
             - name: MYTHOS_QUOTA_ENABLED
               value: "1"
-            - name: MYTHOS_SQLITE_PATH
-              value: /data/mythos.sqlite3
+            - name: MYTHOS_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: mythos-secrets
+                  key: jwt-secret
+            - name: MYTHOS_ALLOW_TOKEN_ISSUE
+              value: "0"
+            - name: MYTHOS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mythos-secrets
+                  key: database-url
+            - name: MYTHOS_REDIS_URL
+              value: redis://mythos-redis:6379/0
           readinessProbe:
             httpGet:
               path: /health/ready
