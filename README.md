@@ -186,6 +186,39 @@ python -m src.mythos.learning.data_engine \
   --shard-rows 10000
 ```
 
+Postgres-backed distributed frontier:
+
+```bash
+python -m src.mythos.learning.data_engine \
+  --sources config/data_sources.defensive.sample.json \
+  --frontier-backend postgres \
+  --postgres-dsn "$MYTHOS_DATABASE_URL" \
+  --raw-output-dir artifacts/mythos/data-engine/raw \
+  --clean-output-dir artifacts/mythos/data-engine/clean \
+  --max-docs 1000000 \
+  --workers 64
+```
+
+One command for `crawl -> clean -> shard -> train`:
+
+```bash
+python -m src.mythos.learning.data_pipeline \
+  --sources config/data_sources.defensive.sample.json \
+  --work-dir artifacts/mythos/data-pipeline \
+  --frontier-backend sqlite \
+  --max-docs 1000000 \
+  --workers 64 \
+  --max-depth 2 \
+  --vocab-size 64000 \
+  --sequence-length 2048 \
+  --shard-token-count 1000000 \
+  --train-device cuda \
+  --train-steps 10000 \
+  --train-batch-size 2 \
+  --gradient-accumulation-steps 16 \
+  --dtype bf16
+```
+
 The data engine is defensive and allowlist-first. It is for public documentation,
 licensed code, security guidance, benchmark corpora, and approved repository
 mirrors; it does not perform exploit execution or unauthorized collection.

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 import httpx
 
 from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore
+from src.mythos.learning.data_pipeline import DataPipelineConfig, run_data_pipeline
+from src.mythos.learning.source_registry import SourceRegistry
 from src.mythos.learning.web_ingest import SourceSpec
 
 
@@ -22,6 +25,21 @@ def _page(title: str, link: str | None = None) -> str:
 
 
 class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
+    def test_source_registry_rejects_urls_outside_allowlist(self) -> None:
+        registry = SourceRegistry(
+            [
+                SourceSpec(
+                    name="bad",
+                    urls=["https://evil.example.net/page"],
+                    allowed_domains=["example.org"],
+                    license="mit",
+                    category="defensive_security",
+                )
+            ]
+        )
+        with self.assertRaises(ValueError):
+            registry.validate()
+
     async def test_persistent_engine_crawls_discovers_deduplicates_and_shards(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -76,6 +94,65 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
                 store.close()
             self.assertEqual(stats["urls_done"], 2)
             self.assertEqual(stats["documents_accepted"], 2)
+
+    async def test_unified_data_pipeline_crawls_shards_and_runs_one_training_step(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sources = root / "sources.json"
+            sources.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": "offline-pipeline-source",
+                                "urls": ["https://example.org/seed.html"],
+                                "allowed_domains": ["example.org"],
+                                "license": "mit",
+                                "category": "agentic_coding",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/robots.txt":
+                    return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+                if request.url.path == "/seed.html":
+                    return httpx.Response(200, text=_page("pipeline", "child"), headers={"content-type": "text/html"})
+                if request.url.path == "/child.html":
+                    return httpx.Response(200, text=_page("pipeline child"), headers={"content-type": "text/html"})
+                return httpx.Response(404, text="missing")
+
+            config = DataPipelineConfig(
+                sources_path=str(sources),
+                work_dir=str(root / "pipeline"),
+                max_docs=2,
+                workers=2,
+                max_depth=1,
+                delay_seconds=0.0,
+                shard_rows=1,
+                vocab_size=1200,
+                tokenizer_min_frequency=1,
+                shard_token_count=128,
+                sequence_length=16,
+                validation_fraction=0.0,
+                train_steps=1,
+                train_device="cpu",
+                train_batch_size=1,
+                dtype="fp32",
+            )
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://example.org") as client:
+                report = await run_data_pipeline(config, client=client)
+
+            self.assertEqual(report.status, "complete")
+            self.assertEqual(report.crawl["accepted"], 2)
+            self.assertTrue(report.clean_files)
+            self.assertTrue(Path(report.tokenizer_path).exists())
+            self.assertTrue(report.shard_manifest["train_shards"])
+            self.assertIsNotNone(report.training)
+            self.assertEqual(report.training["status"], "passed")
 
 
 if __name__ == "__main__":

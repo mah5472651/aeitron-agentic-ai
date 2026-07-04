@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import re
 import sqlite3
@@ -73,7 +74,45 @@ CREATE INDEX IF NOT EXISTS idx_urls_source ON urls(source_name);
 """
 
 
+POSTGRES_FRONTIER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS urls (
+  url TEXT PRIMARY KEY,
+  source_name TEXT NOT NULL,
+  allowed_domains_json TEXT NOT NULL,
+  license TEXT NOT NULL,
+  category TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  priority INTEGER NOT NULL DEFAULT 100,
+  depth INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_fetch_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+  last_error TEXT,
+  discovered_from TEXT,
+  created_at DOUBLE PRECISION NOT NULL,
+  updated_at DOUBLE PRECISION NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS documents (
+  content_hash TEXT PRIMARY KEY,
+  url TEXT NOT NULL,
+  source_name TEXT NOT NULL,
+  license TEXT NOT NULL,
+  category TEXT NOT NULL,
+  text_chars INTEGER NOT NULL,
+  accepted INTEGER NOT NULL,
+  quality_json TEXT NOT NULL,
+  shard_path TEXT,
+  fetched_at DOUBLE PRECISION NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_urls_status_next ON urls(status, next_fetch_at, priority);
+CREATE INDEX IF NOT EXISTS idx_urls_source ON urls(source_name);
+"""
+
+
 class DataEngineConfig(StrictModel):
+    frontier_backend: str = "sqlite"
+    postgres_dsn: str | None = None
     frontier_path: str = "artifacts/mythos/data-engine/frontier.sqlite3"
     output_dir: str = "artifacts/mythos/data-engine/raw"
     clean_output_dir: str = "artifacts/mythos/data-engine/clean"
@@ -276,6 +315,176 @@ class FrontierStore:
         self.connection.close()
 
 
+def _asyncpg_inserted(status: str) -> bool:
+    return status.endswith(" 1")
+
+
+class PostgresFrontierStore:
+    """Postgres frontier for distributed production crawlers.
+
+    Use `await PostgresFrontierStore.create(dsn)` and pass it into `DataEngine`.
+    Claims use row locks with `SKIP LOCKED`, so many crawler processes can share
+    one frontier without claiming the same URL twice.
+    """
+
+    def __init__(self, pool: Any, *, dsn_label: str = "postgres") -> None:
+        self.pool = pool
+        self.path = dsn_label
+
+    @classmethod
+    async def create(cls, dsn: str, *, min_size: int = 1, max_size: int = 10) -> "PostgresFrontierStore":
+        try:
+            import asyncpg
+        except ImportError as exc:  # pragma: no cover - dependency is optional in CPU-only tests
+            raise RuntimeError("asyncpg is required for Postgres frontier support") from exc
+        pool = await asyncpg.create_pool(dsn, min_size=min_size, max_size=max_size)
+        store = cls(pool)
+        async with pool.acquire() as connection:
+            await connection.execute(POSTGRES_FRONTIER_SCHEMA)
+        return store
+
+    async def seed(self, sources: list[SourceSpec]) -> int:
+        inserted = 0
+        now = time.time()
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                for source in sources:
+                    for url in source.urls:
+                        normalized = normalize_url(url)
+                        if not allowed_url(normalized, source.allowed_domains):
+                            continue
+                        status = await connection.execute(
+                            """
+                            INSERT INTO urls(
+                              url, source_name, allowed_domains_json, license, category,
+                              status, priority, depth, created_at, updated_at
+                            )
+                            VALUES($1, $2, $3, $4, $5, 'queued', 100, 0, $6, $7)
+                            ON CONFLICT(url) DO NOTHING
+                            """,
+                            normalized,
+                            source.name,
+                            json.dumps(source.allowed_domains, sort_keys=True),
+                            source.license,
+                            source.category,
+                            now,
+                            now,
+                        )
+                        inserted += 1 if _asyncpg_inserted(status) else 0
+        return inserted
+
+    async def claim(self, *, limit: int, now: float) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                WITH claimed AS (
+                  SELECT url FROM urls
+                  WHERE status = 'queued' AND next_fetch_at <= $1
+                  ORDER BY priority ASC, created_at ASC
+                  FOR UPDATE SKIP LOCKED
+                  LIMIT $2
+                )
+                UPDATE urls
+                SET status = 'in_progress', attempts = attempts + 1, updated_at = $1
+                FROM claimed
+                WHERE urls.url = claimed.url
+                RETURNING urls.*
+                """,
+                now,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def enqueue_discovered(self, *, parent: dict[str, Any], urls: list[str], max_depth: int) -> int:
+        if int(parent["depth"]) >= max_depth:
+            return 0
+        allowed_domains = json.loads(parent["allowed_domains_json"])
+        now = time.time()
+        inserted = 0
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                for url in urls:
+                    normalized = normalize_url(url)
+                    if not allowed_url(normalized, allowed_domains):
+                        continue
+                    status = await connection.execute(
+                        """
+                        INSERT INTO urls(
+                          url, source_name, allowed_domains_json, license, category,
+                          status, priority, depth, discovered_from, created_at, updated_at
+                        )
+                        VALUES($1, $2, $3, $4, $5, 'queued', $6, $7, $8, $9, $10)
+                        ON CONFLICT(url) DO NOTHING
+                        """,
+                        normalized,
+                        parent["source_name"],
+                        parent["allowed_domains_json"],
+                        parent["license"],
+                        parent["category"],
+                        int(parent["priority"]) + 10,
+                        int(parent["depth"]) + 1,
+                        parent["url"],
+                        now,
+                        now,
+                    )
+                    inserted += 1 if _asyncpg_inserted(status) else 0
+        return inserted
+
+    async def mark_done(self, url: str) -> None:
+        async with self.pool.acquire() as connection:
+            await connection.execute("UPDATE urls SET status = 'done', updated_at = $1 WHERE url = $2", time.time(), url)
+
+    async def mark_failed(self, row: dict[str, Any], error: str, *, retry_limit: int, delay_seconds: float) -> None:
+        attempts = int(row["attempts"]) + 1
+        status = "failed" if attempts >= retry_limit else "queued"
+        next_fetch_at = time.time() + delay_seconds * max(1, attempts)
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                "UPDATE urls SET status = $1, last_error = $2, next_fetch_at = $3, updated_at = $4 WHERE url = $5",
+                status,
+                error[:1000],
+                next_fetch_at,
+                time.time(),
+                row["url"],
+            )
+
+    async def record_document(self, row: dict[str, Any], *, quality: dict[str, Any], shard_path: str | None) -> bool:
+        async with self.pool.acquire() as connection:
+            status = await connection.execute(
+                """
+                INSERT INTO documents(
+                  content_hash, url, source_name, license, category, text_chars,
+                  accepted, quality_json, shard_path, fetched_at
+                )
+                VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT(content_hash) DO NOTHING
+                """,
+                row["content_hash"],
+                row["url"],
+                row["source"],
+                row["license"],
+                row["category"],
+                len(row.get("text", "")),
+                1 if quality.get("accepted") else 0,
+                json.dumps(quality, sort_keys=True),
+                shard_path,
+                time.time(),
+            )
+        return _asyncpg_inserted(status)
+
+    async def stats(self) -> dict[str, int]:
+        stats: dict[str, int] = {}
+        async with self.pool.acquire() as connection:
+            for row in await connection.fetch("SELECT status, COUNT(*) AS count FROM urls GROUP BY status"):
+                stats[f"urls_{row['status']}"] = int(row["count"])
+            for row in await connection.fetch("SELECT accepted, COUNT(*) AS count FROM documents GROUP BY accepted"):
+                stats[f"documents_{'accepted' if row['accepted'] else 'rejected'}"] = int(row["count"])
+        return stats
+
+    async def close(self) -> None:
+        await self.pool.close()
+
+
 class DomainThrottle:
     def __init__(self, delay_seconds: float) -> None:
         self.delay_seconds = delay_seconds
@@ -307,11 +516,22 @@ def discover_links(base_url: str, html: str) -> list[str]:
     return output
 
 
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _store_call(store: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
+    method = getattr(store, method_name)
+    return await _maybe_await(method(*args, **kwargs))
+
+
 class DataEngine:
-    def __init__(self, config: DataEngineConfig | None = None, *, store: FrontierStore | None = None) -> None:
+    def __init__(self, config: DataEngineConfig | None = None, *, store: Any | None = None, owns_store: bool | None = None) -> None:
         self.config = config or DataEngineConfig()
         self.store = store or FrontierStore(self.config.frontier_path)
-        self.owns_store = store is None
+        self.owns_store = store is None if owns_store is None else owns_store
         self.quality_gate = DatasetQualityGate()
         self.raw_writer = ShardedJsonlWriter(self.config.output_dir, prefix="raw", rows_per_shard=self.config.shard_rows)
         self.clean_writer = ShardedJsonlWriter(self.config.clean_output_dir, prefix="clean", rows_per_shard=self.config.shard_rows)
@@ -320,11 +540,24 @@ class DataEngine:
         self.raw_writer.close()
         self.clean_writer.close()
         if self.owns_store:
-            self.store.close()
+            result = self.store.close()
+            if inspect.isawaitable(result):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    asyncio.run(result)
+                else:
+                    loop.create_task(result)
+
+    async def aclose(self) -> None:
+        self.raw_writer.close()
+        self.clean_writer.close()
+        if self.owns_store:
+            await _maybe_await(self.store.close())
 
     async def run(self, sources: list[SourceSpec], *, client: httpx.AsyncClient | None = None) -> DataEngineReport:
         started = time.perf_counter()
-        self.store.seed(sources)
+        await _store_call(self.store, "seed", sources)
         throttle = DomainThrottle(self.config.delay_seconds)
         headers = {"User-Agent": self.config.user_agent}
         own_client = client is None
@@ -336,14 +569,21 @@ class DataEngine:
         async def worker() -> None:
             while counters["fetched"] < self.config.max_docs:
                 async with queue_lock:
-                    claimed = self.store.claim(limit=1, now=time.time())
+                    claimed = await _store_call(self.store, "claim", limit=1, now=time.time())
                 if not claimed:
                     return
                 item = claimed[0]
                 try:
                     await throttle.wait(item["url"])
                     if self.config.respect_robots and not await robots.allowed(active_client, item["url"]):
-                        self.store.mark_failed(item, "robots_disallow", retry_limit=0, delay_seconds=self.config.delay_seconds)
+                        await _store_call(
+                            self.store,
+                            "mark_failed",
+                            item,
+                            "robots_disallow",
+                            retry_limit=0,
+                            delay_seconds=self.config.delay_seconds,
+                        )
                         counters["rejected"] += 1
                         continue
                     response = await active_client.get(item["url"])
@@ -370,20 +610,35 @@ class DataEngine:
                         counters["accepted"] += 1
                     else:
                         counters["rejected"] += 1
-                    recorded = self.store.record_document(row, quality=decision.model_dump(), shard_path=str(clean_path) if clean_path else None)
+                    recorded = await _store_call(
+                        self.store,
+                        "record_document",
+                        row,
+                        quality=decision.model_dump(),
+                        shard_path=str(clean_path) if clean_path else None,
+                    )
                     if not recorded:
                         counters["duplicate"] += 1
                     if self.config.discover_links and "html" in content_type.lower():
-                        counters["discovered"] += self.store.enqueue_discovered(
+                        counters["discovered"] += await _store_call(
+                            self.store,
+                            "enqueue_discovered",
                             parent=item,
                             urls=discover_links(item["url"], raw),
                             max_depth=self.config.max_depth,
                         )
-                    self.store.mark_done(item["url"])
+                    await _store_call(self.store, "mark_done", item["url"])
                     counters["fetched"] += 1
                 except Exception as exc:
                     counters["failed"] += 1
-                    self.store.mark_failed(item, str(exc), retry_limit=self.config.retry_limit, delay_seconds=self.config.delay_seconds)
+                    await _store_call(
+                        self.store,
+                        "mark_failed",
+                        item,
+                        str(exc),
+                        retry_limit=self.config.retry_limit,
+                        delay_seconds=self.config.delay_seconds,
+                    )
 
         try:
             await asyncio.gather(*(worker() for _ in range(self.config.workers)))
@@ -406,6 +661,8 @@ class DataEngine:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Mythos million-scale defensive data engine.")
     parser.add_argument("--sources", required=True)
+    parser.add_argument("--frontier-backend", choices=["sqlite", "postgres"], default="sqlite")
+    parser.add_argument("--postgres-dsn")
     parser.add_argument("--frontier", default="artifacts/mythos/data-engine/frontier.sqlite3")
     parser.add_argument("--raw-output-dir", default="artifacts/mythos/data-engine/raw")
     parser.add_argument("--clean-output-dir", default="artifacts/mythos/data-engine/clean")
@@ -418,9 +675,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+async def build_store(args: argparse.Namespace) -> Any:
+    if args.frontier_backend == "postgres":
+        if not args.postgres_dsn:
+            raise ValueError("--postgres-dsn is required when --frontier-backend postgres")
+        return await PostgresFrontierStore.create(args.postgres_dsn)
+    return FrontierStore(args.frontier)
+
+
+async def run_cli(args: argparse.Namespace) -> DataEngineReport:
+    store = await build_store(args)
     config = DataEngineConfig(
+        frontier_backend=args.frontier_backend,
+        postgres_dsn=args.postgres_dsn,
         frontier_path=args.frontier,
         output_dir=args.raw_output_dir,
         clean_output_dir=args.clean_output_dir,
@@ -431,11 +698,16 @@ def main() -> None:
         shard_rows=args.shard_rows,
         respect_robots=not args.ignore_robots,
     )
-    engine = DataEngine(config)
+    engine = DataEngine(config, store=store, owns_store=True)
     try:
-        report = asyncio.run(engine.run(load_sources(args.sources)))
+        return await engine.run(load_sources(args.sources))
     finally:
-        engine.close()
+        await engine.aclose()
+
+
+def main() -> None:
+    args = parse_args()
+    report = asyncio.run(run_cli(args))
     print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
 
 

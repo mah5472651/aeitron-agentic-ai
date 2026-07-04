@@ -55,7 +55,7 @@ No legacy numbered modules are part of the final architecture.
 - Plan scratch pretraining specs for Mythos 7B, 32B, 70B, and 100B-class decoder models.
 - Validate tokenizer/data/checkpoint readiness before any scratch training run.
 - Ingest allowlisted defensive internet data with robots/rate-limit/license metadata.
-- Run persistent million-scale defensive data collection with SQLite frontier resume, retries, per-domain throttling, URL discovery, provenance, content-hash deduplication, and raw/clean JSONL shards.
+- Run persistent million-scale defensive data collection with SQLite/Postgres frontier resume, retries, per-domain throttling, URL discovery, provenance, content-hash deduplication, and raw/clean JSONL shards.
 - Apply quality gates: deduplication, license policy, PII/secret rejection, defensive/security labels.
 - Train BPE tokenizer and build train/validation token shards.
 - Stream token shards into checkpoint-resumable scratch pretraining with gradient accumulation, mixed precision, loss logs, validation loss, and checkpoint resume.
@@ -167,6 +167,8 @@ Defensive web corpus pipeline:
 ```bash
 python -m src.mythos.learning.web_ingest --sources config/data_sources.defensive.sample.json --output data/training/raw_web.jsonl --max-docs 1000 --delay-seconds 1.0
 python -m src.mythos.learning.data_engine --sources config/data_sources.defensive.sample.json --frontier artifacts/mythos/data-engine/frontier.sqlite3 --raw-output-dir artifacts/mythos/data-engine/raw --clean-output-dir artifacts/mythos/data-engine/clean --max-docs 1000000 --workers 64 --max-depth 2 --delay-seconds 1.0 --shard-rows 10000
+python -m src.mythos.learning.data_engine --sources config/data_sources.defensive.sample.json --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --raw-output-dir artifacts/mythos/data-engine/raw --clean-output-dir artifacts/mythos/data-engine/clean --max-docs 1000000 --workers 64
+python -m src.mythos.learning.data_pipeline --sources config/data_sources.defensive.sample.json --work-dir artifacts/mythos/data-pipeline --frontier-backend sqlite --max-docs 1000000 --workers 64 --max-depth 2 --vocab-size 64000 --sequence-length 2048 --shard-token-count 1000000 --train-device cuda --train-steps 10000 --train-batch-size 2 --gradient-accumulation-steps 16 --dtype bf16
 python - <<'PY'
 from src.mythos.learning.quality import DatasetQualityGate
 print(DatasetQualityGate().filter_jsonl("data/training/raw_web.jsonl", "data/training/clean.jsonl"))
@@ -175,8 +177,9 @@ PY
 
 The persistent data engine is the production path for large runs. It should be
 fed only allowlisted public sources, approved mirrors, licensed repositories,
-defensive security references, and benchmark corpora. It does not run exploits
-or collect unauthorized targets.
+defensive security references, and benchmark corpora. For multi-process or
+multi-machine crawls, use the Postgres frontier so URL claims are coordinated
+with row locks. It does not run exploits or collect unauthorized targets.
 
 ## Production Operations
 
