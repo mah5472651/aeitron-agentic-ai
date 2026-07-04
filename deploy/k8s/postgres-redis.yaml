@@ -1,8 +1,9 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: mythos-postgres
 spec:
+  serviceName: mythos-postgres
   replicas: 1
   selector:
     matchLabels:
@@ -25,6 +26,26 @@ spec:
                   key: postgres-password
             - name: POSTGRES_DB
               value: mythos
+          ports:
+            - containerPort: 5432
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 500Gi
 ---
 apiVersion: v1
 kind: Service
@@ -54,6 +75,16 @@ spec:
       containers:
         - name: redis
           image: redis:7
+          command: ["redis-server", "--appendonly", "yes"]
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
 ---
 apiVersion: v1
 kind: Service

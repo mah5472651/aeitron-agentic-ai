@@ -13,6 +13,7 @@ from src.mythos.gateway import api as gateway_api
 from src.mythos.identity.auth import AuthConfig, AuthError, validate_token_issue_request
 from src.mythos.identity.quota import AsyncLocalQuotaStore, LocalQuotaStore
 from src.mythos.indexing import LocalVectorIndex, RepositoryIndexer
+from src.mythos.learning.capacity import CapacityPlanConfig, build_capacity_plan
 from src.mythos.patches import PatchVerifyRequest
 from src.mythos.patches.service import PatchService
 from src.mythos.tools.sandbox import HardenedSandboxPolicy, SandboxRunRequest
@@ -104,6 +105,23 @@ class MythosProductionHardeningTest(unittest.TestCase):
         allowed, remaining = asyncio.run(run_case())
         self.assertTrue(allowed)
         self.assertAlmostEqual(remaining, 1.0)
+
+    def test_data_platform_cluster_manifests_and_capacity_plan_exist(self) -> None:
+        postgres = Path("deploy/k8s/postgres-redis.yaml").read_text(encoding="utf-8")
+        minio = Path("deploy/k8s/minio.yaml").read_text(encoding="utf-8")
+        worker = Path("deploy/k8s/data-worker.yaml").read_text(encoding="utf-8")
+        hpa = Path("deploy/k8s/data-worker-hpa.yaml").read_text(encoding="utf-8")
+        network = Path("deploy/k8s/data-network-policy.yaml").read_text(encoding="utf-8")
+        self.assertIn("kind: StatefulSet", postgres)
+        self.assertIn("volumeClaimTemplates", postgres)
+        self.assertIn("mythos-minio", minio)
+        self.assertIn("mythos-datasets", minio)
+        self.assertIn("mythos-data-worker", worker)
+        self.assertIn("HorizontalPodAutoscaler", hpa)
+        self.assertIn("NetworkPolicy", network)
+        plan = build_capacity_plan(CapacityPlanConfig(target_documents=1_000_000, worker_replicas=8, async_workers_per_replica=16))
+        self.assertGreater(plan.raw_storage_tb, 0.0)
+        self.assertGreater(plan.recommended_worker_replicas_for_target_days, 0)
 
 
 if __name__ == "__main__":

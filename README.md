@@ -242,6 +242,28 @@ python -m src.mythos.learning.production_check \
   --async-workers 64
 ```
 
+Cluster capacity planning:
+
+```bash
+python -m src.mythos.learning.capacity \
+  --target-documents 1000000000 \
+  --target-days 30 \
+  --worker-replicas 32 \
+  --async-workers-per-replica 32
+```
+
+Kubernetes production data platform:
+
+```bash
+kubectl apply -f deploy/k8s/secrets.example.yaml
+kubectl apply -f deploy/k8s/postgres-redis.yaml
+kubectl apply -f deploy/k8s/minio.yaml
+kubectl apply -f deploy/k8s/data-worker.yaml
+kubectl apply -f deploy/k8s/data-worker-hpa.yaml
+kubectl apply -f deploy/k8s/data-network-policy.yaml
+kubectl apply -f deploy/k8s/data-pipeline-job.yaml
+```
+
 Pipeline outputs include:
 
 - contamination report
