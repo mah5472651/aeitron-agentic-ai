@@ -9,6 +9,7 @@ import httpx
 
 from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore
 from src.mythos.learning.data_pipeline import DataPipelineConfig, run_data_pipeline
+from src.mythos.learning.production_check import DataPlatformReadinessConfig, run_readiness_check
 from src.mythos.learning.source_registry import SourceRegistry
 from src.mythos.learning.web_ingest import SourceSpec
 from src.mythos.learning.contamination import ContaminationDetector
@@ -174,6 +175,36 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             report = ContaminationDetector().scan_jsonl([clean])
             self.assertTrue(report.blocked)
             self.assertEqual(len(report.hits), 1)
+
+    def test_production_readiness_blocks_local_only_configuration(self) -> None:
+        report = run_readiness_check(
+            DataPlatformReadinessConfig(
+                sources_path="config/data_sources.production.sample.json",
+                frontier_backend="sqlite",
+                object_store_uri="local://artifacts/mythos/object-store",
+                production_mode=True,
+                worker_replicas=1,
+                async_workers=8,
+            )
+        )
+        self.assertEqual(report.status, "block")
+        failed = {item.name for item in report.checks if item.status == "fail"}
+        self.assertIn("distributed_frontier", failed)
+        self.assertIn("object_storage", failed)
+
+    def test_production_readiness_passes_distributed_configuration_contract(self) -> None:
+        report = run_readiness_check(
+            DataPlatformReadinessConfig(
+                sources_path="config/data_sources.production.sample.json",
+                frontier_backend="postgres",
+                postgres_dsn="postgresql://user:pass@postgres:5432/mythos",
+                object_store_uri="s3://mythos-datasets/pretraining",
+                production_mode=True,
+                worker_replicas=4,
+                async_workers=32,
+            )
+        )
+        self.assertEqual(report.status, "pass")
 
 
 if __name__ == "__main__":

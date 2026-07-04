@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -62,7 +63,7 @@ class LocalObjectStore:
 
 
 class S3ObjectStore:
-    def __init__(self, uri: str, *, endpoint_url: str | None = None) -> None:
+    def __init__(self, uri: str, *, endpoint_url: str | None = None, max_retries: int = 3) -> None:
         try:
             import boto3
         except ImportError as exc:  # pragma: no cover - optional production dependency
@@ -73,6 +74,7 @@ class S3ObjectStore:
         self.bucket = parsed.netloc
         self.prefix = parsed.path.strip("/")
         self.client = boto3.client("s3", endpoint_url=endpoint_url)
+        self.max_retries = max_retries
 
     def _object_key(self, key: str) -> str:
         return f"{self.prefix}/{key}".strip("/") if self.prefix else key
@@ -80,7 +82,7 @@ class S3ObjectStore:
     def put_file(self, path: str | Path, *, key: str | None = None) -> StoredObject:
         source = Path(path)
         object_key = self._object_key(key or source.name)
-        self.client.upload_file(str(source), self.bucket, object_key)
+        retry_sync(lambda: self.client.upload_file(str(source), self.bucket, object_key), max_retries=self.max_retries)
         return StoredObject(
             source_path=str(source),
             uri=f"s3://{self.bucket}/{object_key}",
@@ -91,7 +93,10 @@ class S3ObjectStore:
     def put_json(self, payload: dict[str, Any], *, key: str) -> StoredObject:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         object_key = self._object_key(key)
-        self.client.put_object(Bucket=self.bucket, Key=object_key, Body=body, ContentType="application/json")
+        retry_sync(
+            lambda: self.client.put_object(Bucket=self.bucket, Key=object_key, Body=body, ContentType="application/json"),
+            max_retries=self.max_retries,
+        )
         digest = hashlib.sha256(body).hexdigest()
         return StoredObject(source_path=f"memory:{key}", uri=f"s3://{self.bucket}/{object_key}", size_bytes=len(body), sha256=digest)
 
@@ -99,6 +104,20 @@ class S3ObjectStore:
 class ObjectStoreConfig(StrictModel):
     uri: str = Field(default="local://artifacts/mythos/object-store", min_length=1)
     endpoint_url: str | None = None
+    max_retries: int = Field(default=3, ge=1, le=10)
+
+
+def retry_sync(operation: Any, *, max_retries: int, base_delay_seconds: float = 0.25) -> Any:
+    last_error: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            return operation()
+        except Exception as exc:  # pragma: no cover - network retries are integration-tested in deployment
+            last_error = exc
+            if attempt == max_retries - 1:
+                break
+            time.sleep(base_delay_seconds * (2**attempt))
+    raise RuntimeError(f"object storage operation failed after {max_retries} attempts") from last_error
 
 
 def create_object_store(config: ObjectStoreConfig) -> ObjectStore:
@@ -111,7 +130,7 @@ def create_object_store(config: ObjectStoreConfig) -> ObjectStore:
         root = f"{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
         return LocalObjectStore(root)
     if parsed.scheme == "s3":
-        return S3ObjectStore(config.uri, endpoint_url=config.endpoint_url)
+        return S3ObjectStore(config.uri, endpoint_url=config.endpoint_url, max_retries=config.max_retries)
     raise ValueError(f"unsupported object store URI: {config.uri}")
 
 

@@ -229,6 +229,19 @@ Distributed crawler workers:
 docker compose -f deploy/prod/docker-compose.yml --profile data up --scale crawler-worker=8 crawler-worker
 ```
 
+Production readiness gate:
+
+```bash
+python -m src.mythos.learning.production_check \
+  --sources config/data_sources.production.sample.json \
+  --frontier-backend postgres \
+  --postgres-dsn "$MYTHOS_DATABASE_URL" \
+  --object-store-uri s3://mythos-datasets/pretraining \
+  --production \
+  --worker-replicas 8 \
+  --async-workers 64
+```
+
 Pipeline outputs include:
 
 - contamination report
