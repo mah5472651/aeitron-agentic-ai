@@ -36,7 +36,18 @@ class QualityGateConfig(StrictModel):
     min_chars: int = Field(default=200, ge=1)
     max_chars: int = Field(default=2_000_000, ge=1)
     require_license: bool = True
-    allowed_licenses: set[str] = Field(default_factory=lambda: {"mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "cc-by-4.0", "public-domain", "unknown-ok"})
+    allowed_licenses: set[str] = Field(
+        default_factory=lambda: {
+            "mit",
+            "apache-2.0",
+            "bsd-2-clause",
+            "bsd-3-clause",
+            "cc-by-4.0",
+            "public-domain",
+            "psf-2.0",
+            "unknown-ok",
+        }
+    )
     reject_emails: bool = True
     reject_secrets: bool = True
 
@@ -45,6 +56,9 @@ class QualityDecision(StrictModel):
     accepted: bool
     reasons: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
+    quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    language_hint: str | None = None
+    data_type: str = "unknown"
     content_hash: str
 
 
@@ -67,6 +81,69 @@ def iter_jsonl(path: str | Path) -> Iterable[dict[str, Any]]:
     for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
         if line.strip():
             yield json.loads(line)
+
+
+def infer_language(text: str, url: str = "") -> str | None:
+    lowered_url = url.lower()
+    suffix_map = {
+        ".py": "python",
+        ".rs": "rust",
+        ".go": "go",
+        ".js": "javascript",
+        ".ts": "typescript",
+        ".java": "java",
+        ".c": "c",
+        ".cpp": "cpp",
+        ".h": "c_cpp_header",
+        ".sh": "bash",
+        ".sol": "solidity",
+    }
+    for suffix, language in suffix_map.items():
+        if lowered_url.endswith(suffix):
+            return language
+    lowered = text.lower()
+    if "fn main(" in lowered or "cargo.toml" in lowered:
+        return "rust"
+    if "package main" in lowered and "func " in lowered:
+        return "go"
+    if "pragma solidity" in lowered:
+        return "solidity"
+    if "def " in text or "import " in text and "python" in lowered:
+        return "python"
+    if "#!/bin/bash" in lowered or "set -euo pipefail" in lowered:
+        return "bash"
+    return None
+
+
+def infer_data_type(text: str, labels: list[str]) -> str:
+    lowered = text.lower()
+    if "patch" in lowered or "diff --git" in lowered:
+        return "patch"
+    if "cve-" in lowered or "cwe-" in lowered or "vulnerability" in lowered:
+        return "security_reference"
+    if "tests" in labels:
+        return "test"
+    if "code" in labels:
+        return "code"
+    return "documentation"
+
+
+def quality_score(*, text: str, labels: list[str], reasons: list[str]) -> float:
+    if reasons:
+        return 0.0
+    score = 0.35
+    length = len(" ".join(text.split()))
+    if length >= 500:
+        score += 0.15
+    if length >= 2_000:
+        score += 0.10
+    if "code" in labels:
+        score += 0.15
+    if "tests" in labels:
+        score += 0.10
+    if "defensive_security" in labels:
+        score += 0.15
+    return min(score, 1.0)
 
 
 class DatasetQualityGate:
@@ -99,7 +176,18 @@ class DatasetQualityGate:
             labels.append("code")
         if any(token in lowered for token in ["test_", "pytest", "unittest", "assert "]):
             labels.append("tests")
-        return QualityDecision(accepted=not reasons, reasons=reasons, labels=labels, content_hash=digest)
+        language_hint = infer_language(text, str(row.get("url") or ""))
+        data_type = infer_data_type(text, labels)
+        score = quality_score(text=text, labels=labels, reasons=reasons)
+        return QualityDecision(
+            accepted=not reasons,
+            reasons=reasons,
+            labels=labels,
+            quality_score=score,
+            language_hint=language_hint,
+            data_type=data_type,
+            content_hash=digest,
+        )
 
     def filter_jsonl(self, input_path: str | Path, output_path: str | Path) -> QualityGateReport:
         seen: set[str] = set()

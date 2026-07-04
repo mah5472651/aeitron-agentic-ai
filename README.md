@@ -203,9 +203,13 @@ One command for `crawl -> clean -> shard -> train`:
 
 ```bash
 python -m src.mythos.learning.data_pipeline \
-  --sources config/data_sources.defensive.sample.json \
+  --sources config/data_sources.production.sample.json \
+  --dataset-id mythos-defensive-coding-corpus \
   --work-dir artifacts/mythos/data-pipeline \
-  --frontier-backend sqlite \
+  --frontier-backend postgres \
+  --postgres-dsn "$MYTHOS_DATABASE_URL" \
+  --object-store-uri s3://mythos-datasets/pretraining \
+  --object-store-endpoint-url "$S3_ENDPOINT_URL" \
   --max-docs 1000000 \
   --workers 64 \
   --max-depth 2 \
@@ -218,6 +222,22 @@ python -m src.mythos.learning.data_pipeline \
   --gradient-accumulation-steps 16 \
   --dtype bf16
 ```
+
+Distributed crawler workers:
+
+```bash
+docker compose -f deploy/prod/docker-compose.yml --profile data up --scale crawler-worker=8 crawler-worker
+```
+
+Pipeline outputs include:
+
+- contamination report
+- extracted task JSONL
+- tokenizer and token-shard manifest
+- dataset version manifest
+- append-only dataset ledger
+- local HTML dashboard at `artifacts/mythos/data-pipeline/dashboard.html`
+- optional S3/MinIO uploads
 
 The data engine is defensive and allowlist-first. It is for public documentation,
 licensed code, security guidance, benchmark corpora, and approved repository

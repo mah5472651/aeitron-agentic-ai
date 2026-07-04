@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from src.mythos.db import LocalStore
 from src.mythos.evaluation.benchmarks import BenchmarkHarness, built_in_security_tasks
 from src.mythos.identity import AuthError, auth_status, create_jwt, install_auth, install_quota, validate_token_issue_request
 from src.mythos.indexing import ContextBuilder, LocalVectorIndex, RepositoryIndexer
+from src.mythos.learning.versioning import DatasetLedger
 from src.mythos.model_ops.backends import active_model_health, list_model_profiles
 from src.mythos.model_ops.foundation import PretrainingRunSpec, foundation_status
 from src.mythos.observability import METRICS, install_observability
@@ -127,6 +129,19 @@ async def run_security_static_benchmark() -> dict[str, object]:
 @app.get("/v1/model/foundation/status")
 async def model_foundation_status() -> dict[str, object]:
     return foundation_status()
+
+
+@app.get("/v1/data/platform/status")
+async def data_platform_status() -> dict[str, object]:
+    root = Path(os.environ.get("MYTHOS_DATA_PIPELINE_DIR", "artifacts/mythos/data-pipeline"))
+    latest = DatasetLedger(root / "versions" / "ledger.jsonl").latest()
+    dashboard = root / "dashboard.html"
+    return {
+        "status": "ready" if latest else "no_dataset_versions",
+        "pipeline_dir": str(root),
+        "latest_version": latest.model_dump() if latest else None,
+        "dashboard_path": str(dashboard) if dashboard.exists() else None,
+    }
 
 
 @app.post("/v1/model/foundation/pretraining/readiness")

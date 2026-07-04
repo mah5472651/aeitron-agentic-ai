@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mythos-data-worker
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: mythos-data-worker
+  template:
+    metadata:
+      labels:
+        app: mythos-data-worker
+    spec:
+      containers:
+        - name: crawler
+          image: mythos-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "src.mythos.learning.worker"]
+          env:
+            - name: MYTHOS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mythos-secrets
+                  key: database-url
+            - name: MYTHOS_DATA_SOURCES
+              value: config/data_sources.production.sample.json
+            - name: MYTHOS_RAW_OUTPUT_DIR
+              value: /data/raw
+            - name: MYTHOS_CLEAN_OUTPUT_DIR
+              value: /data/clean
+            - name: MYTHOS_ASYNC_WORKERS
+              value: "32"
+            - name: MYTHOS_BATCH_DOCS
+              value: "10000"
+            - name: MYTHOS_WORKER_LOOPS
+              value: "100"
+          volumeMounts:
+            - name: data-artifacts
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+      volumes:
+        - name: data-artifacts
+          persistentVolumeClaim:
+            claimName: mythos-data-artifacts
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mythos-data-artifacts
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 1Ti

@@ -56,7 +56,11 @@ No legacy numbered modules are part of the final architecture.
 - Validate tokenizer/data/checkpoint readiness before any scratch training run.
 - Ingest allowlisted defensive internet data with robots/rate-limit/license metadata.
 - Run persistent million-scale defensive data collection with SQLite/Postgres frontier resume, retries, per-domain throttling, URL discovery, provenance, content-hash deduplication, and raw/clean JSONL shards.
-- Apply quality gates: deduplication, license policy, PII/secret rejection, defensive/security labels.
+- Apply quality gates: deduplication, license policy, PII/secret rejection, defensive/security labels, quality scoring, language hints, and data-type classification.
+- Block benchmark contamination before training shard creation.
+- Extract agentic coding/security task candidates from clean shards.
+- Store dataset artifacts in local object storage or S3/MinIO.
+- Create versioned dataset manifests, an append-only ledger, and a data-platform dashboard.
 - Train BPE tokenizer and build train/validation token shards.
 - Stream token shards into checkpoint-resumable scratch pretraining with gradient accumulation, mixed precision, loss logs, validation loss, and checkpoint resume.
 - Run a real PyTorch scratch-decoder GPU smoke test with synthetic tokens.
@@ -114,6 +118,7 @@ python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
 - `GET /v1/model/profiles`
 - `POST /v1/evaluation/security-static`
 - `GET /v1/model/foundation/status`
+- `GET /v1/data/platform/status`
 - `POST /v1/model/foundation/pretraining/readiness`
 - `POST /v1/projects`
 - `GET /v1/projects/{project_id}`
@@ -168,7 +173,8 @@ Defensive web corpus pipeline:
 python -m src.mythos.learning.web_ingest --sources config/data_sources.defensive.sample.json --output data/training/raw_web.jsonl --max-docs 1000 --delay-seconds 1.0
 python -m src.mythos.learning.data_engine --sources config/data_sources.defensive.sample.json --frontier artifacts/mythos/data-engine/frontier.sqlite3 --raw-output-dir artifacts/mythos/data-engine/raw --clean-output-dir artifacts/mythos/data-engine/clean --max-docs 1000000 --workers 64 --max-depth 2 --delay-seconds 1.0 --shard-rows 10000
 python -m src.mythos.learning.data_engine --sources config/data_sources.defensive.sample.json --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --raw-output-dir artifacts/mythos/data-engine/raw --clean-output-dir artifacts/mythos/data-engine/clean --max-docs 1000000 --workers 64
-python -m src.mythos.learning.data_pipeline --sources config/data_sources.defensive.sample.json --work-dir artifacts/mythos/data-pipeline --frontier-backend sqlite --max-docs 1000000 --workers 64 --max-depth 2 --vocab-size 64000 --sequence-length 2048 --shard-token-count 1000000 --train-device cuda --train-steps 10000 --train-batch-size 2 --gradient-accumulation-steps 16 --dtype bf16
+python -m src.mythos.learning.data_pipeline --sources config/data_sources.production.sample.json --dataset-id mythos-defensive-coding-corpus --work-dir artifacts/mythos/data-pipeline --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --object-store-uri s3://mythos-datasets/pretraining --object-store-endpoint-url "$S3_ENDPOINT_URL" --max-docs 1000000 --workers 64 --max-depth 2 --vocab-size 64000 --sequence-length 2048 --shard-token-count 1000000 --train-device cuda --train-steps 10000 --train-batch-size 2 --gradient-accumulation-steps 16 --dtype bf16
+docker compose -f deploy/prod/docker-compose.yml --profile data up --scale crawler-worker=8 crawler-worker
 python - <<'PY'
 from src.mythos.learning.quality import DatasetQualityGate
 print(DatasetQualityGate().filter_jsonl("data/training/raw_web.jsonl", "data/training/clean.jsonl"))
@@ -179,7 +185,9 @@ The persistent data engine is the production path for large runs. It should be
 fed only allowlisted public sources, approved mirrors, licensed repositories,
 defensive security references, and benchmark corpora. For multi-process or
 multi-machine crawls, use the Postgres frontier so URL claims are coordinated
-with row locks. It does not run exploits or collect unauthorized targets.
+with row locks. For billion-scale collection, write artifacts to S3/MinIO and
+track every release through the dataset ledger. It does not run exploits or
+collect unauthorized targets.
 
 ## Production Operations
 

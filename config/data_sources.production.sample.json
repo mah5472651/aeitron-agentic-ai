@@ -1,0 +1,81 @@
+{
+  "sources": [
+    {
+      "name": "owasp-cheat-sheet-series",
+      "urls": [
+        "https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "allowed_domains": ["cheatsheetseries.owasp.org"],
+      "license": "cc-by-4.0",
+      "category": "defensive_security"
+    },
+    {
+      "name": "mitre-cwe",
+      "urls": [
+        "https://cwe.mitre.org/data/definitions/20.html",
+        "https://cwe.mitre.org/data/definitions/79.html",
+        "https://cwe.mitre.org/data/definitions/89.html",
+        "https://cwe.mitre.org/data/definitions/120.html",
+        "https://cwe.mitre.org/data/definitions/787.html"
+      ],
+      "allowed_domains": ["cwe.mitre.org"],
+      "license": "unknown-ok",
+      "category": "defensive_security"
+    },
+    {
+      "name": "nist-secure-software-development-framework",
+      "urls": [
+        "https://csrc.nist.gov/Projects/ssdf"
+      ],
+      "allowed_domains": ["csrc.nist.gov"],
+      "license": "public-domain",
+      "category": "defensive_security"
+    },
+    {
+      "name": "python-documentation",
+      "urls": [
+        "https://docs.python.org/3/tutorial/",
+        "https://docs.python.org/3/library/ast.html",
+        "https://docs.python.org/3/library/asyncio.html",
+        "https://docs.python.org/3/library/unittest.html"
+      ],
+      "allowed_domains": ["docs.python.org"],
+      "license": "psf-2.0",
+      "category": "agentic_coding"
+    },
+    {
+      "name": "rust-book",
+      "urls": [
+        "https://doc.rust-lang.org/book/",
+        "https://doc.rust-lang.org/cargo/"
+      ],
+      "allowed_domains": ["doc.rust-lang.org"],
+      "license": "apache-2.0",
+      "category": "agentic_coding"
+    },
+    {
+      "name": "go-documentation",
+      "urls": [
+        "https://go.dev/doc/",
+        "https://go.dev/doc/effective_go"
+      ],
+      "allowed_domains": ["go.dev"],
+      "license": "bsd-3-clause",
+      "category": "agentic_coding"
+    },
+    {
+      "name": "git-documentation",
+      "urls": [
+        "https://git-scm.com/docs",
+        "https://git-scm.com/book/en/v2"
+      ],
+      "allowed_domains": ["git-scm.com"],
+      "license": "cc-by-4.0",
+      "category": "agentic_coding"
+    }
+  ]
+}

@@ -11,6 +11,7 @@ from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, Fronti
 from src.mythos.learning.data_pipeline import DataPipelineConfig, run_data_pipeline
 from src.mythos.learning.source_registry import SourceRegistry
 from src.mythos.learning.web_ingest import SourceSpec
+from src.mythos.learning.contamination import ContaminationDetector
 
 
 def _page(title: str, link: str | None = None) -> str:
@@ -142,6 +143,7 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
                 train_device="cpu",
                 train_batch_size=1,
                 dtype="fp32",
+                object_store_uri=f"local://{root / 'object-store'}",
             )
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://example.org") as client:
                 report = await run_data_pipeline(config, client=client)
@@ -151,8 +153,27 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(report.clean_files)
             self.assertTrue(Path(report.tokenizer_path).exists())
             self.assertTrue(report.shard_manifest["train_shards"])
+            self.assertIsNotNone(report.task_report)
+            self.assertGreater(report.task_report["extracted"], 0)
+            self.assertIsNotNone(report.contamination_report)
+            self.assertFalse(report.contamination_report["blocked"])
+            self.assertTrue(Path(report.version_manifest_path).exists())
+            self.assertTrue(Path(report.dashboard_path).exists())
+            self.assertTrue(report.uploaded_objects)
             self.assertIsNotNone(report.training)
             self.assertEqual(report.training["status"], "passed")
+
+    def test_contamination_detector_blocks_known_benchmark_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clean = root / "clean.jsonl"
+            clean.write_text(
+                json.dumps({"text": "HumanEval check(candidate) leaked benchmark prompt", "license": "mit"}) + "\n",
+                encoding="utf-8",
+            )
+            report = ContaminationDetector().scan_jsonl([clean])
+            self.assertTrue(report.blocked)
+            self.assertEqual(len(report.hits), 1)
 
 
 if __name__ == "__main__":

@@ -11,8 +11,13 @@ from typing import Any
 import httpx
 from pydantic import Field
 
+from src.mythos.learning.contamination import ContaminationDetector, load_patterns
 from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore, PostgresFrontierStore
+from src.mythos.learning.dashboard import write_dashboard
 from src.mythos.learning.source_registry import SourceRegistry, SourceRegistryReport
+from src.mythos.learning.storage import ObjectStoreConfig, create_object_store, upload_paths
+from src.mythos.learning.task_extraction import TaskExtractionReport, extract_tasks
+from src.mythos.learning.versioning import DatasetArtifact, DatasetLedger, DatasetVersionManifest, artifact_from_path, build_version_id
 from src.mythos.model_ops.pretrain_loop import run_pretraining_loop
 from src.mythos.model_ops.tokenizer_pipeline import (
     ShardBuildConfig,
@@ -26,6 +31,7 @@ from src.mythos.shared.schemas import StrictModel
 
 class DataPipelineConfig(StrictModel):
     sources_path: str
+    dataset_id: str = "mythos-defensive-coding-corpus"
     work_dir: str = "artifacts/mythos/data-pipeline"
     frontier_backend: str = "sqlite"
     postgres_dsn: str | None = None
@@ -46,16 +52,30 @@ class DataPipelineConfig(StrictModel):
     train_batch_size: int = Field(default=2, ge=1)
     gradient_accumulation_steps: int = Field(default=1, ge=1)
     dtype: str = "bf16"
+    contamination_patterns_path: str | None = None
+    block_contamination: bool = True
+    extract_tasks: bool = True
+    max_extracted_tasks: int = Field(default=50_000, ge=1)
+    object_store_uri: str = "local://artifacts/mythos/object-store"
+    object_store_endpoint_url: str | None = None
+    upload_artifacts: bool = True
 
 
 class DataPipelineReport(StrictModel):
     status: str
+    dataset_id: str
+    version_id: str
     work_dir: str
     source_registry: SourceRegistryReport
     crawl: dict[str, Any]
+    contamination_report: dict[str, Any] | None
+    task_report: dict[str, Any] | None
     clean_files: list[str]
     tokenizer_path: str
     shard_manifest: dict[str, Any]
+    version_manifest_path: str
+    dashboard_path: str
+    uploaded_objects: list[dict[str, Any]]
     training: dict[str, Any] | None = None
 
 
@@ -76,6 +96,8 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
     tokenizer_path = root / "tokenizer" / "tokenizer.json"
     shards_dir = root / "shards"
     train_dir = root / "train"
+    tasks_path = root / "tasks" / "tasks.jsonl"
+    reports_dir = root / "reports"
     root.mkdir(parents=True, exist_ok=True)
 
     registry = SourceRegistry.from_file(config.sources_path)
@@ -104,6 +126,20 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
     if not clean_files:
         raise RuntimeError("crawler produced zero clean shards; check sources, quality gate, robots policy, and allowlist")
 
+    contamination_report = ContaminationDetector(load_patterns(config.contamination_patterns_path)).scan_jsonl(
+        clean_files,
+        block_on_hit=config.block_contamination,
+    )
+    contamination_path = reports_dir / "contamination_report.json"
+    contamination_path.parent.mkdir(parents=True, exist_ok=True)
+    contamination_path.write_text(json.dumps(contamination_report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
+    if contamination_report.blocked:
+        raise RuntimeError(f"contamination detector blocked dataset: {len(contamination_report.hits)} hits")
+
+    task_report: TaskExtractionReport | None = None
+    if config.extract_tasks:
+        task_report = extract_tasks(clean_files, tasks_path, max_tasks=config.max_extracted_tasks)
+
     trained_tokenizer = train_bpe_tokenizer(
         clean_files,
         tokenizer_path,
@@ -118,7 +154,7 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
             sequence_length=config.sequence_length,
             validation_fraction=config.validation_fraction,
         ),
-        dataset_id="mythos-defensive-coding-corpus",
+        dataset_id=config.dataset_id,
     )
     training_report = None
     if not config.skip_train:
@@ -136,21 +172,71 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
             resume=True,
         )
 
-    return DataPipelineReport(
+    artifacts: list[DatasetArtifact] = []
+    for path in clean_files:
+        artifacts.append(artifact_from_path(path, role="clean_jsonl"))
+    artifacts.append(artifact_from_path(trained_tokenizer, role="tokenizer"))
+    artifacts.append(artifact_from_path(shards_dir / "manifest.json", role="shard_manifest"))
+    artifacts.append(artifact_from_path(contamination_path, role="contamination_report"))
+    if task_report is not None:
+        artifacts.append(artifact_from_path(tasks_path, role="extracted_tasks"))
+    for shard_path in manifest.train_shards + manifest.val_shards:
+        artifacts.append(artifact_from_path(shard_path, role="token_shard"))
+    version_id = build_version_id(config.dataset_id, [artifact.sha256 for artifact in artifacts])
+    uploaded_objects = []
+    store = None
+    if config.upload_artifacts:
+        store = create_object_store(ObjectStoreConfig(uri=config.object_store_uri, endpoint_url=config.object_store_endpoint_url))
+        upload_prefix = f"{config.dataset_id}/{version_id}"
+        upload_candidates = clean_files + [str(trained_tokenizer), str(shards_dir / "manifest.json"), str(contamination_path)]
+        if task_report is not None:
+            upload_candidates.append(str(tasks_path))
+        upload_candidates.extend(manifest.train_shards + manifest.val_shards)
+        uploaded_objects = upload_paths(store, upload_candidates, prefix=upload_prefix)
+    version_manifest = DatasetVersionManifest(
+        dataset_id=config.dataset_id,
+        version_id=version_id,
+        source_registry=registry_report.model_dump(),
+        crawl_report=crawl_report.model_dump(),
+        contamination_report=contamination_report.model_dump(),
+        task_report=task_report.model_dump() if task_report else None,
+        tokenizer_path=str(trained_tokenizer),
+        shard_manifest=manifest.model_dump(),
+        artifacts=artifacts,
+        uploaded_objects=uploaded_objects,
+    )
+    manifest_path = version_manifest.write(root / "versions" / f"{version_id}.json")
+    DatasetLedger(root / "versions" / "ledger.jsonl").append(version_manifest)
+    if store is not None:
+        uploaded_objects.append(store.put_file(manifest_path, key=f"{config.dataset_id}/{version_id}/version_manifest.json"))
+
+    report_payload = DataPipelineReport(
         status="complete",
+        dataset_id=config.dataset_id,
+        version_id=version_id,
         work_dir=str(root),
         source_registry=registry_report,
         crawl=crawl_report.model_dump(),
+        contamination_report=contamination_report.model_dump(),
+        task_report=task_report.model_dump() if task_report else None,
         clean_files=clean_files,
         tokenizer_path=str(trained_tokenizer),
         shard_manifest=manifest.model_dump(),
+        version_manifest_path=str(manifest_path),
+        dashboard_path=str(root / "dashboard.html"),
+        uploaded_objects=[item.model_dump() for item in uploaded_objects],
         training=training_report,
     )
+    report_path = reports_dir / "pipeline_report.json"
+    report_path.write_text(json.dumps(report_payload.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
+    write_dashboard(report_payload.model_dump(), root / "dashboard.html")
+    return report_payload
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Mythos crawl -> clean -> shard -> train pipeline.")
     parser.add_argument("--sources", required=True)
+    parser.add_argument("--dataset-id", default="mythos-defensive-coding-corpus")
     parser.add_argument("--work-dir", default="artifacts/mythos/data-pipeline")
     parser.add_argument("--frontier-backend", choices=["sqlite", "postgres"], default="sqlite")
     parser.add_argument("--postgres-dsn")
@@ -171,12 +257,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--contamination-patterns")
+    parser.add_argument("--allow-contamination-hits", action="store_true")
+    parser.add_argument("--no-task-extraction", action="store_true")
+    parser.add_argument("--max-extracted-tasks", type=int, default=50_000)
+    parser.add_argument("--object-store-uri", default="local://artifacts/mythos/object-store")
+    parser.add_argument("--object-store-endpoint-url")
+    parser.add_argument("--no-upload", action="store_true")
     return parser.parse_args()
 
 
 def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
     return DataPipelineConfig(
         sources_path=args.sources,
+        dataset_id=args.dataset_id,
         work_dir=args.work_dir,
         frontier_backend=args.frontier_backend,
         postgres_dsn=args.postgres_dsn,
@@ -197,6 +291,13 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         dtype=args.dtype,
+        contamination_patterns_path=args.contamination_patterns,
+        block_contamination=not args.allow_contamination_hits,
+        extract_tasks=not args.no_task_extraction,
+        max_extracted_tasks=args.max_extracted_tasks,
+        object_store_uri=args.object_store_uri,
+        object_store_endpoint_url=args.object_store_endpoint_url,
+        upload_artifacts=not args.no_upload,
     )
 
 
