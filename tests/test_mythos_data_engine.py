@@ -11,7 +11,9 @@ from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, Fronti
 from src.mythos.learning.data_pipeline import DataPipelineConfig, run_data_pipeline
 from src.mythos.learning.production_check import DataPlatformReadinessConfig, run_readiness_check
 from src.mythos.learning.quality_inspector import inspect_clean_jsonl
+from src.mythos.learning.review import review_tasks
 from src.mythos.learning.run_plan import DataRunPlanConfig, build_data_run_plan
+from src.mythos.learning.feedback import build_feedback_report
 from src.mythos.learning.source_registry import SourceRegistry
 from src.mythos.learning.web_ingest import SourceSpec
 from src.mythos.learning.contamination import ContaminationDetector
@@ -162,6 +164,10 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(report.contamination_report["blocked"])
             self.assertIsNotNone(report.quality_report)
             self.assertGreater(report.quality_report["avg_quality_score"], 0.0)
+            self.assertIsNotNone(report.source_quality_report)
+            self.assertIsNotNone(report.review_report)
+            self.assertGreaterEqual(report.review_report["approved"], 1)
+            self.assertIsNotNone(report.feedback_report)
             self.assertTrue(Path(report.version_manifest_path).exists())
             self.assertTrue(Path(report.dashboard_path).exists())
             self.assertTrue(report.uploaded_objects)
@@ -250,6 +256,33 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(plan.status, "ready")
             self.assertTrue(Path(plan.merged_registry_path).exists())
             self.assertTrue(Path(plan.output_dir, "run_plan.json").exists())
+
+    def test_task_review_and_feedback_loop_reports_promotion_or_blockers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tasks = root / "tasks.jsonl"
+            tasks.write_text(
+                json.dumps(
+                    {
+                        "task_id": "task-1",
+                        "task_type": "security_patch_generation",
+                        "prompt": "Using approved defensive source context, write a safe secure patch for authentication validation. " * 3,
+                        "source_url": "https://example.org/secure",
+                        "language": "python",
+                        "metadata": {"source": "example"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            review = review_tasks(tasks, root / "decisions.jsonl", root / "approved.jsonl")
+            self.assertEqual(review.approved, 1)
+            quality = root / "quality.json"
+            quality.write_text(json.dumps({"avg_quality_score": 0.8}), encoding="utf-8")
+            review_json = root / "review.json"
+            review_json.write_text(json.dumps(review.model_dump()), encoding="utf-8")
+            feedback = build_feedback_report(quality_report_path=quality, review_report_path=review_json)
+            self.assertEqual(feedback.recommendations[0].kind, "promotion")
 
 
 if __name__ == "__main__":

@@ -282,12 +282,30 @@ Pipeline outputs include:
 
 - contamination report
 - quality inspection report
+- source quality report
 - extracted task JSONL
+- automated review decisions
+- approved task JSONL
+- benchmark/data feedback report
 - tokenizer and token-shard manifest
 - dataset version manifest
 - append-only dataset ledger
 - local HTML dashboard at `artifacts/mythos/data-pipeline/dashboard.html`
 - optional S3/MinIO uploads
+
+Manual/automated review and feedback:
+
+```bash
+python -m src.mythos.learning.review \
+  --input artifacts/mythos/data-pipeline/tasks/tasks.jsonl \
+  --decisions-out artifacts/mythos/data-pipeline/reports/task_review_decisions.jsonl \
+  --approved-out artifacts/mythos/data-pipeline/tasks/approved_tasks.jsonl
+
+python -m src.mythos.learning.feedback \
+  --output artifacts/mythos/data-pipeline/reports/feedback_report.json \
+  --quality-report artifacts/mythos/data-pipeline/reports/quality_report.json \
+  --review-report artifacts/mythos/data-pipeline/reports/task_review_report.json
+```
 
 The data engine is defensive and allowlist-first. It is for public documentation,
 licensed code, security guidance, benchmark corpora, and approved repository

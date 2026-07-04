@@ -14,7 +14,10 @@ def render_dashboard(report: dict[str, Any]) -> str:
     source = report.get("source_registry", {})
     contamination = report.get("contamination_report") or {}
     quality = report.get("quality_report") or {}
+    source_quality = report.get("source_quality_report") or {}
     tasks = report.get("task_report") or {}
+    review = report.get("review_report") or {}
+    feedback = report.get("feedback_report") or {}
     uploaded = report.get("uploaded_objects") or []
     rows = [
         ("Status", report.get("status", "unknown")),
@@ -28,7 +31,10 @@ def render_dashboard(report: dict[str, Any]) -> str:
         ("Duplicates", crawl.get("duplicate", 0)),
         ("Contamination Hits", len(contamination.get("hits", []))),
         ("Avg Quality Score", quality.get("avg_quality_score", 0)),
+        ("Sources Scored", len(source_quality.get("sources", []))),
         ("Extracted Tasks", tasks.get("extracted", 0)),
+        ("Approved Tasks", review.get("approved", 0)),
+        ("Feedback Items", len(feedback.get("recommendations", []))),
         ("Uploaded Objects", len(uploaded)),
     ]
     table = "\n".join(f"<tr><th>{html.escape(str(k))}</th><td>{html.escape(str(v))}</td></tr>" for k, v in rows)

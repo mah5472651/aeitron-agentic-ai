@@ -28,7 +28,10 @@ class DatasetVersionManifest(StrictModel):
     crawl_report: dict[str, Any]
     contamination_report: dict[str, Any] | None = None
     quality_report: dict[str, Any] | None = None
+    source_quality_report: dict[str, Any] | None = None
     task_report: dict[str, Any] | None = None
+    review_report: dict[str, Any] | None = None
+    feedback_report: dict[str, Any] | None = None
     tokenizer_path: str
     shard_manifest: dict[str, Any]
     artifacts: list[DatasetArtifact]
