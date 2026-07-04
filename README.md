@@ -160,7 +160,7 @@ Output:
 
 ## Defensive Data Pipeline
 
-Allowlisted internet ingestion:
+Allowlisted one-shot ingestion:
 
 ```bash
 python -m src.mythos.learning.web_ingest \
@@ -169,6 +169,26 @@ python -m src.mythos.learning.web_ingest \
   --max-docs 1000 \
   --delay-seconds 1.0
 ```
+
+Persistent million-scale ingestion with resume/retry, URL discovery, provenance,
+content deduplication, per-domain throttling, and clean JSONL sharding:
+
+```bash
+python -m src.mythos.learning.data_engine \
+  --sources config/data_sources.defensive.sample.json \
+  --frontier artifacts/mythos/data-engine/frontier.sqlite3 \
+  --raw-output-dir artifacts/mythos/data-engine/raw \
+  --clean-output-dir artifacts/mythos/data-engine/clean \
+  --max-docs 1000000 \
+  --workers 64 \
+  --max-depth 2 \
+  --delay-seconds 1.0 \
+  --shard-rows 10000
+```
+
+The data engine is defensive and allowlist-first. It is for public documentation,
+licensed code, security guidance, benchmark corpora, and approved repository
+mirrors; it does not perform exploit execution or unauthorized collection.
 
 Quality gate:
 
