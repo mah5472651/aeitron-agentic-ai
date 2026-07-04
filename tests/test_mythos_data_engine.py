@@ -10,6 +10,8 @@ import httpx
 from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore
 from src.mythos.learning.data_pipeline import DataPipelineConfig, run_data_pipeline
 from src.mythos.learning.production_check import DataPlatformReadinessConfig, run_readiness_check
+from src.mythos.learning.quality_inspector import inspect_clean_jsonl
+from src.mythos.learning.run_plan import DataRunPlanConfig, build_data_run_plan
 from src.mythos.learning.source_registry import SourceRegistry
 from src.mythos.learning.web_ingest import SourceSpec
 from src.mythos.learning.contamination import ContaminationDetector
@@ -158,6 +160,8 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(report.task_report["extracted"], 0)
             self.assertIsNotNone(report.contamination_report)
             self.assertFalse(report.contamination_report["blocked"])
+            self.assertIsNotNone(report.quality_report)
+            self.assertGreater(report.quality_report["avg_quality_score"], 0.0)
             self.assertTrue(Path(report.version_manifest_path).exists())
             self.assertTrue(Path(report.dashboard_path).exists())
             self.assertTrue(report.uploaded_objects)
@@ -205,6 +209,47 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(report.status, "pass")
+
+    def test_quality_inspector_and_run_plan_prepare_first_serious_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clean = root / "clean.jsonl"
+            clean.write_text(
+                json.dumps(
+                    {
+                        "source": "offline",
+                        "license": "mit",
+                        "text": "def secure_patch(): pass",
+                        "quality": {
+                            "quality_score": 0.8,
+                            "labels": ["code", "defensive_security"],
+                            "language_hint": "python",
+                            "data_type": "code",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            quality = inspect_clean_jsonl([clean])
+            self.assertEqual(quality.rows, 1)
+            self.assertEqual(quality.by_language["python"], 1)
+
+            plan = build_data_run_plan(
+                DataRunPlanConfig(
+                    source_paths=["config/data_sources.production.sample.json"],
+                    output_dir=str(root / "plan"),
+                    target_documents=1000,
+                    target_days=1,
+                    postgres_dsn="postgresql://user:pass@postgres:5432/mythos",
+                    object_store_uri="s3://mythos-datasets/pretraining",
+                    worker_replicas=4,
+                    async_workers=32,
+                )
+            )
+            self.assertEqual(plan.status, "ready")
+            self.assertTrue(Path(plan.merged_registry_path).exists())
+            self.assertTrue(Path(plan.output_dir, "run_plan.json").exists())
 
 
 if __name__ == "__main__":

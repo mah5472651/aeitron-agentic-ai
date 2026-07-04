@@ -49,6 +49,13 @@ class SourceRegistry:
     def from_file(cls, path: str | Path) -> "SourceRegistry":
         return cls(load_sources(path))
 
+    @classmethod
+    def from_files(cls, paths: list[str | Path]) -> "SourceRegistry":
+        sources: list[SourceSpec] = []
+        for path in paths:
+            sources.extend(load_sources(path))
+        return cls(sources)
+
     def validate(self) -> SourceRegistryReport:
         warnings: list[str] = []
         seen_urls: set[str] = set()
@@ -86,14 +93,25 @@ class SourceRegistry:
     def to_sources(self) -> list[SourceSpec]:
         return self.sources
 
+    def write(self, path: str | Path) -> Path:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"sources": [source.model_dump() for source in self.sources]}
+        target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return target
+
 
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Validate a Mythos defensive data source registry.")
-    parser.add_argument("--sources", required=True)
+    parser = argparse.ArgumentParser(description="Validate or merge Mythos defensive data source registries.")
+    parser.add_argument("--sources", nargs="+", required=True)
+    parser.add_argument("--output")
     args = parser.parse_args()
-    report = SourceRegistry.from_file(args.sources).validate()
+    registry = SourceRegistry.from_files(args.sources)
+    report = registry.validate()
+    if args.output:
+        registry.write(args.output)
     print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
 
 

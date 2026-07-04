@@ -242,6 +242,20 @@ python -m src.mythos.learning.production_check \
   --async-workers 64
 ```
 
+Prepare the first serious 100k-1M data run:
+
+```bash
+python -m src.mythos.learning.run_plan \
+  --sources config/data_sources.production.sample.json \
+  --output-dir artifacts/mythos/data-runs/first-serious-run \
+  --target-documents 1000000 \
+  --target-days 7 \
+  --postgres-dsn "$MYTHOS_DATABASE_URL" \
+  --object-store-uri s3://mythos-datasets/pretraining \
+  --worker-replicas 8 \
+  --async-workers 64
+```
+
 Cluster capacity planning:
 
 ```bash
@@ -267,6 +281,7 @@ kubectl apply -f deploy/k8s/data-pipeline-job.yaml
 Pipeline outputs include:
 
 - contamination report
+- quality inspection report
 - extracted task JSONL
 - tokenizer and token-shard manifest
 - dataset version manifest

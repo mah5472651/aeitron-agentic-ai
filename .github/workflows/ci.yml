@@ -33,5 +33,14 @@ jobs:
             --worker-replicas 4 \
             --async-workers 32
           python -m src.mythos.learning.capacity --target-documents 1000000 --worker-replicas 4 --async-workers-per-replica 16
+          python -m src.mythos.learning.run_plan \
+            --sources config/data_sources.production.sample.json \
+            --output-dir artifacts/mythos/ci-data-run \
+            --target-documents 1000 \
+            --target-days 1 \
+            --postgres-dsn postgresql://user:pass@postgres:5432/mythos \
+            --object-store-uri s3://mythos-datasets/pretraining \
+            --worker-replicas 4 \
+            --async-workers 32
       - name: Scratch CPU smoke
         run: python -m src.mythos.model_ops.gpu_smoke --device cpu --steps 1 --sequence-length 16 --batch-size 1 --dtype fp32

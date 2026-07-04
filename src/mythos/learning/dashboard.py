@@ -13,6 +13,7 @@ def render_dashboard(report: dict[str, Any]) -> str:
     crawl = report.get("crawl", {})
     source = report.get("source_registry", {})
     contamination = report.get("contamination_report") or {}
+    quality = report.get("quality_report") or {}
     tasks = report.get("task_report") or {}
     uploaded = report.get("uploaded_objects") or []
     rows = [
@@ -26,6 +27,7 @@ def render_dashboard(report: dict[str, Any]) -> str:
         ("Rejected", crawl.get("rejected", 0)),
         ("Duplicates", crawl.get("duplicate", 0)),
         ("Contamination Hits", len(contamination.get("hits", []))),
+        ("Avg Quality Score", quality.get("avg_quality_score", 0)),
         ("Extracted Tasks", tasks.get("extracted", 0)),
         ("Uploaded Objects", len(uploaded)),
     ]

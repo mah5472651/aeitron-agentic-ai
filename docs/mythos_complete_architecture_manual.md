@@ -63,6 +63,8 @@ No legacy numbered modules are part of the final architecture.
 - Create versioned dataset manifests, an append-only ledger, and a data-platform dashboard.
 - Run a production readiness gate that blocks local-only frontier/storage settings before large data jobs.
 - Plan billion-scale worker/storage/bandwidth needs with the capacity planner.
+- Prepare a first serious run manifest that merges source registries, verifies readiness, estimates capacity, and writes executable commands.
+- Inspect clean dataset shards by label, language, source, license, data type, and quality score.
 - Deploy Postgres, Redis, MinIO, worker autoscaling, network policy, and batch data-pipeline jobs on Kubernetes.
 - Train BPE tokenizer and build train/validation token shards.
 - Stream token shards into checkpoint-resumable scratch pretraining with gradient accumulation, mixed precision, loss logs, validation loss, and checkpoint resume.
@@ -178,6 +180,7 @@ python -m src.mythos.learning.data_engine --sources config/data_sources.defensiv
 python -m src.mythos.learning.data_engine --sources config/data_sources.defensive.sample.json --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --raw-output-dir artifacts/mythos/data-engine/raw --clean-output-dir artifacts/mythos/data-engine/clean --max-docs 1000000 --workers 64
 python -m src.mythos.learning.data_pipeline --sources config/data_sources.production.sample.json --dataset-id mythos-defensive-coding-corpus --work-dir artifacts/mythos/data-pipeline --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --object-store-uri s3://mythos-datasets/pretraining --object-store-endpoint-url "$S3_ENDPOINT_URL" --max-docs 1000000 --workers 64 --max-depth 2 --vocab-size 64000 --sequence-length 2048 --shard-token-count 1000000 --train-device cuda --train-steps 10000 --train-batch-size 2 --gradient-accumulation-steps 16 --dtype bf16
 python -m src.mythos.learning.production_check --sources config/data_sources.production.sample.json --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --object-store-uri s3://mythos-datasets/pretraining --production --worker-replicas 8 --async-workers 64
+python -m src.mythos.learning.run_plan --sources config/data_sources.production.sample.json --output-dir artifacts/mythos/data-runs/first-serious-run --target-documents 1000000 --target-days 7 --postgres-dsn "$MYTHOS_DATABASE_URL" --object-store-uri s3://mythos-datasets/pretraining --worker-replicas 8 --async-workers 64
 python -m src.mythos.learning.capacity --target-documents 1000000000 --target-days 30 --worker-replicas 32 --async-workers-per-replica 32
 docker compose -f deploy/prod/docker-compose.yml --profile data up --scale crawler-worker=8 crawler-worker
 kubectl apply -f deploy/k8s/secrets.example.yaml -f deploy/k8s/postgres-redis.yaml -f deploy/k8s/minio.yaml -f deploy/k8s/data-worker.yaml -f deploy/k8s/data-worker-hpa.yaml -f deploy/k8s/data-network-policy.yaml -f deploy/k8s/data-pipeline-job.yaml

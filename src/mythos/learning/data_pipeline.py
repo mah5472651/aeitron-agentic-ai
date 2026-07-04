@@ -14,6 +14,7 @@ from pydantic import Field
 from src.mythos.learning.contamination import ContaminationDetector, load_patterns
 from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore, PostgresFrontierStore
 from src.mythos.learning.dashboard import write_dashboard
+from src.mythos.learning.quality_inspector import QualityInspectionReport, write_quality_report
 from src.mythos.learning.source_registry import SourceRegistry, SourceRegistryReport
 from src.mythos.learning.storage import ObjectStoreConfig, create_object_store, upload_paths
 from src.mythos.learning.task_extraction import TaskExtractionReport, extract_tasks
@@ -69,6 +70,7 @@ class DataPipelineReport(StrictModel):
     source_registry: SourceRegistryReport
     crawl: dict[str, Any]
     contamination_report: dict[str, Any] | None
+    quality_report: dict[str, Any] | None
     task_report: dict[str, Any] | None
     clean_files: list[str]
     tokenizer_path: str
@@ -136,6 +138,9 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
     if contamination_report.blocked:
         raise RuntimeError(f"contamination detector blocked dataset: {len(contamination_report.hits)} hits")
 
+    quality_report_path = reports_dir / "quality_report.json"
+    quality_report: QualityInspectionReport = write_quality_report(clean_files, quality_report_path)
+
     task_report: TaskExtractionReport | None = None
     if config.extract_tasks:
         task_report = extract_tasks(clean_files, tasks_path, max_tasks=config.max_extracted_tasks)
@@ -178,6 +183,7 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
     artifacts.append(artifact_from_path(trained_tokenizer, role="tokenizer"))
     artifacts.append(artifact_from_path(shards_dir / "manifest.json", role="shard_manifest"))
     artifacts.append(artifact_from_path(contamination_path, role="contamination_report"))
+    artifacts.append(artifact_from_path(quality_report_path, role="quality_report"))
     if task_report is not None:
         artifacts.append(artifact_from_path(tasks_path, role="extracted_tasks"))
     for shard_path in manifest.train_shards + manifest.val_shards:
@@ -188,7 +194,7 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
     if config.upload_artifacts:
         store = create_object_store(ObjectStoreConfig(uri=config.object_store_uri, endpoint_url=config.object_store_endpoint_url))
         upload_prefix = f"{config.dataset_id}/{version_id}"
-        upload_candidates = clean_files + [str(trained_tokenizer), str(shards_dir / "manifest.json"), str(contamination_path)]
+        upload_candidates = clean_files + [str(trained_tokenizer), str(shards_dir / "manifest.json"), str(contamination_path), str(quality_report_path)]
         if task_report is not None:
             upload_candidates.append(str(tasks_path))
         upload_candidates.extend(manifest.train_shards + manifest.val_shards)
@@ -199,6 +205,7 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
         source_registry=registry_report.model_dump(),
         crawl_report=crawl_report.model_dump(),
         contamination_report=contamination_report.model_dump(),
+        quality_report=quality_report.model_dump(),
         task_report=task_report.model_dump() if task_report else None,
         tokenizer_path=str(trained_tokenizer),
         shard_manifest=manifest.model_dump(),
@@ -218,6 +225,7 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
         source_registry=registry_report,
         crawl=crawl_report.model_dump(),
         contamination_report=contamination_report.model_dump(),
+        quality_report=quality_report.model_dump(),
         task_report=task_report.model_dump() if task_report else None,
         clean_files=clean_files,
         tokenizer_path=str(trained_tokenizer),

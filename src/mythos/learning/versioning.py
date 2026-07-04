@@ -27,6 +27,7 @@ class DatasetVersionManifest(StrictModel):
     source_registry: dict[str, Any]
     crawl_report: dict[str, Any]
     contamination_report: dict[str, Any] | None = None
+    quality_report: dict[str, Any] | None = None
     task_report: dict[str, Any] | None = None
     tokenizer_path: str
     shard_manifest: dict[str, Any]
