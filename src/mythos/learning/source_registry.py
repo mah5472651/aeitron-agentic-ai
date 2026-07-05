@@ -20,6 +20,7 @@ APPROVED_LICENSES = {
     "cc0-1.0",
     "mit",
     "mpl-2.0",
+    "postgresql",
     "psf-2.0",
     "public-domain",
     "unknown-ok",

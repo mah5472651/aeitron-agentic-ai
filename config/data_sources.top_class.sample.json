@@ -1,0 +1,309 @@
+{
+  "sources": [
+    {
+      "allowed_domains": [
+        "cheatsheetseries.owasp.org"
+      ],
+      "category": "defensive_security",
+      "license": "cc-by-4.0",
+      "name": "owasp-cheat-sheet-series-expanded",
+      "urls": [
+        "https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/DOM_based_XSS_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Kubernetes_Security_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "owasp.org"
+      ],
+      "category": "defensive_security",
+      "license": "cc-by-4.0",
+      "name": "owasp-core-projects",
+      "urls": [
+        "https://owasp.org/www-project-top-ten/",
+        "https://owasp.org/www-project-application-security-verification-standard/",
+        "https://owasp.org/www-project-web-security-testing-guide/",
+        "https://owasp.org/www-project-api-security/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "cwe.mitre.org"
+      ],
+      "category": "defensive_security",
+      "license": "unknown-ok",
+      "name": "mitre-cwe-expanded",
+      "urls": [
+        "https://cwe.mitre.org/data/index.html",
+        "https://cwe.mitre.org/top25/archive/2024/2024_cwe_top25.html",
+        "https://cwe.mitre.org/data/definitions/20.html",
+        "https://cwe.mitre.org/data/definitions/22.html",
+        "https://cwe.mitre.org/data/definitions/78.html",
+        "https://cwe.mitre.org/data/definitions/79.html",
+        "https://cwe.mitre.org/data/definitions/89.html",
+        "https://cwe.mitre.org/data/definitions/94.html",
+        "https://cwe.mitre.org/data/definitions/120.html",
+        "https://cwe.mitre.org/data/definitions/125.html",
+        "https://cwe.mitre.org/data/definitions/190.html",
+        "https://cwe.mitre.org/data/definitions/200.html",
+        "https://cwe.mitre.org/data/definitions/287.html",
+        "https://cwe.mitre.org/data/definitions/352.html",
+        "https://cwe.mitre.org/data/definitions/416.html",
+        "https://cwe.mitre.org/data/definitions/502.html",
+        "https://cwe.mitre.org/data/definitions/787.html",
+        "https://cwe.mitre.org/data/definitions/798.html",
+        "https://cwe.mitre.org/data/definitions/862.html",
+        "https://cwe.mitre.org/data/definitions/918.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "www.cisa.gov"
+      ],
+      "category": "defensive_security",
+      "license": "public-domain",
+      "name": "cisa-kev-catalog",
+      "urls": [
+        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "csrc.nist.gov"
+      ],
+      "category": "defensive_security",
+      "license": "public-domain",
+      "name": "nist-secure-engineering",
+      "urls": [
+        "https://csrc.nist.gov/Projects/ssdf",
+        "https://csrc.nist.gov/projects/cryptographic-standards-and-guidelines"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "docs.python.org"
+      ],
+      "category": "agentic_coding",
+      "license": "psf-2.0",
+      "name": "python-core-secure-coding",
+      "urls": [
+        "https://docs.python.org/3/tutorial/",
+        "https://docs.python.org/3/library/security_warnings.html",
+        "https://docs.python.org/3/library/ast.html",
+        "https://docs.python.org/3/library/asyncio.html",
+        "https://docs.python.org/3/library/subprocess.html",
+        "https://docs.python.org/3/library/unittest.html",
+        "https://docs.python.org/3/library/sqlite3.html",
+        "https://docs.python.org/3/library/typing.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "doc.rust-lang.org"
+      ],
+      "category": "agentic_coding",
+      "license": "apache-2.0",
+      "name": "rust-core-secure-systems",
+      "urls": [
+        "https://doc.rust-lang.org/book/",
+        "https://doc.rust-lang.org/reference/",
+        "https://doc.rust-lang.org/nomicon/",
+        "https://doc.rust-lang.org/cargo/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "go.dev"
+      ],
+      "category": "agentic_coding",
+      "license": "bsd-3-clause",
+      "name": "go-core-secure-coding",
+      "urls": [
+        "https://go.dev/doc/",
+        "https://go.dev/doc/effective_go",
+        "https://go.dev/doc/security/",
+        "https://go.dev/doc/tutorial/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "nodejs.org"
+      ],
+      "category": "agentic_coding",
+      "license": "mit",
+      "name": "nodejs-secure-runtime",
+      "urls": [
+        "https://nodejs.org/en/learn/getting-started/security-best-practices",
+        "https://nodejs.org/en/learn/asynchronous-work/asynchronous-flow-control",
+        "https://nodejs.org/en/learn/command-line/run-nodejs-scripts-from-the-command-line"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "www.typescriptlang.org"
+      ],
+      "category": "agentic_coding",
+      "license": "apache-2.0",
+      "name": "typescript-handbook",
+      "urls": [
+        "https://www.typescriptlang.org/docs/",
+        "https://www.typescriptlang.org/docs/handbook/intro.html",
+        "https://www.typescriptlang.org/docs/handbook/2/everyday-types.html",
+        "https://www.typescriptlang.org/docs/handbook/2/narrowing.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "fastapi.tiangolo.com"
+      ],
+      "category": "agentic_coding",
+      "license": "mit",
+      "name": "fastapi-production-api",
+      "urls": [
+        "https://fastapi.tiangolo.com/",
+        "https://fastapi.tiangolo.com/tutorial/security/",
+        "https://fastapi.tiangolo.com/advanced/security/",
+        "https://fastapi.tiangolo.com/deployment/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "docs.djangoproject.com"
+      ],
+      "category": "agentic_coding",
+      "license": "bsd-3-clause",
+      "name": "django-security-and-web",
+      "urls": [
+        "https://docs.djangoproject.com/en/stable/topics/security/",
+        "https://docs.djangoproject.com/en/stable/topics/auth/",
+        "https://docs.djangoproject.com/en/stable/topics/testing/",
+        "https://docs.djangoproject.com/en/stable/topics/db/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "docs.pytest.org"
+      ],
+      "category": "agentic_coding",
+      "license": "mit",
+      "name": "pytest-testing-workflows",
+      "urls": [
+        "https://docs.pytest.org/en/stable/",
+        "https://docs.pytest.org/en/stable/how-to/assert.html",
+        "https://docs.pytest.org/en/stable/how-to/fixtures.html",
+        "https://docs.pytest.org/en/stable/how-to/tmp_path.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "www.postgresql.org"
+      ],
+      "category": "agentic_coding",
+      "license": "postgresql",
+      "name": "postgresql-secure-data-layer",
+      "urls": [
+        "https://www.postgresql.org/docs/current/",
+        "https://www.postgresql.org/docs/current/sql-prepare.html",
+        "https://www.postgresql.org/docs/current/libpq.html",
+        "https://www.postgresql.org/docs/current/auth-methods.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "kubernetes.io"
+      ],
+      "category": "agentic_coding",
+      "license": "cc-by-4.0",
+      "name": "kubernetes-production-security",
+      "urls": [
+        "https://kubernetes.io/docs/concepts/security/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/securing-a-cluster/",
+        "https://kubernetes.io/docs/concepts/configuration/secret/",
+        "https://kubernetes.io/docs/concepts/policy/pod-security-policy/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "docs.docker.com"
+      ],
+      "category": "agentic_coding",
+      "license": "apache-2.0",
+      "name": "docker-production-builds",
+      "urls": [
+        "https://docs.docker.com/build/building/best-practices/",
+        "https://docs.docker.com/engine/security/",
+        "https://docs.docker.com/compose/",
+        "https://docs.docker.com/reference/dockerfile/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "git-scm.com"
+      ],
+      "category": "agentic_coding",
+      "license": "cc-by-4.0",
+      "name": "git-repository-workflows",
+      "urls": [
+        "https://git-scm.com/docs",
+        "https://git-scm.com/book/en/v2",
+        "https://git-scm.com/docs/git-bisect",
+        "https://git-scm.com/docs/git-rebase",
+        "https://git-scm.com/docs/git-merge",
+        "https://git-scm.com/docs/git-apply"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "docs.github.com"
+      ],
+      "category": "agentic_coding",
+      "license": "unknown-ok",
+      "name": "github-actions-security",
+      "urls": [
+        "https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions",
+        "https://docs.github.com/en/code-security/codeql-cli",
+        "https://docs.github.com/en/code-security/code-scanning/introduction-to-code-scanning/about-code-scanning-with-codeql",
+        "https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "docs.semgrep.dev",
+        "semgrep.dev"
+      ],
+      "category": "defensive_security",
+      "license": "unknown-ok",
+      "name": "semgrep-defensive-static-analysis",
+      "urls": [
+        "https://semgrep.dev/docs/",
+        "https://semgrep.dev/docs/writing-rules/overview/",
+        "https://semgrep.dev/docs/semgrep-code/overview/",
+        "https://semgrep.dev/docs/kb/semgrep-code/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "scorecard.dev"
+      ],
+      "category": "defensive_security",
+      "license": "apache-2.0",
+      "name": "openssf-scorecard-supply-chain",
+      "urls": [
+        "https://scorecard.dev/"
+      ]
+    }
+  ]
+}

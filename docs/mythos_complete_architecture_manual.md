@@ -106,6 +106,7 @@ deploy/
 config/
   data_sources.defensive.sample.json
   data_sources.production.sample.json
+  data_sources.top_class.sample.json
 scripts/
   runtime checks, Docker repair, security tools install, data platform helpers.
 tests/
@@ -630,6 +631,7 @@ Files:
 - `src/mythos/learning/source_registry.py`
 - `config/data_sources.defensive.sample.json`
 - `config/data_sources.production.sample.json`
+- `config/data_sources.top_class.sample.json`
 
 Purpose:
 
@@ -659,6 +661,7 @@ Commands:
 
 ```bash
 python -m src.mythos.learning.source_registry --sources config/data_sources.production.sample.json
+python -m src.mythos.learning.source_registry --sources config/data_sources.top_class.sample.json
 python -m src.mythos.learning.source_registry --sources registry1.json registry2.json --output artifacts/mythos/sources.merged.json
 ```
 
@@ -666,6 +669,30 @@ Why it exists:
 
 Best data starts with best sources. Crawling random internet pages creates
 noise, legal risk, and model contamination.
+
+Source tiers:
+
+- `data_sources.defensive.sample.json`: small safe defensive crawl for local
+  smoke testing.
+- `data_sources.production.sample.json`: stable medium registry for Kaggle and
+  production-pipeline validation.
+- `data_sources.top_class.sample.json`: larger high-value registry for serious
+  defensive cybersecurity and agentic coding corpus collection.
+
+The top-class registry currently contains 20 sources, 104 seed URLs, and covers:
+
+- OWASP Cheat Sheets, Top 10, ASVS, WSTG, API Security
+- MITRE CWE index, Top 25, and high-impact CWE definitions
+- CISA KEV catalog
+- NIST SSDF and cryptographic standards
+- Python, Rust, Go, Node.js, TypeScript
+- FastAPI, Django, pytest, PostgreSQL
+- Docker, Kubernetes, Git, GitHub Actions
+- Semgrep, CodeQL docs, OpenSSF Scorecard
+
+Use the top-class registry when the goal is better dataset diversity. Use source
+balancing with it, because large documentation sources can otherwise dominate
+training rows.
 
 ## Crawl Frontier And Data Engine
 
@@ -1362,6 +1389,30 @@ python deploy/gpu/run_real_data_training_pipeline.py \
   --gradient-accumulation-steps 8 \
   --early-stopping-patience 8 \
   --max-source-fraction 0.35 \
+  --dtype fp16 \
+  --device cuda
+```
+
+Top-class balanced 20k-record command:
+
+```bash
+python deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.top_class.sample.json \
+  --work-dir artifacts/mythos/real-data-20k-top-class-balanced \
+  --target-records 20000 \
+  --max-docs 50000 \
+  --workers 24 \
+  --max-depth 2 \
+  --delay-seconds 0.35 \
+  --vocab-size 64000 \
+  --sequence-length 256 \
+  --validation-fraction 0.02 \
+  --steps 5000 \
+  --batch-size 4 \
+  --gradient-accumulation-steps 8 \
+  --validation-interval 100 \
+  --early-stopping-patience 10 \
+  --max-source-fraction 0.30 \
   --dtype fp16 \
   --device cuda
 ```
