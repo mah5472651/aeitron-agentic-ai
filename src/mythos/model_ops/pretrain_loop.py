@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
+from src.mythos.model_ops.data_loader import TokenShardStream, count_batches, load_manifest
 from src.mythos.model_ops.foundation import CheckpointManifest
 from src.mythos.model_ops.tokenizer_pipeline import ShardBuildConfig, build_token_shards
 from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, require_torch, tiny_smoke_config
@@ -94,6 +94,22 @@ def tensor_batch(batch: list[list[int]], *, device: "torch.device") -> "torch.Te
     return torch.tensor(batch, dtype=torch.long, device=device)
 
 
+def validate_training_shards(*, train_shards: list[str], sequence_length: int, batch_size: int) -> int:
+    if not train_shards:
+        raise ValueError("manifest has no training shards; provide a corpus that produces at least one train shard")
+    required_tokens = sequence_length * batch_size
+    available_batches = count_batches(train_shards, sequence_length=sequence_length, batch_size=batch_size)
+    if available_batches < 1:
+        total_tokens = sum(len(Path(path).read_bytes()) // 4 for path in train_shards)
+        raise ValueError(
+            "not enough training tokens for one batch: "
+            f"train_tokens={total_tokens}, required_tokens={required_tokens} "
+            f"(batch_size={batch_size} * sequence_length={sequence_length}). "
+            "Use a larger corpus, reduce --batch-size, or reduce --sequence-length."
+        )
+    return available_batches
+
+
 @torch.no_grad() if torch is not None else (lambda fn: fn)
 def validation_loss(
     *,
@@ -165,6 +181,11 @@ def run_pretraining_loop(
     else:
         raise ValueError("provide --manifest, or both --token-file and --tokenizer-path")
 
+    available_batches = validate_training_shards(
+        train_shards=active_manifest.train_shards,
+        sequence_length=sequence_length,
+        batch_size=batch_size,
+    )
     train_stream = TokenShardStream(
         active_manifest.train_shards,
         sequence_length=sequence_length,
@@ -240,7 +261,10 @@ def run_pretraining_loop(
             if current_step >= steps:
                 break
         if not progressed:
-            raise RuntimeError("no training batches were produced from shards")
+            raise RuntimeError(
+                "no training batches were produced from shards after preflight validation; "
+                f"available_batches={available_batches}"
+            )
         epoch += 1
 
     manifest_path = save_training_checkpoint(

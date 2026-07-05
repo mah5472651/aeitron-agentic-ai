@@ -78,6 +78,37 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             self.assertEqual(report["steps"], 2)
             self.assertTrue(Path(report["checkpoint_manifest"]).exists())
 
+    def test_pretrain_loop_reports_small_shards_before_training(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            corpus.write_text(json.dumps({"text": "tiny corpus for one shard", "license": "mit"}) + "\n", encoding="utf-8")
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            build_token_shards(
+                input_paths=[corpus],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "shards",
+                config=ShardBuildConfig(shard_token_count=128, sequence_length=64, validation_fraction=0.0),
+            )
+            with self.assertRaisesRegex(ValueError, "not enough training tokens for one batch"):
+                run_pretraining_loop(
+                    output_dir=root / "train",
+                    manifest=root / "shards" / "manifest.json",
+                    device="cpu",
+                    steps=1,
+                    batch_size=4,
+                    sequence_length=64,
+                    gradient_accumulation_steps=1,
+                    dtype="fp32",
+                    validate_every=0,
+                    checkpoint_every=0,
+                    resume=False,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
