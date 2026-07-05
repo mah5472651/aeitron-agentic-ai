@@ -48,6 +48,9 @@ def build_feedback_report(
     review_total = int(review.get("total", 0))
     review_approved = int(review.get("approved", 0))
     task_approval_rate = review_approved / max(1, review_total)
+    approved_by_type = dict(review.get("approved_by_type") or {})
+    task_type_count = len([value for value in approved_by_type.values() if int(value) > 0])
+    components = dict(quality.get("avg_component_scores") or {})
 
     recommendations: list[FeedbackRecommendation] = []
     if avg_quality_score < 0.65:
@@ -66,6 +69,24 @@ def build_feedback_report(
                 severity="high",
                 message="Task approval rate is low; improve task extraction prompts and reject noisy sources.",
                 metadata={"task_approval_rate": task_approval_rate},
+            )
+        )
+    if review_approved >= 20 and task_type_count < 3:
+        recommendations.append(
+            FeedbackRecommendation(
+                kind="task_diversity",
+                severity="medium",
+                message="Approved task mix is narrow; add sources that produce security, patch, debug, test, and implementation tasks.",
+                metadata={"approved_by_type": approved_by_type},
+            )
+        )
+    if components and max(float(components.get("security_signal", 0.0)), float(components.get("agentic_signal", 0.0))) < 0.2:
+        recommendations.append(
+            FeedbackRecommendation(
+                kind="signal_quality",
+                severity="medium",
+                message="Corpus component scores show weak security/agentic signal; increase high-value defensive and coding sources.",
+                metadata={"avg_component_scores": components},
             )
         )
     if benchmark_total and benchmark_score < 0.75:

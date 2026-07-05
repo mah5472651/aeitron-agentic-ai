@@ -44,6 +44,9 @@ class ReviewReport(StrictModel):
     approved: int
     needs_human_review: int
     rejected: int
+    by_type: dict[str, int] = Field(default_factory=dict)
+    approved_by_type: dict[str, int] = Field(default_factory=dict)
+    avg_score: float = 0.0
     created_at_unix: float = Field(default_factory=time.time)
 
 
@@ -65,7 +68,14 @@ def review_task(task: dict[str, Any]) -> ReviewDecision:
         reasons.append("high_risk_action_request")
         score -= 0.6
     task_type = str(task.get("task_type") or "")
-    if task_type in {"security_finding", "security_patch_generation", "agentic_coding"}:
+    if task_type in {
+        "debugging_from_error_trace",
+        "implementation_planning",
+        "regression_test_generation",
+        "secure_code_review",
+        "security_patch_generation",
+        "security_vulnerability_identification",
+    }:
         score += 0.1
     score = max(0.0, min(1.0, score))
     if "high_risk_action_request" in reasons:
@@ -92,13 +102,20 @@ def review_tasks(input_path: str | Path, decisions_path: str | Path, approved_pa
     decisions_target.parent.mkdir(parents=True, exist_ok=True)
     approved_target.parent.mkdir(parents=True, exist_ok=True)
     total = approved = human = rejected = 0
+    by_type: dict[str, int] = {}
+    approved_by_type: dict[str, int] = {}
+    scores: list[float] = []
     with decisions_target.open("w", encoding="utf-8") as decisions_handle, approved_target.open("w", encoding="utf-8") as approved_handle:
         for task in iter_jsonl(input_path):
             total += 1
+            task_type = str(task.get("task_type") or "unknown")
+            by_type[task_type] = by_type.get(task_type, 0) + 1
             decision = review_task(task)
+            scores.append(decision.score)
             decisions_handle.write(json.dumps(decision.model_dump(), ensure_ascii=False, sort_keys=True) + "\n")
             if decision.status == "approved":
                 approved += 1
+                approved_by_type[task_type] = approved_by_type.get(task_type, 0) + 1
                 task["review"] = decision.model_dump()
                 approved_handle.write(json.dumps(task, ensure_ascii=False, sort_keys=True) + "\n")
             elif decision.status == "needs_human_review":
@@ -113,6 +130,9 @@ def review_tasks(input_path: str | Path, decisions_path: str | Path, approved_pa
         approved=approved,
         needs_human_review=human,
         rejected=rejected,
+        by_type=dict(sorted(by_type.items())),
+        approved_by_type=dict(sorted(approved_by_type.items())),
+        avg_score=round(sum(scores) / max(1, len(scores)), 6),
     )
 
 

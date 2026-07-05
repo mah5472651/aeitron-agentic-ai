@@ -25,6 +25,8 @@ class QualityInspectionReport(StrictModel):
     by_data_type: dict[str, int] = Field(default_factory=dict)
     by_license: dict[str, int] = Field(default_factory=dict)
     by_source: dict[str, int] = Field(default_factory=dict)
+    by_risk_flag: dict[str, int] = Field(default_factory=dict)
+    avg_component_scores: dict[str, float] = Field(default_factory=dict)
 
 
 def _inc(bucket: dict[str, int], key: str | None) -> None:
@@ -39,6 +41,9 @@ def inspect_clean_jsonl(paths: list[str | Path]) -> QualityInspectionReport:
     by_data_type: dict[str, int] = {}
     by_license: dict[str, int] = {}
     by_source: dict[str, int] = {}
+    by_risk_flag: dict[str, int] = {}
+    component_totals: dict[str, float] = {}
+    component_counts: dict[str, int] = {}
     rows = 0
     for path in paths:
         for row in iter_jsonl(path):
@@ -47,6 +52,11 @@ def inspect_clean_jsonl(paths: list[str | Path]) -> QualityInspectionReport:
             scores.append(float(quality.get("quality_score", 0.0)))
             for label in quality.get("labels", []):
                 _inc(by_label, str(label))
+            for risk_flag in quality.get("risk_flags", []):
+                _inc(by_risk_flag, str(risk_flag))
+            for name, value in dict(quality.get("component_scores") or {}).items():
+                component_totals[str(name)] = component_totals.get(str(name), 0.0) + float(value)
+                component_counts[str(name)] = component_counts.get(str(name), 0) + 1
             _inc(by_language, quality.get("language_hint"))
             _inc(by_data_type, quality.get("data_type"))
             _inc(by_license, str(row.get("license") or "unknown"))
@@ -64,6 +74,11 @@ def inspect_clean_jsonl(paths: list[str | Path]) -> QualityInspectionReport:
         by_data_type=dict(sorted(by_data_type.items())),
         by_license=dict(sorted(by_license.items())),
         by_source=dict(sorted(by_source.items())),
+        by_risk_flag=dict(sorted(by_risk_flag.items())),
+        avg_component_scores={
+            key: round(component_totals[key] / max(1, component_counts.get(key, 0)), 6)
+            for key in sorted(component_totals)
+        },
     )
 
 

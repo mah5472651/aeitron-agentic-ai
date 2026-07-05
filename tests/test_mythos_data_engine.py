@@ -20,6 +20,9 @@ from src.mythos.learning.source_balancing import balance_clean_jsonl
 from src.mythos.learning.web_ingest import SourceSpec
 from src.mythos.learning.contamination import ContaminationDetector
 from src.mythos.learning.quality import iter_jsonl
+from src.mythos.learning.quality import DatasetQualityGate
+from src.mythos.learning.task_extraction import extract_tasks
+from src.mythos.evaluation.benchmarks import built_in_security_tasks
 
 
 def _page(title: str, link: str | None = None) -> str:
@@ -94,6 +97,71 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             by_source = {item.source: item.output_rows for item in report.sources}
             self.assertEqual(by_source["dominant"], 5)
             self.assertEqual(by_source["small"], 5)
+
+    def test_quality_gate_scores_security_code_with_components(self) -> None:
+        gate = DatasetQualityGate()
+        decision = gate.evaluate(
+            {
+                "license": "mit",
+                "url": "https://example.org/app.py",
+                "text": (
+                    "def login(user_input):\n"
+                    "    cursor.execute('SELECT * FROM users WHERE name=' + user_input)\n"
+                    "    return validate(user_input)\n"
+                    "This defensive security reference explains CWE-89 SQL injection mitigation and regression tests. "
+                    * 6
+                ),
+            }
+        )
+        self.assertTrue(decision.accepted)
+        self.assertIn("defensive_security", decision.labels)
+        self.assertIn("code", decision.labels)
+        self.assertEqual(decision.language_hint, "python")
+        self.assertGreater(decision.component_scores["security_signal"], 0.0)
+        self.assertGreater(decision.quality_score, 0.4)
+
+    def test_task_extraction_creates_typed_security_and_test_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clean = root / "clean.jsonl"
+            text = (
+                "CWE-89 SQL injection patch guidance with regression tests.\n"
+                "```python\n"
+                "def find_user(name):\n"
+                "    cursor.execute('SELECT * FROM users WHERE name=' + name)\n"
+                "    return cursor.fetchone()\n"
+                "```\n"
+                "Use parameterized queries and add pytest regression coverage. " * 8
+            )
+            row = {
+                "source": "offline",
+                "url": "https://example.org/sql",
+                "license": "mit",
+                "text": text,
+                "quality": {
+                    "quality_score": 0.9,
+                    "labels": ["defensive_security", "code", "tests"],
+                    "language_hint": "python",
+                    "data_type": "security_reference",
+                },
+            }
+            clean.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            report = extract_tasks([clean], root / "tasks.jsonl", max_tasks=20)
+            self.assertGreaterEqual(report.extracted, 3)
+            self.assertIn("security_vulnerability_identification", report.by_type)
+            self.assertIn("security_patch_generation", report.by_type)
+            self.assertIn("regression_test_generation", report.by_type)
+            tasks = list(iter_jsonl(root / "tasks.jsonl"))
+            self.assertTrue(all(task["success_criteria"] for task in tasks))
+            self.assertTrue(all(task["negative_constraints"] for task in tasks))
+
+    def test_builtin_benchmark_suite_is_broader_than_smoke_static_checks(self) -> None:
+        tasks = built_in_security_tasks()
+        tags = {tag for task in tasks for tag in task.tags}
+        self.assertGreaterEqual(len(tasks), 25)
+        self.assertIn("solidity", tags)
+        self.assertIn("kubernetes", tags)
+        self.assertIn("github_actions", tags)
 
     def test_source_registry_rejects_urls_outside_allowlist(self) -> None:
         registry = SourceRegistry(

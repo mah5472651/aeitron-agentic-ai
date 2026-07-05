@@ -849,12 +849,39 @@ not enough.
 
 Files:
 
+- `src/mythos/learning/quality.py`
+- `src/mythos/learning/quality_inspector.py`
 - `src/mythos/learning/source_quality.py`
 
 Purpose:
 
 Score each source based on accepted rows, quality score, code coverage, and
 defensive security coverage.
+
+The row-level quality classifier now scores more than length. It records:
+
+- `component_scores.length`
+- `component_scores.security_signal`
+- `component_scores.agentic_signal`
+- `component_scores.code_signal`
+- `component_scores.test_signal`
+- `component_scores.structure`
+- `component_scores.low_noise`
+- `component_scores.lexical_diversity`
+- `risk_flags`
+- inferred `language_hint`
+- inferred `data_type`
+
+Supported language and artifact signals include Python, Rust, Go, JavaScript,
+TypeScript, Java, C/C++, Bash, Solidity, Docker/Kubernetes/config material,
+patches, tests, debug traces, CVE/CWE references, and defensive security
+documentation.
+
+Hard rejects are reserved for unsafe or unusable rows: too short, too large,
+disallowed license, secret-like content, email-like PII, duplicate content, very
+low text signal, or extremely degenerate repetition. Weaker signals such as
+boilerplate or low lexical diversity become risk flags so useful technical
+references are not thrown away too aggressively.
 
 Actions:
 
@@ -885,16 +912,24 @@ security training/evaluation.
 
 Task types:
 
-- `agentic_coding`
-- `security_finding`
+- `security_vulnerability_identification`
 - `security_patch_generation`
-- `technical_reasoning`
+- `secure_code_review`
+- `regression_test_generation`
+- `debugging_from_error_trace`
+- `implementation_planning`
 
 How it works:
 
-- extracts fenced code blocks when present
-- infers task type from security/code terms
+- extracts fenced code blocks and diff blocks when present
+- detects vulnerability categories such as SQL injection, XSS, SSRF, command
+  injection, deserialization, weak crypto, path traversal, hardcoded secrets,
+  buffer overflow, and vulnerability taxonomy references
+- converts runtime traces and compile errors into debugging tasks
+- converts code artifacts into secure code-review tasks
+- converts test-heavy rows into regression-test generation tasks
 - builds prompts that preserve source URL/provenance
+- attaches `success_criteria` and `negative_constraints` to each task
 - deduplicates task prompts
 - writes JSONL task candidates
 
@@ -967,6 +1002,8 @@ Recommendations can say:
 
 - quality is too low
 - task extraction is too noisy
+- approved task diversity is too narrow
+- security/agentic component scores are weak
 - benchmark score is below promotion threshold
 - dataset can be promoted
 
@@ -1518,7 +1555,11 @@ Expanded built-in benchmark:
 
 - `src/mythos/evaluation/benchmarks.py` includes SQL injection, hardcoded
   secrets, command injection, path traversal, XSS, weak crypto, insecure random,
-  unsafe deserialization, C buffer copy, regression-test shape, and patch-shape
+  unsafe deserialization, C buffer copy, SSRF, unsafe YAML loading, unsafe JWT
+  settings, open redirect, Node.js command execution, TypeScript DOM XSS, Go SQL
+  injection, Rust command execution, Java deserialization, Solidity reentrancy
+  shape, Docker hardening, Kubernetes privileged containers, GitHub Actions
+  script injection, debugging trace shape, regression-test shape, and patch-shape
   checks.
 - This is still a lightweight built-in gate, not a replacement for SWE-Bench or
   a full security benchmark suite.
