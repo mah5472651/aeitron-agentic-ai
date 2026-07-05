@@ -56,13 +56,20 @@ def iter_texts(paths: list[str | Path]) -> Iterable[str]:
     for path in paths:
         source = Path(path)
         if source.suffix == ".jsonl":
-            for line in source.read_text(encoding="utf-8-sig", errors="replace").splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                text = str(row.get("text") or row.get("content") or "")
-                if text:
-                    yield text
+            with source.open("r", encoding="utf-8-sig", errors="replace") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        snippet = line[:240].replace("\n", "\\n")
+                        raise ValueError(
+                            f"invalid JSONL in {source} at line {line_number}: {exc.msg}; snippet={snippet!r}"
+                        ) from exc
+                    text = str(row.get("text") or row.get("content") or "")
+                    if text:
+                        yield text
         else:
             yield source.read_text(encoding="utf-8", errors="replace")
 

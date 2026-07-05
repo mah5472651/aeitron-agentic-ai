@@ -68,50 +68,57 @@ def balance_clean_jsonl(
 ) -> SourceBalanceReport:
     if not 0.05 <= max_source_fraction <= 1.0:
         raise ValueError("max_source_fraction must be between 0.05 and 1.0")
-    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    source_counts: dict[str, int] = defaultdict(int)
+    quality_totals: dict[str, float] = defaultdict(float)
     for path in input_paths:
         for row in iter_jsonl(path):
             source = str(row.get("source") or "unknown")
-            groups[source].append(row)
-    all_rows = sum(len(rows) for rows in groups.values())
+            source_counts[source] += 1
+            quality_totals[source] += _quality(row)
+    all_rows = sum(source_counts.values())
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    selected: list[dict[str, Any]] = []
     items: list[SourceBalanceItem] = []
-    for source, rows in sorted(groups.items()):
-        rows = sorted(rows, key=_row_sort_key)
-        other_count = all_rows - len(rows)
-        cap = len(rows) if max_source_fraction >= 1.0 else _cap_for_source(
-            source_count=len(rows),
+    caps: dict[str, int] = {}
+    for source, source_count in sorted(source_counts.items()):
+        other_count = all_rows - source_count
+        cap = source_count if max_source_fraction >= 1.0 else _cap_for_source(
+            source_count=source_count,
             other_count=other_count,
             max_source_fraction=max_source_fraction,
             min_source_rows=min_source_rows,
         )
-        chosen = rows[:cap]
-        selected.extend(chosen)
-        avg_quality = sum(_quality(row) for row in rows) / max(1, len(rows))
+        caps[source] = cap
+        avg_quality = quality_totals[source] / max(1, source_count)
         items.append(
             SourceBalanceItem(
                 source=source,
-                input_rows=len(rows),
-                output_rows=len(chosen),
-                action="kept" if len(chosen) == len(rows) else "capped",
+                input_rows=source_count,
+                output_rows=cap,
+                action="kept" if cap == source_count else "capped",
                 avg_quality_score=round(avg_quality, 6),
             )
         )
 
-    selected.sort(key=lambda row: (str(row.get("source") or ""), str(row.get("content_hash") or ""), str(row.get("url") or "")))
+    output_rows = 0
+    written_by_source: dict[str, int] = defaultdict(int)
     with target.open("w", encoding="utf-8") as handle:
-        for row in selected:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
-            handle.write("\n")
+        for path in input_paths:
+            for row in iter_jsonl(path):
+                source = str(row.get("source") or "unknown")
+                if written_by_source[source] >= caps.get(source, 0):
+                    continue
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
+                handle.write("\n")
+                written_by_source[source] += 1
+                output_rows += 1
 
     return SourceBalanceReport(
         input_paths=[str(path) for path in input_paths],
         output_path=str(target),
         input_rows=all_rows,
-        output_rows=len(selected),
+        output_rows=output_rows,
         max_source_fraction=max_source_fraction,
         sources=items,
     )

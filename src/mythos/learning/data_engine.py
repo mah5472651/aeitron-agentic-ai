@@ -720,6 +720,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-output-dir", default="artifacts/mythos/data-engine/raw")
     parser.add_argument("--clean-output-dir", default="artifacts/mythos/data-engine/clean")
     parser.add_argument("--max-docs", type=int, default=10_000)
+    parser.add_argument("--max-bytes-per-doc", type=int, default=2_000_000)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-depth", type=int, default=2)
     parser.add_argument("--delay-seconds", type=float, default=1.0)
@@ -745,6 +746,7 @@ async def run_cli(args: argparse.Namespace) -> DataEngineReport:
         output_dir=args.raw_output_dir,
         clean_output_dir=args.clean_output_dir,
         max_docs=args.max_docs,
+        max_bytes_per_doc=args.max_bytes_per_doc,
         workers=args.workers,
         max_depth=args.max_depth,
         delay_seconds=args.delay_seconds,

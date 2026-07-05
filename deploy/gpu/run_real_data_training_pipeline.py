@@ -28,6 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frontier-backend", choices=["sqlite", "postgres"], default="sqlite")
     parser.add_argument("--postgres-dsn")
     parser.add_argument("--max-docs", type=int, default=10_000)
+    parser.add_argument(
+        "--max-bytes-per-doc",
+        type=int,
+        default=300_000,
+        help="Kaggle-safe document text cap. Increase on larger machines.",
+    )
     parser.add_argument("--min-clean-records", "--target-records", dest="min_clean_records", type=int, default=10_000)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--max-depth", type=int, default=2)
@@ -70,6 +76,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             frontier_backend=args.frontier_backend,
             postgres_dsn=args.postgres_dsn,
             max_docs=args.max_docs,
+            max_bytes_per_doc=args.max_bytes_per_doc,
             workers=args.workers,
             max_depth=args.max_depth,
             delay_seconds=args.delay_seconds,

@@ -1438,6 +1438,7 @@ python deploy/gpu/run_real_data_training_pipeline.py \
   --work-dir artifacts/mythos/real-data-20k-top-class-balanced \
   --target-records 20000 \
   --max-docs 50000 \
+  --max-bytes-per-doc 300000 \
   --workers 24 \
   --max-depth 2 \
   --delay-seconds 0.35 \
@@ -1453,6 +1454,19 @@ python deploy/gpu/run_real_data_training_pipeline.py \
   --dtype fp16 \
   --device cuda
 ```
+
+Kaggle memory safety:
+
+- Exit code `137` means the Kaggle/Linux runtime killed the process, usually
+  because host RAM was exhausted.
+- The tokenizer and token-shard builders stream JSONL line by line and should
+  not load full corpus shards into memory.
+- Source balancing is a two-pass streaming process: first count source rows,
+  then write capped rows without keeping the full corpus in memory.
+- `deploy/gpu/run_real_data_training_pipeline.py` defaults to
+  `--max-bytes-per-doc 300000` so huge documentation pages do not dominate RAM.
+- If Kaggle still kills the run, reduce `--workers`, `--max-docs`,
+  `--sequence-length`, or `--batch-size`, and use a fresh `--work-dir`.
 
 100k-record command:
 

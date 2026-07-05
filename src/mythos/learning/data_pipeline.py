@@ -44,6 +44,7 @@ class DataPipelineConfig(StrictModel):
     frontier_backend: str = "sqlite"
     postgres_dsn: str | None = None
     max_docs: int = Field(default=10_000, ge=1)
+    max_bytes_per_doc: int = Field(default=2_000_000, ge=1000)
     workers: int = Field(default=8, ge=1, le=256)
     max_depth: int = Field(default=2, ge=0, le=20)
     delay_seconds: float = Field(default=1.0, ge=0.0)
@@ -196,6 +197,7 @@ async def _run_data_pipeline_locked(
         output_dir=str(raw_dir),
         clean_output_dir=str(clean_dir),
         max_docs=config.max_docs,
+        max_bytes_per_doc=config.max_bytes_per_doc,
         max_depth=config.max_depth,
         workers=config.workers,
         shard_rows=config.shard_rows,
@@ -407,6 +409,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frontier-backend", choices=["sqlite", "postgres"], default="sqlite")
     parser.add_argument("--postgres-dsn")
     parser.add_argument("--max-docs", type=int, default=10_000)
+    parser.add_argument("--max-bytes-per-doc", type=int, default=2_000_000)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-depth", type=int, default=2)
     parser.add_argument("--delay-seconds", type=float, default=1.0)
@@ -450,6 +453,7 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         frontier_backend=args.frontier_backend,
         postgres_dsn=args.postgres_dsn,
         max_docs=args.max_docs,
+        max_bytes_per_doc=args.max_bytes_per_doc,
         workers=args.workers,
         max_depth=args.max_depth,
         delay_seconds=args.delay_seconds,
