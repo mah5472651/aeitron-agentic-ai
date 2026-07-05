@@ -1420,6 +1420,17 @@ Checkpoint evaluation:
 - validation loss is finite when validation batches exist
 - built-in defensive security benchmark harness passes
 
+Training safety preflight:
+
+- the pretraining loop checks that shards can produce at least one batch before
+  allocating the model
+- the scratch model vocabulary is automatically expanded to match the tokenizer
+  vocabulary and the highest token ID found in train/validation shards
+- this prevents CUDA device-side asserts from tokenizer/model vocabulary
+  mismatch
+- the pretraining report includes `model_config` so the exact executable model
+  shape is auditable after each run
+
 Standalone checkpoint eval:
 
 ```bash

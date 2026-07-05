@@ -10,7 +10,7 @@ from typing import Any
 
 from src.mythos.model_ops.data_loader import TokenShardStream, count_batches, load_manifest
 from src.mythos.model_ops.foundation import CheckpointManifest
-from src.mythos.model_ops.tokenizer_pipeline import ShardBuildConfig, build_token_shards
+from src.mythos.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer, read_uint32_tokens
 from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, require_torch, tiny_smoke_config
 
 try:
@@ -110,6 +110,36 @@ def validate_training_shards(*, train_shards: list[str], sequence_length: int, b
     return available_batches
 
 
+def max_token_id(shard_paths: list[str]) -> int:
+    maximum = -1
+    for path in shard_paths:
+        tokens = read_uint32_tokens(path)
+        if tokens:
+            maximum = max(maximum, max(tokens))
+    return maximum
+
+
+def tokenizer_vocab_size(tokenizer_path: str | Path) -> int:
+    return int(load_tokenizer(tokenizer_path).get_vocab_size(with_added_tokens=True))
+
+
+def build_training_config(active_manifest: ShardManifest, *, sequence_length: int) -> ScratchDecoderConfig:
+    base = tiny_smoke_config()
+    vocab_size = base.vocab_size
+    tokenizer_path = Path(active_manifest.tokenizer_path)
+    if tokenizer_path.exists():
+        vocab_size = max(vocab_size, tokenizer_vocab_size(tokenizer_path))
+    highest_token_id = max_token_id(active_manifest.train_shards + active_manifest.val_shards)
+    if highest_token_id >= vocab_size:
+        vocab_size = highest_token_id + 1
+    return base.model_copy(
+        update={
+            "vocab_size": vocab_size,
+            "max_sequence_length": max(base.max_sequence_length, sequence_length),
+        }
+    )
+
+
 @torch.no_grad() if torch is not None else (lambda fn: fn)
 def validation_loss(
     *,
@@ -160,10 +190,6 @@ def run_pretraining_loop(
     selected = select_device(device)
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    config = tiny_smoke_config()
-    if sequence_length > config.max_sequence_length:
-        raise ValueError("sequence_length exceeds config max")
-
     active_manifest_path: Path | None = Path(manifest).resolve() if manifest else None
     if active_manifest_path is None and token_file and tokenizer_path:
         active_manifest = build_token_shards(
@@ -181,6 +207,7 @@ def run_pretraining_loop(
     else:
         raise ValueError("provide --manifest, or both --token-file and --tokenizer-path")
 
+    config = build_training_config(active_manifest, sequence_length=sequence_length)
     available_batches = validate_training_shards(
         train_shards=active_manifest.train_shards,
         sequence_length=sequence_length,
@@ -284,6 +311,7 @@ def run_pretraining_loop(
         "device": str(selected),
         "dtype": dtype,
         "gradient_accumulation_steps": gradient_accumulation_steps,
+        "model_config": config.model_dump(),
         "train_losses": train_losses,
         "validation_losses": val_losses,
         "trained_tokens": trained_tokens,

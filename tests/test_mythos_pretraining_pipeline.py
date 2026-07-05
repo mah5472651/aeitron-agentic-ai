@@ -12,9 +12,11 @@ from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
 from src.mythos.model_ops.pretrain_loop import run_pretraining_loop
 from src.mythos.model_ops.tokenizer_pipeline import (
     ShardBuildConfig,
+    ShardManifest,
     TokenizerTrainConfig,
     build_token_shards,
     train_bpe_tokenizer,
+    write_uint32_tokens,
 )
 
 
@@ -116,6 +118,46 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
                     checkpoint_every=0,
                     resume=False,
                 )
+
+    def test_pretrain_loop_expands_model_vocab_for_large_tokenizer_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            corpus.write_text(json.dumps({"text": "small tokenizer asset", "license": "mit"}) + "\n", encoding="utf-8")
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            shard = root / "shards" / "train" / "shard-000000.bin"
+            write_uint32_tokens(shard, [0, 1, 2, 3000] * 16)
+            manifest = ShardManifest(
+                dataset_id="unit-test",
+                tokenizer_path=str(tokenizer_path),
+                output_dir=str(root / "shards"),
+                train_shards=[str(shard)],
+                val_shards=[],
+                train_tokens=64,
+                val_tokens=0,
+                sequence_length=16,
+            )
+            (root / "shards").mkdir(parents=True, exist_ok=True)
+            (root / "shards" / "manifest.json").write_text(json.dumps(manifest.model_dump()), encoding="utf-8")
+            report = run_pretraining_loop(
+                output_dir=root / "train",
+                manifest=root / "shards" / "manifest.json",
+                device="cpu",
+                steps=1,
+                batch_size=1,
+                sequence_length=16,
+                gradient_accumulation_steps=1,
+                dtype="fp32",
+                validate_every=0,
+                checkpoint_every=0,
+                resume=False,
+            )
+            self.assertEqual(report["status"], "passed")
+            self.assertGreaterEqual(report["model_config"]["vocab_size"], 3001)
 
 
 if __name__ == "__main__":
