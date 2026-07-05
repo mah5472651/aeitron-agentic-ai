@@ -529,6 +529,41 @@ def discover_links(base_url: str, html: str) -> list[str]:
     return output
 
 
+def is_supported_text_response(content_type: str, url: str) -> bool:
+    lowered_type = content_type.lower().split(";", 1)[0].strip()
+    lowered_url = url.lower()
+    if not lowered_type:
+        return not lowered_url.endswith((
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".webp",
+            ".ico",
+            ".pdf",
+            ".zip",
+            ".gz",
+            ".tar",
+            ".woff",
+            ".woff2",
+            ".ttf",
+            ".mp4",
+            ".mp3",
+        ))
+    if lowered_type.startswith("text/"):
+        return True
+    return lowered_type in {
+        "application/json",
+        "application/ld+json",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/javascript",
+        "application/x-javascript",
+        "application/ecmascript",
+        "application/x-ndjson",
+    }
+
+
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
@@ -601,8 +636,13 @@ class DataEngine:
                         continue
                     response = await active_client.get(item["url"])
                     response.raise_for_status()
-                    raw = response.text[: self.config.max_bytes_per_doc]
                     content_type = response.headers.get("content-type", "")
+                    if not is_supported_text_response(content_type, item["url"]):
+                        await _store_call(self.store, "mark_done", item["url"])
+                        counters["rejected"] += 1
+                        counters["fetched"] += 1
+                        continue
+                    raw = response.text[: self.config.max_bytes_per_doc]
                     text = text_from_html(raw) if "html" in content_type.lower() or "<html" in raw.lower() else raw
                     row = {
                         "source": item["source_name"],

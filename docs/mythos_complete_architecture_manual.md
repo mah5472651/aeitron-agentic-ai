@@ -1403,6 +1403,13 @@ Important:
   JSONL lines from interrupted runs contaminating the next run.
 - JSONL readers report the exact file and line number if a malformed row is
   encountered.
+- JSONL readers stream by physical newline instead of Python `splitlines()` so
+  Unicode line separators inside JSON strings do not split valid records.
+- Non-text HTTP responses such as `image/png`, fonts, archives, media, and PDFs
+  are rejected before raw/clean JSONL writing.
+- A `.pipeline.lock` file prevents two processes from writing to the same
+  `--output-dir` at the same time. If a lock error appears, use a fresh output
+  directory or wait for the existing run to finish.
 
 Primary outputs:
 

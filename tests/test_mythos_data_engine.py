@@ -7,9 +7,9 @@ from pathlib import Path
 
 import httpx
 
-from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore
+from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore, is_supported_text_response
 from src.mythos.learning.data_engine import ShardedJsonlWriter
-from src.mythos.learning.data_pipeline import DataPipelineConfig, run_data_pipeline
+from src.mythos.learning.data_pipeline import DataPipelineConfig, PipelineRunLock, run_data_pipeline
 from src.mythos.learning.production_check import DataPlatformReadinessConfig, run_readiness_check
 from src.mythos.learning.quality_inspector import inspect_clean_jsonl
 from src.mythos.learning.review import review_tasks
@@ -52,6 +52,27 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             path.write_text('{"ok": true}\n{"bad": "unterminated\n', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "invalid JSONL.*bad.jsonl.*line 2"):
                 list(iter_jsonl(path))
+
+    def test_iter_jsonl_keeps_unicode_line_separator_inside_json_string(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "valid.jsonl"
+            path.write_text(json.dumps({"text": "left\u2028right"}, ensure_ascii=False) + "\n", encoding="utf-8")
+            rows = list(iter_jsonl(path))
+            self.assertEqual(rows[0]["text"], "left\u2028right")
+
+    def test_binary_content_types_are_not_supported_for_corpus_text(self) -> None:
+        self.assertFalse(is_supported_text_response("image/png", "https://example.org/a.png"))
+        self.assertFalse(is_supported_text_response("", "https://example.org/a.pdf"))
+        self.assertTrue(is_supported_text_response("text/html; charset=utf-8", "https://example.org/a"))
+        self.assertTrue(is_supported_text_response("application/json", "https://example.org/a.json"))
+
+    def test_pipeline_run_lock_blocks_concurrent_same_work_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path = Path(temp_dir) / ".pipeline.lock"
+            with PipelineRunLock(lock_path):
+                with self.assertRaisesRegex(RuntimeError, "already locked"):
+                    with PipelineRunLock(lock_path):
+                        pass
 
     def test_source_registry_rejects_urls_outside_allowlist(self) -> None:
         registry = SourceRegistry(
@@ -122,6 +143,43 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
                 store.close()
             self.assertEqual(stats["urls_done"], 2)
             self.assertEqual(stats["documents_accepted"], 2)
+
+    async def test_engine_rejects_binary_responses_before_jsonl_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/robots.txt":
+                    return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+                if request.url.path == "/image.png":
+                    return httpx.Response(200, content=b"\x89PNG\r\n\x1a\n", headers={"content-type": "image/png"})
+                return httpx.Response(404, text="missing")
+
+            source = SourceSpec(
+                name="offline-binary-source",
+                urls=["https://example.org/image.png"],
+                allowed_domains=["example.org"],
+                license="mit",
+                category="agentic_coding",
+            )
+            config = DataEngineConfig(
+                frontier_path=str(root / "frontier.sqlite3"),
+                output_dir=str(root / "raw"),
+                clean_output_dir=str(root / "clean"),
+                max_docs=1,
+                workers=1,
+                delay_seconds=0.0,
+            )
+            engine = DataEngine(config)
+            try:
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://example.org") as client:
+                    report = await engine.run([source], client=client)
+            finally:
+                engine.close()
+            self.assertEqual(report.fetched, 1)
+            self.assertEqual(report.accepted, 0)
+            self.assertEqual(report.rejected, 1)
+            self.assertFalse(list((root / "clean").glob("clean-*.jsonl")))
 
     async def test_unified_data_pipeline_crawls_shards_and_runs_one_training_step(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

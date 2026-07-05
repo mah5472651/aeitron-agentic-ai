@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
+import time
 from typing import Any
 
 import httpx
@@ -93,6 +95,40 @@ class DataPipelineReport(StrictModel):
     checkpoint_eval: dict[str, Any] | None = None
 
 
+class PipelineRunLock:
+    def __init__(self, path: str | Path, *, stale_after_seconds: int = 24 * 60 * 60) -> None:
+        self.path = Path(path)
+        self.stale_after_seconds = stale_after_seconds
+        self.fd: int | None = None
+
+    def __enter__(self) -> "PipelineRunLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        if self.path.exists() and now - self.path.stat().st_mtime > self.stale_after_seconds:
+            self.path.unlink()
+        try:
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError as exc:
+            details = self.path.read_text(encoding="utf-8", errors="replace") if self.path.exists() else ""
+            raise RuntimeError(
+                f"data pipeline work_dir is already locked: {self.path}. "
+                "Use a fresh --output-dir or wait for the running job to finish. "
+                f"lock_details={details!r}"
+            ) from exc
+        payload = json.dumps({"pid": os.getpid(), "created_at_unix": now}, sort_keys=True) + "\n"
+        os.write(self.fd, payload.encode("utf-8"))
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 async def _build_store(config: DataPipelineConfig) -> Any:
     if config.frontier_backend == "postgres":
         if not config.postgres_dsn:
@@ -114,6 +150,34 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
     reports_dir = root / "reports"
     root.mkdir(parents=True, exist_ok=True)
 
+    with PipelineRunLock(root / ".pipeline.lock"):
+        return await _run_data_pipeline_locked(
+            config,
+            client=client,
+            root=root,
+            raw_dir=raw_dir,
+            clean_dir=clean_dir,
+            tokenizer_path=tokenizer_path,
+            shards_dir=shards_dir,
+            train_dir=train_dir,
+            tasks_path=tasks_path,
+            reports_dir=reports_dir,
+        )
+
+
+async def _run_data_pipeline_locked(
+    config: DataPipelineConfig,
+    *,
+    client: httpx.AsyncClient | None,
+    root: Path,
+    raw_dir: Path,
+    clean_dir: Path,
+    tokenizer_path: Path,
+    shards_dir: Path,
+    train_dir: Path,
+    tasks_path: Path,
+    reports_dir: Path,
+) -> DataPipelineReport:
     registry = SourceRegistry.from_file(config.sources_path)
     registry_report = registry.validate()
     store = await _build_store(config)
