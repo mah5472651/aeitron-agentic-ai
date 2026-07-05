@@ -311,6 +311,8 @@ def run_pretraining_loop(
         "device": str(selected),
         "dtype": dtype,
         "gradient_accumulation_steps": gradient_accumulation_steps,
+        "validate_every": validate_every,
+        "validation_batches": validation_batches,
         "model_config": config.model_dump(),
         "train_losses": train_losses,
         "validation_losses": val_losses,

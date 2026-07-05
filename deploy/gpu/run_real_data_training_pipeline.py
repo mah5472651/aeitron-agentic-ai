@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="fp16")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cuda")
-    parser.add_argument("--validate-every", type=int, default=100)
+    parser.add_argument("--validate-every", type=int, default=25)
     parser.add_argument("--validation-batches", type=int, default=4)
     parser.add_argument("--object-store-uri", default="local://artifacts/mythos/object-store")
     parser.add_argument("--object-store-endpoint-url")
@@ -80,7 +80,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             train_batch_size=args.train_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             dtype=args.dtype,
-            validate_every=args.validate_every,
+            validate_every=min(args.validate_every, args.train_steps) if args.validate_every > 0 else 0,
             validation_batches=args.validation_batches,
             run_checkpoint_eval=not args.skip_train,
             object_store_uri=args.object_store_uri,

@@ -1394,6 +1394,10 @@ Important:
   scraper for unauthorized collection.
 - `--min-clean-records` intentionally blocks the run if the crawl does not
   produce enough accepted records.
+- For short smoke runs, validation must be scheduled inside the run length.
+  `deploy/gpu/run_real_data_training_pipeline.py` defaults to
+  `--validate-every 25`, and clamps validation cadence to `--train-steps` so a
+  50-step run can produce validation losses.
 - Use a fresh `--output-dir` for each run. The pipeline now overwrites its own
   `raw-*.jsonl` and `clean-*.jsonl` shards at startup to prevent stale partial
   JSONL lines from interrupted runs contaminating the next run.

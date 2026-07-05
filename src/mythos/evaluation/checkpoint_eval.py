@@ -116,10 +116,22 @@ def _validation_loss_gate(training_report: dict[str, Any] | None) -> EvalGate:
         return EvalGate(name="validation_loss", status="warn", reason="no training report provided")
     losses = training_report.get("validation_losses", [])
     if not losses:
+        validate_every = int(training_report.get("validate_every", 0) or 0)
+        steps = int(training_report.get("steps", 0) or 0)
+        if validate_every <= 0:
+            reason = "validation was disabled for this training run"
+            recommendation = "set --validate-every to a positive value for checkpoint quality evaluation"
+        elif steps < validate_every:
+            reason = "no validation interval was reached during this training run"
+            recommendation = "set --validate-every less than or equal to --train-steps"
+        else:
+            reason = "no validation batches were produced; increase corpus size or validation_fraction for quality evaluation"
+            recommendation = "increase corpus size or validation_fraction so validation loss is measured"
         return EvalGate(
             name="validation_loss",
             status="warn",
-            reason="no validation batches were produced; increase corpus size or validation_fraction for quality evaluation",
+            reason=reason,
+            metrics={"steps": steps, "validate_every": validate_every, "recommendation": recommendation},
         )
     values = [float(item["loss"]) for item in losses]
     finite = all(math.isfinite(item) for item in values)

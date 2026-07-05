@@ -79,6 +79,7 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             )
             self.assertEqual(report["status"], "passed")
             self.assertEqual(report["steps"], 2)
+            self.assertEqual(report["validate_every"], 0)
             self.assertTrue(Path(report["checkpoint_manifest"]).exists())
             eval_report = evaluate_checkpoint(
                 checkpoint_manifest_path=report["checkpoint_manifest"],
@@ -87,6 +88,45 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             )
             self.assertEqual(eval_report.status, "passed")
             self.assertTrue(Path(root / "checkpoint_eval" / "checkpoint_eval_report.json").exists())
+
+    def test_checkpoint_eval_reports_validation_interval_not_reached(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            text = "def secure_parser(value): assert value CWE mitigation patch " * 200
+            corpus.write_text(json.dumps({"text": text, "license": "mit"}) + "\n", encoding="utf-8")
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            build_token_shards(
+                input_paths=[corpus],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "shards",
+                config=ShardBuildConfig(shard_token_count=128, sequence_length=16, validation_fraction=0.2),
+            )
+            report = run_pretraining_loop(
+                output_dir=root / "train",
+                manifest=root / "shards" / "manifest.json",
+                device="cpu",
+                steps=1,
+                batch_size=1,
+                sequence_length=16,
+                gradient_accumulation_steps=1,
+                dtype="fp32",
+                validate_every=25,
+                checkpoint_every=0,
+                resume=False,
+            )
+            eval_report = evaluate_checkpoint(
+                checkpoint_manifest_path=report["checkpoint_manifest"],
+                training_report=report,
+                output_dir=root / "checkpoint_eval",
+            )
+            validation_gate = next(gate for gate in eval_report.gates if gate.name == "validation_loss")
+            self.assertEqual(validation_gate.status, "warn")
+            self.assertIn("no validation interval", validation_gate.reason)
 
     def test_pretrain_loop_reports_small_shards_before_training(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
