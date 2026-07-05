@@ -149,6 +149,30 @@ def _validation_loss_gate(training_report: dict[str, Any] | None) -> EvalGate:
     )
 
 
+def _checkpoint_selection_gate(training_report: dict[str, Any] | None, checkpoint_manifest_path: Path) -> EvalGate:
+    if training_report is None:
+        return EvalGate(name="checkpoint_selection", status="warn", reason="no training report provided")
+    best_manifest = str(training_report.get("best_checkpoint_manifest") or "")
+    final_manifest = str(training_report.get("checkpoint_manifest") or "")
+    best_loss = float(training_report.get("best_validation_loss", -1.0))
+    best_step = int(training_report.get("best_validation_step", 0) or 0)
+    selected = str(checkpoint_manifest_path)
+    status = "pass" if best_manifest and selected == best_manifest else "warn"
+    reason = "validation-best checkpoint selected" if status == "pass" else "final or unknown checkpoint selected"
+    return EvalGate(
+        name="checkpoint_selection",
+        status=status,
+        reason=reason,
+        metrics={
+            "selected_manifest": selected,
+            "best_manifest": best_manifest,
+            "final_manifest": final_manifest,
+            "best_validation_loss": best_loss,
+            "best_validation_step": best_step,
+        },
+    )
+
+
 def evaluate_checkpoint(
     *,
     checkpoint_manifest_path: str | Path,
@@ -166,6 +190,7 @@ def evaluate_checkpoint(
 
     gates = [
         _checkpoint_integrity_gate(manifest),
+        _checkpoint_selection_gate(active_training_report, manifest_path),
         _training_loss_gate(active_training_report),
         _validation_loss_gate(active_training_report),
         EvalGate(

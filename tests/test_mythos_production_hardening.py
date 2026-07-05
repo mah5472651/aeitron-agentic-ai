@@ -70,6 +70,8 @@ class MythosProductionHardeningTest(unittest.TestCase):
     def test_benchmark_harness_and_gateway_metrics_contract(self) -> None:
         report = BenchmarkHarness().run_static(built_in_security_tasks())
         self.assertEqual(report.status, "passed")
+        self.assertGreaterEqual(report.total, 10)
+        self.assertEqual(report.score, 1.0)
         client = TestClient(gateway_api.app)
         health = client.get("/health/ready")
         self.assertEqual(health.status_code, 200)

@@ -1313,7 +1313,7 @@ Run the first serious end-to-end training path from approved internet sources:
 11. Run scratch-only GPU pretraining.
 12. Save checkpoint manifest.
 13. Evaluate checkpoint integrity and training stability.
-14. Run built-in defensive security benchmark harness.
+14. Run built-in defensive/security/coding benchmark harness.
 15. Write JSON and Markdown reports.
 
 Why this exists:
@@ -1360,6 +1360,8 @@ python deploy/gpu/run_real_data_training_pipeline.py \
   --train-steps 1000 \
   --train-batch-size 4 \
   --gradient-accumulation-steps 8 \
+  --early-stopping-patience 8 \
+  --max-source-fraction 0.35 \
   --dtype fp16 \
   --device cuda
 ```
@@ -1417,6 +1419,7 @@ Primary outputs:
 - `reports/pipeline_report.json`
 - `reports/quality_report.json`
 - `reports/source_quality_report.json`
+- `reports/source_balance_report.json`
 - `reports/contamination_report.json`
 - `reports/task_review_report.json`
 - `reports/feedback_report.json`
@@ -1425,6 +1428,7 @@ Primary outputs:
 - `tokenizer/tokenizer.json`
 - `shards/manifest.json`
 - `train/checkpoint_manifest.json`
+- `train/best_checkpoint_manifest.json`
 
 Checkpoint evaluation:
 
@@ -1432,9 +1436,41 @@ Checkpoint evaluation:
 
 - checkpoint files exist
 - checkpoint file hashes match the checkpoint manifest
+- validation-best checkpoint selection is being used when available
 - training loss is finite and non-exploding
 - validation loss is finite when validation batches exist
-- built-in defensive security benchmark harness passes
+- built-in defensive/security/coding benchmark harness passes
+
+Best checkpoint and early stopping:
+
+- `src/mythos/model_ops/pretrain_loop.py` writes both:
+  - `train/checkpoint_manifest.json` for the final checkpoint
+  - `train/best_checkpoint_manifest.json` for the best validation checkpoint
+- `training.best_validation_loss` and `training.best_validation_step` record the
+  selected checkpoint.
+- `--early-stopping-patience` stops training after repeated validation checks
+  fail to improve by `--early-stopping-min-delta`.
+- The real-data GPU runner defaults to `--early-stopping-patience 8`.
+- Checkpoint evaluation uses `best_checkpoint_manifest` when present.
+
+Source balancing:
+
+- `src/mythos/learning/source_balancing.py` creates
+  `balanced/balanced-clean-000000.jsonl` before tokenizer and shard training.
+- The default `--max-source-fraction 0.35` prevents a single source such as
+  `git-documentation` from dominating model training.
+- `reports/source_balance_report.json` records input rows, output rows, and
+  capped sources.
+- Disable only for diagnostic runs with `--no-source-balancing`.
+
+Expanded built-in benchmark:
+
+- `src/mythos/evaluation/benchmarks.py` includes SQL injection, hardcoded
+  secrets, command injection, path traversal, XSS, weak crypto, insecure random,
+  unsafe deserialization, C buffer copy, regression-test shape, and patch-shape
+  checks.
+- This is still a lightweight built-in gate, not a replacement for SWE-Bench or
+  a full security benchmark suite.
 
 Training safety preflight:
 

@@ -81,8 +81,10 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             self.assertEqual(report["steps"], 2)
             self.assertEqual(report["validate_every"], 0)
             self.assertTrue(Path(report["checkpoint_manifest"]).exists())
+            self.assertTrue(Path(report["best_checkpoint_manifest"]).exists())
+            self.assertIn("best_validation_loss", report)
             eval_report = evaluate_checkpoint(
-                checkpoint_manifest_path=report["checkpoint_manifest"],
+                checkpoint_manifest_path=report["best_checkpoint_manifest"],
                 training_report=report,
                 output_dir=root / "checkpoint_eval",
             )
@@ -127,6 +129,51 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             validation_gate = next(gate for gate in eval_report.gates if gate.name == "validation_loss")
             self.assertEqual(validation_gate.status, "warn")
             self.assertIn("no validation interval", validation_gate.reason)
+
+    def test_pretrain_loop_saves_best_checkpoint_and_can_early_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            corpus.write_text(json.dumps({"text": "def secure_parser(value): assert value", "license": "mit"}) + "\n", encoding="utf-8")
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            train_shard = root / "shards" / "train" / "shard-000000.bin"
+            val_shard = root / "shards" / "val" / "shard-000000.bin"
+            write_uint32_tokens(train_shard, [0, 1, 2, 3] * 128)
+            write_uint32_tokens(val_shard, [0, 1, 2, 3] * 64)
+            manifest = ShardManifest(
+                dataset_id="unit-test",
+                tokenizer_path=str(tokenizer_path),
+                output_dir=str(root / "shards"),
+                train_shards=[str(train_shard)],
+                val_shards=[str(val_shard)],
+                train_tokens=512,
+                val_tokens=256,
+                sequence_length=16,
+            )
+            (root / "shards" / "manifest.json").write_text(json.dumps(manifest.model_dump()), encoding="utf-8")
+            report = run_pretraining_loop(
+                output_dir=root / "train",
+                manifest=root / "shards" / "manifest.json",
+                device="cpu",
+                steps=20,
+                batch_size=1,
+                sequence_length=16,
+                gradient_accumulation_steps=1,
+                dtype="fp32",
+                validate_every=1,
+                validation_batches=1,
+                early_stopping_patience=1,
+                early_stopping_min_delta=10_000.0,
+                checkpoint_every=0,
+                resume=False,
+            )
+            self.assertEqual(report["status"], "early_stopped")
+            self.assertLess(report["steps"], report["requested_steps"])
+            self.assertTrue(Path(report["best_checkpoint_manifest"]).exists())
 
     def test_pretrain_loop_reports_small_shards_before_training(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

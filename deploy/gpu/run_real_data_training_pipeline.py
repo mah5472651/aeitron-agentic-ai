@@ -43,6 +43,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cuda")
     parser.add_argument("--validate-every", type=int, default=25)
     parser.add_argument("--validation-batches", type=int, default=4)
+    parser.add_argument("--early-stopping-patience", type=int, default=8)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
+    parser.add_argument("--no-source-balancing", action="store_true")
+    parser.add_argument("--max-source-fraction", type=float, default=0.35)
+    parser.add_argument("--min-source-rows", type=int, default=25)
     parser.add_argument("--object-store-uri", default="local://artifacts/mythos/object-store")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--skip-train", action="store_true")
@@ -82,6 +87,11 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             dtype=args.dtype,
             validate_every=min(args.validate_every, args.train_steps) if args.validate_every > 0 else 0,
             validation_batches=args.validation_batches,
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_min_delta=args.early_stopping_min_delta,
+            balance_sources=not args.no_source_balancing,
+            max_source_fraction=args.max_source_fraction,
+            min_source_rows=args.min_source_rows,
             run_checkpoint_eval=not args.skip_train,
             object_store_uri=args.object_store_uri,
             object_store_endpoint_url=args.object_store_endpoint_url,

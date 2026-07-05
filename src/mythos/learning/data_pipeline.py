@@ -20,6 +20,7 @@ from src.mythos.learning.dashboard import write_dashboard
 from src.mythos.learning.feedback import BenchmarkFeedbackReport, write_feedback_report
 from src.mythos.learning.quality_inspector import QualityInspectionReport, write_quality_report
 from src.mythos.learning.review import ReviewReport, review_tasks
+from src.mythos.learning.source_balancing import SourceBalanceReport, balance_clean_jsonl
 from src.mythos.learning.source_registry import SourceRegistry, SourceRegistryReport
 from src.mythos.learning.source_quality import SourceQualityReport, write_source_quality_report
 from src.mythos.learning.storage import ObjectStoreConfig, create_object_store, upload_paths
@@ -62,6 +63,11 @@ class DataPipelineConfig(StrictModel):
     validate_every: int = Field(default=25, ge=0)
     validation_batches: int = Field(default=4, ge=1)
     run_checkpoint_eval: bool = True
+    early_stopping_patience: int = Field(default=0, ge=0)
+    early_stopping_min_delta: float = Field(default=0.0, ge=0.0)
+    balance_sources: bool = True
+    max_source_fraction: float = Field(default=0.35, ge=0.05, le=1.0)
+    min_source_rows: int = Field(default=25, ge=1)
     contamination_patterns_path: str | None = None
     block_contamination: bool = True
     extract_tasks: bool = True
@@ -85,7 +91,9 @@ class DataPipelineReport(StrictModel):
     task_report: dict[str, Any] | None
     review_report: dict[str, Any] | None
     feedback_report: dict[str, Any] | None
+    source_balance_report: dict[str, Any] | None = None
     clean_files: list[str]
+    training_files: list[str]
     tokenizer_path: str
     shard_manifest: dict[str, Any]
     version_manifest_path: str
@@ -234,14 +242,29 @@ async def _run_data_pipeline_locked(
         quality_report_path=quality_report_path,
         review_report_path=review_report_path,
     )
+    source_balance_report: SourceBalanceReport | None = None
+    training_files = clean_files
+    balanced_clean_path = root / "balanced" / "balanced-clean-000000.jsonl"
+    if config.balance_sources:
+        source_balance_report = balance_clean_jsonl(
+            input_paths=clean_files,
+            output_path=balanced_clean_path,
+            max_source_fraction=config.max_source_fraction,
+            min_source_rows=config.min_source_rows,
+        )
+        (reports_dir / "source_balance_report.json").write_text(
+            json.dumps(source_balance_report.model_dump(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        training_files = [str(balanced_clean_path)]
 
     trained_tokenizer = train_bpe_tokenizer(
-        clean_files,
+        training_files,
         tokenizer_path,
         TokenizerTrainConfig(vocab_size=config.vocab_size, min_frequency=config.tokenizer_min_frequency),
     )
     manifest: ShardManifest = build_token_shards(
-        input_paths=clean_files,
+        input_paths=training_files,
         tokenizer_path=trained_tokenizer,
         output_dir=shards_dir,
         config=ShardBuildConfig(
@@ -266,11 +289,13 @@ async def _run_data_pipeline_locked(
             checkpoint_every=max(1, config.train_steps),
             validate_every=config.validate_every,
             validation_batches=config.validation_batches,
+            early_stopping_patience=config.early_stopping_patience,
+            early_stopping_min_delta=config.early_stopping_min_delta,
             resume=True,
         )
         if config.run_checkpoint_eval:
             checkpoint_eval_report = evaluate_checkpoint(
-                checkpoint_manifest_path=training_report["checkpoint_manifest"],
+                checkpoint_manifest_path=training_report.get("best_checkpoint_manifest") or training_report["checkpoint_manifest"],
                 training_report=training_report,
                 output_dir=reports_dir / "checkpoint_eval",
             )
@@ -284,6 +309,9 @@ async def _run_data_pipeline_locked(
     artifacts.append(artifact_from_path(quality_report_path, role="quality_report"))
     artifacts.append(artifact_from_path(source_quality_path, role="source_quality_report"))
     artifacts.append(artifact_from_path(feedback_path, role="feedback_report"))
+    if source_balance_report is not None:
+        artifacts.append(artifact_from_path(reports_dir / "source_balance_report.json", role="source_balance_report"))
+        artifacts.append(artifact_from_path(balanced_clean_path, role="balanced_clean_jsonl"))
     checkpoint_eval_path = reports_dir / "checkpoint_eval" / "checkpoint_eval_report.json"
     if checkpoint_eval_report is not None:
         artifacts.append(artifact_from_path(checkpoint_eval_path, role="checkpoint_eval_report"))
@@ -314,6 +342,8 @@ async def _run_data_pipeline_locked(
             upload_candidates.extend([str(reports_dir / "task_review_report.json"), str(approved_tasks_path)])
         if checkpoint_eval_report is not None:
             upload_candidates.append(str(checkpoint_eval_path))
+        if source_balance_report is not None:
+            upload_candidates.extend([str(reports_dir / "source_balance_report.json"), str(balanced_clean_path)])
         upload_candidates.extend(manifest.train_shards + manifest.val_shards)
         uploaded_objects = upload_paths(store, upload_candidates, prefix=upload_prefix)
     version_manifest = DatasetVersionManifest(
@@ -328,6 +358,7 @@ async def _run_data_pipeline_locked(
         review_report=review_report.model_dump() if review_report else None,
         feedback_report=feedback_report.model_dump(),
         checkpoint_eval_report=checkpoint_eval_report.model_dump() if checkpoint_eval_report else None,
+        source_balance_report=source_balance_report.model_dump() if source_balance_report else None,
         tokenizer_path=str(trained_tokenizer),
         shard_manifest=manifest.model_dump(),
         artifacts=artifacts,
@@ -351,7 +382,9 @@ async def _run_data_pipeline_locked(
         task_report=task_report.model_dump() if task_report else None,
         review_report=review_report.model_dump() if review_report else None,
         feedback_report=feedback_report.model_dump(),
+        source_balance_report=source_balance_report.model_dump() if source_balance_report else None,
         clean_files=clean_files,
+        training_files=training_files,
         tokenizer_path=str(trained_tokenizer),
         shard_manifest=manifest.model_dump(),
         version_manifest_path=str(manifest_path),
@@ -393,6 +426,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate-every", type=int, default=25)
     parser.add_argument("--validation-batches", type=int, default=4)
     parser.add_argument("--no-checkpoint-eval", action="store_true")
+    parser.add_argument("--early-stopping-patience", type=int, default=0)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
+    parser.add_argument("--no-source-balancing", action="store_true")
+    parser.add_argument("--max-source-fraction", type=float, default=0.35)
+    parser.add_argument("--min-source-rows", type=int, default=25)
     parser.add_argument("--contamination-patterns")
     parser.add_argument("--allow-contamination-hits", action="store_true")
     parser.add_argument("--no-task-extraction", action="store_true")
@@ -431,6 +469,11 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         validate_every=args.validate_every,
         validation_batches=args.validation_batches,
         run_checkpoint_eval=not args.no_checkpoint_eval,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        balance_sources=not args.no_source_balancing,
+        max_source_fraction=args.max_source_fraction,
+        min_source_rows=args.min_source_rows,
         contamination_patterns_path=args.contamination_patterns,
         block_contamination=not args.allow_contamination_hits,
         extract_tasks=not args.no_task_extraction,

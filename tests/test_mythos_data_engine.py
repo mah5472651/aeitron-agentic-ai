@@ -16,6 +16,7 @@ from src.mythos.learning.review import review_tasks
 from src.mythos.learning.run_plan import DataRunPlanConfig, build_data_run_plan
 from src.mythos.learning.feedback import build_feedback_report
 from src.mythos.learning.source_registry import SourceRegistry
+from src.mythos.learning.source_balancing import balance_clean_jsonl
 from src.mythos.learning.web_ingest import SourceSpec
 from src.mythos.learning.contamination import ContaminationDetector
 from src.mythos.learning.quality import iter_jsonl
@@ -73,6 +74,26 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(RuntimeError, "already locked"):
                     with PipelineRunLock(lock_path):
                         pass
+
+    def test_source_balancing_caps_dominant_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clean = root / "clean.jsonl"
+            rows = []
+            for index in range(20):
+                rows.append({"source": "dominant", "url": f"d/{index}", "text": "secure code", "quality": {"quality_score": 0.9}})
+            for index in range(5):
+                rows.append({"source": "small", "url": f"s/{index}", "text": "secure code", "quality": {"quality_score": 0.8}})
+            clean.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            report = balance_clean_jsonl(
+                input_paths=[clean],
+                output_path=root / "balanced.jsonl",
+                max_source_fraction=0.5,
+                min_source_rows=1,
+            )
+            by_source = {item.source: item.output_rows for item in report.sources}
+            self.assertEqual(by_source["dominant"], 5)
+            self.assertEqual(by_source["small"], 5)
 
     def test_source_registry_rejects_urls_outside_allowlist(self) -> None:
         registry = SourceRegistry(
@@ -248,6 +269,8 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(report.review_report)
             self.assertGreaterEqual(report.review_report["approved"], 1)
             self.assertIsNotNone(report.feedback_report)
+            self.assertIsNotNone(report.source_balance_report)
+            self.assertTrue(report.training_files)
             self.assertTrue(Path(report.version_manifest_path).exists())
             self.assertTrue(Path(report.dashboard_path).exists())
             self.assertTrue(report.uploaded_objects)

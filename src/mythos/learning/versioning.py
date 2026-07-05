@@ -29,6 +29,7 @@ class DatasetVersionManifest(StrictModel):
     contamination_report: dict[str, Any] | None = None
     quality_report: dict[str, Any] | None = None
     source_quality_report: dict[str, Any] | None = None
+    source_balance_report: dict[str, Any] | None = None
     task_report: dict[str, Any] | None = None
     review_report: dict[str, Any] | None = None
     feedback_report: dict[str, Any] | None = None

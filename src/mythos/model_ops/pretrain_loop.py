@@ -51,6 +51,7 @@ def save_training_checkpoint(
     step: int,
     trained_tokens: int,
     metrics: dict[str, float],
+    manifest_filename: str = "checkpoint_manifest.json",
 ) -> Path:
     checkpoint_dir = output_dir / f"checkpoint-step-{step:08d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -74,7 +75,7 @@ def save_training_checkpoint(
         checkpoint_dir=checkpoint_dir,
         metrics=metrics,
     )
-    return manifest.write_atomic(output_dir / "checkpoint_manifest.json")
+    return manifest.write_atomic(output_dir / manifest_filename)
 
 
 def load_checkpoint(
@@ -180,6 +181,8 @@ def run_pretraining_loop(
     validate_every: int = 25,
     validation_batches: int = 4,
     checkpoint_every: int = 50,
+    early_stopping_patience: int = 0,
+    early_stopping_min_delta: float = 0.0,
     resume: bool = True,
 ) -> dict[str, Any]:
     require_torch()
@@ -187,6 +190,8 @@ def run_pretraining_loop(
         raise ValueError("steps must be >= 1")
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be >= 1")
+    if early_stopping_patience < 0:
+        raise ValueError("early_stopping_patience must be >= 0")
     selected = select_device(device)
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -243,6 +248,12 @@ def run_pretraining_loop(
     optimizer.zero_grad(set_to_none=True)
     current_step = start_step
     epoch = 0
+    best_val_loss = float("inf")
+    best_val_step = 0
+    best_checkpoint_manifest: Path | None = None
+    validations_without_improvement = 0
+    early_stopped = False
+    early_stop_reason = ""
     while current_step < steps:
         progressed = False
         for batch in train_stream.batches(epoch=epoch):
@@ -263,18 +274,37 @@ def run_pretraining_loop(
             train_losses.append(float(output.loss.detach().cpu()))
 
             if val_stream is not None and validate_every > 0 and current_step % validate_every == 0:
-                val_losses.append(
-                    {
-                        "step": float(current_step),
-                        "loss": validation_loss(
-                            model=model,
-                            stream=val_stream,
-                            device=selected,
-                            max_batches=validation_batches,
-                            dtype=dtype,
-                        ),
-                    }
+                current_val_loss = validation_loss(
+                    model=model,
+                    stream=val_stream,
+                    device=selected,
+                    max_batches=validation_batches,
+                    dtype=dtype,
                 )
+                val_losses.append({"step": float(current_step), "loss": current_val_loss})
+                if current_val_loss < best_val_loss - early_stopping_min_delta:
+                    best_val_loss = current_val_loss
+                    best_val_step = current_step
+                    validations_without_improvement = 0
+                    best_checkpoint_manifest = save_training_checkpoint(
+                        output_dir=root,
+                        model=model,
+                        optimizer=optimizer,
+                        config=config,
+                        step=current_step,
+                        trained_tokens=trained_tokens,
+                        metrics={"train_loss": train_losses[-1], "val_loss": current_val_loss, "best_val_loss": current_val_loss},
+                        manifest_filename="best_checkpoint_manifest.json",
+                    )
+                else:
+                    validations_without_improvement += 1
+                    if early_stopping_patience > 0 and validations_without_improvement >= early_stopping_patience:
+                        early_stopped = True
+                        early_stop_reason = (
+                            f"validation loss did not improve by {early_stopping_min_delta} "
+                            f"for {validations_without_improvement} validation checks"
+                        )
+                        break
             if checkpoint_every > 0 and current_step % checkpoint_every == 0:
                 save_training_checkpoint(
                     output_dir=root,
@@ -287,6 +317,8 @@ def run_pretraining_loop(
                 )
             if current_step >= steps:
                 break
+        if early_stopped:
+            break
         if not progressed:
             raise RuntimeError(
                 "no training batches were produced from shards after preflight validation; "
@@ -294,6 +326,7 @@ def run_pretraining_loop(
             )
         epoch += 1
 
+    final_val_loss = val_losses[-1]["loss"] if val_losses else -1.0
     manifest_path = save_training_checkpoint(
         output_dir=root,
         model=model,
@@ -301,21 +334,43 @@ def run_pretraining_loop(
         config=config,
         step=current_step,
         trained_tokens=trained_tokens,
-        metrics={"train_loss": train_losses[-1], "val_loss": val_losses[-1]["loss"] if val_losses else -1.0},
+        metrics={"train_loss": train_losses[-1], "val_loss": final_val_loss, "best_val_loss": best_val_loss if val_losses else -1.0},
+        manifest_filename="checkpoint_manifest.json",
     )
+    if best_checkpoint_manifest is None:
+        best_checkpoint_manifest = save_training_checkpoint(
+            output_dir=root,
+            model=model,
+            optimizer=optimizer,
+            config=config,
+            step=current_step,
+            trained_tokens=trained_tokens,
+            metrics={"train_loss": train_losses[-1], "val_loss": final_val_loss, "best_val_loss": final_val_loss},
+            manifest_filename="best_checkpoint_manifest.json",
+        )
+        best_val_loss = final_val_loss
+        best_val_step = current_step
     report = {
-        "status": "passed",
+        "status": "early_stopped" if early_stopped else "passed",
         "scratch_only": True,
         "steps": current_step,
+        "requested_steps": steps,
         "start_step": start_step,
         "device": str(selected),
         "dtype": dtype,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "validate_every": validate_every,
         "validation_batches": validation_batches,
+        "early_stopping_patience": early_stopping_patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
+        "early_stopped": early_stopped,
+        "early_stop_reason": early_stop_reason,
         "model_config": config.model_dump(),
         "train_losses": train_losses,
         "validation_losses": val_losses,
+        "best_validation_loss": best_val_loss,
+        "best_validation_step": best_val_step,
+        "best_checkpoint_manifest": str(best_checkpoint_manifest),
         "trained_tokens": trained_tokens,
         "checkpoint_manifest": str(manifest_path),
         "duration_ms": round((time.perf_counter() - started) * 1000, 3),
@@ -340,6 +395,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate-every", type=int, default=25)
     parser.add_argument("--validation-batches", type=int, default=4)
     parser.add_argument("--checkpoint-every", type=int, default=50)
+    parser.add_argument("--early-stopping-patience", type=int, default=0)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--no-resume", action="store_true")
     return parser.parse_args()
 
@@ -361,6 +418,8 @@ def main() -> None:
         validate_every=args.validate_every,
         validation_batches=args.validation_batches,
         checkpoint_every=args.checkpoint_every,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
         resume=not args.no_resume,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
