@@ -10,6 +10,7 @@ from src.mythos.evaluation.checkpoint_eval import evaluate_checkpoint
 from src.mythos.learning.web_ingest import allowed_url, text_from_html
 from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
 from src.mythos.model_ops.pretrain_loop import run_pretraining_loop
+from src.mythos.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints
 from src.mythos.model_ops.tokenizer_pipeline import (
     ShardBuildConfig,
     ShardManifest,
@@ -245,6 +246,49 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             )
             self.assertEqual(report["status"], "passed")
             self.assertGreaterEqual(report["model_config"]["vocab_size"], 3001)
+
+    def test_checkpoint_comparison_writes_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            text = "def secure_login(user_input): parameterized query validation test patch " * 300
+            corpus.write_text(json.dumps({"text": text, "license": "mit"}) + "\n", encoding="utf-8")
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            build_token_shards(
+                input_paths=[corpus],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "shards",
+                config=ShardBuildConfig(shard_token_count=128, sequence_length=16, validation_fraction=0.0),
+            )
+            training = run_pretraining_loop(
+                output_dir=root / "train",
+                manifest=root / "shards" / "manifest.json",
+                device="cpu",
+                steps=1,
+                batch_size=1,
+                sequence_length=16,
+                gradient_accumulation_steps=1,
+                dtype="fp32",
+                validate_every=0,
+                checkpoint_every=0,
+                resume=False,
+            )
+            comparison = compare_checkpoints(
+                baseline_manifest=training["checkpoint_manifest"],
+                candidate_manifest=training["checkpoint_manifest"],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "compare",
+                device="cpu",
+                generation_config=GenerationConfig(max_new_tokens=8),
+            )
+            self.assertEqual(comparison.status, "neutral")
+            self.assertEqual(comparison.baseline.total, 5)
+            self.assertTrue(Path(root / "compare" / "checkpoint_comparison_report.json").exists())
+            self.assertTrue(Path(root / "compare" / "checkpoint_comparison_report.md").exists())
 
 
 if __name__ == "__main__":

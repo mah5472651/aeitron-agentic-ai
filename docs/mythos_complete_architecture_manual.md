@@ -1598,6 +1598,75 @@ python -m src.mythos.evaluation.checkpoint_eval \
   --output-dir artifacts/mythos/real-data-smoke/reports/checkpoint_eval
 ```
 
+## Checkpoint Learning Comparison
+
+Files:
+
+- `src/mythos/model_ops/checkpoint_compare.py`
+- `deploy/gpu/run_checkpoint_comparison.py`
+
+Purpose:
+
+Measure whether a newer scratch checkpoint is behaviorally better than an older
+checkpoint on the same deterministic prompt suite. This answers whether the
+model learned more than before, not just whether training loss moved.
+
+How it works:
+
+1. Load a baseline checkpoint manifest.
+2. Load a candidate checkpoint manifest.
+3. Load the exact tokenizer used by the training run.
+4. Run the same fixed coding/security/debugging prompts through both models.
+5. Score outputs locally with deterministic heuristics:
+   - expected security/coding terms found
+   - forbidden unsafe terms avoided
+   - output is non-empty
+   - output has basic structure signals
+   - repetition is not excessive
+6. Write JSON and Markdown reports with per-task deltas.
+
+Default prompt categories:
+
+- SQL injection finding and safe patch
+- XSS review and safe fix
+- Python traceback debugging
+- FastAPI JWT middleware planning
+- empty-password patch and regression tests
+
+Compare final vs best checkpoint from a real data run:
+
+```bash
+python deploy/gpu/run_checkpoint_comparison.py \
+  --training-report artifacts/mythos/real-data-20k-v3-kaggle-safe/reports/real_data_training_report.json \
+  --output-dir artifacts/mythos/real-data-20k-v3-kaggle-safe/reports/checkpoint_compare \
+  --device cuda \
+  --max-new-tokens 96
+```
+
+Compare two explicit checkpoint manifests:
+
+```bash
+python deploy/gpu/run_checkpoint_comparison.py \
+  --baseline-manifest artifacts/mythos/run-a/train/best_checkpoint_manifest.json \
+  --candidate-manifest artifacts/mythos/run-b/train/best_checkpoint_manifest.json \
+  --tokenizer artifacts/mythos/run-b/tokenizer/tokenizer.json \
+  --output-dir artifacts/mythos/checkpoint-compare/run-a-vs-run-b \
+  --device cuda
+```
+
+Outputs:
+
+- `checkpoint_comparison_report.json`
+- `checkpoint_comparison_report.md`
+
+Interpretation:
+
+- `status=improved`: candidate scored higher without meaningful regressions.
+- `status=neutral`: candidate is not clearly better yet.
+- `status=regressed`: candidate should not be promoted without inspection.
+- `score_delta`: average score movement across the prompt suite.
+- `pass_delta`: number of tasks crossing the pass threshold.
+
 ## Verification Commands
 
 Use these after major changes:
