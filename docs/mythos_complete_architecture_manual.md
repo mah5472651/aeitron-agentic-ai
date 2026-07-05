@@ -1394,6 +1394,11 @@ Important:
   scraper for unauthorized collection.
 - `--min-clean-records` intentionally blocks the run if the crawl does not
   produce enough accepted records.
+- Use a fresh `--output-dir` for each run. The pipeline now overwrites its own
+  `raw-*.jsonl` and `clean-*.jsonl` shards at startup to prevent stale partial
+  JSONL lines from interrupted runs contaminating the next run.
+- JSONL readers report the exact file and line number if a malformed row is
+  encountered.
 
 Primary outputs:
 

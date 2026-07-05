@@ -13,6 +13,7 @@ import inspect
 import json
 import re
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -144,31 +145,43 @@ class DataEngineReport(StrictModel):
 
 
 class ShardedJsonlWriter:
-    def __init__(self, output_dir: str | Path, *, prefix: str, rows_per_shard: int) -> None:
+    def __init__(self, output_dir: str | Path, *, prefix: str, rows_per_shard: int, overwrite: bool = True) -> None:
         self.output_dir = Path(output_dir)
         self.prefix = prefix
         self.rows_per_shard = rows_per_shard
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        if overwrite:
+            for path in self.output_dir.glob(f"{self.prefix}-*.jsonl"):
+                path.unlink()
         self.shard_index = 0
         self.row_count = 0
         self.handle = None
+        self.current_path: Path | None = None
+        self.lock = threading.RLock()
 
     def write(self, row: dict[str, Any]) -> Path:
-        if self.handle is None or self.row_count >= self.rows_per_shard:
-            self.close()
-            path = self.output_dir / f"{self.prefix}-{self.shard_index:06d}.jsonl"
-            self.handle = path.open("a", encoding="utf-8")
-            self.current_path = path
-            self.shard_index += 1
-            self.row_count = 0
-        self.handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
-        self.row_count += 1
-        return self.current_path
+        with self.lock:
+            if self.handle is None or self.row_count >= self.rows_per_shard:
+                self.close()
+                path = self.output_dir / f"{self.prefix}-{self.shard_index:06d}.jsonl"
+                self.handle = path.open("w", encoding="utf-8")
+                self.current_path = path
+                self.shard_index += 1
+                self.row_count = 0
+            line = json.dumps(row, ensure_ascii=False, sort_keys=True)
+            self.handle.write(line)
+            self.handle.write("\n")
+            self.handle.flush()
+            self.row_count += 1
+            if self.current_path is None:
+                raise RuntimeError("writer current_path missing after write")
+            return self.current_path
 
     def close(self) -> None:
-        if self.handle is not None:
-            self.handle.close()
-            self.handle = None
+        with self.lock:
+            if self.handle is not None:
+                self.handle.close()
+                self.handle = None
 
 
 class FrontierStore:

@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 
 from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore
+from src.mythos.learning.data_engine import ShardedJsonlWriter
 from src.mythos.learning.data_pipeline import DataPipelineConfig, run_data_pipeline
 from src.mythos.learning.production_check import DataPlatformReadinessConfig, run_readiness_check
 from src.mythos.learning.quality_inspector import inspect_clean_jsonl
@@ -17,6 +18,7 @@ from src.mythos.learning.feedback import build_feedback_report
 from src.mythos.learning.source_registry import SourceRegistry
 from src.mythos.learning.web_ingest import SourceSpec
 from src.mythos.learning.contamination import ContaminationDetector
+from src.mythos.learning.quality import iter_jsonl
 
 
 def _page(title: str, link: str | None = None) -> str:
@@ -31,6 +33,26 @@ def _page(title: str, link: str | None = None) -> str:
 
 
 class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
+    def test_sharded_jsonl_writer_overwrites_stale_corrupt_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stale = root / "clean-000000.jsonl"
+            stale.write_text('{"text": "unterminated', encoding="utf-8")
+            writer = ShardedJsonlWriter(root, prefix="clean", rows_per_shard=10)
+            try:
+                writer.write({"text": "valid", "license": "mit"})
+            finally:
+                writer.close()
+            rows = list(iter_jsonl(stale))
+            self.assertEqual(rows, [{"license": "mit", "text": "valid"}])
+
+    def test_iter_jsonl_reports_path_and_line_for_corrupt_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "bad.jsonl"
+            path.write_text('{"ok": true}\n{"bad": "unterminated\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid JSONL.*bad.jsonl.*line 2"):
+                list(iter_jsonl(path))
+
     def test_source_registry_rejects_urls_outside_allowlist(self) -> None:
         registry = SourceRegistry(
             [

@@ -78,9 +78,14 @@ def stable_hash(text: str) -> str:
 
 
 def iter_jsonl(path: str | Path) -> Iterable[dict[str, Any]]:
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+    source = Path(path)
+    for line_number, line in enumerate(source.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
         if line.strip():
-            yield json.loads(line)
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                snippet = line[:240].replace("\n", "\\n")
+                raise ValueError(f"invalid JSONL in {source} at line {line_number}: {exc.msg}; snippet={snippet!r}") from exc
 
 
 def infer_language(text: str, url: str = "") -> str | None:
