@@ -32,6 +32,7 @@ class DatasetVersionManifest(StrictModel):
     task_report: dict[str, Any] | None = None
     review_report: dict[str, Any] | None = None
     feedback_report: dict[str, Any] | None = None
+    checkpoint_eval_report: dict[str, Any] | None = None
     tokenizer_path: str
     shard_manifest: dict[str, Any]
     artifacts: list[DatasetArtifact]

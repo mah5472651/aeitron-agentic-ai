@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from src.mythos.learning.quality import DatasetQualityGate, QualityGateConfig
+from src.mythos.evaluation.checkpoint_eval import evaluate_checkpoint
 from src.mythos.learning.web_ingest import allowed_url, text_from_html
 from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
 from src.mythos.model_ops.pretrain_loop import run_pretraining_loop
@@ -77,6 +78,13 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             self.assertEqual(report["status"], "passed")
             self.assertEqual(report["steps"], 2)
             self.assertTrue(Path(report["checkpoint_manifest"]).exists())
+            eval_report = evaluate_checkpoint(
+                checkpoint_manifest_path=report["checkpoint_manifest"],
+                training_report=report,
+                output_dir=root / "checkpoint_eval",
+            )
+            self.assertEqual(eval_report.status, "passed")
+            self.assertTrue(Path(root / "checkpoint_eval" / "checkpoint_eval_report.json").exists())
 
     def test_pretrain_loop_reports_small_shards_before_training(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

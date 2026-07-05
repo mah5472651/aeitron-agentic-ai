@@ -173,6 +173,9 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(report.uploaded_objects)
             self.assertIsNotNone(report.training)
             self.assertEqual(report.training["status"], "passed")
+            self.assertIsNotNone(report.checkpoint_eval)
+            self.assertEqual(report.checkpoint_eval["status"], "passed")
+            self.assertTrue(Path(root / "pipeline" / "reports" / "checkpoint_eval" / "checkpoint_eval_report.json").exists())
 
     def test_contamination_detector_blocks_known_benchmark_patterns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

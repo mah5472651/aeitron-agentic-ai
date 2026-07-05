@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 from pydantic import Field
 
+from src.mythos.evaluation.checkpoint_eval import CheckpointEvalReport, evaluate_checkpoint
 from src.mythos.learning.contamination import ContaminationDetector, load_patterns
 from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore, PostgresFrontierStore
 from src.mythos.learning.dashboard import write_dashboard
@@ -56,6 +57,9 @@ class DataPipelineConfig(StrictModel):
     train_batch_size: int = Field(default=2, ge=1)
     gradient_accumulation_steps: int = Field(default=1, ge=1)
     dtype: str = "bf16"
+    validate_every: int = Field(default=25, ge=0)
+    validation_batches: int = Field(default=4, ge=1)
+    run_checkpoint_eval: bool = True
     contamination_patterns_path: str | None = None
     block_contamination: bool = True
     extract_tasks: bool = True
@@ -86,6 +90,7 @@ class DataPipelineReport(StrictModel):
     dashboard_path: str
     uploaded_objects: list[dict[str, Any]]
     training: dict[str, Any] | None = None
+    checkpoint_eval: dict[str, Any] | None = None
 
 
 async def _build_store(config: DataPipelineConfig) -> Any:
@@ -183,6 +188,7 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
         dataset_id=config.dataset_id,
     )
     training_report = None
+    checkpoint_eval_report: CheckpointEvalReport | None = None
     if not config.skip_train:
         training_report = run_pretraining_loop(
             output_dir=train_dir,
@@ -194,9 +200,16 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             dtype=config.dtype,
             checkpoint_every=max(1, config.train_steps),
-            validate_every=0,
+            validate_every=config.validate_every,
+            validation_batches=config.validation_batches,
             resume=True,
         )
+        if config.run_checkpoint_eval:
+            checkpoint_eval_report = evaluate_checkpoint(
+                checkpoint_manifest_path=training_report["checkpoint_manifest"],
+                training_report=training_report,
+                output_dir=reports_dir / "checkpoint_eval",
+            )
 
     artifacts: list[DatasetArtifact] = []
     for path in clean_files:
@@ -207,6 +220,9 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
     artifacts.append(artifact_from_path(quality_report_path, role="quality_report"))
     artifacts.append(artifact_from_path(source_quality_path, role="source_quality_report"))
     artifacts.append(artifact_from_path(feedback_path, role="feedback_report"))
+    checkpoint_eval_path = reports_dir / "checkpoint_eval" / "checkpoint_eval_report.json"
+    if checkpoint_eval_report is not None:
+        artifacts.append(artifact_from_path(checkpoint_eval_path, role="checkpoint_eval_report"))
     if task_report is not None:
         artifacts.append(artifact_from_path(tasks_path, role="extracted_tasks"))
     if review_report is not None:
@@ -232,6 +248,8 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
             upload_candidates.append(str(tasks_path))
         if review_report is not None:
             upload_candidates.extend([str(reports_dir / "task_review_report.json"), str(approved_tasks_path)])
+        if checkpoint_eval_report is not None:
+            upload_candidates.append(str(checkpoint_eval_path))
         upload_candidates.extend(manifest.train_shards + manifest.val_shards)
         uploaded_objects = upload_paths(store, upload_candidates, prefix=upload_prefix)
     version_manifest = DatasetVersionManifest(
@@ -245,6 +263,7 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
         task_report=task_report.model_dump() if task_report else None,
         review_report=review_report.model_dump() if review_report else None,
         feedback_report=feedback_report.model_dump(),
+        checkpoint_eval_report=checkpoint_eval_report.model_dump() if checkpoint_eval_report else None,
         tokenizer_path=str(trained_tokenizer),
         shard_manifest=manifest.model_dump(),
         artifacts=artifacts,
@@ -275,6 +294,7 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
         dashboard_path=str(root / "dashboard.html"),
         uploaded_objects=[item.model_dump() for item in uploaded_objects],
         training=training_report,
+        checkpoint_eval=checkpoint_eval_report.model_dump() if checkpoint_eval_report else None,
     )
     report_path = reports_dir / "pipeline_report.json"
     report_path.write_text(json.dumps(report_payload.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
@@ -306,6 +326,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--validate-every", type=int, default=25)
+    parser.add_argument("--validation-batches", type=int, default=4)
+    parser.add_argument("--no-checkpoint-eval", action="store_true")
     parser.add_argument("--contamination-patterns")
     parser.add_argument("--allow-contamination-hits", action="store_true")
     parser.add_argument("--no-task-extraction", action="store_true")
@@ -341,6 +364,9 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         dtype=args.dtype,
+        validate_every=args.validate_every,
+        validation_batches=args.validation_batches,
+        run_checkpoint_eval=not args.no_checkpoint_eval,
         contamination_patterns_path=args.contamination_patterns,
         block_contamination=not args.allow_contamination_hits,
         extract_tasks=not args.no_task_extraction,

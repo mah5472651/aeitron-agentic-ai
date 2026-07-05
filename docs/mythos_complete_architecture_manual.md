@@ -1288,6 +1288,147 @@ first:
    - `tasks/approved_tasks.jsonl`
 7. If clean, scale to 5k, then 100k, then 1M.
 
+## Real Approved-Source GPU Training Run
+
+Files:
+
+- `deploy/gpu/run_real_data_training_pipeline.py`
+- `src/mythos/learning/data_pipeline.py`
+- `src/mythos/evaluation/checkpoint_eval.py`
+
+Purpose:
+
+Run the first serious end-to-end training path from approved internet sources:
+
+1. Load approved source registry.
+2. Crawl only allowlisted domains.
+3. Respect robots policy by default.
+4. Deduplicate by content hash.
+5. Run quality filtering.
+6. Run contamination detection.
+7. Extract coding/security tasks.
+8. Review extracted tasks.
+9. Train Mythos tokenizer.
+10. Build token shards.
+11. Run scratch-only GPU pretraining.
+12. Save checkpoint manifest.
+13. Evaluate checkpoint integrity and training stability.
+14. Run built-in defensive security benchmark harness.
+15. Write JSON and Markdown reports.
+
+Why this exists:
+
+Toy data proves plumbing. Real approved-source data proves that the architecture
+can ingest web data, filter it, convert it into training shards, train on GPU,
+and produce auditable evidence after the checkpoint.
+
+Kaggle T4 smoke command:
+
+```bash
+python deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.production.sample.json \
+  --output-dir artifacts/mythos/real-data-smoke \
+  --max-docs 200 \
+  --min-clean-records 25 \
+  --workers 8 \
+  --max-depth 1 \
+  --delay-seconds 0.2 \
+  --vocab-size 8000 \
+  --sequence-length 64 \
+  --validation-fraction 0.05 \
+  --train-steps 200 \
+  --train-batch-size 4 \
+  --gradient-accumulation-steps 4 \
+  --dtype fp16 \
+  --device cuda
+```
+
+First 10k-record command:
+
+```bash
+python deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.production.sample.json \
+  --output-dir artifacts/mythos/real-data-10k \
+  --max-docs 10000 \
+  --min-clean-records 10000 \
+  --workers 16 \
+  --max-depth 2 \
+  --delay-seconds 0.5 \
+  --vocab-size 64000 \
+  --sequence-length 128 \
+  --validation-fraction 0.02 \
+  --train-steps 1000 \
+  --train-batch-size 4 \
+  --gradient-accumulation-steps 8 \
+  --dtype fp16 \
+  --device cuda
+```
+
+100k-record command:
+
+```bash
+python deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.production.sample.json \
+  --output-dir artifacts/mythos/real-data-100k \
+  --max-docs 100000 \
+  --min-clean-records 100000 \
+  --workers 32 \
+  --max-depth 3 \
+  --delay-seconds 0.5 \
+  --vocab-size 64000 \
+  --sequence-length 128 \
+  --validation-fraction 0.02 \
+  --train-steps 10000 \
+  --train-batch-size 4 \
+  --gradient-accumulation-steps 8 \
+  --dtype fp16 \
+  --device cuda
+```
+
+Important:
+
+- Kaggle is good for a real smoke or small training run.
+- Production-scale 10k-100k+ collection is better on a long-running VM or
+  Kubernetes worker setup.
+- The crawler is defensive and allowlist-based. It is not a general web
+  scraper for unauthorized collection.
+- `--min-clean-records` intentionally blocks the run if the crawl does not
+  produce enough accepted records.
+
+Primary outputs:
+
+- `reports/real_data_training_report.json`
+- `reports/pipeline_report.json`
+- `reports/quality_report.json`
+- `reports/source_quality_report.json`
+- `reports/contamination_report.json`
+- `reports/task_review_report.json`
+- `reports/feedback_report.json`
+- `reports/checkpoint_eval/checkpoint_eval_report.json`
+- `reports/checkpoint_eval/benchmarks/built_in_security_benchmark.md`
+- `tokenizer/tokenizer.json`
+- `shards/manifest.json`
+- `train/checkpoint_manifest.json`
+
+Checkpoint evaluation:
+
+`src/mythos/evaluation/checkpoint_eval.py` verifies:
+
+- checkpoint files exist
+- checkpoint file hashes match the checkpoint manifest
+- training loss is finite and non-exploding
+- validation loss is finite when validation batches exist
+- built-in defensive security benchmark harness passes
+
+Standalone checkpoint eval:
+
+```bash
+python -m src.mythos.evaluation.checkpoint_eval \
+  --checkpoint-manifest artifacts/mythos/real-data-smoke/train/checkpoint_manifest.json \
+  --training-report artifacts/mythos/real-data-smoke/train/pretrain_report.json \
+  --output-dir artifacts/mythos/real-data-smoke/reports/checkpoint_eval
+```
+
 ## Verification Commands
 
 Use these after major changes:
