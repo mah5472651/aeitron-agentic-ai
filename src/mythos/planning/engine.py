@@ -53,7 +53,7 @@ class IntentPlanningEngine:
             run_id=rid,
             prompt=prompt,
             expansion=expansion,
-            task_graph_brief="understand -> retrieve_context -> edit -> test -> verify -> summarize",
+            task_graph_brief="understand -> planner -> retrieve_context -> edit -> test -> critic_review -> security_review -> performance_review -> verify -> summarize",
             goal=f"Complete Mythos request: {prompt}",
             requirements=requirements,
             risks=risks,

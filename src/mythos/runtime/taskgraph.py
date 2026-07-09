@@ -14,9 +14,13 @@ from src.mythos.shared.schemas import StrictModel
 
 TASK_NODE_ORDER = [
     ("understand", "Understand request and repository target"),
+    ("planner", "Build durable implementation plan"),
     ("retrieve_context", "Retrieve ranked repository context"),
     ("edit", "Generate patch proposal"),
     ("test", "Run targeted tests"),
+    ("critic_review", "Review correctness and reasoning risks"),
+    ("security_review", "Review defensive security constraints"),
+    ("performance_review", "Review performance and maintainability"),
     ("verify", "Verify patch and security constraints"),
     ("summarize", "Return final answer and evidence"),
 ]
@@ -165,9 +169,13 @@ class TaskGraphRuntime:
     def instructions_for(self, kind: str, *, prompt: str, mode: str, apply_patch: bool) -> str:
         instructions = {
             "understand": "Classify intent, target files, risks, and expected verification evidence.",
+            "planner": "Create a durable dependency-aware task plan. Do not write executable code in this stage.",
             "retrieve_context": "Build a ranked context pack from indexed repository chunks.",
             "edit": "Generate minimal file edits as structured patch operations.",
             "test": "Run targeted tests and capture stdout, stderr, exit code, and duration.",
+            "critic_review": "Review executor outputs for logic gaps, missing requirements, and incorrect assumptions. Do not produce the final solution.",
+            "security_review": "Review patch and evidence for defensive security risks, secret exposure, unsafe execution, and vulnerability regressions.",
+            "performance_review": "Review patch for unnecessary complexity, slow paths, resource usage, and maintainability risk.",
             "verify": "Accept only if patch applies cleanly and verification passes.",
             "summarize": "Return concise final answer with changed files and verification evidence.",
         }

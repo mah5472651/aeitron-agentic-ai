@@ -171,6 +171,7 @@ CREATE INDEX IF NOT EXISTS idx_code_chunks_project_path ON code_chunks(project_i
 CREATE INDEX IF NOT EXISTS idx_code_chunks_project_symbol ON code_chunks(project_id, symbol_name);
 CREATE INDEX IF NOT EXISTS idx_runs_project_status ON runs(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_graph_status ON tasks(task_graph_id, status);
+CREATE INDEX IF NOT EXISTS idx_memory_project_kind ON memory_entries(project_id, kind);
 """
 
 
@@ -640,3 +641,84 @@ class LocalStore:
         metadata = data.pop("metadata_json", "{}")
         data["metadata"] = json.loads(metadata or "{}")
         return data
+
+    def insert_memory_entry(
+        self,
+        *,
+        project_id: str | None,
+        kind: str,
+        content: dict[str, Any],
+        source_run_id: str | None = None,
+        relevance: float = 0.5,
+        success_rate: float = 0.5,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        entry_id = new_id()
+        timestamp = now_unix()
+        self.connection.execute(
+            """
+            INSERT INTO memory_entries(
+              id, project_id, kind, content, source_run_id, relevance,
+              success_rate, usage_count, metadata_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                entry_id,
+                project_id,
+                kind,
+                json.dumps(content, sort_keys=True),
+                source_run_id,
+                relevance,
+                success_rate,
+                json.dumps(metadata or {}, sort_keys=True),
+                timestamp,
+            ),
+        )
+        self.connection.commit()
+        result = self.get_memory_entry(entry_id)
+        if result is None:
+            raise RuntimeError("memory entry insert did not round-trip")
+        return result
+
+    def get_memory_entry(self, entry_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM memory_entries WHERE id = ?", (entry_id,)).fetchone()
+        data = row_to_dict(row)
+        if data is None:
+            return None
+        data["content"] = json.loads(data["content"] or "{}")
+        data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
+        return data
+
+    def list_memory_entries(self, project_id: str | None = None, *, kinds: list[str] | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            clauses.append("(project_id = ? OR project_id IS NULL)")
+            params.append(project_id)
+        if kinds:
+            clauses.append(f"kind IN ({','.join('?' for _ in kinds)})")
+            params.extend(kinds)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.connection.execute(
+            f"SELECT * FROM memory_entries {where} ORDER BY created_at DESC",
+            params,
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            data = row_to_dict(row) or {}
+            data["content"] = json.loads(data["content"] or "{}")
+            data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
+            results.append(data)
+        return results
+
+    def mark_memory_used(self, entry_id: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE memory_entries
+            SET usage_count = usage_count + 1, last_used_at = ?
+            WHERE id = ?
+            """,
+            (now_unix(), entry_id),
+        )
+        self.connection.commit()

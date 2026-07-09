@@ -90,7 +90,7 @@ src/mythos/
   identity/      JWT auth and quota/rate limiting.
   indexing/      Repository indexer, AST facts, vector search, context builder.
   learning/      Data collection, quality, review, versioning, training data platform.
-  memory/        Verified fix memory retrieval/promotion.
+  memory/        Unified working/project/episodic/semantic/user/fix memory.
   model_ops/     Scratch model specs, tokenizer, shards, pretraining, GPU smoke.
   patches/       Patch preview/apply/rollback/verify.
   planning/      Intent and planning engine.
@@ -148,7 +148,10 @@ Important endpoints:
 - `POST /v1/projects/{project_id}/index`: index repository files
 - `GET /v1/projects/{project_id}/symbols`: inspect extracted symbols
 - `POST /v1/context/build`: build ranked context pack
-- `POST /v1/context/vector-search`: local vector search
+- `POST /v1/context/vector-search`: vector search with backend selector
+- `GET /v1/context/vector-capabilities`: vector backend readiness
+- `POST /v1/memory/ingest`: ingest verified memory
+- `POST /v1/memory/retrieve`: retrieve ranked memory
 - `POST /v1/agent/runs`: create a durable agent run
 - `GET /v1/taskgraphs/{task_graph_id}`: inspect TaskGraph
 - `POST /v1/taskgraphs/{task_graph_id}/advance`: advance next ready task
@@ -311,6 +314,31 @@ API:
 
 - `POST /v1/context/build`
 - `POST /v1/context/vector-search`
+- `GET /v1/context/vector-capabilities`
+
+Vector backend details:
+
+- `local_hashing`: built-in deterministic hashed embedding backend. It scans
+  indexed chunks exactly and is the default for local development, tests, and
+  small/medium repositories.
+- `faiss`: explicit FAISS adapter contract. Use when `faiss` is installed and a
+  large local ANN sidecar index is desired.
+- `hnsw`: explicit HNSW adapter contract. Use when `hnswlib` is installed and a
+  fast local approximate index is desired.
+- `qdrant`: production distributed vector database contract. Requires
+  `MYTHOS_QDRANT_URL` or `qdrant_url`.
+- `pgvector`: Postgres-native vector search contract. Requires
+  `MYTHOS_DATABASE_URL` or `postgres_dsn`.
+
+Current production path:
+
+- local/dev/smoke: `local_hashing`
+- many projects or large memory: `qdrant`
+- relational + vector in one database: `pgvector`
+- single-node large repo: `faiss` or `hnsw`
+
+The API rejects unavailable production backends with explicit configuration or
+dependency errors instead of silently pretending they are active.
 
 Why it exists:
 
@@ -330,7 +358,16 @@ Purpose:
 Create and execute durable task graphs for agentic work. Current default graph:
 
 ```text
-understand -> retrieve_context -> edit -> test -> verify -> summarize
+understand
+  -> planner
+  -> retrieve_context
+  -> edit
+  -> test
+  -> critic_review
+  -> security_review
+  -> performance_review
+  -> verify
+  -> summarize
 ```
 
 When it runs:
@@ -350,8 +387,9 @@ APIs:
 Why it exists:
 
 Agent work must be durable and inspectable. A hidden single prompt loop is hard
-to debug. TaskGraph state shows what failed: planning, context, editing,
-testing, verification, or summary.
+to debug. TaskGraph state shows what failed: intent understanding, planning,
+context retrieval, editing, testing, critic review, security review,
+performance review, verification, or summary.
 
 ## Tool Runtime And Sandbox
 
@@ -525,19 +563,51 @@ Files:
 
 Purpose:
 
-Store and retrieve verified fixes so the agent can avoid repeating solved
-mistakes. Memory is intentionally conservative: only verified fixes should be
-promoted.
+Store and retrieve typed, ranked memory without polluting future context. The
+memory manager supports six layers:
+
+- `working`: current session/task context only; in-process TTL.
+- `project`: repository facts, architecture decisions, module paths, stack.
+- `episodic`: solved workflow traces and successful run outcomes.
+- `semantic`: durable technical concepts and reusable knowledge.
+- `user`: durable user preferences and operating constraints.
+- `verified_fix`: failure -> fix -> verified outcome records.
+
+Anti-pollution policy:
+
+- allowed: verified fixes, passed benchmarks, security findings, successful
+  plans, project facts, user preferences
+- rejected: raw thoughts, failed guesses, transient outputs
+
+Retrieval ranking:
+
+```text
+Final Score =
+  0.4 * vector_similarity
+  + 0.3 * success_rate
+  + 0.2 * recency_weight
+  + 0.1 * usage_count_weight
+```
+
+This formula is implemented in `memory_rank_score`.
 
 When it runs:
 
 - after a bug is fixed and verified
+- after a benchmark or security finding is confirmed
+- when project facts or user preferences should persist
 - before similar future tasks
+
+APIs:
+
+- `POST /v1/memory/ingest`
+- `POST /v1/memory/retrieve`
 
 Why it exists:
 
-Repeated failures are expensive. Verified memory creates compounding
-engineering improvement.
+Repeated failures are expensive, but bad memory is worse than no memory. The
+layered manager preserves useful evidence while preventing context pollution
+from guesses and transient outputs.
 
 ## Model Foundation And Scratch Training
 

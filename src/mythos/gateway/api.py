@@ -13,8 +13,9 @@ from pydantic import BaseModel, Field
 from src.mythos.db import LocalStore
 from src.mythos.evaluation.benchmarks import BenchmarkHarness, built_in_security_tasks
 from src.mythos.identity import AuthError, auth_status, create_jwt, install_auth, install_quota, validate_token_issue_request
-from src.mythos.indexing import ContextBuilder, LocalVectorIndex, RepositoryIndexer
+from src.mythos.indexing import ContextBuilder, RepositoryIndexer, VectorBackendConfig, create_vector_index, vector_capabilities
 from src.mythos.learning.versioning import DatasetLedger
+from src.mythos.memory import MemoryIngestRequest, UnifiedMemoryManager
 from src.mythos.model_ops.backends import active_model_health, list_model_profiles
 from src.mythos.model_ops.foundation import PretrainingRunSpec, foundation_status
 from src.mythos.observability import METRICS, install_observability
@@ -64,6 +65,15 @@ class VectorSearchRequest(BaseModel):
     project_id: str = Field(min_length=1)
     query: str = Field(min_length=1)
     top_k: int = Field(default=12, ge=1, le=100)
+    backend: str = Field(default="local_hashing", pattern="^(local_hashing|faiss|hnsw|qdrant|pgvector)$")
+    dims: int = Field(default=384, ge=64, le=4096)
+
+
+class MemoryRetrieveRequest(BaseModel):
+    project_id: str | None = None
+    query: str = Field(min_length=1)
+    limit: int = Field(default=5, ge=1, le=50)
+    layers: list[str] = Field(default_factory=list)
 
 
 class SessionCreateRequest(BaseModel):
@@ -310,11 +320,40 @@ async def build_context(request: ContextBuildRequest) -> dict[str, Any]:
 async def vector_search(request: VectorSearchRequest) -> dict[str, Any]:
     if STORE.get_project(request.project_id) is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return LocalVectorIndex(STORE).search(
-        project_id=request.project_id,
-        query=request.query,
-        top_k=request.top_k,
-    ).model_dump()
+    try:
+        index = create_vector_index(STORE, VectorBackendConfig(backend=request.backend, dims=request.dims))  # type: ignore[arg-type]
+        return index.search(project_id=request.project_id, query=request.query, top_k=request.top_k).model_dump()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/context/vector-capabilities")
+async def get_vector_capabilities() -> dict[str, Any]:
+    return {"capabilities": [item.model_dump() for item in vector_capabilities()]}
+
+
+@app.post("/v1/memory/ingest")
+async def ingest_memory(request: MemoryIngestRequest, project_id: str | None = None) -> dict[str, Any]:
+    if project_id is not None and STORE.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return UnifiedMemoryManager(project_id=project_id, store=STORE).ingest(request).model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/memory/retrieve")
+async def retrieve_memory(request: MemoryRetrieveRequest) -> dict[str, Any]:
+    if request.project_id is not None and STORE.get_project(request.project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return UnifiedMemoryManager(project_id=request.project_id, store=STORE).retrieve_report(
+            request.query,
+            limit=request.limit,
+            layers=request.layers or None,  # type: ignore[arg-type]
+        ).model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/v1/tools/execute")

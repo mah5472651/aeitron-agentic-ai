@@ -77,7 +77,11 @@ class MythosMvpFoundationTest(unittest.TestCase):
                 self.assertEqual(run.status, "queued")
                 graph = store.get_task_graph(run.task_graph_id)
                 self.assertIsNotNone(graph)
-                self.assertEqual(len(graph["nodes"]), 6)
+                self.assertEqual(len(graph["nodes"]), 10)
+                self.assertIn("planner", [node["kind"] for node in graph["nodes"]])
+                self.assertIn("critic_review", [node["kind"] for node in graph["nodes"]])
+                self.assertIn("security_review", [node["kind"] for node in graph["nodes"]])
+                self.assertIn("performance_review", [node["kind"] for node in graph["nodes"]])
                 self.assertEqual(graph["nodes"][0]["kind"], "understand")
                 self.assertEqual(graph["nodes"][-1]["kind"], "summarize")
                 runtime = TaskGraphRuntime(store)
@@ -90,7 +94,7 @@ class MythosMvpFoundationTest(unittest.TestCase):
                 )
                 self.assertEqual(after_complete.status, "running")
                 self.assertEqual(after_complete.completed_task_count, 1)
-                self.assertEqual(after_complete.active_task["kind"], "retrieve_context")
+                self.assertEqual(after_complete.active_task["kind"], "planner")
 
                 verification = VerifierRuntime(store).run(
                     VerificationRequest(
@@ -167,7 +171,7 @@ class MythosMvpFoundationTest(unittest.TestCase):
 
                 graph_response = client.get(f"/v1/taskgraphs/{task_graph_id}")
                 self.assertEqual(graph_response.status_code, 200, graph_response.text)
-                self.assertEqual(len(graph_response.json()["nodes"]), 6)
+                self.assertEqual(len(graph_response.json()["nodes"]), 10)
 
                 advance_response = client.post(f"/v1/taskgraphs/{task_graph_id}/advance")
                 self.assertEqual(advance_response.status_code, 200, advance_response.text)

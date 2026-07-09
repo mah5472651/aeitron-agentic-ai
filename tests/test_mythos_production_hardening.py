@@ -12,8 +12,9 @@ from src.mythos.evaluation.benchmarks import BenchmarkHarness, built_in_security
 from src.mythos.gateway import api as gateway_api
 from src.mythos.identity.auth import AuthConfig, AuthError, validate_token_issue_request
 from src.mythos.identity.quota import AsyncLocalQuotaStore, LocalQuotaStore
-from src.mythos.indexing import LocalVectorIndex, RepositoryIndexer
+from src.mythos.indexing import LocalVectorIndex, RepositoryIndexer, VectorBackendConfig, create_vector_index, vector_capabilities
 from src.mythos.learning.capacity import CapacityPlanConfig, build_capacity_plan
+from src.mythos.memory import MemoryIngestRequest, UnifiedMemoryManager
 from src.mythos.patches import PatchVerifyRequest
 from src.mythos.patches.service import PatchService
 from src.mythos.tools.sandbox import HardenedSandboxPolicy, SandboxRunRequest
@@ -50,6 +51,10 @@ class MythosProductionHardeningTest(unittest.TestCase):
                 RepositoryIndexer(store).index_project(project_id=project["id"])
                 search = LocalVectorIndex(store).search(project_id=project["id"], query="login password", top_k=3)
                 self.assertTrue(search.results)
+                selected = create_vector_index(store, VectorBackendConfig(backend="local_hashing", dims=256))
+                selected_search = selected.search(project_id=project["id"], query="login password", top_k=1)
+                self.assertEqual(selected_search.backend, "local_hashing")
+                self.assertEqual(selected_search.dims, 256)
                 response = PatchService(store).preview_apply_verify(
                     PatchVerifyRequest(
                         project_id=project["id"],
@@ -66,6 +71,35 @@ class MythosProductionHardeningTest(unittest.TestCase):
                 self.assertEqual(response.verdict, "accept")
                 self.assertTrue(response.rolled_back)
                 self.assertIn("password == 'secret'", (workspace / "auth.py").read_text(encoding="utf-8"))
+
+    def test_vector_capabilities_and_unified_memory_manager(self) -> None:
+        capabilities = vector_capabilities()
+        self.assertTrue(any(item.backend == "local_hashing" and item.available for item in capabilities))
+        with tempfile.TemporaryDirectory() as db_dir:
+            with LocalStore(Path(db_dir) / "memory.sqlite3") as store:
+                project = store.create_project(name="memory-demo", repo_path=str(Path(db_dir)))
+                manager = UnifiedMemoryManager(project_id=project["id"], store=store)
+                manager.ingest(
+                    MemoryIngestRequest(
+                        layer="project",
+                        kind="project_fact",
+                        content={"module_name": "auth", "path": "auth.py", "tech_stack": "python"},
+                        relevance=0.8,
+                        success_rate=0.95,
+                    )
+                )
+                manager.remember_verified_fix("empty password accepted", "reject empty password", "auth login")
+                report = manager.retrieve_report("fix auth empty password", limit=2)
+                self.assertTrue(report.hits)
+                self.assertGreaterEqual(report.hits[0].final_score, report.hits[-1].final_score)
+                with self.assertRaises(ValueError):
+                    manager.ingest(
+                        MemoryIngestRequest(
+                            layer="semantic",
+                            kind="raw_thought",
+                            content={"thought": "maybe this works"},
+                        )
+                    )
 
     def test_benchmark_harness_and_gateway_metrics_contract(self) -> None:
         report = BenchmarkHarness().run_static(built_in_security_tasks())

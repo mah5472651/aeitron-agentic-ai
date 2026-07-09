@@ -2,6 +2,24 @@
 
 from src.mythos.indexing.context_builder import ContextBuilder
 from src.mythos.indexing.repository_indexer import RepositoryIndexer
-from src.mythos.indexing.vector_index import LocalVectorIndex, VectorSearchReport, VectorSearchResult
+from src.mythos.indexing.vector_index import (
+    LocalVectorIndex,
+    VectorBackendConfig,
+    VectorIndexCapability,
+    VectorSearchReport,
+    VectorSearchResult,
+    create_vector_index,
+    vector_capabilities,
+)
 
-__all__ = ["ContextBuilder", "LocalVectorIndex", "RepositoryIndexer", "VectorSearchReport", "VectorSearchResult"]
+__all__ = [
+    "ContextBuilder",
+    "LocalVectorIndex",
+    "RepositoryIndexer",
+    "VectorBackendConfig",
+    "VectorIndexCapability",
+    "VectorSearchReport",
+    "VectorSearchResult",
+    "create_vector_index",
+    "vector_capabilities",
+]
