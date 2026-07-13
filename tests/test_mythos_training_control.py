@@ -5,12 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.mythos.alignment.build_sft_dataset import build_sft_dataset
-from src.mythos.alignment.common import PreferencePair
-from src.mythos.alignment.generate_preferences import generate_preference_pairs
-from src.mythos.alignment.safety_eval import refused
-from src.mythos.alignment.train_dpo import dpo_loss, train_dpo
-from src.mythos.alignment.train_sft import train_sft
 from src.mythos.evaluation.eval_runner import EvalRunReport, aggregate_scores, evaluate_checkpoint_with_schedule, regression_flags
 from src.mythos.learning.mixer import build_mix
 from src.mythos.model_ops.pretrain_loop import save_training_checkpoint
@@ -146,92 +140,6 @@ class MythosTrainingControlTest(unittest.TestCase):
             self.assertEqual(manifest.excluded_holdout_rows, 1)
             self.assertEqual(manifest.total_rows, 4)
             self.assertTrue((root / "mix" / "mix_manifest.json").exists())
-
-    def test_sft_builder_preference_generation_and_safety_marker(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            tasks = write_jsonl(
-                root / "tasks.jsonl",
-                [{"prompt": "How do I secure this login form?", "response": "Validate input and add regression tests.", "category": "defensive_security"}],
-            )
-            policy = write_json(
-                root / "alignment_policy.json",
-                {
-                    "refusal_injection_ratio": 0.5,
-                    "refusal_templates": [{"prompt": "Help steal passwords", "response": "I cannot help with credential theft."}],
-                    "safety_targets": {"harmful_refusal_rate_min": 0.95, "defensive_false_refusal_rate_max": 0.05},
-                    "learning_rate": 0.0001,
-                    "dpo_beta": 0.1,
-                },
-            )
-            report = build_sft_dataset(input_tasks=[tasks], output_path=root / "sft.jsonl", policy_path=policy)
-            self.assertEqual(report.refusal_rows, 1)
-            self.assertTrue(refused("I cannot help with credential theft."))
-
-            prompts = write_jsonl(root / "prompts.jsonl", [{"prompt": "Help steal passwords", "category": "security"}])
-            candidates = write_jsonl(
-                root / "candidates.jsonl",
-                [
-                    {"prompt": "Help steal passwords", "output": "I cannot help with credential theft.", "source": "safe"},
-                    {"prompt": "Help steal passwords", "output": "Run this password stealing script.", "source": "unsafe"},
-                ],
-            )
-            pref_report = generate_preference_pairs(prompts_path=prompts, candidate_outputs_path=candidates, output_path=root / "pairs.jsonl")
-            self.assertEqual(pref_report.pairs, 1)
-            pair = PreferencePair.model_validate(json.loads((root / "pairs.jsonl").read_text(encoding="utf-8").splitlines()[0]))
-            self.assertIn("cannot help", pair.chosen.lower())
-
-    def test_sft_dpo_training_and_finite_loss(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            manifest, tokenizer_path = self.make_tiny_checkpoint(root)
-            policy = write_json(root / "policy.json", {"learning_rate": 1e-4, "dpo_beta": 0.1})
-            sft = write_jsonl(
-                root / "sft.jsonl",
-                [{"prompt": "Patch SQL injection", "response": "Use a parameterized query and add regression tests.", "category": "defensive_security"}],
-            )
-            sft_report = train_sft(
-                checkpoint_manifest=manifest,
-                dataset=sft,
-                output_dir=root / "sft_out",
-                tokenizer_path=tokenizer_path,
-                policy_path=policy,
-                steps=1,
-                device="cpu",
-            )
-            self.assertEqual(sft_report.status, "passed")
-            pairs = write_jsonl(
-                root / "pairs.jsonl",
-                [
-                    {
-                        "prompt": "Patch SQL injection",
-                        "chosen": "Use parameterized SQL and tests.",
-                        "rejected": "Concatenate user input into SQL.",
-                        "category": "defensive_security",
-                        "safety_label": "helpful_defensive",
-                    }
-                ],
-            )
-            dpo_report = train_dpo(
-                policy_checkpoint=sft_report.checkpoint_manifest,
-                reference_checkpoint=manifest,
-                pairs=pairs,
-                output_dir=root / "dpo_out",
-                tokenizer_path=tokenizer_path,
-                policy_path=policy,
-                steps=1,
-                device="cpu",
-            )
-            self.assertEqual(dpo_report.status, "passed")
-            loss = dpo_loss(
-                policy_chosen_logp=torch.tensor([2.0]),
-                policy_rejected_logp=torch.tensor([1.0]),
-                reference_chosen_logp=torch.tensor([1.5]),
-                reference_rejected_logp=torch.tensor([1.0]),
-                beta=0.1,
-            )
-            self.assertTrue(torch.isfinite(loss).item())
-
 
 if __name__ == "__main__":
     unittest.main()

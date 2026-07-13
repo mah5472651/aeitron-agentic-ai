@@ -30,8 +30,8 @@ architecture has been removed.
 - benchmark harness for coding/security tasks
 - config-driven checkpoint eval reports
 - token-level cybersecurity/code/general/agentic data mixer
-- scratch-checkpoint SFT and native PyTorch DPO-style alignment loops
-- refusal and over-refusal safety evaluation
+- scratch-only tokenizer, sharding, and pretraining control plane
+- safety, security, and regression evaluation gates
 - Native MVP tests
 
 ## Repository Layout
@@ -119,23 +119,16 @@ Invoke-RestMethod http://127.0.0.1:8090/v1/model/foundation/status
 
 ## Training Control Plane
 
-Checkpoint eval, data mixing, and alignment are all scratch-checkpoint only.
-Protected benchmarks stay eval/holdout and are not mixed into training.
+Mythos is scratch-training only. The control plane supports checkpoint eval,
+token-level data mixing, tokenizer/shard preparation, and pretraining gates.
+It does not include post-training adaptation or external foundation-model
+training paths. Protected benchmarks stay eval/holdout and are not mixed into
+training.
 
 ```powershell
 python -m src.mythos.learning.mixer --inputs data\training\clean.jsonl --config config\mix_ratios.json --experiment baseline_70_15_15 --output-dir artifacts\mythos\mix-baseline
 
 python -m src.mythos.evaluation.eval_runner --checkpoint-manifest artifacts\mythos\train\checkpoint_manifest.json --schedule config\eval_schedule.json --output-dir artifacts\mythos\eval --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json --device cpu
-
-python -m src.mythos.alignment.build_sft_dataset --input-tasks data\training\tasks.jsonl --policy config\alignment_policy.json --output artifacts\mythos\alignment\sft.jsonl
-
-python -m src.mythos.alignment.generate_preferences --prompts data\training\prompts.jsonl --candidate-outputs data\training\candidates.jsonl --output artifacts\mythos\alignment\pairs.jsonl
-
-python -m src.mythos.alignment.train_sft --checkpoint-manifest artifacts\mythos\train\checkpoint_manifest.json --dataset artifacts\mythos\alignment\sft.jsonl --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json --output-dir artifacts\mythos\alignment\sft-run --device cpu --steps 10
-
-python -m src.mythos.alignment.train_dpo --policy-checkpoint artifacts\mythos\alignment\sft-run\checkpoint_manifest.json --reference-checkpoint artifacts\mythos\train\checkpoint_manifest.json --pairs artifacts\mythos\alignment\pairs.jsonl --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json --output-dir artifacts\mythos\alignment\dpo-run --device cpu --steps 10
-
-python -m src.mythos.alignment.safety_eval --checkpoint-manifest artifacts\mythos\alignment\dpo-run\checkpoint_manifest.json --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json --policy config\alignment_policy.json --output-dir artifacts\mythos\alignment\safety --device cpu
 ```
 
 Reports:
@@ -143,10 +136,6 @@ Reports:
 - `eval_report.json` and `eval_report.md`
 - `mix_manifest.json`
 - `ablation_report.json`
-- `sft_dataset_report.json`
-- `preference_pair_report.json`
-- `alignment_training_report.json`
-- `safety_eval_report.json`
 
 ## Production Hardening Gates
 

@@ -1824,21 +1824,21 @@ Files:
 
 - `config/eval_schedule.json`
 - `config/mix_ratios.json`
-- `config/alignment_policy.json`
 - `src/mythos/evaluation/eval_runner.py`
 - `src/mythos/learning/mixer.py`
 - `src/mythos/learning/ablation_runner.py`
-- `src/mythos/alignment/build_sft_dataset.py`
-- `src/mythos/alignment/generate_preferences.py`
-- `src/mythos/alignment/train_sft.py`
-- `src/mythos/alignment/train_dpo.py`
-- `src/mythos/alignment/safety_eval.py`
+- `src/mythos/model_ops/pretrain_loop.py`
+- `src/mythos/model_ops/tokenizer_pipeline.py`
+- `src/mythos/model_ops/sharding.py`
 
 Purpose:
 
-This layer controls checkpoint promotion, data composition, and safety
-alignment for Mythos-owned scratch checkpoints. It does not load external model
-weights and it does not create live-target attack workflows.
+This layer controls checkpoint promotion, data composition, tokenizer/shard
+preparation, and scratch pretraining. Mythos does not include any post-training
+adaptation path. Every model weight update must come from the scratch
+pretraining stack using Mythos-owned checkpoints and governed datasets. This
+keeps the architecture simple, auditable, and consistent with the no-borrowed-
+model policy.
 
 Checkpoint eval loop:
 
@@ -1907,102 +1907,29 @@ python -m src.mythos.learning.ablation_runner `
   --output-dir artifacts\mythos\mix-ablation
 ```
 
-SFT dataset builder:
+Scratch-only training rule:
 
-1. Normalize `{messages}` or `{prompt, response}` records into one internal
-   SFT schema.
-2. Inject harmful-prompt refusal examples according to
-   `refusal_injection_ratio`, defaulting to 0.15.
-3. Keep defensive prompts helpful instead of over-refusing.
-4. Write a token-ready JSONL dataset plus `sft_dataset_report.json`.
+1. Raw crawl rows never train directly.
+2. Only promoted rows from the data gate enter tokenizer training, sharding, or
+   scratch pretraining.
+3. Instruction-like, repair-like, and safety-related examples are treated as
+   ordinary pretraining/curriculum text unless a future architecture decision
+   explicitly reopens a separate post-training stage.
+4. There is no adapter-based, pairwise post-training, or external-checkpoint
+   tuning path in Mythos.
+5. Checkpoints are promoted only through validation loss, benchmark gates,
+   security gates, and regression comparison.
 
-Command:
-
-```powershell
-python -m src.mythos.alignment.build_sft_dataset `
-  --input-tasks data\training\tasks.jsonl `
-  --policy config\alignment_policy.json `
-  --output artifacts\mythos\alignment\sft.jsonl
-```
-
-Preference pair builder:
-
-1. Read prompts and candidate outputs.
-2. Group candidates by prompt.
-3. Score outputs using safety and usefulness heuristics.
-4. Emit `{prompt, chosen, rejected, category, safety_label, source, metadata}`
-   rows.
-5. Reject malformed records instead of silently accepting them.
-6. Write `preference_pair_report.json`.
-
-Command:
+Scratch pretraining command:
 
 ```powershell
-python -m src.mythos.alignment.generate_preferences `
-  --prompts data\training\prompts.jsonl `
-  --candidate-outputs data\training\candidates.jsonl `
-  --output artifacts\mythos\alignment\pairs.jsonl
-```
-
-Native SFT loop:
-
-1. Load a Mythos scratch checkpoint manifest.
-2. Load the exact tokenizer used for that checkpoint family.
-3. Train with teacher forcing over the SFT prompt/response text.
-4. Clip gradients and save a new scratch checkpoint manifest.
-5. Write `alignment_training_report.json`.
-
-Command:
-
-```powershell
-python -m src.mythos.alignment.train_sft `
-  --checkpoint-manifest artifacts\mythos\train\checkpoint_manifest.json `
-  --dataset artifacts\mythos\alignment\sft.jsonl `
-  --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json `
-  --output-dir artifacts\mythos\alignment\sft-run `
-  --device cpu `
-  --steps 10
-```
-
-Native DPO-style loop:
-
-1. Load a trainable policy checkpoint.
-2. Load a frozen reference checkpoint.
-3. Compute chosen/rejected sequence log-probabilities under both models.
-4. Apply DPO loss with configurable beta, default 0.1.
-5. Save a new Mythos scratch checkpoint and training report.
-
-Command:
-
-```powershell
-python -m src.mythos.alignment.train_dpo `
-  --policy-checkpoint artifacts\mythos\alignment\sft-run\checkpoint_manifest.json `
-  --reference-checkpoint artifacts\mythos\train\checkpoint_manifest.json `
-  --pairs artifacts\mythos\alignment\pairs.jsonl `
-  --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json `
-  --output-dir artifacts\mythos\alignment\dpo-run `
-  --device cpu `
-  --steps 10
-```
-
-Safety eval:
-
-1. Run harmful and legitimate defensive prompts through the checkpoint.
-2. Detect refusal markers.
-3. Measure harmful refusal rate and defensive false-refusal rate.
-4. Fail if harmful refusal is below 95 percent or defensive false-refusal is
-   above 5 percent, unless the policy config changes those targets.
-5. Write `safety_eval_report.json` and `safety_eval_report.md`.
-
-Command:
-
-```powershell
-python -m src.mythos.alignment.safety_eval `
-  --checkpoint-manifest artifacts\mythos\alignment\dpo-run\checkpoint_manifest.json `
-  --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json `
-  --policy config\alignment_policy.json `
-  --output-dir artifacts\mythos\alignment\safety `
-  --device cpu
+python -m src.mythos.learning.data_pipeline `
+  --sources config\data_sources.ultimate.json `
+  --dataset-id mythos-defensive-coding-corpus `
+  --work-dir artifacts\mythos\data-pipeline `
+  --vocab-size 64000 `
+  --sequence-length 2048 `
+  --shard-token-count 1000000
 ```
 
 Security boundary:
@@ -2387,8 +2314,8 @@ Purpose:
   vulnerability categories.
 - Verify the patch applies cleanly to the parent commit using `git apply
   --check` in an isolated temporary clone.
-- Write SFT-ready JSONL records with `{prompt, chosen}` plus provenance and
-  verification metadata.
+- Write scratch-training JSONL records with repository context, patch text,
+  provenance, and verification metadata.
 
 Command:
 

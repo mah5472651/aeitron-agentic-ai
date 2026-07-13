@@ -368,7 +368,7 @@
   "training_priority_groups": [
     {
       "name": "Primus cybersecurity series",
-      "purpose": "Highest-value cybersecurity pretraining/SFT resource group after license approval.",
+      "purpose": "Highest-value cybersecurity scratch-pretraining resource group after license approval.",
       "rank": 1,
       "resource_ids": [1, 2, 3, 4, 5, 6, 7]
     },
