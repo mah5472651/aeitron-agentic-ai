@@ -14,7 +14,7 @@ from pydantic import Field
 
 from src.mythos.model_ops.foundation import CheckpointManifest
 from src.mythos.model_ops.tokenizer_pipeline import load_tokenizer
-from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, require_torch
+from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, load_trusted_checkpoint, require_torch
 from src.mythos.shared.schemas import StrictModel
 
 try:
@@ -144,7 +144,7 @@ def _load_model(manifest_path: str | Path, *, device: "torch.device") -> tuple[M
     checkpoint_path = Path(manifest.checkpoint_dir) / "model.pt"
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"checkpoint model file not found: {checkpoint_path}")
-    payload = torch.load(checkpoint_path, map_location=device)
+    payload = load_trusted_checkpoint(checkpoint_path, map_location=device)
     config = ScratchDecoderConfig.model_validate(payload["config"])
     model = MythosDecoderLM(config).to(device)
     model.load_state_dict(payload["model"])

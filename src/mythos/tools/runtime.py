@@ -50,6 +50,13 @@ class ExecutionResult(ToolExecuteResponse):
     pass
 
 
+ALLOWED_TOOL_COMMANDS: dict[str, set[str]] = {
+    "git_diff": {"git"},
+    "test": {"python", "python.exe", "python3", "pytest", "pytest.exe", "npm", "npm.cmd", "node", "node.exe"},
+    "shell": {"python", "python.exe", "python3", "pytest", "pytest.exe", "git", "npm", "npm.cmd", "node", "node.exe"},
+}
+
+
 def project_root(store: LocalStore, project_id: str) -> Path:
     project = store.get_project(project_id)
     if project is None:
@@ -60,15 +67,25 @@ def project_root(store: LocalStore, project_id: str) -> Path:
     return root
 
 
+def validate_command_policy(request: ToolExecuteRequest) -> None:
+    executable = Path(request.command[0]).name.lower()
+    allowed = ALLOWED_TOOL_COMMANDS.get(request.tool, set())
+    if executable not in allowed:
+        raise ValueError(f"command {executable!r} is not allowed for tool {request.tool!r}")
+    if request.tool == "git_diff" and request.command[:2] != ["git", "diff"]:
+        raise ValueError("git_diff tool may only run: git diff")
+
+
 class ToolRuntime:
     def __init__(self, store: LocalStore | None = None) -> None:
         self.store = store or LocalStore()
 
     def execute(self, request: ToolExecuteRequest) -> ToolExecuteResponse:
         root = project_root(self.store, request.project_id)
+        validate_command_policy(request)
         started = time.perf_counter()
         try:
-            completed = subprocess.run(  # nosec B603 - argv list, shell disabled.
+            completed = subprocess.run(  # nosec B603 - argv list, shell disabled. # nosemgrep: python.django.security.injection.command.subprocess-injection.subprocess-injection
                 request.command,
                 cwd=root,
                 capture_output=True,

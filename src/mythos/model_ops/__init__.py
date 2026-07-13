@@ -12,6 +12,7 @@ from src.mythos.model_ops.foundation import (
 )
 from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, tiny_smoke_config
 from src.mythos.model_ops.native_serving import NativeServingConfig, create_app as create_native_serving_app
+from src.mythos.model_ops.production_adapters import export_hf_llama_package, validate_vllm_package
 
 __all__ = [
     "CheckpointManifest",
@@ -27,4 +28,6 @@ __all__ = [
     "foundation_status",
     "tiny_smoke_config",
     "create_native_serving_app",
+    "export_hf_llama_package",
+    "validate_vllm_package",
 ]

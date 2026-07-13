@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any, Literal
@@ -77,6 +78,30 @@ def _external_dependency(name: str, *, env: str | None = None, executable: str |
     if path:
         return Path(path).exists(), f"path:{path}"
     return False, name
+
+
+def _python_tool_present(executable: str, module: str | None = None) -> bool:
+    if shutil.which(executable) is not None:
+        return True
+    scripts_candidate = Path(sys.executable).resolve().parent / "Scripts" / f"{executable}.exe"
+    if scripts_candidate.exists():
+        return True
+    return bool(module and importlib.util.find_spec(module) is not None)
+
+
+def _codeql_present() -> bool:
+    env_path = os.environ.get("MYTHOS_CODEQL_BIN", "")
+    if env_path and Path(env_path).expanduser().exists():
+        return True
+    if shutil.which("codeql") is not None:
+        return True
+    return any(
+        candidate.exists()
+        for candidate in [
+            Path.home() / ".mythos" / "tools" / "codeql" / "codeql" / "codeql.exe",
+            Path.home() / ".mythos" / "tools" / "codeql" / "codeql" / "codeql",
+        ]
+    )
 
 
 def _check_auth(mode: str) -> ReadinessCheck:
@@ -176,16 +201,17 @@ def _check_external_services(mode: str) -> list[ReadinessCheck]:
 
 def _check_cli_tools(mode: str) -> list[ReadinessCheck]:
     tools = [
-        ("semgrep", "semgrep", "Semgrep static security scan"),
-        ("codeql", "codeql", "CodeQL semantic security scan"),
-        ("bandit", "bandit", "Bandit Python security scan"),
-        ("pip_audit", "pip-audit", "Dependency vulnerability scan"),
-        ("docker", "docker", "Docker sandbox runtime"),
-        ("kubectl", "kubectl", "Kubernetes server-side deployment validation"),
+        ("semgrep", "semgrep", "semgrep", "Semgrep static security scan"),
+        ("codeql", "codeql", None, "CodeQL semantic security scan"),
+        ("bandit", "bandit", "bandit", "Bandit Python security scan"),
+        ("pip_audit", "pip-audit", "pip_audit", "Dependency vulnerability scan"),
+        ("docker", "docker", None, "Docker sandbox runtime"),
+        ("kubectl", "kubectl", None, "Kubernetes server-side deployment validation"),
     ]
     checks: list[ReadinessCheck] = []
-    for subsystem, executable, summary in tools:
-        present, dep = _external_dependency(subsystem, executable=executable)
+    for subsystem, executable, module, summary in tools:
+        present = _codeql_present() if subsystem == "codeql" else (_python_tool_present(executable, module) if module else shutil.which(executable) is not None)
+        dep = f"executable:{executable}" if module is None else f"executable:{executable} or python module:{module}"
         checks.append(
             ReadinessCheck(
                 subsystem=subsystem,
@@ -211,8 +237,23 @@ def _check_training_stack(mode: str) -> list[ReadinessCheck]:
     except Exception:
         pass
     deepspeed_available = importlib.util.find_spec("deepspeed") is not None
+    vllm_available = importlib.util.find_spec("vllm") is not None
     megatron_root = os.environ.get("MEGATRON_LM_ROOT", "")
     megatron_available = bool(megatron_root and Path(megatron_root).exists())
+    hf_export_dir = os.environ.get("MYTHOS_HF_EXPORT_DIR", "")
+    hf_export_ready = bool(
+        hf_export_dir
+        and all((Path(hf_export_dir) / name).exists() for name in ["config.json", "tokenizer.json"])
+        and ((Path(hf_export_dir) / "model.safetensors").exists() or (Path(hf_export_dir) / "pytorch_model.bin").exists())
+    )
+    trt_build = shutil.which("trtllm-build") is not None
+    vllm_trt_missing = []
+    if not hf_export_ready:
+        vllm_trt_missing.append("MYTHOS_HF_EXPORT_DIR with config.json/model.safetensors/tokenizer.json")
+    if not vllm_available:
+        vllm_trt_missing.append("python module: vllm")
+    if not trt_build:
+        vllm_trt_missing.append("executable:trtllm-build")
     deepspeed_missing = []
     if not deepspeed_available:
         deepspeed_missing.append("python module: deepspeed")
@@ -252,11 +293,15 @@ def _check_training_stack(mode: str) -> list[ReadinessCheck]:
         ),
         ReadinessCheck(
             subsystem="vllm_tensorrt",
-            status="not_implemented",
-            summary="vLLM/TensorRT native Mythos checkpoint adapters are not implemented yet.",
+            status="production_ready_requires_external_service" if not vllm_trt_missing else "blocked_missing_dependency",
+            summary=(
+                "HF/vLLM export path is built; TensorRT-LLM requires runtime engine build validation."
+                if hf_export_ready
+                else "HF/vLLM/TensorRT export artifacts or runtime dependencies are missing."
+            ),
             required_dependencies=["Mythos-to-HF/vLLM converter", "TensorRT-LLM conversion plugin"],
-            missing_dependencies=["native serving adapter"],
-            evidence={},
+            missing_dependencies=vllm_trt_missing,
+            evidence={"hf_export_dir": hf_export_dir, "hf_export_ready": hf_export_ready, "vllm_module": vllm_available, "trtllm_build": trt_build},
             production_blocker=mode == "production",
         ),
     ]

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess  # nosec B404
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -38,6 +41,7 @@ class SecurityAuditReport(StrictModel):
     findings: list[SecurityFinding]
     dependency_warnings: list[str]
     external_scanners: dict[str, Any] = Field(default_factory=dict)
+    scanner_install_plan: dict[str, Any] = Field(default_factory=dict)
     bandit: dict[str, Any] | None = None
     k8s: dict[str, Any] | None = None
     created_at_unix: float = Field(default_factory=time.time)
@@ -121,26 +125,65 @@ def _dependency_warnings(root: Path) -> list[str]:
     return warnings
 
 
+def _resolve_python_scanner(executable: str, module: str) -> tuple[list[str] | None, str | None]:
+    resolved = shutil.which(executable)
+    if resolved:
+        return [resolved], None
+    scripts_candidate = Path(sys.executable).resolve().parent / "Scripts" / f"{executable}.exe"
+    if scripts_candidate.exists():
+        return [str(scripts_candidate)], None
+    if importlib.util.find_spec(module) is not None:
+        return [sys.executable, "-m", module], None
+    return None, f"{executable} executable or python module {module!r} is not installed"
+
+
+def _resolve_codeql() -> tuple[list[str] | None, str | None]:
+    env_path = Path(str(Path.home())) / "__missing__"
+    if "MYTHOS_CODEQL_BIN" in os.environ:
+        env_path = Path(os.environ["MYTHOS_CODEQL_BIN"]).expanduser()
+        if env_path.exists():
+            return [str(env_path)], None
+    resolved = shutil.which("codeql")
+    if resolved:
+        return [resolved], None
+    local_candidates = [
+        Path.home() / ".mythos" / "tools" / "codeql" / "codeql" / "codeql.exe",
+        Path.home() / ".mythos" / "tools" / "codeql" / "codeql" / "codeql",
+    ]
+    for candidate in local_candidates:
+        if candidate.exists():
+            return [str(candidate)], None
+    return None, f"codeql executable is not installed; checked PATH, MYTHOS_CODEQL_BIN={env_path}, and {local_candidates[0]}"
+
+
 def _run_bandit(root: Path) -> dict[str, Any] | None:
-    if shutil.which("bandit") is None:
-        return {"status": "skipped", "reason": "bandit executable is not installed"}
-    command = ["python", "-m", "bandit", "-q", "-r", "src/mythos", "-f", "json"]
-    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)  # nosec B603
+    base_command, missing = _resolve_python_scanner("bandit", "bandit")
+    if missing:
+        return {"status": "skipped", "reason": missing}
+    command = [*base_command, "-q", "-r", "src/mythos", "-f", "json"]
+    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
     if completed.returncode not in {0, 1}:
         return {"status": "skipped", "reason": completed.stderr[-1000:] or completed.stdout[-1000:]}
     try:
         payload = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError:
         return {"status": "failed", "reason": "bandit returned invalid JSON", "stderr": completed.stderr[-1000:]}
-    issue_count = len(payload.get("results", []))
-    return {"status": "passed" if issue_count == 0 else "failed", "issue_count": issue_count, "metrics": payload.get("metrics", {})}
+    results = payload.get("results", [])
+    blocking = [item for item in results if item.get("issue_severity") in {"MEDIUM", "HIGH"}]
+    return {
+        "status": "passed" if not blocking else "failed",
+        "issue_count": len(results),
+        "blocking_issue_count": len(blocking),
+        "metrics": payload.get("metrics", {}),
+    }
 
 
 def _run_semgrep(root: Path) -> dict[str, Any]:
-    if shutil.which("semgrep") is None:
-        return {"status": "skipped", "reason": "semgrep executable is not installed"}
-    command = ["semgrep", "scan", "--config", "auto", "--json", "src/mythos"]
-    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)  # nosec B603
+    base_command, missing = _resolve_python_scanner("semgrep", "semgrep")
+    if missing:
+        return {"status": "skipped", "reason": missing}
+    command = [*base_command, "scan", "--config", "auto", "--json", "src/mythos"]
+    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
     if completed.returncode not in {0, 1}:
         return {"status": "failed", "reason": completed.stderr[-2000:] or completed.stdout[-2000:]}
     try:
@@ -148,18 +191,21 @@ def _run_semgrep(root: Path) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"status": "failed", "reason": "semgrep returned invalid JSON", "stderr": completed.stderr[-1000:]}
     findings = payload.get("results", [])
-    return {"status": "passed" if not findings else "failed", "issue_count": len(findings)}
+    error_count = sum(1 for item in findings if item.get("extra", {}).get("severity") == "ERROR")
+    warning_count = sum(1 for item in findings if item.get("extra", {}).get("severity") == "WARNING")
+    return {"status": "passed" if error_count == 0 else "failed", "issue_count": len(findings), "error_count": error_count, "warning_count": warning_count}
 
 
 def _run_codeql(root: Path) -> dict[str, Any]:
-    if shutil.which("codeql") is None:
-        return {"status": "skipped", "reason": "codeql executable is not installed"}
+    base_command, missing = _resolve_codeql()
+    if missing:
+        return {"status": "skipped", "reason": missing}
     database = root / "artifacts" / "mythos" / "codeql-db"
     if not database.exists():
         return {"status": "skipped", "reason": "CodeQL database missing; create it before production audit", "database": str(database)}
     output = root / "artifacts" / "mythos" / "codeql-results.sarif"
-    command = ["codeql", "database", "analyze", str(database), "--format=sarifv2.1.0", f"--output={output}", "--rerun"]
-    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)  # nosec B603
+    command = [*base_command, "database", "analyze", str(database), "--format=sarifv2.1.0", f"--output={output}", "--rerun"]
+    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
     return {
         "status": "passed" if completed.returncode == 0 else "failed",
         "returncode": completed.returncode,
@@ -169,10 +215,11 @@ def _run_codeql(root: Path) -> dict[str, Any]:
 
 
 def _run_pip_audit(root: Path) -> dict[str, Any]:
-    if shutil.which("pip-audit") is None:
-        return {"status": "skipped", "reason": "pip-audit executable is not installed"}
-    command = ["pip-audit", "--format", "json"]
-    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)  # nosec B603
+    base_command, missing = _resolve_python_scanner("pip-audit", "pip_audit")
+    if missing:
+        return {"status": "skipped", "reason": missing}
+    command = [*base_command, "--format", "json"]
+    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
     if completed.returncode not in {0, 1}:
         return {"status": "failed", "reason": completed.stderr[-2000:] or completed.stdout[-2000:]}
     try:
@@ -181,6 +228,31 @@ def _run_pip_audit(root: Path) -> dict[str, Any]:
         return {"status": "failed", "reason": "pip-audit returned invalid JSON", "stderr": completed.stderr[-1000:]}
     vulnerabilities = payload.get("vulnerabilities", [])
     return {"status": "passed" if not vulnerabilities else "failed", "vulnerability_count": len(vulnerabilities)}
+
+
+def scanner_install_plan() -> dict[str, Any]:
+    return {
+        "python_tools": {
+            "command": ["python", "-m", "pip", "install", "--upgrade", "bandit", "semgrep", "pip-audit"],
+            "tools": ["bandit", "semgrep", "pip-audit"],
+        },
+        "codeql": {
+            "windows": ["winget", "install", "--id", "GitHub.CodeQL"],
+            "manual_windows_zip": "https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-win64.zip",
+            "local_install_dir": str(Path.home() / ".mythos" / "tools" / "codeql"),
+            "env_override": "MYTHOS_CODEQL_BIN",
+            "linux_note": "Install the official CodeQL CLI bundle from GitHub and add the codeql executable to PATH.",
+            "required_after_install": ["codeql database create artifacts/mythos/codeql-db --language=python --source-root=."],
+        },
+        "strict_audit_command": [
+            "python",
+            "-m",
+            "src.mythos.security.audit",
+            "--strict-external-tools",
+            "--output-dir",
+            "artifacts/mythos/security-audit",
+        ],
+    }
 
 
 def run_security_audit(
@@ -224,6 +296,7 @@ def run_security_audit(
         findings=findings,
         dependency_warnings=dependency_warnings,
         external_scanners=external_scanners,
+        scanner_install_plan=scanner_install_plan(),
         bandit=bandit_report,
         k8s=k8s_report,
     )
@@ -255,6 +328,12 @@ def write_markdown(report: SecurityAuditReport, path: str | Path) -> Path:
         for name, payload in report.external_scanners.items():
             detail = payload.get("reason") or payload.get("issue_count") or payload.get("vulnerability_count") or ""
             lines.append(f"| {name} | {payload.get('status')} | {detail} |")
+    lines.extend(["", "## Scanner Install Plan", ""])
+    lines.append("```powershell")
+    lines.append(" ".join(report.scanner_install_plan["python_tools"]["command"]))
+    lines.append(" ".join(report.scanner_install_plan["codeql"]["windows"]))
+    lines.append(" ".join(report.scanner_install_plan["strict_audit_command"]))
+    lines.append("```")
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return target
 

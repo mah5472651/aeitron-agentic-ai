@@ -12,6 +12,8 @@ venv/
 artifacts/
 *.log
 *.pid
+data/eval/*.jsonl
+data/eval/*_report.json
 
 # Downloaded tools and model/checkpoint payloads
 tools/
@@ -36,4 +38,3 @@ config/*secret*
 .idea/
 .DS_Store
 Thumbs.db
-

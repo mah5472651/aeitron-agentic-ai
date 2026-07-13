@@ -88,6 +88,35 @@ def require_torch() -> None:
         raise RuntimeError("torch is required for Mythos scratch decoder execution")
 
 
+def save_trusted_checkpoint(payload: dict[str, Any], path: str | Path) -> None:
+    """Save a Mythos-owned local training checkpoint.
+
+    The training checkpoint includes optimizer/scheduler state, so PyTorch's
+    native format is still required for resumable training. External/untrusted
+    checkpoints must not be loaded through this path.
+    """
+    require_torch()
+    torch.save(payload, path)  # nosec B614 # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
+
+
+def load_trusted_checkpoint(path: str | Path, *, map_location: Any = "cpu") -> dict[str, Any]:
+    """Load a Mythos-owned checkpoint with PyTorch's restricted unpickler."""
+    require_torch()
+    checkpoint_path = Path(path).resolve()
+    if checkpoint_path.suffix != ".pt":
+        raise ValueError(f"unsupported checkpoint suffix: {checkpoint_path.suffix}")
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
+    payload = torch.load(  # nosec B614 # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
+        checkpoint_path,
+        map_location=map_location,
+        weights_only=True,
+    )
+    if not isinstance(payload, dict) or "model" not in payload or "config" not in payload:
+        raise ValueError("checkpoint payload must contain model and config dictionaries")
+    return payload
+
+
 class RMSNorm(nn.Module):  # type: ignore[misc]
     def __init__(self, hidden_size: int, eps: float) -> None:
         require_torch()
@@ -358,7 +387,7 @@ class MythosDecoderLM(nn.Module):  # type: ignore[misc]
         target = Path(output_dir)
         target.mkdir(parents=True, exist_ok=True)
         (target / "config.json").write_text(self.config.model_dump_json(indent=2), encoding="utf-8")
-        torch.save({"model": self.state_dict(), "config": self.config.model_dump(), "format": "mythos_decoder_v1", "dtype": dtype}, target / "model.pt")
+        save_trusted_checkpoint({"model": self.state_dict(), "config": self.config.model_dump(), "format": "mythos_decoder_v1", "dtype": dtype}, target / "model.pt")
         serving_contract = {
             "format": "mythos_decoder_v1",
             "scratch_only": True,

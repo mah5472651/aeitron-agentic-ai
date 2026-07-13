@@ -23,7 +23,7 @@ class HardenedSandboxPolicy(StrictModel):
     read_only: bool = True
     cap_drop: list[str] = Field(default_factory=lambda: ["ALL"])
     security_opt: list[str] = Field(default_factory=lambda: ["no-new-privileges:true"])
-    tmpfs: dict[str, str] = Field(default_factory=lambda: {"/tmp": "rw,noexec,nosuid,size=32m"})
+    tmpfs: dict[str, str] = Field(default_factory=lambda: {"/tmp": "rw,noexec,nosuid,size=32m"})  # nosec B108 - isolated container tmpfs, noexec and nosuid.
     timeout_ms: int = Field(default=5_000, ge=100, le=300_000)
 
 

@@ -25,7 +25,7 @@ from src.mythos.identity.quota import install_quota
 from src.mythos.model_ops.checkpoint_compare import GenerationConfig, generate_text
 from src.mythos.model_ops.foundation import CheckpointManifest, sha256_file
 from src.mythos.model_ops.tokenizer_pipeline import load_tokenizer
-from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, require_torch
+from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, load_trusted_checkpoint, require_torch
 from src.mythos.observability import install_observability
 from src.mythos.shared.schemas import StrictModel
 
@@ -71,7 +71,7 @@ class NativeServingState:
         if not self.tokenizer_path.exists():
             raise FileNotFoundError(f"tokenizer file not found: {self.tokenizer_path}")
         self.device = self._select_device(config.device)
-        payload = torch.load(self.checkpoint_path, map_location=self.device)
+        payload = load_trusted_checkpoint(self.checkpoint_path, map_location=self.device)
         self.payload = payload
         self.model_config = ScratchDecoderConfig.model_validate(payload["config"])
         self.tokenizer = load_tokenizer(self.tokenizer_path)

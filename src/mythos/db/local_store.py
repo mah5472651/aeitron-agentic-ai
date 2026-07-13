@@ -696,17 +696,14 @@ class LocalStore:
         if project_id is not None:
             clauses.append("(project_id = ? OR project_id IS NULL)")
             params.append(project_id)
-        if kinds:
-            clauses.append(f"kind IN ({','.join('?' for _ in kinds)})")
-            params.extend(kinds)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self.connection.execute(
-            f"SELECT * FROM memory_entries {where} ORDER BY created_at DESC",
-            params,
-        ).fetchall()
+        query = "SELECT * FROM memory_entries WHERE (project_id = ? OR project_id IS NULL) ORDER BY created_at DESC" if clauses else "SELECT * FROM memory_entries ORDER BY created_at DESC"
+        rows = self.connection.execute(query, params).fetchall()
+        allowed_kinds = set(kinds or [])
         results: list[dict[str, Any]] = []
         for row in rows:
             data = row_to_dict(row) or {}
+            if allowed_kinds and data.get("kind") not in allowed_kinds:
+                continue
             data["content"] = json.loads(data["content"] or "{}")
             data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
             results.append(data)

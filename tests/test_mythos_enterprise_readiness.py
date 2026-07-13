@@ -211,6 +211,19 @@ class MythosEnterpriseReadinessTest(unittest.TestCase):
             self.assertIn("humaneval", report.required_suites)
             self.assertTrue((root / "bench" / "benchmark_pack_report.json").exists())
 
+            production_report = run_benchmark_pack(
+                BenchmarkPackConfig(
+                    human_eval_path=str(human),
+                    mbpp_path=str(mbpp),
+                    cyberseceval_path=str(security),
+                    strict=True,
+                    production=True,
+                ),
+                output_dir=root / "bench-production",
+            )
+            self.assertEqual(production_report.status, "failed")
+            self.assertTrue(production_report.recommendations)
+
     def test_security_audit_detects_secret_and_can_pass_clean_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -219,6 +232,8 @@ class MythosEnterpriseReadinessTest(unittest.TestCase):
             (clean / "app.py").write_text("def ok():\n    return True\n", encoding="utf-8")
             report = run_security_audit(root=root, run_bandit=False, validate_k8s=False, run_semgrep=False, run_codeql=False, run_pip_audit=False)
             self.assertEqual(report.status, "passed")
+            self.assertIn("python_tools", report.scanner_install_plan)
+            self.assertIn("strict_audit_command", report.scanner_install_plan)
 
             (clean / "bad.py").write_text("API_KEY = 'abcdefghijklmnopqrstuvwxyz123456'\n", encoding="utf-8")
             bad = run_security_audit(root=root, run_bandit=False, validate_k8s=False, run_semgrep=False, run_codeql=False, run_pip_audit=False)

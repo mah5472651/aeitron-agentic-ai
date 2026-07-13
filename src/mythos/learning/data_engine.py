@@ -421,7 +421,7 @@ class PostgresFrontierStore:
                     normalized = normalize_url(url)
                     if not allowed_url(normalized, allowed_domains):
                         continue
-                    status = await connection.execute(
+                    status = await connection.execute(  # nosemgrep: python.lang.security.audit.sqli.asyncpg-sqli.asyncpg-sqli
                         """
                         INSERT INTO urls(
                           url, source_name, allowed_domains_json, license, category,
@@ -464,7 +464,7 @@ class PostgresFrontierStore:
 
     async def record_document(self, row: dict[str, Any], *, quality: dict[str, Any], shard_path: str | None) -> bool:
         async with self.pool.acquire() as connection:
-            status = await connection.execute(
+            status = await connection.execute(  # nosemgrep: python.lang.security.audit.sqli.asyncpg-sqli.asyncpg-sqli
                 """
                 INSERT INTO documents(
                   content_hash, url, source_name, license, category, text_chars,

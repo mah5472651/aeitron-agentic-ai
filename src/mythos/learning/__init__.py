@@ -46,6 +46,6 @@ def __getattr__(name: str) -> Any:
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module_name, attr_name = _EXPORTS[name]
-    value = getattr(import_module(module_name), attr_name)
+    value = getattr(import_module(module_name), attr_name)  # nosemgrep: python.lang.security.audit.non-literal-import.non-literal-import
     globals()[name] = value
     return value

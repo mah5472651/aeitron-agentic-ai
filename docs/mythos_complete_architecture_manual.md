@@ -2748,6 +2748,135 @@ DeepSpeed run saves, reloads, and evaluates a checkpoint. Megatron-LM remains an
 external-checkout requirement until a real Megatron adapter is implemented and
 cluster-tested.
 
+## vLLM / TensorRT-LLM / Megatron Adapters
+
+Module:
+
+- `src/mythos/model_ops/production_adapters.py`
+
+Purpose:
+
+Bridge native Mythos scratch checkpoints into production runtime ecosystems
+without pretending that external GPU runtimes have been validated locally.
+
+HF/vLLM export:
+
+```bash
+python -m src.mythos.model_ops.production_adapters export-hf \
+  --checkpoint-manifest artifacts/mythos/train/checkpoint_manifest.json \
+  --tokenizer-path artifacts/mythos/tokenizer/tokenizer.json \
+  --output-dir artifacts/mythos/exports/hf-llama \
+  --torch-dtype bfloat16
+```
+
+This writes:
+
+- `config.json`
+- `model.safetensors`
+- `tokenizer.json`
+- `tokenizer_config.json`
+- `special_tokens_map.json`
+- `mythos_conversion_manifest.json`
+
+Validate vLLM prerequisites:
+
+```bash
+python -m src.mythos.model_ops.production_adapters validate-vllm \
+  --hf-model-dir artifacts/mythos/exports/hf-llama
+```
+
+TensorRT-LLM build plan:
+
+```bash
+python -m src.mythos.model_ops.production_adapters plan-tensorrt \
+  --hf-model-dir artifacts/mythos/exports/hf-llama \
+  --output-dir artifacts/mythos/exports/tensorrt \
+  --dtype bfloat16
+```
+
+Megatron launch plan:
+
+```bash
+python -m src.mythos.model_ops.production_adapters plan-megatron \
+  --manifest artifacts/mythos/shards/manifest.json \
+  --tokenizer-path artifacts/mythos/tokenizer/tokenizer.json \
+  --output-dir artifacts/mythos/megatron \
+  --model-profile 7b \
+  --tensor-parallel 2 \
+  --pipeline-parallel 2 \
+  --data-parallel 4 \
+  --sequence-length 2048 \
+  --micro-batch-size 1 \
+  --global-batch-size 16 \
+  --train-iters 10000 \
+  --megatron-root /opt/Megatron-LM
+```
+
+Promotion rule:
+
+- HF export existing is not enough.
+- vLLM must load and decode the exported package.
+- TensorRT-LLM must build an engine and pass decode parity.
+- Megatron must run on a real cluster, save a checkpoint, reload, and evaluate.
+
+## Production Benchmark Pack
+
+The benchmark pack now has production minimum-count checks. A tiny local JSONL
+file can still validate adapter shape in dev mode, but cannot pass production
+coverage.
+
+Public coding benchmarks can be materialized locally:
+
+```bash
+python -m src.mythos.evaluation.benchmark_pack \
+  --materialize-public \
+  --target-dir data/eval
+```
+
+This fetches OpenAI HumanEval and Google Research MBPP from their public
+repositories and writes:
+
+- `data/eval/humaneval.jsonl`
+- `data/eval/mbpp.jsonl`
+- `data/eval/benchmark_materialization_report.json`
+
+SWE-Bench and CyberSecEval remain governed local-file inputs. They are not
+silently downloaded into training or evaluation because the real runners,
+licenses, and holdout rules must be handled explicitly.
+
+```bash
+python -m src.mythos.evaluation.benchmark_pack \
+  --production \
+  --human-eval data/eval/humaneval.jsonl \
+  --mbpp data/eval/mbpp.jsonl \
+  --swe-bench data/eval/swe_bench_style.jsonl \
+  --cyberseceval data/eval/cyberseceval_style.jsonl \
+  --custom-security data/eval/mythos_security.jsonl \
+  --output-dir artifacts/mythos/benchmark-pack
+```
+
+Default production minimums:
+
+- HumanEval: 164 tasks
+- MBPP: 374 tasks
+- SWE-style suite: at least 1 local governed task file
+- CyberSecEval-style suite: at least 1 local governed task file
+
+## Strict Scanner Bootstrap
+
+Security audit reports now include a scanner install plan. For local Windows
+setup:
+
+```powershell
+python -m pip install --upgrade bandit semgrep pip-audit
+winget install --id GitHub.CodeQL
+codeql database create artifacts/mythos/codeql-db --language=python --source-root=.
+python -m src.mythos.security.audit --strict-external-tools --output-dir artifacts\mythos\security-audit
+```
+
+Strict mode fails when required scanner tools are missing or scanner findings
+fail policy.
+
 ## Security Audit Production Behavior
 
 Module:

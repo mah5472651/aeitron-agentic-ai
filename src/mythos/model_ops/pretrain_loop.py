@@ -14,7 +14,16 @@ from typing import Any, Literal
 from src.mythos.model_ops.data_loader import TokenShardStream, count_batches, load_manifest
 from src.mythos.model_ops.foundation import CheckpointManifest, sha256_file
 from src.mythos.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer, read_uint32_tokens
-from src.mythos.model_ops.torch_decoder import DecoderBlock, MythosDecoderLM, ScratchDecoderConfig, model_profile, require_torch, tiny_smoke_config
+from src.mythos.model_ops.torch_decoder import (
+    DecoderBlock,
+    MythosDecoderLM,
+    ScratchDecoderConfig,
+    load_trusted_checkpoint,
+    model_profile,
+    require_torch,
+    save_trusted_checkpoint,
+    tiny_smoke_config,
+)
 from src.mythos.shared.progress import NullProgressReporter, ProgressReporter
 
 try:
@@ -463,7 +472,7 @@ def save_training_checkpoint(
     if distributed_rank() == 0:
         dataset_manifest_hash = sha256_file(Path(dataset_manifest_path)) if dataset_manifest_path and Path(dataset_manifest_path).exists() else ""
         tokenizer_hash = sha256_file(Path(tokenizer_path)) if tokenizer_path and Path(tokenizer_path).exists() else ""
-        torch.save(
+        save_trusted_checkpoint(
             {
                 "model": model_state,
                 "optimizer": optimizer.state_dict(),
@@ -506,7 +515,7 @@ def load_checkpoint(
     device: "torch.device",
     expected_config: ScratchDecoderConfig | None = None,
 ) -> tuple[int, int]:
-    payload = torch.load(checkpoint_path, map_location=device)
+    payload = load_trusted_checkpoint(checkpoint_path, map_location=device)
     if expected_config is not None:
         saved_config = payload.get("config") or {}
         if int(saved_config.get("vocab_size", expected_config.vocab_size)) != expected_config.vocab_size:

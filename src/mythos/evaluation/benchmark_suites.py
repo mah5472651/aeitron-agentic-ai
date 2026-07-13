@@ -96,12 +96,13 @@ def code_style_to_tasks(path: str | Path, *, tag: str) -> list[BenchmarkTask]:
         prompt = str(row.get("prompt") or row.get("text") or row.get("question") or "")
         solution = str(row.get("canonical_solution") or row.get("code") or row.get("answer") or "")
         expected = row.get("expected_terms") or (["def"] if tag == "human_eval_style" else [])
+        source_text = f"{prompt}\n{solution}".strip() if tag == "human_eval_style" else (solution or prompt)
         tasks.append(
             BenchmarkTask(
                 task_id=task_id,
                 benchmark="swe_style",
                 prompt=prompt,
-                files={"solution.py": solution or prompt},
+                files={"solution.py": source_text},
                 expected_findings=[str(item) for item in expected],
                 tags=[tag],
             )

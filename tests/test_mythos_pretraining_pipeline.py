@@ -13,6 +13,7 @@ from src.mythos.learning.web_ingest import allowed_url, text_from_html
 from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
 from src.mythos.model_ops.pretrain_loop import build_cluster_training_plan, load_deepspeed_config, run_pretraining_loop, validate_production_training_args
 from src.mythos.model_ops.native_serving import NativeServingConfig, create_app
+from src.mythos.model_ops.production_adapters import build_megatron_launch_plan, build_tensorrt_llm_plan, export_hf_llama_package, validate_vllm_package
 from src.mythos.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints
 from src.mythos.model_ops.tokenizer_pipeline import (
     RealCorpusTokenizerConfig,
@@ -424,6 +425,64 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             self.assertEqual(payload["model"], "mythos-test")
             self.assertIn("choices", payload)
             self.assertTrue(payload["mythos"]["scratch_only"])
+
+    def test_hf_export_and_external_runtime_plans_are_real_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            text = "def secure_patch(value): return value.strip() tokenizer export " * 250
+            corpus.write_text(json.dumps({"text": text, "license": "mit"}) + "\n", encoding="utf-8")
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            build_token_shards(
+                input_paths=[corpus],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "shards",
+                config=ShardBuildConfig(shard_token_count=128, sequence_length=16, validation_fraction=0.0),
+            )
+            training = run_pretraining_loop(
+                output_dir=root / "train",
+                manifest=root / "shards" / "manifest.json",
+                device="cpu",
+                steps=1,
+                batch_size=1,
+                sequence_length=16,
+                dtype="fp32",
+                validate_every=0,
+                checkpoint_every=0,
+                resume=False,
+            )
+            hf_report = export_hf_llama_package(
+                checkpoint_manifest=training["checkpoint_manifest"],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "hf",
+            )
+            self.assertEqual(hf_report.status, "built_not_runtime_proven")
+            self.assertTrue((root / "hf" / "model.safetensors").exists())
+            self.assertEqual(json.loads((root / "hf" / "config.json").read_text(encoding="utf-8"))["model_type"], "llama")
+            vllm = validate_vllm_package(hf_model_dir=root / "hf")
+            self.assertIn(vllm.status, {"blocked_missing_dependency", "production_ready_requires_external_service"})
+            trt = build_tensorrt_llm_plan(hf_model_dir=root / "hf", output_dir=root / "trt")
+            self.assertTrue((root / "trt" / "tensorrt_llm_plan.json").exists())
+            self.assertIn("trtllm-build", trt.command)
+            megatron = build_megatron_launch_plan(
+                manifest=root / "shards" / "manifest.json",
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "mega",
+                model_profile="tiny",
+                tensor_parallel=1,
+                pipeline_parallel=1,
+                data_parallel=1,
+                sequence_length=16,
+                micro_batch_size=1,
+                global_batch_size=1,
+                train_iters=1,
+                megatron_root=root / "missing-megatron",
+            )
+            self.assertEqual(megatron.status, "blocked_missing_dependency")
 
     def test_cluster_training_plan_validates_manifest_and_batch_math(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

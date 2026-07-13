@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from src.mythos.model_ops.foundation import CheckpointManifest
-from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, require_torch, tiny_smoke_config
+from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, require_torch, save_trusted_checkpoint, tiny_smoke_config
 
 try:
     import torch
@@ -83,7 +83,7 @@ def run_scratch_gpu_smoke(
     root = Path(output_dir).resolve()
     checkpoint_dir = root / "checkpoint"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
+    save_trusted_checkpoint(
         {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
