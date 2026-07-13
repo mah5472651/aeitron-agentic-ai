@@ -181,7 +181,7 @@ docker compose --env-file deploy\prod\.env.example -f deploy\prod\docker-compose
 Run a real scratch-decoder forward/backward/checkpoint smoke test:
 
 ```bash
-pip install -r requirements-linux-gpu.txt
+pip install -r requirements-kaggle-smoke.txt
 python deploy/gpu/run_scratch_gpu_smoke.py --device cuda --steps 2 --sequence-length 64
 ```
 

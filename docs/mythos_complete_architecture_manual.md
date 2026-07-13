@@ -2123,6 +2123,10 @@ python -m src.mythos.learning.dataset_validation `
 - It runs the scratch pretraining loop and checkpoint eval.
 - Use this on Kaggle/Colab T4/A100/L4/P100-compatible PyTorch builds or on a
   real GPU node.
+- On Kaggle/Colab, install `requirements-kaggle-smoke.txt` first. It avoids
+  `vllm`, `deepspeed`, and torch reinstallations that can break the hosted CUDA
+  runtime. Use `requirements-linux-gpu.txt` only on controlled GPU machines or
+  containers.
 
 Command:
 

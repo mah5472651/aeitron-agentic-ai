@@ -1,0 +1,36 @@
+# Kaggle/Colab smoke-test dependencies.
+#
+# Important:
+# - Do not install torch here. Use the notebook image's preinstalled CUDA-matched torch.
+# - Do not install vLLM/DeepSpeed here. They often upgrade CUDA/Torch packages and
+#   break Kaggle's prebuilt GPU runtime.
+# - Use requirements-linux-gpu.txt only on a controlled GPU machine/container.
+
+tokenizers>=0.15.2
+tree-sitter>=0.22.0
+tree-sitter-language-pack>=0.8.0
+docker>=7.0.0
+asyncpg>=0.29.0
+qdrant-client>=1.12,<1.14
+redis>=5.0.0
+pydantic>=2.7.0
+fastapi>=0.111.0,<1.0.0
+starlette>=0.40.0,<1.0.0
+uvicorn>=0.30.0
+httpx>=0.27.0
+transformers>=4.44.0
+accelerate>=0.33.0
+wandb>=0.17.0
+datasets>=2.20.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0,<6.0.0
+safetensors>=0.4.0
+tqdm>=4.66.0
+bandit>=1.9.0
+boto3>=1.34.0
+alembic>=1.13.0
+pyyaml>=6.0.1
+opentelemetry-api>=1.25.0
+opentelemetry-sdk>=1.25.0
+opentelemetry-exporter-otlp>=1.25.0
+opentelemetry-instrumentation-fastapi>=0.46b0
