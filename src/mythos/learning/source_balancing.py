@@ -56,7 +56,7 @@ def _cap_for_source(*, source_count: int, other_count: int, max_source_fraction:
     if other_count <= 0:
         return source_count
     cap = math.floor((max_source_fraction / max(1e-9, 1.0 - max_source_fraction)) * other_count)
-    return max(min_source_rows, min(source_count, cap))
+    return min(source_count, max(min_source_rows, cap))
 
 
 def balance_clean_jsonl(

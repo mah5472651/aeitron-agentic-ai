@@ -624,7 +624,7 @@ async def _run_data_pipeline_locked(
             "quality_report": str(reports_dir / "quality_report.json"),
             "source_reputation_report": str(reports_dir / "source_reputation_report.json"),
             "source_budget_plan": str(reports_dir / "source_budget_plan.json"),
-            "checkpoint_eval_report": str(reports_dir / "checkpoint_eval_report.json"),
+            "checkpoint_eval_report": str(reports_dir / "checkpoint_eval" / "checkpoint_eval_report.json"),
             "progress_log": str(progress.path) if progress.path else "",
         },
     )

@@ -235,9 +235,18 @@ def create_object_store(config: ObjectStoreConfig) -> ObjectStore:
 
 def upload_paths(store: ObjectStore, paths: list[str | Path], *, prefix: str) -> list[StoredObject]:
     uploaded: list[StoredObject] = []
+    used_keys: set[str] = set()
     for path in paths:
         source = Path(path)
-        uploaded.append(store.put_file(source, key=f"{prefix}/{source.name}"))
+        object_key = f"{prefix}/{source.name}"
+        if object_key in used_keys:
+            object_key = f"{prefix}/{source.parent.name}/{source.name}"
+        counter = 2
+        while object_key in used_keys:
+            object_key = f"{prefix}/{source.parent.name}/{source.stem}-{counter}{source.suffix}"
+            counter += 1
+        used_keys.add(object_key)
+        uploaded.append(store.put_file(source, key=object_key))
     return uploaded
 
 

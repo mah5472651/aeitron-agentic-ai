@@ -8,7 +8,8 @@ from pathlib import Path
 from src.mythos.deployment.k8s_validate import validate_manifests
 from src.mythos.evaluation.benchmark_suites import BenchmarkSuiteSpec, run_benchmark_suites
 from src.mythos.learning.dataset_validation import DatasetValidationConfig, validate_dataset
-from src.mythos.learning.storage import ObjectStoreConfig, verify_object_store_lifecycle
+from src.mythos.learning.source_balancing import balance_clean_jsonl
+from src.mythos.learning.storage import LocalObjectStore, ObjectStoreConfig, upload_paths, verify_object_store_lifecycle
 from src.mythos.security.audit import run_security_audit
 
 
@@ -39,6 +40,28 @@ class MythosEnterpriseReadinessTest(unittest.TestCase):
             self.assertEqual(report.status, "passed")
             self.assertTrue(report.checksum_match)
             self.assertTrue(report.deleted)
+
+    def test_object_store_upload_paths_keeps_duplicate_shard_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            train = root / "shards" / "train" / "shard-000000.bin"
+            val = root / "shards" / "val" / "shard-000000.bin"
+            train.parent.mkdir(parents=True)
+            val.parent.mkdir(parents=True)
+            train.write_bytes(b"train")
+            val.write_bytes(b"validation")
+
+            objects = upload_paths(
+                LocalObjectStore(root / "objects"),
+                [train, val],
+                prefix="runs/example/shards",
+            )
+
+            self.assertEqual(len(objects), 2)
+            self.assertEqual(len({item.uri for item in objects}), 2)
+            self.assertTrue(all(Path(item.uri).exists() for item in objects))
+            self.assertIn("train", Path(objects[0].uri).read_text(encoding="utf-8"))
+            self.assertIn("validation", Path(objects[1].uri).read_text(encoding="utf-8"))
 
     def test_dataset_validation_passes_and_blocks_bad_corpus(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -91,6 +114,32 @@ class MythosEnterpriseReadinessTest(unittest.TestCase):
                 )
             )
             self.assertEqual(bad_report.status, "failed")
+
+    def test_source_balancing_report_never_claims_more_rows_than_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rows = [
+                {
+                    "text": f"dominant source record {index}",
+                    "source": "dominant",
+                    "quality": {"quality_score": 0.6},
+                }
+                for index in range(10)
+            ]
+            rows.append({"text": "tiny source record", "source": "tiny", "quality": {"quality_score": 0.9}})
+            corpus = write_jsonl(root / "clean.jsonl", rows)
+
+            report = balance_clean_jsonl(
+                input_paths=[corpus],
+                output_path=root / "balanced.jsonl",
+                max_source_fraction=0.30,
+                min_source_rows=25,
+            )
+
+            self.assertEqual(report.input_rows, 11)
+            self.assertLessEqual(report.output_rows, report.input_rows)
+            for item in report.sources:
+                self.assertLessEqual(item.output_rows, item.input_rows)
 
     def test_k8s_manifests_validate_without_blocking_failures(self) -> None:
         report = validate_manifests(sorted(Path("deploy/k8s").glob("*.yaml")))
