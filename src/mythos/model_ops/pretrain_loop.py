@@ -5,19 +5,290 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from src.mythos.model_ops.data_loader import TokenShardStream, count_batches, load_manifest
 from src.mythos.model_ops.foundation import CheckpointManifest
 from src.mythos.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer, read_uint32_tokens
-from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, model_profile, require_torch, tiny_smoke_config
+from src.mythos.model_ops.torch_decoder import DecoderBlock, MythosDecoderLM, ScratchDecoderConfig, model_profile, require_torch, tiny_smoke_config
 from src.mythos.shared.progress import NullProgressReporter, ProgressReporter
 
 try:
     import torch
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
+
+
+DistributedStrategy = Literal["none", "fsdp", "deepspeed_zero2", "deepspeed_zero3", "megatron"]
+
+
+def build_cluster_training_plan(
+    *,
+    output_dir: str | Path,
+    manifest: str | Path,
+    model_profile_name: str,
+    strategy: DistributedStrategy,
+    num_nodes: int,
+    gpus_per_node: int,
+    sequence_length: int,
+    batch_size: int,
+    gradient_accumulation_steps: int,
+    steps: int,
+    dtype: str,
+    attention_impl: str = "auto",
+    gradient_checkpointing: bool = True,
+    node_rank: int = 0,
+    master_addr: str = "127.0.0.1",
+    master_port: int = 29500,
+    deepspeed_config: str | Path | None = None,
+    megatron_root: str | Path | None = None,
+) -> dict[str, Any]:
+    if strategy == "none":
+        raise ValueError("cluster training plan requires a distributed strategy")
+    if num_nodes < 1:
+        raise ValueError("num_nodes must be >= 1")
+    if gpus_per_node < 1:
+        raise ValueError("gpus_per_node must be >= 1")
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if batch_size < 1 or gradient_accumulation_steps < 1:
+        raise ValueError("batch_size and gradient_accumulation_steps must be >= 1")
+    if dtype not in {"bf16", "fp16", "fp32"}:
+        raise ValueError("dtype must be one of bf16, fp16, fp32")
+    if not Path(manifest).exists():
+        raise FileNotFoundError(f"shard manifest not found: {manifest}")
+    profile = model_profile(model_profile_name) if model_profile_name != "tiny" else tiny_smoke_config()
+    total_gpus = num_nodes * gpus_per_node
+    global_sequences = total_gpus * batch_size * gradient_accumulation_steps
+    tokens_per_optimizer_step = global_sequences * sequence_length
+    base_train_args = [
+        "--manifest",
+        str(manifest),
+        "--output-dir",
+        str(output_dir),
+        "--device",
+        "cuda",
+        "--steps",
+        str(steps),
+        "--batch-size",
+        str(batch_size),
+        "--sequence-length",
+        str(sequence_length),
+        "--gradient-accumulation-steps",
+        str(gradient_accumulation_steps),
+        "--dtype",
+        dtype,
+        "--model-profile",
+        model_profile_name,
+        "--attention-impl",
+        attention_impl,
+    ]
+    if gradient_checkpointing:
+        base_train_args.append("--gradient-checkpointing")
+
+    warnings: list[str] = []
+    required_env = {
+        "MASTER_ADDR": master_addr,
+        "MASTER_PORT": str(master_port),
+        "NODE_RANK": str(node_rank),
+        "WORLD_SIZE": str(total_gpus),
+        "NCCL_ASYNC_ERROR_HANDLING": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "PYTHONUNBUFFERED": "1",
+    }
+    if model_profile_name in {"32b", "62b"} and total_gpus < 8:
+        warnings.append("32B/62B profiles normally need >=8 high-memory GPUs; this plan may OOM on smaller clusters.")
+    if sequence_length > 8192 and strategy not in {"deepspeed_zero3", "megatron"}:
+        warnings.append("Long-context runs above 8k tokens should usually use ZeRO-3/Megatron-style partitioning.")
+    if dtype == "fp32" and model_profile_name != "tiny":
+        warnings.append("fp32 is not practical for large-profile training; prefer bf16 on Ampere/Hopper or fp16 where required.")
+
+    if strategy == "fsdp":
+        launcher = "torchrun"
+        command = [
+            "torchrun",
+            "--nnodes",
+            str(num_nodes),
+            "--nproc_per_node",
+            str(gpus_per_node),
+            "--node_rank",
+            str(node_rank),
+            "--master_addr",
+            master_addr,
+            "--master_port",
+            str(master_port),
+            "-m",
+            "src.mythos.model_ops.pretrain_loop",
+            "--distributed-strategy",
+            "fsdp",
+            *base_train_args,
+        ]
+    elif strategy in {"deepspeed_zero2", "deepspeed_zero3"}:
+        launcher = "deepspeed"
+        if deepspeed_config is None:
+            stage = "2" if strategy == "deepspeed_zero2" else "3"
+            warnings.append(f"No DeepSpeed JSON path provided; generate/use a ZeRO-{stage} config before launching.")
+        elif not Path(deepspeed_config).exists():
+            raise FileNotFoundError(f"DeepSpeed config not found: {deepspeed_config}")
+        command = [
+            "deepspeed",
+            "--num_nodes",
+            str(num_nodes),
+            "--num_gpus",
+            str(gpus_per_node),
+            "-m",
+            "src.mythos.model_ops.pretrain_loop",
+            "--distributed-strategy",
+            strategy,
+            *base_train_args,
+        ]
+        if deepspeed_config is not None:
+            command.extend(["--deepspeed-config", str(deepspeed_config)])
+    else:
+        launcher = "megatron"
+        if megatron_root is None:
+            warnings.append("Megatron root path is not set; set --megatron-root to the checked-out Megatron-LM repository.")
+        elif not Path(megatron_root).exists():
+            raise FileNotFoundError(f"Megatron root not found: {megatron_root}")
+        command = [
+            "torchrun",
+            "--nnodes",
+            str(num_nodes),
+            "--nproc_per_node",
+            str(gpus_per_node),
+            "--node_rank",
+            str(node_rank),
+            "--master_addr",
+            master_addr,
+            "--master_port",
+            str(master_port),
+            "-m",
+            "src.mythos.model_ops.pretrain_loop",
+            "--distributed-strategy",
+            "megatron",
+            *base_train_args,
+        ]
+    return {
+        "status": "ready_with_warnings" if warnings else "ready",
+        "scratch_only": True,
+        "strategy": strategy,
+        "launcher": launcher,
+        "command": command,
+        "env": required_env,
+        "model_profile": profile.model_dump(),
+        "estimated_parameter_count": profile.parameter_estimate(),
+        "num_nodes": num_nodes,
+        "gpus_per_node": gpus_per_node,
+        "total_gpus": total_gpus,
+        "batch_size_per_gpu": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "global_sequences_per_optimizer_step": global_sequences,
+        "tokens_per_optimizer_step": tokens_per_optimizer_step,
+        "target_train_tokens": tokens_per_optimizer_step * steps,
+        "warnings": warnings,
+        "required_release_gates": [
+            "tokenizer audit passes on real corpus",
+            "dataset contamination gate passes",
+            "10k-step single-node GPU validation passes",
+            "distributed dry-run initializes every rank",
+            "first cluster checkpoint reloads and evaluates",
+        ],
+    }
+
+
+def write_cluster_training_plan(*, output_path: str | Path, plan: dict[str, Any]) -> Path:
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(plan, indent=2, sort_keys=True), encoding="utf-8")
+    return target
+
+
+def distributed_is_initialized() -> bool:
+    require_torch()
+    return bool(torch.distributed.is_available() and torch.distributed.is_initialized())
+
+
+def distributed_rank() -> int:
+    if distributed_is_initialized():
+        return int(torch.distributed.get_rank())
+    return 0
+
+
+def distributed_world_size() -> int:
+    if distributed_is_initialized():
+        return int(torch.distributed.get_world_size())
+    return 1
+
+
+def distributed_barrier() -> None:
+    if distributed_is_initialized():
+        torch.distributed.barrier()
+
+
+def initialize_distributed_runtime(strategy: DistributedStrategy, requested_device: "torch.device") -> dict[str, Any]:
+    require_torch()
+    if strategy == "none":
+        return {"enabled": False, "strategy": "none", "rank": 0, "world_size": 1, "local_rank": 0}
+    if strategy != "fsdp":
+        raise RuntimeError(
+            f"{strategy} requires its dedicated engine adapter and cluster release gate. "
+            "Use --cluster-plan-only to validate launch math; use --distributed-strategy fsdp for native torch FSDP runtime."
+        )
+    if not torch.distributed.is_available():
+        raise RuntimeError("torch.distributed is not available in this PyTorch build")
+    if not torch.distributed.is_initialized():
+        backend = "nccl" if requested_device.type == "cuda" else "gloo"
+        torch.distributed.init_process_group(backend=backend, init_method="env://")
+    local_rank = int(__import__("os").environ.get("LOCAL_RANK", "0"))
+    if requested_device.type == "cuda":
+        torch.cuda.set_device(local_rank)
+    return {
+        "enabled": True,
+        "strategy": strategy,
+        "rank": distributed_rank(),
+        "world_size": distributed_world_size(),
+        "local_rank": local_rank,
+        "backend": torch.distributed.get_backend(),
+    }
+
+
+def wrap_for_distributed(
+    model: "MythosDecoderLM",
+    *,
+    strategy: DistributedStrategy,
+    dtype: str,
+    device: "torch.device",
+) -> "torch.nn.Module":
+    require_torch()
+    if strategy == "none":
+        return model
+    if strategy != "fsdp":
+        raise RuntimeError(f"unsupported distributed runtime strategy: {strategy}")
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import MixedPrecision
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+    mixed_precision = None
+    if device.type == "cuda" and dtype in {"bf16", "fp16"}:
+        active_dtype = autocast_dtype(dtype)
+        mixed_precision = MixedPrecision(param_dtype=active_dtype, reduce_dtype=active_dtype, buffer_dtype=active_dtype)
+    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={DecoderBlock})
+    return FSDP(model, auto_wrap_policy=auto_wrap_policy, mixed_precision=mixed_precision, use_orig_params=True)
+
+
+def checkpoint_model_state_dict(model: "torch.nn.Module") -> dict[str, Any]:
+    require_torch()
+    try:
+        from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, StateDictType
+    except ImportError:
+        return model.state_dict()
+    if isinstance(model, FSDP):
+        config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, config):
+            return model.state_dict()
+    return model.state_dict()
 
 
 def select_device(requested: str) -> "torch.device":
@@ -46,7 +317,7 @@ def latest_checkpoint(output_dir: str | Path) -> Path | None:
 def save_training_checkpoint(
     *,
     output_dir: Path,
-    model: "MythosDecoderLM",
+    model: "torch.nn.Module",
     optimizer: "torch.optim.Optimizer",
     config: ScratchDecoderConfig,
     step: int,
@@ -56,27 +327,33 @@ def save_training_checkpoint(
 ) -> Path:
     checkpoint_dir = output_dir / f"checkpoint-step-{step:08d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "config": config.model_dump(),
-            "step": step,
-            "trained_tokens": trained_tokens,
-            "metrics": metrics,
-        },
-        checkpoint_dir / "model.pt",
-    )
-    (checkpoint_dir / "config.json").write_text(json.dumps(config.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
-    manifest = CheckpointManifest.from_directory(
-        architecture_name=config.name,
-        run_id="scratch-pretrain-loop",
-        step=step,
-        trained_tokens=trained_tokens,
-        checkpoint_dir=checkpoint_dir,
-        metrics=metrics,
-    )
-    return manifest.write_atomic(output_dir / manifest_filename)
+    model_state = checkpoint_model_state_dict(model)
+    manifest_path = output_dir / manifest_filename
+    if distributed_rank() == 0:
+        torch.save(
+            {
+                "model": model_state,
+                "optimizer": optimizer.state_dict(),
+                "config": config.model_dump(),
+                "step": step,
+                "trained_tokens": trained_tokens,
+                "metrics": metrics,
+                "distributed_world_size": distributed_world_size(),
+            },
+            checkpoint_dir / "model.pt",
+        )
+        (checkpoint_dir / "config.json").write_text(json.dumps(config.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
+        manifest = CheckpointManifest.from_directory(
+            architecture_name=config.name,
+            run_id="scratch-pretrain-loop",
+            step=step,
+            trained_tokens=trained_tokens,
+            checkpoint_dir=checkpoint_dir,
+            metrics=metrics,
+        )
+        manifest.write_atomic(manifest_path)
+    distributed_barrier()
+    return manifest_path
 
 
 def load_checkpoint(
@@ -199,6 +476,7 @@ def run_pretraining_loop(
     model_profile_name: str = "tiny",
     attention_impl: str = "auto",
     gradient_checkpointing: bool = False,
+    distributed_strategy: DistributedStrategy = "none",
 ) -> dict[str, Any]:
     require_torch()
     if steps < 1:
@@ -208,7 +486,12 @@ def run_pretraining_loop(
     if early_stopping_patience < 0:
         raise ValueError("early_stopping_patience must be >= 0")
     selected = select_device(device)
+    distributed_report = initialize_distributed_runtime(distributed_strategy, selected)
+    if distributed_report["enabled"] and selected.type == "cuda":
+        selected = torch.device(f"cuda:{distributed_report['local_rank']}")
     active_progress = progress or NullProgressReporter()
+    if distributed_rank() != 0:
+        active_progress = NullProgressReporter()
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     active_manifest_path: Path | None = Path(manifest).resolve() if manifest else None
@@ -271,6 +554,7 @@ def run_pretraining_loop(
     model = MythosDecoderLM(config).to(selected)
     if config.gradient_checkpointing:
         model.enable_gradient_checkpointing()
+    model = wrap_for_distributed(model, strategy=distributed_strategy, dtype=dtype, device=selected)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.1)
     start_step = 0
     trained_tokens = 0
@@ -445,6 +729,8 @@ def run_pretraining_loop(
         "model_config": config.model_dump(),
         "model_profile_name": model_profile_name,
         "attention_impl": attention_impl,
+        "distributed_strategy": distributed_strategy,
+        "distributed": distributed_report,
         "train_losses": train_losses,
         "validation_losses": val_losses,
         "best_validation_loss": best_val_loss,
@@ -454,7 +740,8 @@ def run_pretraining_loop(
         "checkpoint_manifest": str(manifest_path),
         "duration_ms": round((time.perf_counter() - started) * 1000, 3),
     }
-    (root / "pretrain_report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    if distributed_rank() == 0:
+        (root / "pretrain_report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     active_progress.emit(
         "training",
         "complete",
@@ -491,11 +778,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-profile", default="tiny", choices=["tiny", "1b", "7b", "32b", "62b"])
     parser.add_argument("--attention-impl", default="auto", choices=["auto", "sdpa", "eager"])
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument(
+        "--distributed-strategy",
+        default="none",
+        choices=["none", "fsdp", "deepspeed_zero2", "deepspeed_zero3", "megatron"],
+        help="Validated distributed strategy contract. Use --cluster-plan-only before cluster execution.",
+    )
+    parser.add_argument("--cluster-plan-only", action="store_true", help="Write/print a distributed training launch plan without training.")
+    parser.add_argument("--cluster-plan-out", default="artifacts/mythos/cluster_training_plan.json")
+    parser.add_argument("--num-nodes", type=int, default=1)
+    parser.add_argument("--gpus-per-node", type=int, default=8)
+    parser.add_argument("--node-rank", type=int, default=0)
+    parser.add_argument("--master-addr", default="127.0.0.1")
+    parser.add_argument("--master-port", type=int, default=29500)
+    parser.add_argument("--deepspeed-config")
+    parser.add_argument("--megatron-root")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.cluster_plan_only:
+        if not args.manifest:
+            raise SystemExit("--manifest is required for --cluster-plan-only")
+        plan = build_cluster_training_plan(
+            output_dir=args.output_dir,
+            manifest=args.manifest,
+            model_profile_name=args.model_profile,
+            strategy=args.distributed_strategy,
+            num_nodes=args.num_nodes,
+            gpus_per_node=args.gpus_per_node,
+            sequence_length=args.sequence_length,
+            batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            steps=args.steps,
+            dtype=args.dtype,
+            attention_impl=args.attention_impl,
+            gradient_checkpointing=args.gradient_checkpointing,
+            node_rank=args.node_rank,
+            master_addr=args.master_addr,
+            master_port=args.master_port,
+            deepspeed_config=args.deepspeed_config,
+            megatron_root=args.megatron_root,
+        )
+        write_cluster_training_plan(output_path=args.cluster_plan_out, plan=plan)
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return
     report = run_pretraining_loop(
         output_dir=args.output_dir,
         manifest=args.manifest,
@@ -517,6 +845,7 @@ def main() -> None:
         model_profile_name=args.model_profile,
         attention_impl=args.attention_impl,
         gradient_checkpointing=args.gradient_checkpointing,
+        distributed_strategy=args.distributed_strategy,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

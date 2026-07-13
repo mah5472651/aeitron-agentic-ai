@@ -9,7 +9,7 @@ from src.mythos.learning.quality import DatasetQualityGate, QualityGateConfig
 from src.mythos.evaluation.checkpoint_eval import evaluate_checkpoint
 from src.mythos.learning.web_ingest import allowed_url, text_from_html
 from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
-from src.mythos.model_ops.pretrain_loop import run_pretraining_loop
+from src.mythos.model_ops.pretrain_loop import build_cluster_training_plan, run_pretraining_loop
 from src.mythos.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints
 from src.mythos.model_ops.tokenizer_pipeline import (
     RealCorpusTokenizerConfig,
@@ -353,6 +353,44 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             self.assertEqual(comparison.baseline.total, 5)
             self.assertTrue(Path(root / "compare" / "checkpoint_comparison_report.json").exists())
             self.assertTrue(Path(root / "compare" / "checkpoint_comparison_report.md").exists())
+
+    def test_cluster_training_plan_validates_manifest_and_batch_math(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shard = root / "train.bin"
+            write_uint32_tokens(shard, [0, 1, 2, 3] * 64)
+            tokenizer_path = root / "tokenizer.json"
+            tokenizer_path.write_text("{}", encoding="utf-8")
+            manifest = ShardManifest(
+                dataset_id="cluster-plan-test",
+                tokenizer_path=str(tokenizer_path),
+                output_dir=str(root / "shards"),
+                train_shards=[str(shard)],
+                val_shards=[],
+                train_tokens=256,
+                val_tokens=0,
+                sequence_length=32,
+            )
+            (root / "shards").mkdir(parents=True, exist_ok=True)
+            manifest_path = root / "shards" / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest.model_dump()), encoding="utf-8")
+            plan = build_cluster_training_plan(
+                output_dir=root / "cluster-run",
+                manifest=manifest_path,
+                model_profile_name="7b",
+                strategy="fsdp",
+                num_nodes=2,
+                gpus_per_node=4,
+                sequence_length=128,
+                batch_size=2,
+                gradient_accumulation_steps=8,
+                steps=100,
+                dtype="bf16",
+            )
+            self.assertEqual(plan["strategy"], "fsdp")
+            self.assertEqual(plan["total_gpus"], 8)
+            self.assertEqual(plan["tokens_per_optimizer_step"], 8 * 2 * 8 * 128)
+            self.assertIn("torchrun", plan["command"][0])
 
 
 if __name__ == "__main__":

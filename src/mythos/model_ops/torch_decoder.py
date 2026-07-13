@@ -9,6 +9,7 @@ and export helpers.
 from __future__ import annotations
 
 import math
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -358,14 +359,56 @@ class MythosDecoderLM(nn.Module):  # type: ignore[misc]
         target.mkdir(parents=True, exist_ok=True)
         (target / "config.json").write_text(self.config.model_dump_json(indent=2), encoding="utf-8")
         torch.save({"model": self.state_dict(), "config": self.config.model_dump(), "format": "mythos_decoder_v1", "dtype": dtype}, target / "model.pt")
-        (target / "serving_compatibility.json").write_text(
-            "{\n"
-            '  "format": "mythos_decoder_v1",\n'
-            '  "vllm": "requires Mythos model adapter or conversion to Hugging Face compatible module",\n'
-            '  "tensorrt_llm": "requires conversion plugin for Mythos decoder weights",\n'
-            '  "kv_cache": true,\n'
-            f'  "attention_impl": "{self.config.attention_impl}"\n'
-            "}\n",
+        serving_contract = {
+            "format": "mythos_decoder_v1",
+            "scratch_only": True,
+            "dtype": dtype,
+            "architecture": {
+                "decoder_only": True,
+                "rms_norm": True,
+                "swiglu": True,
+                "rope": True,
+                "gqa": True,
+                "num_attention_heads": self.config.num_attention_heads,
+                "num_key_value_heads": self.config.num_key_value_heads,
+                "hidden_size": self.config.hidden_size,
+                "max_sequence_length": self.config.max_sequence_length,
+                "vocab_size": self.config.vocab_size,
+            },
+            "runtime_features": {
+                "kv_cache": self.config.use_cache,
+                "attention_impl": self.config.attention_impl,
+                "attention_window": self.config.attention_window,
+                "gradient_checkpointing": self.config.gradient_checkpointing,
+                "logits_soft_cap": self.config.logits_soft_cap,
+            },
+            "serving_targets": {
+                "native_mythos": "supported",
+                "vllm": "requires Mythos model adapter or conversion to a Hugging Face compatible module",
+                "tensorrt_llm": "requires a Mythos decoder weight conversion plugin",
+            },
+            "required_conversion_checks": [
+                "tokenizer vocab size matches config.vocab_size",
+                "tied embeddings preserved when tie_word_embeddings=true",
+                "RoPE scaling and theta preserved",
+                "GQA key/value head mapping preserved",
+                "KV-cache decode numerically matches native Mythos decode on a fixed prompt",
+            ],
+        }
+        (target / "serving_compatibility.json").write_text(json.dumps(serving_contract, indent=2, sort_keys=True), encoding="utf-8")
+        (target / "generation_config.json").write_text(
+            json.dumps(
+                {
+                    "do_sample": False,
+                    "temperature": 0.0,
+                    "top_k": None,
+                    "max_new_tokens": 256,
+                    "eos_token_id": None,
+                    "format": "mythos_generation_config_v1",
+                },
+                indent=2,
+                sort_keys=True,
+            ),
             encoding="utf-8",
         )
         return target

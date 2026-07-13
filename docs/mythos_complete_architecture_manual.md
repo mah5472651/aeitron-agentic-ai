@@ -2495,8 +2495,13 @@ Current implemented transformer capabilities:
 - Logit soft-cap option.
 - Finite-loss and finite-gradient checks in pretraining.
 - Export directory with `model.pt`, `config.json`, and serving compatibility
-  metadata.
+  metadata, including native Mythos support status, KV-cache contract,
+  vLLM/TensorRT conversion blockers, and deterministic generation defaults.
 - Shape-valid scratch profiles: `tiny`, `1b`, `7b`, `32b`, `62b`.
+- Cluster training plan generator for FSDP, DeepSpeed ZeRO-2/ZeRO-3, and
+  Megatron-style launch contracts. This validates the shard manifest, global
+  batch math, token throughput target, node/GPU counts, and required environment
+  before a large run is attempted.
 
 Important boundary:
 
@@ -2506,6 +2511,11 @@ Important boundary:
   and 10k+ step multi-GPU validation still require real Linux CUDA cluster
   hardware. Do not mark those as production-proven until cluster release gates
   have run.
+- Native PyTorch FSDP runtime is wired into the pretraining loop for `torchrun`
+  execution: it initializes distributed state, maps local CUDA ranks, wraps
+  decoder blocks, uses mixed precision when requested, and writes rank-safe full
+  checkpoints. DeepSpeed and Megatron paths are launch/readiness contracts until
+  their dedicated engine adapters pass cluster release gates.
 
 Tiny transformer smoke:
 
@@ -2537,6 +2547,44 @@ from src.mythos.model_ops.torch_decoder import model_profile
 profile = model_profile("62b")
 print(profile.parameter_estimate(), profile.model_dump())
 ```
+
+Cluster training plan:
+
+```bash
+python -m src.mythos.model_ops.pretrain_loop \
+  --cluster-plan-only \
+  --distributed-strategy fsdp \
+  --manifest artifacts/mythos/real-tokenizer-v1/shards/manifest.json \
+  --output-dir artifacts/mythos/cluster-runs/mythos-62b \
+  --cluster-plan-out artifacts/mythos/cluster-runs/mythos-62b/cluster_training_plan.json \
+  --model-profile 62b \
+  --num-nodes 8 \
+  --gpus-per-node 8 \
+  --sequence-length 8192 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 16 \
+  --steps 10000 \
+  --dtype bf16 \
+  --attention-impl auto \
+  --gradient-checkpointing
+```
+
+What the plan proves:
+
+- the training manifest exists
+- the selected scratch model profile is shape-valid
+- global batch size and tokens per optimizer step are explicit
+- required distributed environment variables are visible before launch
+- warnings appear when hardware is too small for the selected profile
+
+What the plan does not prove:
+
+- that the cluster has enough GPU memory
+- that NCCL networking is healthy
+- that DeepSpeed/Megatron/FSDP actually completed a checkpoint on your cluster
+- that exported weights are vLLM/TensorRT native without adapter/conversion work
+
+Those are cluster release-gate tasks, not laptop/Kaggle smoke tasks.
 
 ## Verification Commands
 

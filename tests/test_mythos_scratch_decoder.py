@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from src.mythos.model_ops.gpu_smoke import run_scratch_gpu_smoke
@@ -41,7 +42,11 @@ class MythosScratchDecoderTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             export_dir = model.export_checkpoint(temp_dir)
             self.assertTrue(Path(export_dir, "model.pt").exists())
-            self.assertTrue(Path(export_dir, "serving_compatibility.json").exists())
+            serving = json.loads(Path(export_dir, "serving_compatibility.json").read_text(encoding="utf-8"))
+            self.assertEqual(serving["format"], "mythos_decoder_v1")
+            self.assertEqual(serving["serving_targets"]["native_mythos"], "supported")
+            self.assertTrue(serving["runtime_features"]["kv_cache"])
+            self.assertTrue(Path(export_dir, "generation_config.json").exists())
 
     def test_large_profile_contracts_are_shape_valid_without_instantiation(self) -> None:
         profile = model_profile("62b")
