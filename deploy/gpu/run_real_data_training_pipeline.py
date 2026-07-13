@@ -51,6 +51,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-batches", type=int, default=4)
     parser.add_argument("--early-stopping-patience", type=int, default=8)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
+    parser.add_argument("--no-training-data-gate", action="store_true")
+    parser.add_argument("--min-training-quality-score", type=float, default=0.58)
+    parser.add_argument("--min-source-reputation-score", type=float, default=0.45)
+    parser.add_argument("--eval-holdout-fraction", type=float, default=0.02)
     parser.add_argument("--no-source-balancing", action="store_true")
     parser.add_argument("--max-source-fraction", type=float, default=0.35)
     parser.add_argument("--min-source-rows", type=int, default=25)
@@ -58,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--progress-path")
+    parser.add_argument("--progress-to-stdout", action="store_true", help="Explicitly stream structured progress events to stdout.")
     parser.add_argument("--no-progress-stdout", action="store_true")
     parser.add_argument("--progress-every-docs", type=int, default=10)
     parser.add_argument("--progress-every-steps", type=int, default=10)
@@ -101,6 +106,10 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             validation_batches=args.validation_batches,
             early_stopping_patience=args.early_stopping_patience,
             early_stopping_min_delta=args.early_stopping_min_delta,
+            apply_training_data_gate=not args.no_training_data_gate,
+            min_training_quality_score=args.min_training_quality_score,
+            min_source_reputation_score=args.min_source_reputation_score,
+            eval_holdout_fraction=args.eval_holdout_fraction,
             balance_sources=not args.no_source_balancing,
             max_source_fraction=args.max_source_fraction,
             min_source_rows=args.min_source_rows,
@@ -109,7 +118,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             object_store_endpoint_url=args.object_store_endpoint_url,
             upload_artifacts=True,
             progress_path=progress_path,
-            progress_to_stdout=not args.no_progress_stdout,
+            progress_to_stdout=args.progress_to_stdout or not args.no_progress_stdout,
             progress_every_docs=args.progress_every_docs,
             progress_every_steps=args.progress_every_steps,
         )

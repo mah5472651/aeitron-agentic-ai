@@ -2161,6 +2161,62 @@ PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
 tail -n 80 artifacts/mythos/kaggle-real-data-smoke/progress.jsonl
 ```
 
+Kaggle notebooks may buffer `%%bash` output until the process exits. For real
+live progress, run the job in the background and tail the progress file in a
+second cell.
+
+Cell 1:
+
+```bash
+%%bash
+cd /kaggle/working/mythos-agentic-ai
+git pull origin master
+mkdir -p artifacts/mythos/real-data-5k-quality-gated
+PYTHONUNBUFFERED=1 nohup python -u deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.ultimate.json \
+  --work-dir artifacts/mythos/real-data-5k-quality-gated \
+  --target-records 5000 \
+  --max-docs 12000 \
+  --max-bytes-per-doc 250000 \
+  --workers 6 \
+  --max-depth 2 \
+  --delay-seconds 0.35 \
+  --steps 1000 \
+  --sequence-length 128 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 8 \
+  --validation-interval 100 \
+  --early-stopping-patience 8 \
+  --min-training-quality-score 0.55 \
+  --min-source-reputation-score 0.40 \
+  --eval-holdout-fraction 0.02 \
+  --max-source-fraction 0.30 \
+  --progress-path artifacts/mythos/real-data-5k-quality-gated/progress.jsonl \
+  --progress-to-stdout \
+  --progress-every-docs 10 \
+  --progress-every-steps 25 \
+  > artifacts/mythos/real-data-5k-quality-gated/run.log 2>&1 &
+echo $! > artifacts/mythos/real-data-5k-quality-gated/run.pid
+cat artifacts/mythos/real-data-5k-quality-gated/run.pid
+```
+
+Cell 2:
+
+```bash
+%%bash
+cd /kaggle/working/mythos-agentic-ai
+tail -f artifacts/mythos/real-data-5k-quality-gated/progress.jsonl
+```
+
+When the job finishes:
+
+```bash
+%%bash
+cd /kaggle/working/mythos-agentic-ai
+tail -n 80 artifacts/mythos/real-data-5k-quality-gated/run.log
+cat artifacts/mythos/real-data-5k-quality-gated/reports/real_data_training_report.json
+```
+
 Benchmark suite adapters:
 
 - `swe_bench_style`: local SWE-Bench-like JSONL files.
