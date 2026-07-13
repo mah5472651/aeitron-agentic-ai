@@ -2127,6 +2127,10 @@ python -m src.mythos.learning.dataset_validation `
   `vllm`, `deepspeed`, and torch reinstallations that can break the hosted CUDA
   runtime. Use `requirements-linux-gpu.txt` only on controlled GPU machines or
   containers.
+- Long-running GPU/data commands emit structured progress to stdout and to
+  `progress.jsonl`. Each event has `stage`, `status`, `ts_unix`, and metrics
+  such as fetched docs, accepted rows, train loss, validation loss, trained
+  tokens, checkpoint paths, and final report paths.
 
 Command:
 
@@ -2138,6 +2142,23 @@ python deploy/gpu/run_10k_training_validation.py \
   --sequence-length 128 \
   --batch-size 2 \
   --gradient-accumulation-steps 8
+```
+
+Live progress example:
+
+```bash
+PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.ultimate.json \
+  --work-dir artifacts/mythos/kaggle-real-data-smoke \
+  --target-records 1000 \
+  --max-docs 3000 \
+  --steps 200 \
+  --device cuda \
+  --dtype fp16 \
+  --progress-every-docs 10 \
+  --progress-every-steps 10
+
+tail -n 80 artifacts/mythos/kaggle-real-data-smoke/progress.jsonl
 ```
 
 Benchmark suite adapters:

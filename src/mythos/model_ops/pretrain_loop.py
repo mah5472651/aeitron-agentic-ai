@@ -12,6 +12,7 @@ from src.mythos.model_ops.data_loader import TokenShardStream, count_batches, lo
 from src.mythos.model_ops.foundation import CheckpointManifest
 from src.mythos.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer, read_uint32_tokens
 from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, require_torch, tiny_smoke_config
+from src.mythos.shared.progress import NullProgressReporter, ProgressReporter
 
 try:
     import torch
@@ -184,6 +185,8 @@ def run_pretraining_loop(
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 0.0,
     resume: bool = True,
+    progress: ProgressReporter | None = None,
+    progress_every_steps: int = 25,
 ) -> dict[str, Any]:
     require_torch()
     if steps < 1:
@@ -193,6 +196,7 @@ def run_pretraining_loop(
     if early_stopping_patience < 0:
         raise ValueError("early_stopping_patience must be >= 0")
     selected = select_device(device)
+    active_progress = progress or NullProgressReporter()
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     active_manifest_path: Path | None = Path(manifest).resolve() if manifest else None
@@ -217,6 +221,21 @@ def run_pretraining_loop(
         train_shards=active_manifest.train_shards,
         sequence_length=sequence_length,
         batch_size=batch_size,
+    )
+    active_progress.emit(
+        "training",
+        "started",
+        device=str(selected),
+        dtype=dtype,
+        requested_steps=steps,
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        train_shards=len(active_manifest.train_shards),
+        val_shards=len(active_manifest.val_shards),
+        available_batches=available_batches,
+        vocab_size=config.vocab_size,
+        parameter_count=config.parameter_estimate(),
     )
     train_stream = TokenShardStream(
         active_manifest.train_shards,
@@ -272,6 +291,16 @@ def run_pretraining_loop(
             current_step += 1
             trained_tokens += batch_size * sequence_length
             train_losses.append(float(output.loss.detach().cpu()))
+            if current_step == 1 or current_step % max(1, progress_every_steps) == 0 or current_step >= steps:
+                active_progress.emit(
+                    "training",
+                    "running",
+                    step=current_step,
+                    requested_steps=steps,
+                    loss=round(train_losses[-1], 6),
+                    trained_tokens=trained_tokens,
+                    epoch=epoch,
+                )
 
             if val_stream is not None and validate_every > 0 and current_step % validate_every == 0:
                 current_val_loss = validation_loss(
@@ -282,6 +311,13 @@ def run_pretraining_loop(
                     dtype=dtype,
                 )
                 val_losses.append({"step": float(current_step), "loss": current_val_loss})
+                active_progress.emit(
+                    "validation",
+                    "complete",
+                    step=current_step,
+                    validation_loss=round(current_val_loss, 6),
+                    best_validation_loss=round(best_val_loss, 6) if best_val_loss != float("inf") else None,
+                )
                 if current_val_loss < best_val_loss - early_stopping_min_delta:
                     best_val_loss = current_val_loss
                     best_val_step = current_step
@@ -296,6 +332,13 @@ def run_pretraining_loop(
                         metrics={"train_loss": train_losses[-1], "val_loss": current_val_loss, "best_val_loss": current_val_loss},
                         manifest_filename="best_checkpoint_manifest.json",
                     )
+                    active_progress.emit(
+                        "checkpoint",
+                        "best_saved",
+                        step=current_step,
+                        validation_loss=round(current_val_loss, 6),
+                        checkpoint_manifest=str(best_checkpoint_manifest),
+                    )
                 else:
                     validations_without_improvement += 1
                     if early_stopping_patience > 0 and validations_without_improvement >= early_stopping_patience:
@@ -304,9 +347,10 @@ def run_pretraining_loop(
                             f"validation loss did not improve by {early_stopping_min_delta} "
                             f"for {validations_without_improvement} validation checks"
                         )
+                        active_progress.emit("training", "early_stopping", step=current_step, reason=early_stop_reason)
                         break
             if checkpoint_every > 0 and current_step % checkpoint_every == 0:
-                save_training_checkpoint(
+                checkpoint_manifest = save_training_checkpoint(
                     output_dir=root,
                     model=model,
                     optimizer=optimizer,
@@ -314,6 +358,14 @@ def run_pretraining_loop(
                     step=current_step,
                     trained_tokens=trained_tokens,
                     metrics={"train_loss": train_losses[-1], "val_loss": val_losses[-1]["loss"] if val_losses else -1.0},
+                )
+                active_progress.emit(
+                    "checkpoint",
+                    "saved",
+                    step=current_step,
+                    checkpoint_manifest=str(checkpoint_manifest),
+                    train_loss=round(train_losses[-1], 6),
+                    validation_loss=round(val_losses[-1]["loss"], 6) if val_losses else None,
                 )
             if current_step >= steps:
                 break
@@ -376,6 +428,17 @@ def run_pretraining_loop(
         "duration_ms": round((time.perf_counter() - started) * 1000, 3),
     }
     (root / "pretrain_report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    active_progress.emit(
+        "training",
+        "complete",
+        training_status=report["status"],
+        steps=current_step,
+        trained_tokens=trained_tokens,
+        final_loss=round(train_losses[-1], 6),
+        best_validation_loss=round(best_val_loss, 6) if best_val_loss != float("inf") else None,
+        checkpoint_manifest=str(manifest_path),
+        duration_ms=report["duration_ms"],
+    )
     return report
 
 

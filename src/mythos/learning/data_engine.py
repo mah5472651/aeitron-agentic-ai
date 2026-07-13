@@ -23,6 +23,7 @@ import httpx
 from pydantic import Field
 
 from src.mythos.learning.quality import DatasetQualityGate
+from src.mythos.shared.progress import NullProgressReporter, ProgressReporter
 from src.mythos.learning.web_ingest import (
     RobotsCache,
     SourceSpec,
@@ -603,8 +604,24 @@ class DataEngine:
         if self.owns_store:
             await _maybe_await(self.store.close())
 
-    async def run(self, sources: list[SourceSpec], *, client: httpx.AsyncClient | None = None) -> DataEngineReport:
+    async def run(
+        self,
+        sources: list[SourceSpec],
+        *,
+        client: httpx.AsyncClient | None = None,
+        progress: ProgressReporter | None = None,
+        progress_every_docs: int = 25,
+    ) -> DataEngineReport:
         started = time.perf_counter()
+        active_progress = progress or NullProgressReporter()
+        active_progress.emit(
+            "crawl",
+            "started",
+            sources=len(sources),
+            max_docs=self.config.max_docs,
+            workers=self.config.workers,
+            max_depth=self.config.max_depth,
+        )
         await _store_call(self.store, "seed", sources)
         throttle = DomainThrottle(self.config.delay_seconds)
         headers = {"User-Agent": self.config.user_agent}
@@ -613,6 +630,32 @@ class DataEngine:
         robots = RobotsCache(self.config.user_agent)
         counters = {"fetched": 0, "accepted": 0, "rejected": 0, "discovered": 0, "failed": 0, "duplicate": 0}
         queue_lock = asyncio.Lock()
+        progress_lock = asyncio.Lock()
+        last_progress_docs = 0
+        last_progress_time = 0.0
+
+        async def emit_crawl_progress(force: bool = False) -> None:
+            nonlocal last_progress_docs, last_progress_time
+            async with progress_lock:
+                now = time.time()
+                if (
+                    force
+                    or counters["fetched"] - last_progress_docs >= max(1, progress_every_docs)
+                    or now - last_progress_time >= 10.0
+                ):
+                    last_progress_docs = counters["fetched"]
+                    last_progress_time = now
+                    active_progress.emit(
+                        "crawl",
+                        "running",
+                        fetched=counters["fetched"],
+                        accepted=counters["accepted"],
+                        rejected=counters["rejected"],
+                        discovered=counters["discovered"],
+                        failed=counters["failed"],
+                        duplicate=counters["duplicate"],
+                        max_docs=self.config.max_docs,
+                    )
 
         async def worker() -> None:
             while counters["fetched"] < self.config.max_docs:
@@ -682,6 +725,7 @@ class DataEngine:
                         )
                     await _store_call(self.store, "mark_done", item["url"])
                     counters["fetched"] += 1
+                    await emit_crawl_progress()
                 except Exception as exc:
                     counters["failed"] += 1
                     await _store_call(
@@ -692,6 +736,7 @@ class DataEngine:
                         retry_limit=self.config.retry_limit,
                         delay_seconds=self.config.delay_seconds,
                     )
+                    await emit_crawl_progress()
 
         try:
             await asyncio.gather(*(worker() for _ in range(self.config.workers)))
@@ -701,6 +746,7 @@ class DataEngine:
             if own_client:
                 await active_client.aclose()
 
+        active_progress.emit("crawl", "complete", **counters, duration_ms=round((time.perf_counter() - started) * 1000, 3))
         return DataEngineReport(
             status="complete",
             frontier_path=str(self.store.path),

@@ -42,6 +42,7 @@ from src.mythos.model_ops.tokenizer_pipeline import (
     build_token_shards,
     train_bpe_tokenizer,
 )
+from src.mythos.shared.progress import ProgressReporter, progress_from_options
 from src.mythos.shared.schemas import StrictModel
 
 
@@ -93,6 +94,10 @@ class DataPipelineConfig(StrictModel):
     object_store_uri: str = "local://artifacts/mythos/object-store"
     object_store_endpoint_url: str | None = None
     upload_artifacts: bool = True
+    progress_path: str | None = None
+    progress_to_stdout: bool = False
+    progress_every_docs: int = Field(default=25, ge=1)
+    progress_every_steps: int = Field(default=25, ge=1)
 
 
 class DataPipelineReport(StrictModel):
@@ -181,6 +186,8 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
     reports_dir = root / "reports"
     root.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = config.progress_path or str(root / "progress.jsonl")
+    progress = progress_from_options(path=progress_path, to_stdout=config.progress_to_stdout)
 
     with PipelineRunLock(root / ".pipeline.lock"):
         return await _run_data_pipeline_locked(
@@ -194,6 +201,7 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
             train_dir=train_dir,
             tasks_path=tasks_path,
             reports_dir=reports_dir,
+            progress=progress,
         )
 
 
@@ -209,9 +217,27 @@ async def _run_data_pipeline_locked(
     train_dir: Path,
     tasks_path: Path,
     reports_dir: Path,
+    progress: ProgressReporter,
 ) -> DataPipelineReport:
+    progress.emit(
+        "pipeline",
+        "started",
+        dataset_id=config.dataset_id,
+        work_dir=str(root),
+        sources_path=config.sources_path,
+        max_docs=config.max_docs,
+        train_steps=config.train_steps,
+        skip_train=config.skip_train,
+    )
     registry = SourceRegistry.from_file(config.sources_path)
     registry_report = registry.validate()
+    progress.emit(
+        "source_registry",
+        "complete",
+        source_count=registry_report.source_count,
+        url_count=registry_report.url_count,
+        warnings=len(registry_report.warnings),
+    )
     store = await _build_store(config)
     engine_config = DataEngineConfig(
         frontier_backend=config.frontier_backend,
@@ -229,7 +255,12 @@ async def _run_data_pipeline_locked(
     )
     engine = DataEngine(engine_config, store=store, owns_store=True)
     try:
-        crawl_report = await engine.run(registry.to_sources(), client=client)
+        crawl_report = await engine.run(
+            registry.to_sources(),
+            client=client,
+            progress=progress,
+            progress_every_docs=config.progress_every_docs,
+        )
     finally:
         await engine.aclose()
 
@@ -240,10 +271,17 @@ async def _run_data_pipeline_locked(
     license_filter_report: LicenseFilterReport | None = None
     license_filter_path = root / "filtered" / "license-clean-000000.jsonl"
     if config.filter_licenses:
+        progress.emit("license_filter", "started", input_files=len(clean_files))
         license_filter_report = filter_jsonl_by_license(
             clean_files,
             license_filter_path,
             strict_unknown=config.strict_unknown_licenses,
+        )
+        progress.emit(
+            "license_filter",
+            "complete",
+            accepted=license_filter_report.accepted,
+            rejected=license_filter_report.rejected,
         )
         (reports_dir / "license_filter_report.json").write_text(
             json.dumps(license_filter_report.model_dump(), indent=2, sort_keys=True),
@@ -256,7 +294,14 @@ async def _run_data_pipeline_locked(
     benchmark_filter_report: BenchmarkContaminationFilterReport | None = None
     benchmark_filter_path = root / "filtered" / "benchmark-clean-000000.jsonl"
     if config.filter_benchmark_contamination:
+        progress.emit("benchmark_contamination_filter", "started", input_files=len(clean_files))
         benchmark_filter_report = filter_benchmark_contamination_jsonl(clean_files, benchmark_filter_path)
+        progress.emit(
+            "benchmark_contamination_filter",
+            "complete",
+            accepted=benchmark_filter_report.accepted,
+            rejected=benchmark_filter_report.rejected,
+        )
         (reports_dir / "benchmark_contamination_filter_report.json").write_text(
             json.dumps(benchmark_filter_report.model_dump(), indent=2, sort_keys=True),
             encoding="utf-8",
@@ -268,10 +313,18 @@ async def _run_data_pipeline_locked(
     near_dedup_report: NearDedupReport | None = None
     near_dedup_path = root / "dedup" / "dedup-clean-000000.jsonl"
     if config.near_dedup:
+        progress.emit("near_dedup", "started", input_files=len(clean_files))
         near_dedup_report = deduplicate_jsonl(
             clean_files,
             near_dedup_path,
             hamming_threshold=config.near_dedup_hamming_threshold,
+        )
+        progress.emit(
+            "near_dedup",
+            "complete",
+            accepted=near_dedup_report.accepted,
+            exact_duplicates=near_dedup_report.exact_duplicates,
+            near_duplicates=near_dedup_report.near_duplicates,
         )
         (reports_dir / "near_dedup_report.json").write_text(
             json.dumps(near_dedup_report.model_dump(), indent=2, sort_keys=True),
@@ -281,9 +334,16 @@ async def _run_data_pipeline_locked(
         if near_dedup_report.accepted == 0:
             raise RuntimeError("deduplication rejected every row; lower --near-dedup-hamming-threshold")
 
+    progress.emit("contamination_scan", "started", input_files=len(clean_files))
     contamination_report = ContaminationDetector(load_patterns(config.contamination_patterns_path)).scan_jsonl(
         clean_files,
         block_on_hit=config.block_contamination,
+    )
+    progress.emit(
+        "contamination_scan",
+        "complete",
+        blocked=contamination_report.blocked,
+        hits=len(contamination_report.hits),
     )
     contamination_path = reports_dir / "contamination_report.json"
     contamination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -292,20 +352,32 @@ async def _run_data_pipeline_locked(
         raise RuntimeError(f"contamination detector blocked dataset: {len(contamination_report.hits)} hits")
 
     quality_report_path = reports_dir / "quality_report.json"
+    progress.emit("quality_inspection", "started", input_files=len(clean_files))
     quality_report: QualityInspectionReport = write_quality_report(clean_files, quality_report_path)
     source_quality_path = reports_dir / "source_quality_report.json"
     source_quality_report: SourceQualityReport = write_source_quality_report(clean_files, source_quality_path)
+    progress.emit(
+        "quality_inspection",
+        "complete",
+        rows=quality_report.rows,
+        avg_quality_score=quality_report.avg_quality_score,
+        sources=len(source_quality_report.sources),
+    )
 
     task_report: TaskExtractionReport | None = None
     review_report: ReviewReport | None = None
     approved_tasks_path = root / "tasks" / "approved_tasks.jsonl"
     task_report_path = reports_dir / "task_extraction_report.json"
     if config.extract_tasks:
+        progress.emit("task_extraction", "started", max_tasks=config.max_extracted_tasks)
         task_report = extract_tasks(clean_files, tasks_path, max_tasks=config.max_extracted_tasks)
         task_report_path.write_text(json.dumps(task_report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
+        progress.emit("task_extraction", "complete", extracted=task_report.extracted)
         if config.review_tasks:
+            progress.emit("task_review", "started")
             review_report = review_tasks(tasks_path, reports_dir / "task_review_decisions.jsonl", approved_tasks_path)
             (reports_dir / "task_review_report.json").write_text(json.dumps(review_report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
+            progress.emit("task_review", "complete", approved=review_report.approved, rejected=review_report.rejected)
     feedback_path = reports_dir / "feedback_report.json"
     review_report_path = reports_dir / "task_review_report.json" if review_report is not None else None
     feedback_report: BenchmarkFeedbackReport = write_feedback_report(
@@ -313,11 +385,13 @@ async def _run_data_pipeline_locked(
         quality_report_path=quality_report_path,
         review_report_path=review_report_path,
     )
+    progress.emit("feedback_report", "complete", recommendations=len(feedback_report.recommendations))
     source_reputation_report: SourceReputationReport | None = None
     source_budget_plan: SourceBudgetPlan | None = None
     source_reputation_path = reports_dir / "source_reputation_report.json"
     source_budget_path = reports_dir / "source_budget_plan.json"
     if config.build_source_reputation:
+        progress.emit("source_reputation", "started")
         source_reputation_report = write_source_reputation_report(
             source_reputation_path,
             source_quality_report_path=source_quality_path,
@@ -327,22 +401,33 @@ async def _run_data_pipeline_locked(
             contamination_report_path=contamination_path,
             dedup_report_path=reports_dir / "near_dedup_report.json" if near_dedup_report is not None else None,
         )
+        progress.emit("source_reputation", "complete", sources=len(source_reputation_report.sources))
     if config.build_source_budget:
+        progress.emit("source_budget", "started", target_total_docs=config.source_budget_target_docs or config.max_docs)
         source_budget_plan = write_source_budget_plan(
             source_budget_path,
             sources_path=config.sources_path,
             reputation_report_path=source_reputation_path if source_reputation_report is not None else None,
             target_total_docs=config.source_budget_target_docs or config.max_docs,
         )
+        progress.emit("source_budget", "complete", budgets=len(source_budget_plan.budgets), allocated_total_docs=source_budget_plan.allocated_total_docs)
     source_balance_report: SourceBalanceReport | None = None
     training_files = clean_files
     balanced_clean_path = root / "balanced" / "balanced-clean-000000.jsonl"
     if config.balance_sources:
+        progress.emit("source_balancing", "started", max_source_fraction=config.max_source_fraction)
         source_balance_report = balance_clean_jsonl(
             input_paths=clean_files,
             output_path=balanced_clean_path,
             max_source_fraction=config.max_source_fraction,
             min_source_rows=config.min_source_rows,
+        )
+        progress.emit(
+            "source_balancing",
+            "complete",
+            input_rows=source_balance_report.input_rows,
+            output_rows=source_balance_report.output_rows,
+            capped_sources=sum(1 for item in source_balance_report.sources if item.action == "capped"),
         )
         (reports_dir / "source_balance_report.json").write_text(
             json.dumps(source_balance_report.model_dump(), indent=2, sort_keys=True),
@@ -350,11 +435,14 @@ async def _run_data_pipeline_locked(
         )
         training_files = [str(balanced_clean_path)]
 
+    progress.emit("tokenizer", "started", vocab_size=config.vocab_size, input_files=len(training_files))
     trained_tokenizer = train_bpe_tokenizer(
         training_files,
         tokenizer_path,
         TokenizerTrainConfig(vocab_size=config.vocab_size, min_frequency=config.tokenizer_min_frequency),
     )
+    progress.emit("tokenizer", "complete", tokenizer_path=str(trained_tokenizer))
+    progress.emit("sharding", "started", shard_token_count=config.shard_token_count, sequence_length=config.sequence_length)
     manifest: ShardManifest = build_token_shards(
         input_paths=training_files,
         tokenizer_path=trained_tokenizer,
@@ -365,6 +453,14 @@ async def _run_data_pipeline_locked(
             validation_fraction=config.validation_fraction,
         ),
         dataset_id=config.dataset_id,
+    )
+    progress.emit(
+        "sharding",
+        "complete",
+        train_tokens=manifest.train_tokens,
+        val_tokens=manifest.val_tokens,
+        train_shards=len(manifest.train_shards),
+        val_shards=len(manifest.val_shards),
     )
     training_report = None
     checkpoint_eval_report: CheckpointEvalReport | None = None
@@ -384,13 +480,17 @@ async def _run_data_pipeline_locked(
             early_stopping_patience=config.early_stopping_patience,
             early_stopping_min_delta=config.early_stopping_min_delta,
             resume=True,
+            progress=progress,
+            progress_every_steps=config.progress_every_steps,
         )
         if config.run_checkpoint_eval:
+            progress.emit("checkpoint_eval", "started")
             checkpoint_eval_report = evaluate_checkpoint(
                 checkpoint_manifest_path=training_report.get("best_checkpoint_manifest") or training_report["checkpoint_manifest"],
                 training_report=training_report,
                 output_dir=reports_dir / "checkpoint_eval",
             )
+            progress.emit("checkpoint_eval", "complete", eval_status=checkpoint_eval_report.status, gates=len(checkpoint_eval_report.gates))
 
     artifacts: list[DatasetArtifact] = []
     for path in clean_files:
@@ -429,6 +529,7 @@ async def _run_data_pipeline_locked(
     uploaded_objects = []
     store = None
     if config.upload_artifacts:
+        progress.emit("artifact_upload", "started", object_store_uri=config.object_store_uri, artifact_count=len(artifacts))
         store = create_object_store(ObjectStoreConfig(uri=config.object_store_uri, endpoint_url=config.object_store_endpoint_url))
         upload_prefix = f"{config.dataset_id}/{version_id}"
         upload_candidates = clean_files + [
@@ -459,6 +560,7 @@ async def _run_data_pipeline_locked(
             upload_candidates.extend([str(reports_dir / "source_balance_report.json"), str(balanced_clean_path)])
         upload_candidates.extend(manifest.train_shards + manifest.val_shards)
         uploaded_objects = upload_paths(store, upload_candidates, prefix=upload_prefix)
+        progress.emit("artifact_upload", "complete", uploaded_objects=len(uploaded_objects))
     version_manifest = DatasetVersionManifest(
         dataset_id=config.dataset_id,
         version_id=version_id,
@@ -486,6 +588,7 @@ async def _run_data_pipeline_locked(
     DatasetLedger(root / "versions" / "ledger.jsonl").append(version_manifest)
     if store is not None:
         uploaded_objects.append(store.put_file(manifest_path, key=f"{config.dataset_id}/{version_id}/version_manifest.json"))
+        progress.emit("version_manifest_upload", "complete", version_manifest_path=str(manifest_path))
 
     report_payload = DataPipelineReport(
         status="complete",
@@ -522,11 +625,22 @@ async def _run_data_pipeline_locked(
             "source_reputation_report": str(reports_dir / "source_reputation_report.json"),
             "source_budget_plan": str(reports_dir / "source_budget_plan.json"),
             "checkpoint_eval_report": str(reports_dir / "checkpoint_eval_report.json"),
+            "progress_log": str(progress.path) if progress.path else "",
         },
     )
     report_path = reports_dir / "pipeline_report.json"
     report_path.write_text(json.dumps(report_payload.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
     write_dashboard(report_payload.model_dump(), root / "dashboard.html")
+    progress.emit(
+        "pipeline",
+        "complete",
+        dataset_id=config.dataset_id,
+        version_id=version_id,
+        pipeline_status=report_payload.status,
+        clean_files=len(clean_files),
+        training_files=len(training_files),
+        dashboard_path=str(root / "dashboard.html"),
+    )
     return report_payload
 
 
@@ -579,6 +693,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object-store-uri", default="local://artifacts/mythos/object-store")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--no-upload", action="store_true")
+    parser.add_argument("--progress-path")
+    parser.add_argument("--progress-to-stdout", action="store_true")
+    parser.add_argument("--progress-every-docs", type=int, default=25)
+    parser.add_argument("--progress-every-steps", type=int, default=25)
     return parser.parse_args()
 
 
@@ -631,6 +749,10 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         object_store_uri=args.object_store_uri,
         object_store_endpoint_url=args.object_store_endpoint_url,
         upload_artifacts=not args.no_upload,
+        progress_path=args.progress_path,
+        progress_to_stdout=args.progress_to_stdout,
+        progress_every_docs=args.progress_every_docs,
+        progress_every_steps=args.progress_every_steps,
     )
 
 

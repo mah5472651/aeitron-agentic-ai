@@ -57,6 +57,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object-store-uri", default="local://artifacts/mythos/object-store")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--skip-train", action="store_true")
+    parser.add_argument("--progress-path")
+    parser.add_argument("--no-progress-stdout", action="store_true")
+    parser.add_argument("--progress-every-docs", type=int, default=10)
+    parser.add_argument("--progress-every-steps", type=int, default=10)
     return parser.parse_args()
 
 
@@ -68,6 +72,7 @@ def clean_record_count(report: dict[str, object]) -> int:
 
 
 async def run(args: argparse.Namespace) -> dict[str, object]:
+    progress_path = args.progress_path or str(Path(args.output_dir) / "progress.jsonl")
     report = await run_data_pipeline(
         DataPipelineConfig(
             sources_path=args.sources,
@@ -103,6 +108,10 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             object_store_uri=args.object_store_uri,
             object_store_endpoint_url=args.object_store_endpoint_url,
             upload_artifacts=True,
+            progress_path=progress_path,
+            progress_to_stdout=not args.no_progress_stdout,
+            progress_every_docs=args.progress_every_docs,
+            progress_every_steps=args.progress_every_steps,
         )
     )
     payload = report.model_dump()
@@ -131,6 +140,21 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
 
 def main() -> None:
     args = parse_args()
+    print(
+        json.dumps(
+            {
+                "event": "mythos_real_data_training_start",
+                "work_dir": args.output_dir,
+                "progress_path": args.progress_path or str(Path(args.output_dir) / "progress.jsonl"),
+                "progress_stdout": not args.no_progress_stdout,
+                "train_steps": args.train_steps,
+                "max_docs": args.max_docs,
+                "min_clean_records": args.min_clean_records,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     payload = asyncio.run(run(args))
     print(json.dumps(payload, indent=2, sort_keys=True))
     raise SystemExit(0 if payload.get("status") == "complete" else 1)

@@ -185,6 +185,28 @@ pip install -r requirements-kaggle-smoke.txt
 python deploy/gpu/run_scratch_gpu_smoke.py --device cuda --steps 2 --sequence-length 64
 ```
 
+Long Kaggle runs now emit live structured progress lines and write
+`progress.jsonl` inside the run directory:
+
+```bash
+PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.ultimate.json \
+  --work-dir artifacts/mythos/kaggle-real-data-smoke \
+  --target-records 1000 \
+  --max-docs 3000 \
+  --steps 200 \
+  --device cuda \
+  --dtype fp16 \
+  --progress-every-docs 10 \
+  --progress-every-steps 10
+```
+
+Watch the file from another Kaggle cell:
+
+```bash
+tail -n 80 artifacts/mythos/kaggle-real-data-smoke/progress.jsonl
+```
+
 Run the longer scratch pretraining loop:
 
 ```bash
