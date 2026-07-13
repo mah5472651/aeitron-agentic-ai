@@ -1,0 +1,993 @@
+{
+  "description": "Canonical Mythos data source registry. The `sources` list is crawl-ready and license-gated. Other sections are advisory/API metadata and review queues; they are not crawled by SourceRegistry until promoted into `sources` after legal/source approval.",
+  "sources": [
+    {
+      "allowed_domains": [
+        "cheatsheetseries.owasp.org"
+      ],
+      "category": "defensive_security",
+      "license": "cc-by-4.0",
+      "name": "owasp-cheat-sheet-series",
+      "urls": [
+        "https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/DOM_based_XSS_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Kubernetes_Security_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "owasp.org"
+      ],
+      "category": "defensive_security",
+      "license": "cc-by-4.0",
+      "name": "owasp-core-projects",
+      "urls": [
+        "https://owasp.org/www-project-top-ten/",
+        "https://owasp.org/www-project-application-security-verification-standard/",
+        "https://owasp.org/www-project-web-security-testing-guide/",
+        "https://owasp.org/www-project-api-security/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "www.cisa.gov"
+      ],
+      "category": "vulnerability_database",
+      "license": "public-domain",
+      "name": "cisa-kev-catalog",
+      "urls": [
+        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "csrc.nist.gov"
+      ],
+      "category": "defensive_security",
+      "license": "public-domain",
+      "name": "nist-secure-engineering",
+      "urls": [
+        "https://csrc.nist.gov/Projects/ssdf",
+        "https://csrc.nist.gov/projects/cryptographic-standards-and-guidelines"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "docs.python.org"
+      ],
+      "category": "agentic_coding",
+      "license": "psf-2.0",
+      "name": "python-core-secure-coding",
+      "urls": [
+        "https://docs.python.org/3/tutorial/",
+        "https://docs.python.org/3/library/security_warnings.html",
+        "https://docs.python.org/3/library/ast.html",
+        "https://docs.python.org/3/library/asyncio.html",
+        "https://docs.python.org/3/library/subprocess.html",
+        "https://docs.python.org/3/library/unittest.html",
+        "https://docs.python.org/3/library/sqlite3.html",
+        "https://docs.python.org/3/library/typing.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "doc.rust-lang.org"
+      ],
+      "category": "agentic_coding",
+      "license": "apache-2.0",
+      "name": "rust-core-secure-systems",
+      "urls": [
+        "https://doc.rust-lang.org/book/",
+        "https://doc.rust-lang.org/reference/",
+        "https://doc.rust-lang.org/nomicon/",
+        "https://doc.rust-lang.org/cargo/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "go.dev"
+      ],
+      "category": "agentic_coding",
+      "license": "bsd-3-clause",
+      "name": "go-core-secure-coding",
+      "urls": [
+        "https://go.dev/doc/",
+        "https://go.dev/doc/effective_go",
+        "https://go.dev/doc/security/",
+        "https://go.dev/doc/tutorial/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "nodejs.org"
+      ],
+      "category": "agentic_coding",
+      "license": "mit",
+      "name": "nodejs-secure-runtime",
+      "urls": [
+        "https://nodejs.org/en/learn/getting-started/security-best-practices",
+        "https://nodejs.org/en/learn/asynchronous-work/asynchronous-flow-control",
+        "https://nodejs.org/en/learn/command-line/run-nodejs-scripts-from-the-command-line"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "www.typescriptlang.org"
+      ],
+      "category": "agentic_coding",
+      "license": "apache-2.0",
+      "name": "typescript-handbook",
+      "urls": [
+        "https://www.typescriptlang.org/docs/",
+        "https://www.typescriptlang.org/docs/handbook/intro.html",
+        "https://www.typescriptlang.org/docs/handbook/2/everyday-types.html",
+        "https://www.typescriptlang.org/docs/handbook/2/narrowing.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "fastapi.tiangolo.com"
+      ],
+      "category": "agentic_coding",
+      "license": "mit",
+      "name": "fastapi-production-api",
+      "urls": [
+        "https://fastapi.tiangolo.com/",
+        "https://fastapi.tiangolo.com/tutorial/security/",
+        "https://fastapi.tiangolo.com/advanced/security/",
+        "https://fastapi.tiangolo.com/deployment/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "docs.djangoproject.com"
+      ],
+      "category": "agentic_coding",
+      "license": "bsd-3-clause",
+      "name": "django-security-and-web",
+      "urls": [
+        "https://docs.djangoproject.com/en/stable/topics/security/",
+        "https://docs.djangoproject.com/en/stable/topics/auth/",
+        "https://docs.djangoproject.com/en/stable/topics/testing/",
+        "https://docs.djangoproject.com/en/stable/topics/db/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "docs.pytest.org"
+      ],
+      "category": "agentic_coding",
+      "license": "mit",
+      "name": "pytest-testing-workflows",
+      "urls": [
+        "https://docs.pytest.org/en/stable/",
+        "https://docs.pytest.org/en/stable/how-to/assert.html",
+        "https://docs.pytest.org/en/stable/how-to/fixtures.html",
+        "https://docs.pytest.org/en/stable/how-to/tmp_path.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "www.postgresql.org"
+      ],
+      "category": "agentic_coding",
+      "license": "postgresql",
+      "name": "postgresql-secure-data-layer",
+      "urls": [
+        "https://www.postgresql.org/docs/current/",
+        "https://www.postgresql.org/docs/current/sql-prepare.html",
+        "https://www.postgresql.org/docs/current/libpq.html",
+        "https://www.postgresql.org/docs/current/auth-methods.html"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "kubernetes.io"
+      ],
+      "category": "agentic_coding",
+      "license": "cc-by-4.0",
+      "name": "kubernetes-production-security",
+      "urls": [
+        "https://kubernetes.io/docs/concepts/security/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/securing-a-cluster/",
+        "https://kubernetes.io/docs/concepts/configuration/secret/",
+        "https://kubernetes.io/docs/concepts/security/pod-security-standards/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "docs.docker.com"
+      ],
+      "category": "agentic_coding",
+      "license": "apache-2.0",
+      "name": "docker-production-builds",
+      "urls": [
+        "https://docs.docker.com/build/building/best-practices/",
+        "https://docs.docker.com/engine/security/",
+        "https://docs.docker.com/compose/",
+        "https://docs.docker.com/reference/dockerfile/"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "git-scm.com"
+      ],
+      "category": "agentic_coding",
+      "license": "cc-by-4.0",
+      "name": "git-repository-workflows",
+      "urls": [
+        "https://git-scm.com/docs",
+        "https://git-scm.com/book/en/v2",
+        "https://git-scm.com/docs/git-bisect",
+        "https://git-scm.com/docs/git-rebase",
+        "https://git-scm.com/docs/git-merge",
+        "https://git-scm.com/docs/git-apply"
+      ]
+    },
+    {
+      "allowed_domains": [
+        "scorecard.dev"
+      ],
+      "category": "defensive_security",
+      "license": "apache-2.0",
+      "name": "openssf-scorecard-supply-chain",
+      "urls": [
+        "https://scorecard.dev/"
+      ]
+    }
+  ],
+  "vulnerability_adapters": [
+    {
+      "description": "CISA Known Exploited Vulnerabilities JSON feed.",
+      "license": "public-domain",
+      "name": "cisa-kev",
+      "official_url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+      "type": "cisa-kev"
+    },
+    {
+      "description": "NVD CVE 2.0 API. Set NVD_API_KEY for higher quota.",
+      "license": "public-domain",
+      "name": "nvd-cve",
+      "official_url": "https://services.nvd.nist.gov/rest/json/cves/2.0",
+      "type": "nvd-cve"
+    },
+    {
+      "description": "OSV vulnerability API. Use seed IDs/packages from approved source manifests.",
+      "license": "cc-by-4.0",
+      "name": "osv",
+      "official_url": "https://api.osv.dev/v1",
+      "type": "osv"
+    },
+    {
+      "description": "Go vulnerability database in OSV schema.",
+      "license": "bsd-3-clause",
+      "name": "go-vuln",
+      "official_url": "https://vuln.go.dev/",
+      "type": "go-vuln"
+    },
+    {
+      "description": "GitHub Advisory Database through official GraphQL API. Requires GITHUB_TOKEN.",
+      "license": "cc-by-4.0",
+      "name": "github-advisory",
+      "official_url": "https://api.github.com/graphql",
+      "requires_env": [
+        "GITHUB_TOKEN"
+      ],
+      "type": "github-advisory"
+    }
+  ],
+  "review_required_sources": [
+    {
+      "category": "defensive_security",
+      "name": "mitre-cwe-capec",
+      "policy": "Promote only after confirming current redistribution/training license terms.",
+      "urls": [
+        "https://cwe.mitre.org/data/index.html",
+        "https://capec.mitre.org/data/index.html"
+      ]
+    },
+    {
+      "category": "security_static_analysis",
+      "name": "github-codeql-docs",
+      "policy": "Prefer official API/docs metadata and verify license before using row text for training.",
+      "urls": [
+        "https://docs.github.com/en/code-security/codeql-cli",
+        "https://docs.github.com/en/code-security/code-scanning/introduction-to-code-scanning/about-code-scanning-with-codeql"
+      ]
+    },
+    {
+      "category": "security_static_analysis",
+      "name": "semgrep-rules-docs",
+      "policy": "Promote only from approved docs/rules repositories with explicit compatible license.",
+      "urls": [
+        "https://semgrep.dev/docs/",
+        "https://semgrep.dev/docs/writing-rules/overview/"
+      ]
+    },
+    {
+      "category": "ecosystem_advisories",
+      "name": "rustsec-go-vulndb-pypa-advisory-db",
+      "policy": "Ingest advisory records through adapters or approved source repos after license review.",
+      "urls": [
+        "https://rustsec.org/advisories/",
+        "https://pkg.go.dev/vuln",
+        "https://github.com/pypa/advisory-database"
+      ]
+    },
+    {
+      "category": "security_patch",
+      "name": "real-permissive-security-patches",
+      "policy": "Clone only repos with explicit compatible license, extract local patches with repo_patch_extraction.py, and preserve provenance.",
+      "urls": []
+    },
+    {
+      "category": "authorized_security_testing_labs",
+      "name": "portswigger-web-security-academy",
+      "policy": "Use only after terms/license review. Ingest as authorized web security testing education, never as autonomous target exploitation instructions.",
+      "urls": [
+        "https://portswigger.net/web-security"
+      ]
+    },
+    {
+      "category": "authorized_security_testing_labs",
+      "name": "owasp-juice-shop",
+      "policy": "Prefer the official permissive-license repository and extract defensive tasks, tests, and patch lessons from local approved clones.",
+      "urls": [
+        "https://owasp.org/www-project-juice-shop/"
+      ]
+    },
+    {
+      "category": "authorized_security_testing_labs",
+      "name": "webgoat",
+      "policy": "Prefer the official OWASP repository after license confirmation. Use only for secure coding and authorized testing task generation.",
+      "urls": [
+        "https://owasp.org/www-project-webgoat/"
+      ]
+    },
+    {
+      "category": "adversary_knowledge_for_defense",
+      "name": "mitre-attack",
+      "policy": "Use for defensive detection, threat modeling, and mitigation mapping only after license review.",
+      "urls": [
+        "https://attack.mitre.org/"
+      ]
+    }
+  ],
+  "training_priority_groups": [
+    {
+      "name": "Primus cybersecurity series",
+      "purpose": "Highest-value cybersecurity pretraining/SFT resource group after license approval.",
+      "rank": 1,
+      "resource_ids": [1, 2, 3, 4, 5, 6, 7]
+    },
+    {
+      "name": "CyberLLMInstruct",
+      "purpose": "High-value cybersecurity instruction data and methodology reference.",
+      "rank": 2,
+      "resource_ids": [8]
+    },
+    {
+      "name": "NYU CTF Bench",
+      "purpose": "Offensive-security evaluation reference; keep protected as benchmark/holdout unless explicitly approved for derived training.",
+      "rank": 3,
+      "resource_ids": [11]
+    },
+    {
+      "name": "SWE-Gym and SWE-smith",
+      "purpose": "Agentic coding task/environment data for repository-level repair behavior.",
+      "rank": 4,
+      "resource_ids": [26, 27, 28]
+    },
+    {
+      "name": "SWE-bench Verified",
+      "purpose": "Protected evaluation/contamination reference; do not mix into pretraining rows.",
+      "rank": 5,
+      "resource_ids": [31]
+    },
+    {
+      "name": "The Stack v2 and CommitPack",
+      "purpose": "Raw code and commit-history corpus foundation after license and PII/secret filtering.",
+      "rank": 6,
+      "resource_ids": [39, 40]
+    }
+  ],
+  "training_resources": [
+    {
+      "ingestion_mode": "huggingface_dataset",
+      "license_status": "review_required",
+      "name": "Primus-Seed",
+      "notes": "Curated cybersecurity text from MITRE, Wikipedia, and company sources.",
+      "priority_rank": 1,
+      "resource_id": 1,
+      "resource_type": "cybersecurity_pretraining_dataset",
+      "safety_policy": "license_filter_and_defensive_security_quality_gate",
+      "section": "cybersecurity_pretraining_sft",
+      "train_policy": "pretrain",
+      "url": "https://huggingface.co/datasets/trendmicro-ailab/Primus-Seed"
+    },
+    {
+      "ingestion_mode": "huggingface_dataset",
+      "license_status": "review_required",
+      "name": "Primus-FineWeb",
+      "notes": "Cybersecurity-filtered Common Crawl corpus.",
+      "priority_rank": 2,
+      "resource_id": 2,
+      "resource_type": "cybersecurity_pretraining_dataset",
+      "safety_policy": "license_filter_contamination_filter_near_dedup",
+      "section": "cybersecurity_pretraining_sft",
+      "train_policy": "pretrain",
+      "url": "https://huggingface.co/datasets/trendmicro-ailab/Primus-FineWeb"
+    },
+    {
+      "ingestion_mode": "huggingface_dataset",
+      "license_status": "review_required",
+      "name": "Primus-Reasoning",
+      "notes": "Cybersecurity reasoning distillation/task data.",
+      "priority_rank": 3,
+      "resource_id": 3,
+      "resource_type": "cybersecurity_reasoning_dataset",
+      "safety_policy": "strip_ground_truth_leakage_and_keep_defensive_framing",
+      "section": "cybersecurity_pretraining_sft",
+      "train_policy": "sft",
+      "url": "https://huggingface.co/datasets/trendmicro-ailab/Primus-Reasoning"
+    },
+    {
+      "ingestion_mode": "reference_collection",
+      "license_status": "review_required",
+      "name": "Primus collection",
+      "notes": "Collection page for Primus data/model methodology references.",
+      "priority_rank": 4,
+      "resource_id": 4,
+      "resource_type": "resource_collection",
+      "safety_policy": "catalog_reference_only_until_individual_items_are_approved",
+      "section": "cybersecurity_pretraining_sft",
+      "train_policy": "research_reference",
+      "url": "https://huggingface.co/collections/trendmicro-ailab/primus-67b1fd27052b802b4af9d243"
+    },
+    {
+      "ingestion_mode": "paper_reference",
+      "license_status": "research_reference",
+      "name": "Primus paper",
+      "notes": "Methodology reference for cybersecurity data construction.",
+      "priority_rank": 5,
+      "resource_id": 5,
+      "resource_type": "research_paper",
+      "safety_policy": "use_for_methodology_not_training_corpus_by_default",
+      "section": "cybersecurity_pretraining_sft",
+      "train_policy": "research_reference",
+      "url": "https://arxiv.org/abs/2502.11191"
+    },
+    {
+      "ingestion_mode": "model_reference",
+      "license_status": "not_training_data",
+      "name": "Llama-Primus-Merged 8B",
+      "notes": "Model reference only; Mythos remains scratch-training oriented.",
+      "priority_rank": 6,
+      "resource_id": 6,
+      "resource_type": "model_reference",
+      "safety_policy": "do_not_import_weights_or_outputs_as_training_data",
+      "section": "cybersecurity_pretraining_sft",
+      "train_policy": "research_reference",
+      "url": "https://huggingface.co/trendmicro-ailab/Llama-Primus-Merged"
+    },
+    {
+      "ingestion_mode": "model_reference",
+      "license_status": "not_training_data",
+      "name": "Llama-Primus-Nemotron-70B",
+      "notes": "Cybersecurity CPT lineage reference only.",
+      "priority_rank": 7,
+      "resource_id": 7,
+      "resource_type": "model_reference",
+      "safety_policy": "do_not_import_weights_or_outputs_as_training_data",
+      "section": "cybersecurity_pretraining_sft",
+      "train_policy": "research_reference",
+      "url": "https://huggingface.co/collections/trend-cybertron/llama-primus-nemotron-70b-6805fd8a55d3c792e1bc1ec9"
+    },
+    {
+      "ingestion_mode": "paper_or_dataset_reference",
+      "license_status": "review_required",
+      "name": "CyberLLMInstruct",
+      "notes": "Cybersecurity instruction-response dataset/methodology reference.",
+      "priority_rank": 8,
+      "resource_id": 8,
+      "resource_type": "cybersecurity_instruction_dataset",
+      "safety_policy": "dual_use_filter_and_instruction_safety_review",
+      "section": "cybersecurity_pretraining_sft",
+      "train_policy": "sft",
+      "url": "https://arxiv.org/html/2503.09334v2"
+    },
+    {
+      "ingestion_mode": "dataset_page",
+      "license_status": "review_required",
+      "name": "Cybersecurity Heimdall v1.1",
+      "notes": "Dialogue dataset aligned with OWASP/NIST/MITRE ATT&CK.",
+      "priority_rank": 18,
+      "resource_id": 9,
+      "resource_type": "cybersecurity_dialogue_dataset",
+      "safety_policy": "license_review_and_defensive_instruction_filter",
+      "section": "cybersecurity_pretraining_sft",
+      "train_policy": "sft",
+      "url": "https://www.innovatiana.com/en/datasets/cybersecurity-heimdall-v1-1"
+    },
+    {
+      "ingestion_mode": "github_repo",
+      "license_status": "review_required",
+      "name": "Trend Cybertron Cloud Risk Agent",
+      "notes": "Open-source agent reference implementation.",
+      "priority_rank": 30,
+      "resource_id": 10,
+      "resource_type": "agent_reference_repo",
+      "safety_policy": "clone_only_after_license_review_and_secret_scan",
+      "section": "cybersecurity_pretraining_sft",
+      "train_policy": "agentic_task",
+      "url": "https://github.com/trendmicro/cloud-risk-assessment-agent"
+    },
+    {
+      "ingestion_mode": "paper_reference",
+      "license_status": "benchmark_holdout",
+      "name": "NYU CTF Bench",
+      "notes": "Scalable offensive-security benchmark reference.",
+      "priority_rank": 9,
+      "resource_id": 11,
+      "resource_type": "offensive_security_benchmark",
+      "safety_policy": "eval_holdout_no_autonomous_exploit_execution",
+      "section": "offensive_security_ctf",
+      "train_policy": "eval_holdout",
+      "url": "https://arxiv.org/abs/2406.05590"
+    },
+    {
+      "ingestion_mode": "paper_reference",
+      "license_status": "benchmark_holdout",
+      "name": "CRAKEN",
+      "notes": "Knowledge-based CTF agent execution paper.",
+      "priority_rank": 32,
+      "resource_id": 12,
+      "resource_type": "offensive_security_benchmark",
+      "safety_policy": "eval_holdout_and_authorized_lab_only",
+      "section": "offensive_security_ctf",
+      "train_policy": "eval_holdout",
+      "url": "https://arxiv.org/pdf/2505.17107"
+    },
+    {
+      "ingestion_mode": "paper_reference",
+      "license_status": "research_reference",
+      "name": "LLM Offensive Security Evaluation",
+      "notes": "Empirical evaluation paper.",
+      "priority_rank": 33,
+      "resource_id": 13,
+      "resource_type": "offensive_security_evaluation_reference",
+      "safety_policy": "research_reference_only",
+      "section": "offensive_security_ctf",
+      "train_policy": "research_reference",
+      "url": "https://arxiv.org/abs/2402.11814"
+    },
+    {
+      "ingestion_mode": "review_required_crawl_or_structured_feed",
+      "license_status": "review_required",
+      "name": "MITRE ATT&CK",
+      "notes": "Threat behavior knowledge base.",
+      "priority_rank": 24,
+      "resource_id": 14,
+      "resource_type": "threat_intel_knowledge_base",
+      "safety_policy": "defensive_detection_and_mitigation_mapping",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "governance_review",
+      "url": "https://attack.mitre.org"
+    },
+    {
+      "ingestion_mode": "review_required_crawl_or_structured_feed",
+      "license_status": "review_required",
+      "name": "MITRE CAPEC",
+      "notes": "Attack pattern taxonomy.",
+      "priority_rank": 25,
+      "resource_id": 15,
+      "resource_type": "attack_pattern_taxonomy",
+      "safety_policy": "taxonomy_and_defensive_mapping_only",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "governance_review",
+      "url": "https://capec.mitre.org"
+    },
+    {
+      "ingestion_mode": "structured_feed",
+      "license_status": "review_required",
+      "name": "MITRE CVE",
+      "notes": "CVE program reference.",
+      "priority_rank": 26,
+      "resource_id": 16,
+      "resource_type": "vulnerability_database",
+      "safety_policy": "prefer_cve_records_with_provenance",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "governance_review",
+      "url": "https://cve.mitre.org"
+    },
+    {
+      "ingestion_mode": "vulnerability_adapter",
+      "license_status": "public_domain",
+      "name": "NVD",
+      "notes": "Official CVE API and NVD metadata.",
+      "priority_rank": 14,
+      "resource_id": 17,
+      "resource_type": "vulnerability_database",
+      "safety_policy": "normalize_records_and_preserve_cve_provenance",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "pretrain",
+      "url": "https://nvd.nist.gov"
+    },
+    {
+      "ingestion_mode": "review_required_crawl_or_structured_feed",
+      "license_status": "review_required",
+      "name": "CWE",
+      "notes": "Weakness taxonomy.",
+      "priority_rank": 15,
+      "resource_id": 18,
+      "resource_type": "weakness_taxonomy",
+      "safety_policy": "taxonomy_and_secure_coding_guidance",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "governance_review",
+      "url": "https://cwe.mitre.org"
+    },
+    {
+      "ingestion_mode": "blocked_direct_ingest",
+      "license_status": "high_risk_review_required",
+      "name": "Exploit-DB",
+      "notes": "Exploit corpus; do not directly ingest executable exploit code.",
+      "priority_rank": 900,
+      "resource_id": 19,
+      "resource_type": "exploit_reference",
+      "safety_policy": "metadata_only_or_authorized_lab_transforms_after_review",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "governance_review",
+      "url": "https://www.exploit-db.com"
+    },
+    {
+      "ingestion_mode": "github_repo",
+      "license_status": "high_risk_review_required",
+      "name": "Metasploit Framework",
+      "notes": "Security testing framework; do not train autonomous misuse behavior.",
+      "priority_rank": 901,
+      "resource_id": 20,
+      "resource_type": "security_tooling_repo",
+      "safety_policy": "defensive_module_metadata_and_authorized_lab_only",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "governance_review",
+      "url": "https://github.com/rapid7/metasploit-framework"
+    },
+    {
+      "ingestion_mode": "vulnerability_adapter",
+      "license_status": "cc-by-4.0",
+      "name": "GitHub Security Advisories",
+      "notes": "Official advisory database.",
+      "priority_rank": 16,
+      "resource_id": 21,
+      "resource_type": "vulnerability_database",
+      "safety_policy": "use_graphql_api_with_token_and_provenance",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "pretrain",
+      "url": "https://github.com/advisories"
+    },
+    {
+      "ingestion_mode": "crawl_ready",
+      "license_status": "cc-by-4.0",
+      "name": "OWASP Top Ten",
+      "notes": "Core web vulnerability taxonomy.",
+      "priority_rank": 13,
+      "resource_id": 22,
+      "resource_type": "defensive_security_reference",
+      "safety_policy": "crawl_ready_license_gate",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "pretrain",
+      "url": "https://owasp.org/www-project-top-ten/"
+    },
+    {
+      "ingestion_mode": "blocked_direct_ingest",
+      "license_status": "high_risk_review_required",
+      "name": "MalwareBazaar",
+      "notes": "Malware sample/intel source.",
+      "priority_rank": 902,
+      "resource_id": 23,
+      "resource_type": "malware_intel",
+      "safety_policy": "metadata_only_no_malware_sample_collection",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "governance_review",
+      "url": "https://bazaar.abuse.ch"
+    },
+    {
+      "ingestion_mode": "api_reference",
+      "license_status": "terms_review_required",
+      "name": "VirusTotal",
+      "notes": "Threat intelligence API/service.",
+      "priority_rank": 903,
+      "resource_id": 24,
+      "resource_type": "threat_intel_service",
+      "safety_policy": "metadata_only_follow_api_terms_no_sample_downloads",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "governance_review",
+      "url": "https://www.virustotal.com"
+    },
+    {
+      "ingestion_mode": "benchmark_reference",
+      "license_status": "review_required",
+      "name": "picoCTF archive",
+      "notes": "CTF education archive.",
+      "priority_rank": 34,
+      "resource_id": 25,
+      "resource_type": "ctf_education_benchmark",
+      "safety_policy": "authorized_lab_and_eval_holdout",
+      "section": "ground_truth_threat_vulnerability",
+      "train_policy": "eval_holdout",
+      "url": "https://picoctf.org"
+    },
+    {
+      "ingestion_mode": "paper_reference",
+      "license_status": "research_reference",
+      "name": "SWE-Gym paper",
+      "notes": "Agentic coding benchmark methodology.",
+      "priority_rank": 10,
+      "resource_id": 26,
+      "resource_type": "agentic_coding_reference",
+      "safety_policy": "methodology_reference",
+      "section": "agentic_coding",
+      "train_policy": "research_reference",
+      "url": "https://arxiv.org/abs/2412.21139"
+    },
+    {
+      "ingestion_mode": "github_repo",
+      "license_status": "review_required",
+      "name": "SWE-Gym GitHub",
+      "notes": "Executable agentic coding environment.",
+      "priority_rank": 11,
+      "resource_id": 27,
+      "resource_type": "agentic_coding_environment",
+      "safety_policy": "license_review_then_task_extraction",
+      "section": "agentic_coding",
+      "train_policy": "agentic_task",
+      "url": "https://github.com/SWE-Gym/SWE-Gym"
+    },
+    {
+      "ingestion_mode": "github_repo",
+      "license_status": "review_required",
+      "name": "SWE-smith",
+      "notes": "Synthetic bug-fix instances.",
+      "priority_rank": 12,
+      "resource_id": 28,
+      "resource_type": "agentic_bugfix_dataset",
+      "safety_policy": "license_review_contamination_filter_task_extraction",
+      "section": "agentic_coding",
+      "train_policy": "agentic_task",
+      "url": "https://github.com/SWE-agent/SWE-smith"
+    },
+    {
+      "ingestion_mode": "benchmark_reference",
+      "license_status": "eval_holdout",
+      "name": "SWE-bench main site",
+      "notes": "Standard software engineering evaluation benchmark.",
+      "priority_rank": 40,
+      "resource_id": 29,
+      "resource_type": "agentic_coding_benchmark",
+      "safety_policy": "eval_holdout_and_contamination_patterns",
+      "section": "agentic_coding",
+      "train_policy": "eval_holdout",
+      "url": "https://www.swebench.com"
+    },
+    {
+      "ingestion_mode": "github_repo",
+      "license_status": "eval_holdout",
+      "name": "SWE-bench GitHub",
+      "notes": "Benchmark implementation and tasks.",
+      "priority_rank": 41,
+      "resource_id": 30,
+      "resource_type": "agentic_coding_benchmark",
+      "safety_policy": "eval_holdout_no_training_mix",
+      "section": "agentic_coding",
+      "train_policy": "eval_holdout",
+      "url": "https://github.com/SWE-bench/SWE-bench"
+    },
+    {
+      "ingestion_mode": "huggingface_dataset",
+      "license_status": "eval_holdout",
+      "name": "SWE-bench Verified",
+      "notes": "Human-validated benchmark subset.",
+      "priority_rank": 17,
+      "resource_id": 31,
+      "resource_type": "agentic_coding_benchmark",
+      "safety_policy": "protected_eval_holdout_never_pretraining",
+      "section": "agentic_coding",
+      "train_policy": "eval_holdout",
+      "url": "https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified"
+    },
+    {
+      "ingestion_mode": "huggingface_dataset",
+      "license_status": "eval_holdout",
+      "name": "SWE-bench Multilingual",
+      "notes": "Multilingual SWE-bench benchmark.",
+      "priority_rank": 42,
+      "resource_id": 32,
+      "resource_type": "agentic_coding_benchmark",
+      "safety_policy": "eval_holdout_no_training_mix",
+      "section": "agentic_coding",
+      "train_policy": "eval_holdout",
+      "url": "https://huggingface.co/datasets/princeton-nlp/SWE-bench_Multilingual"
+    },
+    {
+      "ingestion_mode": "github_repo",
+      "license_status": "review_required",
+      "name": "R2E-Gym",
+      "notes": "Synthetic execution environment.",
+      "priority_rank": 35,
+      "resource_id": 33,
+      "resource_type": "agentic_coding_environment",
+      "safety_policy": "license_review_task_extraction",
+      "section": "agentic_coding",
+      "train_policy": "agentic_task",
+      "url": "https://github.com/R2E-Gym/R2E-Gym"
+    },
+    {
+      "ingestion_mode": "huggingface_dataset",
+      "license_status": "review_required",
+      "name": "SWE-rebench",
+      "notes": "Repository issue/task benchmark dataset.",
+      "priority_rank": 36,
+      "resource_id": 34,
+      "resource_type": "agentic_coding_dataset",
+      "safety_policy": "contamination_filter_and_license_review",
+      "section": "agentic_coding",
+      "train_policy": "agentic_task",
+      "url": "https://huggingface.co/datasets/nebius/SWE-rebench"
+    },
+    {
+      "ingestion_mode": "paper_reference",
+      "license_status": "research_reference",
+      "name": "SWE-World paper",
+      "notes": "Docker-free SWE data pipeline methodology.",
+      "priority_rank": 37,
+      "resource_id": 35,
+      "resource_type": "agentic_coding_reference",
+      "safety_policy": "methodology_reference",
+      "section": "agentic_coding",
+      "train_policy": "research_reference",
+      "url": "https://arxiv.org/pdf/2602.03419"
+    },
+    {
+      "ingestion_mode": "paper_reference",
+      "license_status": "research_reference",
+      "name": "SWE-RL",
+      "notes": "Commit-history based reinforcement learning reference.",
+      "priority_rank": 38,
+      "resource_id": 36,
+      "resource_type": "agentic_coding_rl_reference",
+      "safety_policy": "methodology_reference",
+      "section": "agentic_coding",
+      "train_policy": "research_reference",
+      "url": "https://arxiv.org/abs/2502.18449"
+    },
+    {
+      "ingestion_mode": "github_repo",
+      "license_status": "review_required",
+      "name": "OpenHands",
+      "notes": "Agent scaffold and trajectory reference.",
+      "priority_rank": 31,
+      "resource_id": 37,
+      "resource_type": "agentic_coding_repo",
+      "safety_policy": "license_review_and_secret_scan",
+      "section": "agentic_coding",
+      "train_policy": "agentic_task",
+      "url": "https://github.com/All-Hands-AI/OpenHands"
+    },
+    {
+      "ingestion_mode": "github_repo",
+      "license_status": "review_required",
+      "name": "SWE-agent",
+      "notes": "Agentic coding reference implementation.",
+      "priority_rank": 29,
+      "resource_id": 38,
+      "resource_type": "agentic_coding_repo",
+      "safety_policy": "license_review_and_trajectory_task_extraction",
+      "section": "agentic_coding",
+      "train_policy": "agentic_task",
+      "url": "https://github.com/SWE-agent/SWE-agent"
+    },
+    {
+      "ingestion_mode": "huggingface_dataset",
+      "license_status": "review_required",
+      "name": "The Stack v2",
+      "notes": "Large code pretraining corpus.",
+      "priority_rank": 19,
+      "resource_id": 39,
+      "resource_type": "code_pretraining_corpus",
+      "safety_policy": "license_filter_pii_secret_filter_dedup",
+      "section": "classic_code_foundation",
+      "train_policy": "pretrain",
+      "url": "https://huggingface.co/datasets/bigcode/the-stack-v2"
+    },
+    {
+      "ingestion_mode": "huggingface_dataset",
+      "license_status": "review_required",
+      "name": "CommitPack / CommitPackFT",
+      "notes": "Commit-history corpus for code change learning.",
+      "priority_rank": 20,
+      "resource_id": 40,
+      "resource_type": "commit_pretraining_corpus",
+      "safety_policy": "license_filter_secret_filter_patch_task_extraction",
+      "section": "classic_code_foundation",
+      "train_policy": "pretrain",
+      "url": "https://huggingface.co/datasets/bigcode/commitpack"
+    },
+    {
+      "ingestion_mode": "github_org_reference",
+      "license_status": "review_required",
+      "name": "BigCode / StarCoder org",
+      "notes": "Code data tooling/reference organization.",
+      "priority_rank": 43,
+      "resource_id": 41,
+      "resource_type": "code_corpus_reference",
+      "safety_policy": "use_only_approved_datasets_and_tools",
+      "section": "classic_code_foundation",
+      "train_policy": "research_reference",
+      "url": "https://github.com/bigcode-project"
+    },
+    {
+      "ingestion_mode": "github_repo",
+      "license_status": "review_required",
+      "name": "CodeSearchNet",
+      "notes": "Code-search dataset/reference.",
+      "priority_rank": 44,
+      "resource_id": 42,
+      "resource_type": "code_search_dataset",
+      "safety_policy": "license_review_and_dedup",
+      "section": "classic_code_foundation",
+      "train_policy": "pretrain",
+      "url": "https://github.com/github/CodeSearchNet"
+    },
+    {
+      "ingestion_mode": "benchmark_reference",
+      "license_status": "eval_holdout",
+      "name": "HumanEval",
+      "notes": "Coding benchmark.",
+      "priority_rank": 45,
+      "resource_id": 43,
+      "resource_type": "coding_benchmark",
+      "safety_policy": "eval_holdout_and_contamination_patterns",
+      "section": "classic_code_foundation",
+      "train_policy": "eval_holdout",
+      "url": "https://github.com/openai/human-eval"
+    },
+    {
+      "ingestion_mode": "benchmark_reference",
+      "license_status": "eval_holdout",
+      "name": "LiveCodeBench",
+      "notes": "Coding benchmark.",
+      "priority_rank": 46,
+      "resource_id": 44,
+      "resource_type": "coding_benchmark",
+      "safety_policy": "eval_holdout_and_contamination_patterns",
+      "section": "classic_code_foundation",
+      "train_policy": "eval_holdout",
+      "url": "https://livecodebench.github.io"
+    },
+    {
+      "ingestion_mode": "huggingface_dataset",
+      "license_status": "eval_holdout",
+      "name": "MBPP",
+      "notes": "Programming benchmark.",
+      "priority_rank": 47,
+      "resource_id": 45,
+      "resource_type": "coding_benchmark",
+      "safety_policy": "eval_holdout_and_contamination_patterns",
+      "section": "classic_code_foundation",
+      "train_policy": "eval_holdout",
+      "url": "https://huggingface.co/datasets/google-research-datasets/mbpp"
+    }
+  ]
+}

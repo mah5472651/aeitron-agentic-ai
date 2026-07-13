@@ -1,0 +1,60 @@
+{
+  "seed": 1337,
+  "tokenizer_path": null,
+  "max_rows": null,
+  "experiments": [
+    {
+      "name": "baseline_70_15_15",
+      "ratios": {
+        "general": 0.7,
+        "code": 0.15,
+        "cybersecurity": 0.15,
+        "agentic": 0.0
+      }
+    },
+    {
+      "name": "domain_heavy_55_15_30",
+      "ratios": {
+        "general": 0.55,
+        "code": 0.15,
+        "cybersecurity": 0.3,
+        "agentic": 0.0
+      }
+    },
+    {
+      "name": "domain_extreme_40_10_50",
+      "ratios": {
+        "general": 0.4,
+        "code": 0.1,
+        "cybersecurity": 0.5,
+        "agentic": 0.0
+      }
+    }
+  ],
+  "progressive_curriculum": [
+    {
+      "name": "early_general_foundation",
+      "step_fraction_end": 0.4,
+      "ratios": {
+        "general": 0.75,
+        "code": 0.15,
+        "cybersecurity": 0.1,
+        "agentic": 0.0
+      }
+    },
+    {
+      "name": "late_domain_focus",
+      "step_fraction_end": 1.0,
+      "ratios": {
+        "general": 0.45,
+        "code": 0.2,
+        "cybersecurity": 0.3,
+        "agentic": 0.05
+      }
+    }
+  ],
+  "holdout_policies": [
+    "eval_holdout",
+    "benchmark_holdout"
+  ]
+}

@@ -1,4 +1,4 @@
-"""Run a real approved-source Mythos data -> GPU training -> eval job.
+﻿"""Run a real approved-source Mythos data -> GPU training -> eval job.
 
 This entrypoint is intended for Kaggle/Colab smoke runs and single-node GPU
 jobs. For production-scale collection, use the same pipeline with Postgres
@@ -22,7 +22,7 @@ from src.mythos.learning.data_pipeline import DataPipelineConfig, run_data_pipel
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run real approved-source crawl, shard, scratch training, and checkpoint eval.")
-    parser.add_argument("--sources", default="config/data_sources.production.sample.json")
+    parser.add_argument("--sources", default="config/data_sources.ultimate.json")
     parser.add_argument("--dataset-id", default="mythos-real-approved-corpus")
     parser.add_argument("--output-dir", "--work-dir", dest="output_dir", default="artifacts/mythos/real-data-training")
     parser.add_argument("--frontier-backend", choices=["sqlite", "postgres"], default="sqlite")
@@ -138,3 +138,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

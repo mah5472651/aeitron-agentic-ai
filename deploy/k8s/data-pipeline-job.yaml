@@ -17,7 +17,7 @@ spec:
             - src.mythos.learning.data_pipeline
           args:
             - --sources
-            - config/data_sources.production.sample.json
+            - config/data_sources.ultimate.json
             - --dataset-id
             - mythos-defensive-coding-corpus
             - --work-dir

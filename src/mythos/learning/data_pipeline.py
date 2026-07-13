@@ -18,11 +18,19 @@ from src.mythos.learning.contamination import ContaminationDetector, load_patter
 from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore, PostgresFrontierStore
 from src.mythos.learning.dashboard import write_dashboard
 from src.mythos.learning.feedback import BenchmarkFeedbackReport, write_feedback_report
+from src.mythos.learning.benchmark_contamination_filter import (
+    BenchmarkContaminationFilterReport,
+    filter_benchmark_contamination_jsonl,
+)
+from src.mythos.learning.license_filter import LicenseFilterReport, filter_jsonl_by_license
+from src.mythos.learning.near_dedup import NearDedupReport, deduplicate_jsonl
 from src.mythos.learning.quality_inspector import QualityInspectionReport, write_quality_report
 from src.mythos.learning.review import ReviewReport, review_tasks
 from src.mythos.learning.source_balancing import SourceBalanceReport, balance_clean_jsonl
+from src.mythos.learning.source_budget import SourceBudgetPlan, write_source_budget_plan
 from src.mythos.learning.source_registry import SourceRegistry, SourceRegistryReport
 from src.mythos.learning.source_quality import SourceQualityReport, write_source_quality_report
+from src.mythos.learning.source_reputation import SourceReputationReport, write_source_reputation_report
 from src.mythos.learning.storage import ObjectStoreConfig, create_object_store, upload_paths
 from src.mythos.learning.task_extraction import TaskExtractionReport, extract_tasks
 from src.mythos.learning.versioning import DatasetArtifact, DatasetLedger, DatasetVersionManifest, artifact_from_path, build_version_id
@@ -66,6 +74,14 @@ class DataPipelineConfig(StrictModel):
     run_checkpoint_eval: bool = True
     early_stopping_patience: int = Field(default=0, ge=0)
     early_stopping_min_delta: float = Field(default=0.0, ge=0.0)
+    filter_licenses: bool = True
+    strict_unknown_licenses: bool = True
+    filter_benchmark_contamination: bool = True
+    near_dedup: bool = True
+    near_dedup_hamming_threshold: int = Field(default=3, ge=0, le=16)
+    build_source_reputation: bool = True
+    build_source_budget: bool = True
+    source_budget_target_docs: int | None = Field(default=None, ge=1)
     balance_sources: bool = True
     max_source_fraction: float = Field(default=0.35, ge=0.05, le=1.0)
     min_source_rows: int = Field(default=25, ge=1)
@@ -86,12 +102,17 @@ class DataPipelineReport(StrictModel):
     work_dir: str
     source_registry: SourceRegistryReport
     crawl: dict[str, Any]
+    license_filter_report: dict[str, Any] | None = None
+    benchmark_contamination_filter_report: dict[str, Any] | None = None
+    near_dedup_report: dict[str, Any] | None = None
     contamination_report: dict[str, Any] | None
     quality_report: dict[str, Any] | None
     source_quality_report: dict[str, Any] | None
     task_report: dict[str, Any] | None
     review_report: dict[str, Any] | None
     feedback_report: dict[str, Any] | None
+    source_reputation_report: dict[str, Any] | None = None
+    source_budget_plan: dict[str, Any] | None = None
     source_balance_report: dict[str, Any] | None = None
     clean_files: list[str]
     training_files: list[str]
@@ -102,6 +123,7 @@ class DataPipelineReport(StrictModel):
     uploaded_objects: list[dict[str, Any]]
     training: dict[str, Any] | None = None
     checkpoint_eval: dict[str, Any] | None = None
+    report_artifacts: dict[str, str] = Field(default_factory=dict)
 
 
 class PipelineRunLock:
@@ -158,6 +180,7 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
     tasks_path = root / "tasks" / "tasks.jsonl"
     reports_dir = root / "reports"
     root.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
 
     with PipelineRunLock(root / ".pipeline.lock"):
         return await _run_data_pipeline_locked(
@@ -214,6 +237,50 @@ async def _run_data_pipeline_locked(
     if not clean_files:
         raise RuntimeError("crawler produced zero clean shards; check sources, quality gate, robots policy, and allowlist")
 
+    license_filter_report: LicenseFilterReport | None = None
+    license_filter_path = root / "filtered" / "license-clean-000000.jsonl"
+    if config.filter_licenses:
+        license_filter_report = filter_jsonl_by_license(
+            clean_files,
+            license_filter_path,
+            strict_unknown=config.strict_unknown_licenses,
+        )
+        (reports_dir / "license_filter_report.json").write_text(
+            json.dumps(license_filter_report.model_dump(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        clean_files = [str(license_filter_path)]
+        if license_filter_report.accepted == 0:
+            raise RuntimeError("license filter rejected every row; review source licenses or disable strict unknown handling")
+
+    benchmark_filter_report: BenchmarkContaminationFilterReport | None = None
+    benchmark_filter_path = root / "filtered" / "benchmark-clean-000000.jsonl"
+    if config.filter_benchmark_contamination:
+        benchmark_filter_report = filter_benchmark_contamination_jsonl(clean_files, benchmark_filter_path)
+        (reports_dir / "benchmark_contamination_filter_report.json").write_text(
+            json.dumps(benchmark_filter_report.model_dump(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        clean_files = [str(benchmark_filter_path)]
+        if benchmark_filter_report.accepted == 0:
+            raise RuntimeError("benchmark contamination filter rejected every row")
+
+    near_dedup_report: NearDedupReport | None = None
+    near_dedup_path = root / "dedup" / "dedup-clean-000000.jsonl"
+    if config.near_dedup:
+        near_dedup_report = deduplicate_jsonl(
+            clean_files,
+            near_dedup_path,
+            hamming_threshold=config.near_dedup_hamming_threshold,
+        )
+        (reports_dir / "near_dedup_report.json").write_text(
+            json.dumps(near_dedup_report.model_dump(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        clean_files = [str(near_dedup_path)]
+        if near_dedup_report.accepted == 0:
+            raise RuntimeError("deduplication rejected every row; lower --near-dedup-hamming-threshold")
+
     contamination_report = ContaminationDetector(load_patterns(config.contamination_patterns_path)).scan_jsonl(
         clean_files,
         block_on_hit=config.block_contamination,
@@ -232,8 +299,10 @@ async def _run_data_pipeline_locked(
     task_report: TaskExtractionReport | None = None
     review_report: ReviewReport | None = None
     approved_tasks_path = root / "tasks" / "approved_tasks.jsonl"
+    task_report_path = reports_dir / "task_extraction_report.json"
     if config.extract_tasks:
         task_report = extract_tasks(clean_files, tasks_path, max_tasks=config.max_extracted_tasks)
+        task_report_path.write_text(json.dumps(task_report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
         if config.review_tasks:
             review_report = review_tasks(tasks_path, reports_dir / "task_review_decisions.jsonl", approved_tasks_path)
             (reports_dir / "task_review_report.json").write_text(json.dumps(review_report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
@@ -244,6 +313,27 @@ async def _run_data_pipeline_locked(
         quality_report_path=quality_report_path,
         review_report_path=review_report_path,
     )
+    source_reputation_report: SourceReputationReport | None = None
+    source_budget_plan: SourceBudgetPlan | None = None
+    source_reputation_path = reports_dir / "source_reputation_report.json"
+    source_budget_path = reports_dir / "source_budget_plan.json"
+    if config.build_source_reputation:
+        source_reputation_report = write_source_reputation_report(
+            source_reputation_path,
+            source_quality_report_path=source_quality_path,
+            task_report_path=task_report_path if task_report is not None else None,
+            review_report_path=review_report_path,
+            feedback_report_path=feedback_path,
+            contamination_report_path=contamination_path,
+            dedup_report_path=reports_dir / "near_dedup_report.json" if near_dedup_report is not None else None,
+        )
+    if config.build_source_budget:
+        source_budget_plan = write_source_budget_plan(
+            source_budget_path,
+            sources_path=config.sources_path,
+            reputation_report_path=source_reputation_path if source_reputation_report is not None else None,
+            target_total_docs=config.source_budget_target_docs or config.max_docs,
+        )
     source_balance_report: SourceBalanceReport | None = None
     training_files = clean_files
     balanced_clean_path = root / "balanced" / "balanced-clean-000000.jsonl"
@@ -307,10 +397,20 @@ async def _run_data_pipeline_locked(
         artifacts.append(artifact_from_path(path, role="clean_jsonl"))
     artifacts.append(artifact_from_path(trained_tokenizer, role="tokenizer"))
     artifacts.append(artifact_from_path(shards_dir / "manifest.json", role="shard_manifest"))
+    if license_filter_report is not None:
+        artifacts.append(artifact_from_path(reports_dir / "license_filter_report.json", role="license_filter_report"))
+    if benchmark_filter_report is not None:
+        artifacts.append(artifact_from_path(reports_dir / "benchmark_contamination_filter_report.json", role="benchmark_contamination_filter_report"))
+    if near_dedup_report is not None:
+        artifacts.append(artifact_from_path(reports_dir / "near_dedup_report.json", role="near_dedup_report"))
     artifacts.append(artifact_from_path(contamination_path, role="contamination_report"))
     artifacts.append(artifact_from_path(quality_report_path, role="quality_report"))
     artifacts.append(artifact_from_path(source_quality_path, role="source_quality_report"))
     artifacts.append(artifact_from_path(feedback_path, role="feedback_report"))
+    if source_reputation_report is not None:
+        artifacts.append(artifact_from_path(source_reputation_path, role="source_reputation_report"))
+    if source_budget_plan is not None:
+        artifacts.append(artifact_from_path(source_budget_path, role="source_budget_plan"))
     if source_balance_report is not None:
         artifacts.append(artifact_from_path(reports_dir / "source_balance_report.json", role="source_balance_report"))
         artifacts.append(artifact_from_path(balanced_clean_path, role="balanced_clean_jsonl"))
@@ -319,6 +419,7 @@ async def _run_data_pipeline_locked(
         artifacts.append(artifact_from_path(checkpoint_eval_path, role="checkpoint_eval_report"))
     if task_report is not None:
         artifacts.append(artifact_from_path(tasks_path, role="extracted_tasks"))
+        artifacts.append(artifact_from_path(task_report_path, role="task_extraction_report"))
     if review_report is not None:
         artifacts.append(artifact_from_path(reports_dir / "task_review_report.json", role="task_review_report"))
         artifacts.append(artifact_from_path(approved_tasks_path, role="approved_tasks"))
@@ -338,8 +439,18 @@ async def _run_data_pipeline_locked(
             str(source_quality_path),
             str(feedback_path),
         ]
+        if license_filter_report is not None:
+            upload_candidates.append(str(reports_dir / "license_filter_report.json"))
+        if benchmark_filter_report is not None:
+            upload_candidates.append(str(reports_dir / "benchmark_contamination_filter_report.json"))
+        if near_dedup_report is not None:
+            upload_candidates.append(str(reports_dir / "near_dedup_report.json"))
+        if source_reputation_report is not None:
+            upload_candidates.append(str(source_reputation_path))
+        if source_budget_plan is not None:
+            upload_candidates.append(str(source_budget_path))
         if task_report is not None:
-            upload_candidates.append(str(tasks_path))
+            upload_candidates.extend([str(tasks_path), str(task_report_path)])
         if review_report is not None:
             upload_candidates.extend([str(reports_dir / "task_review_report.json"), str(approved_tasks_path)])
         if checkpoint_eval_report is not None:
@@ -353,12 +464,17 @@ async def _run_data_pipeline_locked(
         version_id=version_id,
         source_registry=registry_report.model_dump(),
         crawl_report=crawl_report.model_dump(),
+        license_filter_report=license_filter_report.model_dump() if license_filter_report else None,
+        benchmark_contamination_filter_report=benchmark_filter_report.model_dump() if benchmark_filter_report else None,
+        near_dedup_report=near_dedup_report.model_dump() if near_dedup_report else None,
         contamination_report=contamination_report.model_dump(),
         quality_report=quality_report.model_dump(),
         source_quality_report=source_quality_report.model_dump(),
         task_report=task_report.model_dump() if task_report else None,
         review_report=review_report.model_dump() if review_report else None,
         feedback_report=feedback_report.model_dump(),
+        source_reputation_report=source_reputation_report.model_dump() if source_reputation_report else None,
+        source_budget_plan=source_budget_plan.model_dump() if source_budget_plan else None,
         checkpoint_eval_report=checkpoint_eval_report.model_dump() if checkpoint_eval_report else None,
         source_balance_report=source_balance_report.model_dump() if source_balance_report else None,
         tokenizer_path=str(trained_tokenizer),
@@ -378,12 +494,17 @@ async def _run_data_pipeline_locked(
         work_dir=str(root),
         source_registry=registry_report,
         crawl=crawl_report.model_dump(),
+        license_filter_report=license_filter_report.model_dump() if license_filter_report else None,
+        benchmark_contamination_filter_report=benchmark_filter_report.model_dump() if benchmark_filter_report else None,
+        near_dedup_report=near_dedup_report.model_dump() if near_dedup_report else None,
         contamination_report=contamination_report.model_dump(),
         quality_report=quality_report.model_dump(),
         source_quality_report=source_quality_report.model_dump(),
         task_report=task_report.model_dump() if task_report else None,
         review_report=review_report.model_dump() if review_report else None,
         feedback_report=feedback_report.model_dump(),
+        source_reputation_report=source_reputation_report.model_dump() if source_reputation_report else None,
+        source_budget_plan=source_budget_plan.model_dump() if source_budget_plan else None,
         source_balance_report=source_balance_report.model_dump() if source_balance_report else None,
         clean_files=clean_files,
         training_files=training_files,
@@ -394,6 +515,14 @@ async def _run_data_pipeline_locked(
         uploaded_objects=[item.model_dump() for item in uploaded_objects],
         training=training_report,
         checkpoint_eval=checkpoint_eval_report.model_dump() if checkpoint_eval_report else None,
+        report_artifacts={
+            "pipeline_report": str(reports_dir / "pipeline_report.json"),
+            "dashboard": str(root / "dashboard.html"),
+            "quality_report": str(reports_dir / "quality_report.json"),
+            "source_reputation_report": str(reports_dir / "source_reputation_report.json"),
+            "source_budget_plan": str(reports_dir / "source_budget_plan.json"),
+            "checkpoint_eval_report": str(reports_dir / "checkpoint_eval_report.json"),
+        },
     )
     report_path = reports_dir / "pipeline_report.json"
     report_path.write_text(json.dumps(report_payload.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
@@ -431,6 +560,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-checkpoint-eval", action="store_true")
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
+    parser.add_argument("--no-license-filter", action="store_true")
+    parser.add_argument("--allow-unknown-license", action="store_true")
+    parser.add_argument("--no-benchmark-contamination-filter", action="store_true")
+    parser.add_argument("--no-near-dedup", action="store_true")
+    parser.add_argument("--near-dedup-hamming-threshold", type=int, default=3)
+    parser.add_argument("--no-source-reputation", action="store_true")
+    parser.add_argument("--no-source-budget", action="store_true")
+    parser.add_argument("--source-budget-target-docs", type=int)
     parser.add_argument("--no-source-balancing", action="store_true")
     parser.add_argument("--max-source-fraction", type=float, default=0.35)
     parser.add_argument("--min-source-rows", type=int, default=25)
@@ -475,6 +612,14 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         run_checkpoint_eval=not args.no_checkpoint_eval,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        filter_licenses=not args.no_license_filter,
+        strict_unknown_licenses=not args.allow_unknown_license,
+        filter_benchmark_contamination=not args.no_benchmark_contamination_filter,
+        near_dedup=not args.no_near_dedup,
+        near_dedup_hamming_threshold=args.near_dedup_hamming_threshold,
+        build_source_reputation=not args.no_source_reputation,
+        build_source_budget=not args.no_source_budget,
+        source_budget_target_docs=args.source_budget_target_docs,
         balance_sources=not args.no_source_balancing,
         max_source_fraction=args.max_source_fraction,
         min_source_rows=args.min_source_rows,

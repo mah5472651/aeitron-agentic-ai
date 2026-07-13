@@ -94,3 +94,10 @@ spec:
               mc alias set mythos http://mythos-minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
               mc mb --ignore-existing mythos/mythos-datasets
               mc anonymous set none mythos/mythos-datasets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 512Mi

@@ -19,6 +19,8 @@ def main() -> None:
             "tests.test_mythos_pretraining_pipeline",
             "tests.test_mythos_production_hardening",
             "tests.test_mythos_scratch_decoder",
+            "tests.test_mythos_training_control",
+            "tests.test_mythos_enterprise_readiness",
         ],
         capture_output=True,
         text=True,

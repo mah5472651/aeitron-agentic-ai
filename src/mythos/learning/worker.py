@@ -1,4 +1,4 @@
-"""Distributed Mythos crawler worker entrypoint."""
+﻿"""Distributed Mythos crawler worker entrypoint."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ async def run_crawler_worker(config: CrawlerWorkerConfig) -> dict[str, object]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a distributed Mythos crawler worker.")
-    parser.add_argument("--sources", default=os.environ.get("MYTHOS_DATA_SOURCES", "config/data_sources.defensive.sample.json"))
+    parser.add_argument("--sources", default=os.environ.get("MYTHOS_DATA_SOURCES", "config/data_sources.ultimate.json"))
     parser.add_argument("--postgres-dsn", default=os.environ.get("MYTHOS_DATABASE_URL", ""))
     parser.add_argument("--raw-output-dir", default=os.environ.get("MYTHOS_RAW_OUTPUT_DIR", "artifacts/mythos/data-engine/raw"))
     parser.add_argument("--clean-output-dir", default=os.environ.get("MYTHOS_CLEAN_OUTPUT_DIR", "artifacts/mythos/data-engine/clean"))
@@ -105,3 +105,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -12,6 +12,7 @@ from pydantic import Field
 
 from src.mythos.learning.capacity import CapacityPlanConfig, build_capacity_plan
 from src.mythos.learning.production_check import DataPlatformReadinessConfig, run_readiness_check
+from src.mythos.learning.resource_catalog import ResourceCatalogReport, write_resource_catalog_report
 from src.mythos.learning.source_registry import SourceRegistry
 from src.mythos.shared.schemas import StrictModel
 
@@ -42,6 +43,8 @@ class DataRunPlan(StrictModel):
     source_registry: dict[str, Any]
     readiness: dict[str, Any]
     capacity: dict[str, Any]
+    resource_catalog: dict[str, Any] | None = None
+    resource_catalog_path: str | None = None
     commands: dict[str, str]
 
 
@@ -52,6 +55,10 @@ def build_data_run_plan(config: DataRunPlanConfig) -> DataRunPlan:
     registry_report = registry.validate()
     merged_registry_path = Path(config.merged_registry_path) if config.merged_registry_path else root / "sources.merged.json"
     registry.write(merged_registry_path)
+    resource_catalog: ResourceCatalogReport | None = None
+    resource_catalog_path = root / "resource_catalog_report.json"
+    if len(config.source_paths) == 1:
+        resource_catalog = write_resource_catalog_report(config.source_paths[0], resource_catalog_path)
 
     readiness = run_readiness_check(
         DataPlatformReadinessConfig(
@@ -93,6 +100,10 @@ def build_data_run_plan(config: DataRunPlanConfig) -> DataRunPlan:
             f"--target-documents {config.target_documents} --target-days {config.target_days} "
             f"--worker-replicas {config.worker_replicas} --async-workers-per-replica {config.async_workers}"
         ),
+        "resource_catalog": (
+            "python -m src.mythos.learning.resource_catalog "
+            f"--catalog {config.source_paths[0]} --output {resource_catalog_path}"
+        ),
     }
     plan = DataRunPlan(
         status="ready" if readiness.status == "pass" else "blocked",
@@ -101,6 +112,8 @@ def build_data_run_plan(config: DataRunPlanConfig) -> DataRunPlan:
         source_registry=registry_report.model_dump(),
         readiness=readiness.model_dump(),
         capacity=capacity.model_dump(),
+        resource_catalog=resource_catalog.model_dump() if resource_catalog else None,
+        resource_catalog_path=str(resource_catalog_path) if resource_catalog else None,
         commands=commands,
     )
     (root / "run_plan.json").write_text(json.dumps(plan.model_dump(), indent=2, sort_keys=True), encoding="utf-8")

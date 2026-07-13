@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mythos-data-supervisor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mythos-data-supervisor
+  template:
+    metadata:
+      labels:
+        app: mythos-data-supervisor
+    spec:
+      containers:
+        - name: supervisor
+          image: mythos-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "src.mythos.learning.supervisor"]
+          env:
+            - name: MYTHOS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mythos-secrets
+                  key: database-url
+            - name: MYTHOS_DATA_SOURCES
+              value: config/data_sources.ultimate.json
+            - name: MYTHOS_RAW_OUTPUT_DIR
+              value: /data/raw
+            - name: MYTHOS_CLEAN_OUTPUT_DIR
+              value: /data/clean
+            - name: MYTHOS_OBJECT_STORE_URI
+              value: s3://mythos-datasets/pretraining
+            - name: MYTHOS_WORKER_REPLICAS
+              value: "4"
+            - name: MYTHOS_ASYNC_WORKERS
+              value: "32"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: mythos-secrets
+                  key: minio-root-user
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mythos-secrets
+                  key: minio-root-password
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
+          volumeMounts:
+            - name: data-artifacts
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+      volumes:
+        - name: data-artifacts
+          persistentVolumeClaim:
+            claimName: mythos-data-artifacts

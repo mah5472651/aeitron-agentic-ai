@@ -1,4 +1,4 @@
-# Mythos Agentic AI
+﻿# Mythos Agentic AI
 
 Mythos is an AI coding-agent backend for repository understanding, code editing,
 patch verification, and model-agnostic serving.
@@ -28,6 +28,10 @@ architecture has been removed.
 - preview/apply/verify/rollback patch loop
 - Verifier runtime
 - benchmark harness for coding/security tasks
+- config-driven checkpoint eval reports
+- token-level cybersecurity/code/general/agentic data mixer
+- scratch-checkpoint SFT and native PyTorch DPO-style alignment loops
+- refusal and over-refusal safety evaluation
 - Native MVP tests
 
 ## Repository Layout
@@ -113,6 +117,65 @@ double for plumbing checks.
 Invoke-RestMethod http://127.0.0.1:8090/v1/model/foundation/status
 ```
 
+## Training Control Plane
+
+Checkpoint eval, data mixing, and alignment are all scratch-checkpoint only.
+Protected benchmarks stay eval/holdout and are not mixed into training.
+
+```powershell
+python -m src.mythos.learning.mixer --inputs data\training\clean.jsonl --config config\mix_ratios.json --experiment baseline_70_15_15 --output-dir artifacts\mythos\mix-baseline
+
+python -m src.mythos.evaluation.eval_runner --checkpoint-manifest artifacts\mythos\train\checkpoint_manifest.json --schedule config\eval_schedule.json --output-dir artifacts\mythos\eval --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json --device cpu
+
+python -m src.mythos.alignment.build_sft_dataset --input-tasks data\training\tasks.jsonl --policy config\alignment_policy.json --output artifacts\mythos\alignment\sft.jsonl
+
+python -m src.mythos.alignment.generate_preferences --prompts data\training\prompts.jsonl --candidate-outputs data\training\candidates.jsonl --output artifacts\mythos\alignment\pairs.jsonl
+
+python -m src.mythos.alignment.train_sft --checkpoint-manifest artifacts\mythos\train\checkpoint_manifest.json --dataset artifacts\mythos\alignment\sft.jsonl --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json --output-dir artifacts\mythos\alignment\sft-run --device cpu --steps 10
+
+python -m src.mythos.alignment.train_dpo --policy-checkpoint artifacts\mythos\alignment\sft-run\checkpoint_manifest.json --reference-checkpoint artifacts\mythos\train\checkpoint_manifest.json --pairs artifacts\mythos\alignment\pairs.jsonl --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json --output-dir artifacts\mythos\alignment\dpo-run --device cpu --steps 10
+
+python -m src.mythos.alignment.safety_eval --checkpoint-manifest artifacts\mythos\alignment\dpo-run\checkpoint_manifest.json --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json --policy config\alignment_policy.json --output-dir artifacts\mythos\alignment\safety --device cpu
+```
+
+Reports:
+
+- `eval_report.json` and `eval_report.md`
+- `mix_manifest.json`
+- `ablation_report.json`
+- `sft_dataset_report.json`
+- `preference_pair_report.json`
+- `alignment_training_report.json`
+- `safety_eval_report.json`
+
+## Production Hardening Gates
+
+Local deterministic gates:
+
+```powershell
+python -m src.mythos.db.migration_runner --database-url postgresql://mythos:pass@localhost:5432/mythos --dry-run
+python -m src.mythos.deployment.k8s_validate --output-dir artifacts\mythos\k8s-validation
+python -m src.mythos.learning.storage --uri local://artifacts/mythos/object-store --work-dir artifacts\mythos\object-store-lifecycle
+python -m src.mythos.learning.dataset_validation --inputs data\training\clean.jsonl --output-dir artifacts\mythos\dataset-validation --min-records 100000
+python -m src.mythos.evaluation.benchmark_suites --suite swe swe_bench_style data\eval\swe_style.jsonl --suite cyber cyberseceval_style data\eval\cyber.jsonl --output-dir artifacts\mythos\benchmark-suites
+python -m src.mythos.security.audit --no-bandit --output-dir artifacts\mythos\security-audit
+```
+
+Real production commands:
+
+```powershell
+alembic upgrade head
+python -m src.mythos.deployment.k8s_validate --kubectl-dry-run --output-dir artifacts\mythos\k8s-validation
+python -m src.mythos.learning.storage --uri s3://mythos-datasets/pretraining --endpoint-url http://localhost:9000 --work-dir artifacts\mythos\s3-lifecycle
+python deploy\gpu\run_10k_training_validation.py --manifest artifacts\mythos\shards\manifest.json --device cuda --steps 10000
+```
+
+The production stack includes Prometheus, Grafana, and optional OpenTelemetry:
+
+```powershell
+docker compose --env-file deploy\prod\.env.example -f deploy\prod\docker-compose.yml --profile monitoring up
+```
+
 ## Colab/Kaggle GPU Smoke
 
 Run a real scratch-decoder forward/backward/checkpoint smoke test:
@@ -164,7 +227,7 @@ Allowlisted one-shot ingestion:
 
 ```bash
 python -m src.mythos.learning.web_ingest \
-  --sources config/data_sources.defensive.sample.json \
+  --sources config/data_sources.ultimate.json \
   --output data/training/raw_web.jsonl \
   --max-docs 1000 \
   --delay-seconds 1.0
@@ -175,7 +238,7 @@ content deduplication, per-domain throttling, and clean JSONL sharding:
 
 ```bash
 python -m src.mythos.learning.data_engine \
-  --sources config/data_sources.defensive.sample.json \
+  --sources config/data_sources.ultimate.json \
   --frontier artifacts/mythos/data-engine/frontier.sqlite3 \
   --raw-output-dir artifacts/mythos/data-engine/raw \
   --clean-output-dir artifacts/mythos/data-engine/clean \
@@ -190,7 +253,7 @@ Postgres-backed distributed frontier:
 
 ```bash
 python -m src.mythos.learning.data_engine \
-  --sources config/data_sources.defensive.sample.json \
+  --sources config/data_sources.ultimate.json \
   --frontier-backend postgres \
   --postgres-dsn "$MYTHOS_DATABASE_URL" \
   --raw-output-dir artifacts/mythos/data-engine/raw \
@@ -203,7 +266,7 @@ One command for `crawl -> clean -> shard -> train`:
 
 ```bash
 python -m src.mythos.learning.data_pipeline \
-  --sources config/data_sources.production.sample.json \
+  --sources config/data_sources.ultimate.json \
   --dataset-id mythos-defensive-coding-corpus \
   --work-dir artifacts/mythos/data-pipeline \
   --frontier-backend postgres \
@@ -229,11 +292,31 @@ Distributed crawler workers:
 docker compose -f deploy/prod/docker-compose.yml --profile data up --scale crawler-worker=8 crawler-worker
 ```
 
+Supervised long-running data collection:
+
+```bash
+docker compose -f deploy/prod/docker-compose.yml --profile data up crawler-supervisor
+python -m src.mythos.learning.supervisor \
+  --sources config/data_sources.ultimate.json \
+  --postgres-dsn "$MYTHOS_DATABASE_URL" \
+  --raw-output-dir artifacts/mythos/data-engine/raw \
+  --clean-output-dir artifacts/mythos/data-engine/clean \
+  --object-store-uri s3://mythos-datasets/pretraining \
+  --worker-replicas 8 \
+  --async-workers 64
+```
+
+Monitoring dashboard:
+
+```bash
+docker compose -f deploy/prod/docker-compose.yml --profile monitoring up prometheus
+```
+
 Production readiness gate:
 
 ```bash
 python -m src.mythos.learning.production_check \
-  --sources config/data_sources.production.sample.json \
+  --sources config/data_sources.ultimate.json \
   --frontier-backend postgres \
   --postgres-dsn "$MYTHOS_DATABASE_URL" \
   --object-store-uri s3://mythos-datasets/pretraining \
@@ -246,7 +329,7 @@ Prepare the first serious 100k-1M data run:
 
 ```bash
 python -m src.mythos.learning.run_plan \
-  --sources config/data_sources.production.sample.json \
+  --sources config/data_sources.ultimate.json \
   --output-dir artifacts/mythos/data-runs/first-serious-run \
   --target-documents 1000000 \
   --target-days 7 \
@@ -255,6 +338,19 @@ python -m src.mythos.learning.run_plan \
   --worker-replicas 8 \
   --async-workers 64
 ```
+
+Training resource priority catalog:
+
+```bash
+python -m src.mythos.learning.resource_catalog \
+  --catalog config/data_sources.ultimate.json \
+  --output artifacts/mythos/resource_catalog_report.json
+```
+
+The catalog keeps all 45 external cybersecurity/agentic-coding resources in one
+place. The top six priority groups are surfaced first, while protected benchmark
+resources such as SWE-bench Verified, HumanEval, MBPP, and CTF benchmarks stay
+as evaluation/contamination holdouts instead of raw pretraining rows.
 
 Cluster capacity planning:
 
@@ -273,6 +369,7 @@ kubectl apply -f deploy/k8s/secrets.example.yaml
 kubectl apply -f deploy/k8s/postgres-redis.yaml
 kubectl apply -f deploy/k8s/minio.yaml
 kubectl apply -f deploy/k8s/data-worker.yaml
+kubectl apply -f deploy/k8s/data-supervisor.yaml
 kubectl apply -f deploy/k8s/data-worker-hpa.yaml
 kubectl apply -f deploy/k8s/data-network-policy.yaml
 kubectl apply -f deploy/k8s/data-pipeline-job.yaml
@@ -296,6 +393,17 @@ Pipeline outputs include:
 Manual/automated review and feedback:
 
 ```bash
+python -m src.mythos.learning.governance --store artifacts/mythos/governance report
+
+python -m src.mythos.learning.governance --store artifacts/mythos/governance submit-source \
+  --source-name portswigger-web-security-academy \
+  --category authorized_security_testing_labs \
+  --url https://portswigger.net/web-security \
+  --license review-required \
+  --evidence-url https://portswigger.net/web-security \
+  --requested-by security-team \
+  --justification "High-value authorized web security education source"
+
 python -m src.mythos.learning.review \
   --input artifacts/mythos/data-pipeline/tasks/tasks.jsonl \
   --decisions-out artifacts/mythos/data-pipeline/reports/task_review_decisions.jsonl \
@@ -340,3 +448,4 @@ $env:MYTHOS_REDIS_URL = "redis://redis:6379/0"
 ## Final Rule
 
 All new production code belongs under `src/mythos`.
+

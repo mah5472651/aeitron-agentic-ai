@@ -141,7 +141,7 @@ def stable_hash(text: str) -> str:
 
 def iter_jsonl(path: str | Path) -> Iterable[dict[str, Any]]:
     source = Path(path)
-    with source.open("r", encoding="utf-8", errors="replace") as handle:
+    with source.open("r", encoding="utf-8-sig", errors="replace") as handle:
         for line_number, line in enumerate(handle, start=1):
             if line.strip():
                 try:

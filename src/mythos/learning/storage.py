@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import argparse
 import json
 import shutil
 import time
@@ -27,6 +28,18 @@ class ObjectStore(Protocol):
         ...
 
     def put_json(self, payload: dict[str, Any], *, key: str) -> StoredObject:
+        ...
+
+    def head(self, key: str) -> StoredObject:
+        ...
+
+    def get_file(self, key: str, target_path: str | Path) -> StoredObject:
+        ...
+
+    def delete(self, key: str) -> None:
+        ...
+
+    def list_objects(self, prefix: str = "") -> list[StoredObject]:
         ...
 
 
@@ -60,6 +73,46 @@ class LocalObjectStore:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         return StoredObject(source_path=str(target), uri=str(target), size_bytes=target.stat().st_size, sha256=file_sha256(target))
+
+    def _resolve_key(self, key: str) -> Path:
+        target = (self.root / key).resolve()
+        root = self.root.resolve()
+        if root != target and root not in target.parents:
+            raise ValueError(f"object key escapes local object store root: {key}")
+        return target
+
+    def head(self, key: str) -> StoredObject:
+        target = self._resolve_key(key)
+        if not target.exists() or not target.is_file():
+            raise FileNotFoundError(f"object not found: {key}")
+        return StoredObject(source_path=str(target), uri=str(target), size_bytes=target.stat().st_size, sha256=file_sha256(target))
+
+    def get_file(self, key: str, target_path: str | Path) -> StoredObject:
+        source = self._resolve_key(key)
+        if not source.exists() or not source.is_file():
+            raise FileNotFoundError(f"object not found: {key}")
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        return StoredObject(source_path=str(source), uri=str(target), size_bytes=target.stat().st_size, sha256=file_sha256(target))
+
+    def delete(self, key: str) -> None:
+        target = self._resolve_key(key)
+        if target.exists():
+            target.unlink()
+
+    def list_objects(self, prefix: str = "") -> list[StoredObject]:
+        base = self._resolve_key(prefix) if prefix else self.root.resolve()
+        if base.is_file():
+            paths = [base]
+        elif base.exists():
+            paths = sorted(item for item in base.rglob("*") if item.is_file())
+        else:
+            paths = []
+        return [
+            StoredObject(source_path=str(path), uri=str(path), size_bytes=path.stat().st_size, sha256=file_sha256(path))
+            for path in paths
+        ]
 
 
 class S3ObjectStore:
@@ -99,6 +152,52 @@ class S3ObjectStore:
         )
         digest = hashlib.sha256(body).hexdigest()
         return StoredObject(source_path=f"memory:{key}", uri=f"s3://{self.bucket}/{object_key}", size_bytes=len(body), sha256=digest)
+
+    def head(self, key: str) -> StoredObject:
+        object_key = self._object_key(key)
+        response = retry_sync(
+            lambda: self.client.head_object(Bucket=self.bucket, Key=object_key),
+            max_retries=self.max_retries,
+        )
+        return StoredObject(
+            source_path=f"s3://{self.bucket}/{object_key}",
+            uri=f"s3://{self.bucket}/{object_key}",
+            size_bytes=int(response.get("ContentLength", 0)),
+            sha256=str(response.get("Metadata", {}).get("sha256", "")),
+        )
+
+    def get_file(self, key: str, target_path: str | Path) -> StoredObject:
+        object_key = self._object_key(key)
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        retry_sync(
+            lambda: self.client.download_file(self.bucket, object_key, str(target)),
+            max_retries=self.max_retries,
+        )
+        return StoredObject(source_path=f"s3://{self.bucket}/{object_key}", uri=str(target), size_bytes=target.stat().st_size, sha256=file_sha256(target))
+
+    def delete(self, key: str) -> None:
+        object_key = self._object_key(key)
+        retry_sync(lambda: self.client.delete_object(Bucket=self.bucket, Key=object_key), max_retries=self.max_retries)
+
+    def list_objects(self, prefix: str = "") -> list[StoredObject]:
+        object_prefix = self._object_key(prefix) if prefix else self.prefix
+        response = retry_sync(
+            lambda: self.client.list_objects_v2(Bucket=self.bucket, Prefix=object_prefix),
+            max_retries=self.max_retries,
+        )
+        objects = []
+        for item in response.get("Contents", []):
+            key = item["Key"]
+            objects.append(
+                StoredObject(
+                    source_path=f"s3://{self.bucket}/{key}",
+                    uri=f"s3://{self.bucket}/{key}",
+                    size_bytes=int(item.get("Size", 0)),
+                    sha256="",
+                )
+            )
+        return objects
 
 
 class ObjectStoreConfig(StrictModel):
@@ -140,3 +239,81 @@ def upload_paths(store: ObjectStore, paths: list[str | Path], *, prefix: str) ->
         source = Path(path)
         uploaded.append(store.put_file(source, key=f"{prefix}/{source.name}"))
     return uploaded
+
+
+class ObjectStoreLifecycleReport(StrictModel):
+    status: str
+    uri: str
+    key: str
+    uploaded: StoredObject
+    downloaded: StoredObject
+    listed_count: int
+    checksum_match: bool
+    deleted: bool
+
+
+def verify_object_store_lifecycle(
+    *,
+    config: ObjectStoreConfig,
+    work_dir: str | Path,
+    key: str = "lifecycle/probe.json",
+) -> ObjectStoreLifecycleReport:
+    root = Path(work_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    source = root / "probe-source.json"
+    downloaded = root / "probe-downloaded.json"
+    payload = {"component": "mythos-object-store-lifecycle", "created_at_unix": time.time()}
+    source.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    store = create_object_store(config)
+    uploaded = store.put_file(source, key=key)
+    store.head(key)
+    downloaded_object = store.get_file(key, downloaded)
+    listed = store.list_objects(str(Path(key).parent))
+    checksum_match = file_sha256(source) == file_sha256(downloaded)
+    store.delete(key)
+    deleted = True
+    try:
+        store.head(key)
+        deleted = False
+    except FileNotFoundError:
+        deleted = True
+    report = ObjectStoreLifecycleReport(
+        status="passed" if checksum_match and deleted else "failed",
+        uri=config.uri,
+        key=key,
+        uploaded=uploaded,
+        downloaded=downloaded_object,
+        listed_count=len(listed),
+        checksum_match=checksum_match,
+        deleted=deleted,
+    )
+    (root / "object_store_lifecycle_report.json").write_text(
+        json.dumps(report.model_dump(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return report
+
+
+def _parse_args() -> Any:
+    parser = argparse.ArgumentParser(description="Verify Mythos object storage lifecycle.")
+    parser.add_argument("--uri", default="local://artifacts/mythos/object-store")
+    parser.add_argument("--endpoint-url")
+    parser.add_argument("--work-dir", default="artifacts/mythos/object-store-lifecycle")
+    parser.add_argument("--key", default="lifecycle/probe.json")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    report = verify_object_store_lifecycle(
+        config=ObjectStoreConfig(uri=args.uri, endpoint_url=args.endpoint_url),
+        work_dir=args.work_dir,
+        key=args.key,
+    )
+    print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
+    if report.status != "passed":
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()

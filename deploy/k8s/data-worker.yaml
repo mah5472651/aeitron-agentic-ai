@@ -24,7 +24,7 @@ spec:
                   name: mythos-secrets
                   key: database-url
             - name: MYTHOS_DATA_SOURCES
-              value: config/data_sources.production.sample.json
+              value: config/data_sources.ultimate.json
             - name: MYTHOS_RAW_OUTPUT_DIR
               value: /data/raw
             - name: MYTHOS_CLEAN_OUTPUT_DIR

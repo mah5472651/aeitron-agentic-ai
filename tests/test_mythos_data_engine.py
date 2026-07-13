@@ -1,22 +1,38 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import tempfile
 import unittest
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import httpx
 
+from src.mythos.learning.benchmark_contamination_filter import filter_benchmark_contamination_jsonl
 from src.mythos.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore, is_supported_text_response
 from src.mythos.learning.data_engine import ShardedJsonlWriter
 from src.mythos.learning.data_pipeline import DataPipelineConfig, PipelineRunLock, run_data_pipeline
+from src.mythos.learning.license_filter import filter_jsonl_by_license
+from src.mythos.learning.near_dedup import deduplicate_jsonl
 from src.mythos.learning.production_check import DataPlatformReadinessConfig, run_readiness_check
 from src.mythos.learning.quality_inspector import inspect_clean_jsonl
+from src.mythos.learning.repo_patch_extraction import extract_security_patch_tasks
+from src.mythos.learning.resource_catalog import build_resource_catalog_report
 from src.mythos.learning.review import review_tasks
 from src.mythos.learning.run_plan import DataRunPlanConfig, build_data_run_plan
 from src.mythos.learning.feedback import build_feedback_report
+from src.mythos.learning.governance import GovernanceStore, HumanReviewItem, SourceApprovalRequest
+from src.mythos.learning.source_budget import build_source_budget_plan
 from src.mythos.learning.source_registry import SourceRegistry
 from src.mythos.learning.source_balancing import balance_clean_jsonl
+from src.mythos.learning.source_reputation import build_source_reputation_report
+from src.mythos.learning.vulnerability_adapters import (
+    CisaKevAdapter,
+    GoVulnAdapter,
+    NvdCveAdapter,
+    VulnerabilityFetchConfig,
+)
 from src.mythos.learning.web_ingest import SourceSpec
 from src.mythos.learning.contamination import ContaminationDetector
 from src.mythos.learning.quality import iter_jsonl
@@ -97,6 +113,230 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             by_source = {item.source: item.output_rows for item in report.sources}
             self.assertEqual(by_source["dominant"], 5)
             self.assertEqual(by_source["small"], 5)
+
+    def test_license_benchmark_and_near_dedup_filters_prepare_clean_training_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "raw.jsonl"
+            rows = [
+                {
+                    "source": "good",
+                    "license": "mit",
+                    "text": "Secure authentication validation guidance with CWE mitigation and regression tests. " * 5,
+                },
+                {
+                    "source": "bad-license",
+                    "license": "proprietary",
+                    "text": "Do not train on this.",
+                },
+                {
+                    "source": "leak",
+                    "license": "mit",
+                    "text": "HumanEval canonical_solution should never enter pretraining.",
+                },
+                {
+                    "source": "near",
+                    "license": "mit",
+                    "text": "Secure authentication validation guidance with CWE mitigation and regression test coverage. " * 5,
+                },
+            ]
+            source.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            license_report = filter_jsonl_by_license([source], root / "license.jsonl")
+            self.assertEqual(license_report.accepted, 3)
+            self.assertEqual(license_report.rejected, 1)
+            benchmark_report = filter_benchmark_contamination_jsonl([root / "license.jsonl"], root / "benchmark.jsonl")
+            self.assertEqual(benchmark_report.rejected, 1)
+            dedup_report = deduplicate_jsonl([root / "benchmark.jsonl"], root / "dedup.jsonl", hamming_threshold=64)
+            self.assertEqual(dedup_report.accepted, 1)
+            self.assertEqual(dedup_report.near_duplicates, 1)
+
+    def test_source_reputation_and_budget_promote_high_quality_security_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sources = root / "sources.json"
+            sources.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": "good-security",
+                                "urls": ["https://example.org/security"],
+                                "allowed_domains": ["example.org"],
+                                "license": "mit",
+                                "category": "defensive_security",
+                            },
+                            {
+                                "name": "weak-docs",
+                                "urls": ["https://docs.example.org/page"],
+                                "allowed_domains": ["docs.example.org"],
+                                "license": "mit",
+                                "category": "documentation",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source_quality = root / "source_quality.json"
+            source_quality.write_text(
+                json.dumps(
+                    {
+                        "input_paths": ["clean.jsonl"],
+                        "sources": [
+                            {
+                                "source": "good-security",
+                                "rows": 100,
+                                "avg_quality_score": 0.86,
+                                "defensive_security_rows": 80,
+                                "code_rows": 50,
+                                "score": 0.95,
+                                "action": "promote",
+                            },
+                            {
+                                "source": "weak-docs",
+                                "rows": 100,
+                                "avg_quality_score": 0.42,
+                                "defensive_security_rows": 1,
+                                "code_rows": 0,
+                                "score": 0.42,
+                                "action": "demote",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            reputation = build_source_reputation_report(source_quality_report_path=source_quality)
+            self.assertGreater(reputation.sources[0].reputation_score, reputation.sources[1].reputation_score)
+            reputation_path = root / "reputation.json"
+            reputation_path.write_text(json.dumps(reputation.model_dump()), encoding="utf-8")
+            plan = build_source_budget_plan(
+                sources_path=sources,
+                reputation_report_path=reputation_path,
+                target_total_docs=1000,
+                min_docs_per_source=1,
+            )
+            budgets = {item.source: item.target_docs for item in plan.budgets}
+            self.assertGreater(budgets["good-security"], budgets["weak-docs"])
+
+    async def test_vulnerability_adapters_normalize_official_api_payloads(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if "known_exploited_vulnerabilities" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json={
+                        "vulnerabilities": [
+                            {
+                                "cveID": "CVE-2024-0001",
+                                "vendorProject": "Example",
+                                "product": "Widget",
+                                "vulnerabilityName": "Input validation flaw",
+                                "shortDescription": "Improper validation allows unsafe behavior.",
+                                "requiredAction": "Apply vendor update.",
+                                "dateAdded": "2024-01-01",
+                            }
+                        ]
+                    },
+                )
+            if request.url.path.endswith("/cves/2.0"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "vulnerabilities": [
+                            {
+                                "cve": {
+                                    "id": "CVE-2024-0002",
+                                    "published": "2024-01-02T00:00:00.000",
+                                    "lastModified": "2024-01-03T00:00:00.000",
+                                    "descriptions": [{"lang": "en", "value": "Buffer overflow in example parser."}],
+                                    "weaknesses": [{"description": [{"value": "CWE-120"}]}],
+                                    "references": {"referenceData": [{"url": "https://example.org/advisory"}]},
+                                }
+                            }
+                        ]
+                    },
+                )
+            if str(request.url) == "https://vuln.go.dev/index/db.json":
+                return httpx.Response(200, json=[{"id": "GO-2024-0001"}])
+            if str(request.url) == "https://vuln.go.dev/GO-2024-0001.json":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "GO-2024-0001",
+                        "summary": "Unsafe parsing in Go example module",
+                        "details": "Bounds check bypass in parser.",
+                        "affected": [{"package": {"name": "example.com/mod"}}],
+                        "references": [{"url": "https://pkg.go.dev/vuln/GO-2024-0001"}],
+                    },
+                )
+            return httpx.Response(404)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            cisa = await CisaKevAdapter(VulnerabilityFetchConfig(max_records=1)).fetch(client)
+            nvd = await NvdCveAdapter(VulnerabilityFetchConfig(max_records=1)).fetch(client)
+            go_vuln = await GoVulnAdapter(VulnerabilityFetchConfig(max_records=1)).fetch(client)
+        self.assertEqual(cisa[0].vulnerability_id, "CVE-2024-0001")
+        self.assertEqual(cisa[0].license, "public-domain")
+        self.assertEqual(nvd[0].cwe_ids, ["CWE-120"])
+        self.assertEqual(go_vuln[0].vulnerability_id, "GO-2024-0001")
+        self.assertEqual(go_vuln[0].source, "go-vuln")
+
+    def test_governance_store_tracks_source_approvals_and_human_review_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = GovernanceStore(temp_dir)
+            approval = store.submit_source_approval(
+                SourceApprovalRequest(
+                    source_name="portswigger-web-security-academy",
+                    category="authorized_security_testing_labs",
+                    urls=["https://portswigger.net/web-security"],
+                    proposed_license="review-required",
+                    evidence_url="https://portswigger.net/web-security",
+                    requested_by="tester",
+                    justification="High-value authorized web security education source.",
+                )
+            )
+            store.decide_source_approval(
+                approval.request_id,
+                status="rejected",
+                decided_by="legal",
+                reason="license terms not approved for training yet",
+            )
+            item = store.enqueue_review(
+                HumanReviewItem(
+                    kind="high_value_patch_task",
+                    priority=9,
+                    payload={"source": "repo", "content_hash": "abc"},
+                )
+            )
+            store.decide_review(item.item_id, status="approved", reviewer="security-reviewer", reason="defensive task")
+            report = store.report()
+            self.assertEqual(report.approvals_rejected, 1)
+            self.assertEqual(report.review_approved, 1)
+            self.assertEqual(report.high_priority_review, 0)
+
+    def test_repo_patch_extraction_builds_defensive_patch_tasks_from_local_git_repo(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git executable is not available")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.org"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Mythos Test"], check=True)
+            (repo / "app.py").write_text("def login(name):\n    return name\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+            (repo / "app.py").write_text("def login(name):\n    return name.strip()\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-m", "security validation fix for auth input"],
+                check=True,
+                capture_output=True,
+            )
+            report = extract_security_patch_tasks(repo, Path(temp_dir) / "patches.jsonl", license_name="mit")
+            self.assertEqual(report.extracted, 1)
+            tasks = list(iter_jsonl(Path(temp_dir) / "patches.jsonl"))
+            self.assertIn("security validation fix", tasks[0]["subject"])
 
     def test_quality_gate_scores_security_code_with_components(self) -> None:
         gate = DatasetQualityGate()
@@ -327,6 +567,10 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(report.clean_files)
             self.assertTrue(Path(report.tokenizer_path).exists())
             self.assertTrue(report.shard_manifest["train_shards"])
+            self.assertIsNotNone(report.license_filter_report)
+            self.assertGreaterEqual(report.license_filter_report["accepted"], 1)
+            self.assertIsNotNone(report.benchmark_contamination_filter_report)
+            self.assertIsNotNone(report.near_dedup_report)
             self.assertIsNotNone(report.task_report)
             self.assertGreater(report.task_report["extracted"], 0)
             self.assertIsNotNone(report.contamination_report)
@@ -337,6 +581,10 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(report.review_report)
             self.assertGreaterEqual(report.review_report["approved"], 1)
             self.assertIsNotNone(report.feedback_report)
+            self.assertIsNotNone(report.source_reputation_report)
+            self.assertTrue(report.source_reputation_report["sources"])
+            self.assertIsNotNone(report.source_budget_plan)
+            self.assertTrue(report.source_budget_plan["budgets"])
             self.assertIsNotNone(report.source_balance_report)
             self.assertTrue(report.training_files)
             self.assertTrue(Path(report.version_manifest_path).exists())
@@ -363,7 +611,7 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
     def test_production_readiness_blocks_local_only_configuration(self) -> None:
         report = run_readiness_check(
             DataPlatformReadinessConfig(
-                sources_path="config/data_sources.production.sample.json",
+                sources_path="config/data_sources.ultimate.json",
                 frontier_backend="sqlite",
                 object_store_uri="local://artifacts/mythos/object-store",
                 production_mode=True,
@@ -379,7 +627,7 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
     def test_production_readiness_passes_distributed_configuration_contract(self) -> None:
         report = run_readiness_check(
             DataPlatformReadinessConfig(
-                sources_path="config/data_sources.production.sample.json",
+                sources_path="config/data_sources.ultimate.json",
                 frontier_backend="postgres",
                 postgres_dsn="postgresql://user:pass@postgres:5432/mythos",
                 object_store_uri="s3://mythos-datasets/pretraining",
@@ -417,7 +665,7 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
 
             plan = build_data_run_plan(
                 DataRunPlanConfig(
-                    source_paths=["config/data_sources.production.sample.json"],
+                    source_paths=["config/data_sources.ultimate.json"],
                     output_dir=str(root / "plan"),
                     target_documents=1000,
                     target_days=1,
@@ -430,6 +678,20 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(plan.status, "ready")
             self.assertTrue(Path(plan.merged_registry_path).exists())
             self.assertTrue(Path(plan.output_dir, "run_plan.json").exists())
+            self.assertIsNotNone(plan.resource_catalog)
+            self.assertTrue(Path(plan.resource_catalog_path).exists())
+            self.assertEqual(plan.resource_catalog["priority_groups"][0]["name"], "Primus cybersecurity series")
+
+    def test_resource_catalog_keeps_top_sources_and_benchmarks_separated(self) -> None:
+        report = build_resource_catalog_report("config/data_sources.ultimate.json")
+        self.assertEqual(report.total_resources, 45)
+        self.assertEqual(report.priority_groups[0].resource_ids, [1, 2, 3, 4, 5, 6, 7])
+        train_first_names = [item.name for item in report.train_first_resources]
+        self.assertIn("Primus-Seed", train_first_names)
+        self.assertIn("The Stack v2", train_first_names)
+        eval_names = [item.name for item in report.eval_holdout_resources]
+        self.assertIn("SWE-bench Verified", eval_names)
+        self.assertIn("HumanEval", eval_names)
 
     def test_task_review_and_feedback_loop_reports_promotion_or_blockers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -461,3 +723,4 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

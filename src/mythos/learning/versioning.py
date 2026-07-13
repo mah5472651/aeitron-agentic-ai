@@ -26,9 +26,14 @@ class DatasetVersionManifest(StrictModel):
     created_at_unix: float = Field(default_factory=time.time)
     source_registry: dict[str, Any]
     crawl_report: dict[str, Any]
+    license_filter_report: dict[str, Any] | None = None
+    benchmark_contamination_filter_report: dict[str, Any] | None = None
+    near_dedup_report: dict[str, Any] | None = None
     contamination_report: dict[str, Any] | None = None
     quality_report: dict[str, Any] | None = None
     source_quality_report: dict[str, Any] | None = None
+    source_reputation_report: dict[str, Any] | None = None
+    source_budget_plan: dict[str, Any] | None = None
     source_balance_report: dict[str, Any] | None = None
     task_report: dict[str, Any] | None = None
     review_report: dict[str, Any] | None = None

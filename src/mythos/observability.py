@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -137,3 +138,24 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
 def install_observability(app: FastAPI) -> None:
     configure_logging()
     app.add_middleware(ObservabilityMiddleware)
+    install_tracing(app)
+
+
+def install_tracing(app: FastAPI) -> None:
+    endpoint = os.environ.get("MYTHOS_OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not endpoint:
+        return
+    try:
+        from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    except ImportError:
+        logging.getLogger("mythos.gateway").warning("opentelemetry_not_installed")
+        return
+    provider = TracerProvider(resource=Resource.create({"service.name": os.environ.get("MYTHOS_SERVICE_NAME", "mythos-api")}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
+    trace.set_tracer_provider(provider)
+    FastAPIInstrumentor.instrument_app(app)

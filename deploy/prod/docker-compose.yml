@@ -1,4 +1,14 @@
 services:
+  migrator:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["python", "-m", "src.mythos.db.migration_runner"]
+    environment:
+      MYTHOS_DATABASE_URL: "postgresql://mythos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/mythos"
+    depends_on:
+      postgres:
+        condition: service_healthy
   api:
     build:
       context: ../..
@@ -13,8 +23,18 @@ services:
       MYTHOS_DATABASE_URL: "postgresql://mythos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/mythos"
       MYTHOS_REDIS_URL: "redis://redis:6379/0"
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health/ready', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
   crawler-worker:
     build:
       context: ../..
@@ -23,7 +43,7 @@ services:
     command: ["python", "-m", "src.mythos.learning.worker"]
     environment:
       MYTHOS_DATABASE_URL: "postgresql://mythos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/mythos"
-      MYTHOS_DATA_SOURCES: "config/data_sources.production.sample.json"
+      MYTHOS_DATA_SOURCES: "config/data_sources.ultimate.json"
       MYTHOS_RAW_OUTPUT_DIR: "/data/raw"
       MYTHOS_CLEAN_OUTPUT_DIR: "/data/clean"
       MYTHOS_ASYNC_WORKERS: "32"
@@ -32,9 +52,72 @@ services:
     volumes:
       - data-artifacts:/data
     depends_on:
-      - postgres
-      - minio
-      - minio-bootstrap
+      postgres:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+  crawler-supervisor:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    profiles: ["data"]
+    command: ["python", "-m", "src.mythos.learning.supervisor"]
+    environment:
+      MYTHOS_DATABASE_URL: "postgresql://mythos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/mythos"
+      MYTHOS_DATA_SOURCES: "config/data_sources.ultimate.json"
+      MYTHOS_RAW_OUTPUT_DIR: "/data/raw"
+      MYTHOS_CLEAN_OUTPUT_DIR: "/data/clean"
+      MYTHOS_OBJECT_STORE_URI: "s3://mythos-datasets/pretraining"
+      MYTHOS_ASYNC_WORKERS: "32"
+      MYTHOS_WORKER_REPLICAS: "4"
+      MYTHOS_BATCH_DOCS: "10000"
+      AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER:?set MINIO_ROOT_USER}"
+      AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
+      AWS_EC2_METADATA_DISABLED: "true"
+    volumes:
+      - data-artifacts:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["monitoring"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=15d"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      api:
+        condition: service_healthy
+  grafana:
+    image: grafana/grafana:11.3.1
+    profiles: ["monitoring"]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/mythos.json:ro
+    depends_on:
+      - prometheus
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    profiles: ["monitoring"]
+    command: ["--config=/etc/otel-collector.yaml"]
+    ports:
+      - "4318:4318"
+    volumes:
+      - ./otel-collector.yaml:/etc/otel-collector.yaml:ro
   postgres:
     image: postgres:16
     environment:
@@ -43,11 +126,21 @@ services:
       POSTGRES_DB: mythos
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mythos -d mythos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
   redis:
     image: redis:7
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: ["server", "/data", "--console-address", ":9001"]
@@ -79,3 +172,5 @@ volumes:
   redis-data:
   minio-data:
   data-artifacts:
+  prometheus-data:
+  grafana-data:

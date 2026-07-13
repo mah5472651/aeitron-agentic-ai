@@ -1,4 +1,4 @@
-# Mythos Complete Architecture Manual
+﻿# Mythos Complete Architecture Manual
 
 This file is the single source of truth for the current Mythos system. A person
 should be able to read this file and understand what exists, why it exists, when
@@ -104,9 +104,7 @@ deploy/
   k8s/           Kubernetes API, Postgres, Redis, MinIO, workers, HPA, policies.
   gpu/           GPU smoke/pretraining profile scripts.
 config/
-  data_sources.defensive.sample.json
-  data_sources.production.sample.json
-  data_sources.top_class.sample.json
+  data_sources.ultimate.json
 scripts/
   runtime checks, Docker repair, security tools install, data platform helpers.
 tests/
@@ -473,7 +471,7 @@ When it runs:
 
 Why it exists:
 
-The model can be wrong. Verification is the system’s practical truth source.
+The model can be wrong. Verification is the systemâ€™s practical truth source.
 
 ## Evaluation Service
 
@@ -699,9 +697,7 @@ mirrors. It does not run exploits or collect unauthorized targets.
 Files:
 
 - `src/mythos/learning/source_registry.py`
-- `config/data_sources.defensive.sample.json`
-- `config/data_sources.production.sample.json`
-- `config/data_sources.top_class.sample.json`
+- `config/data_sources.ultimate.json`
 
 Purpose:
 
@@ -730,9 +726,7 @@ What it blocks:
 Commands:
 
 ```bash
-python -m src.mythos.learning.source_registry --sources config/data_sources.production.sample.json
-python -m src.mythos.learning.source_registry --sources config/data_sources.top_class.sample.json
-python -m src.mythos.learning.source_registry --sources registry1.json registry2.json --output artifacts/mythos/sources.merged.json
+python -m src.mythos.learning.source_registry --sources config/data_sources.ultimate.json
 ```
 
 Why it exists:
@@ -740,35 +734,116 @@ Why it exists:
 Best data starts with best sources. Crawling random internet pages creates
 noise, legal risk, and model contamination.
 
-Source tiers:
+Canonical registry structure:
 
-- `data_sources.defensive.sample.json`: small safe defensive crawl for local
-  smoke testing.
-- `data_sources.production.sample.json`: stable medium registry for Kaggle and
-  production-pipeline validation.
-- `data_sources.top_class.sample.json`: larger high-value registry for serious
-  defensive cybersecurity and agentic coding corpus collection.
+- `sources`: crawl-ready, license-gated sources used directly by the crawler.
+- `vulnerability_adapters`: official API-backed vulnerability feeds consumed by
+  adapter code, not by the web crawler.
+- `review_required_sources`: valuable sources that must be license-approved
+  before being promoted into `sources`.
 
-The top-class registry currently contains 20 sources, 104 seed URLs, and covers:
+The ultimate registry currently contains 17 crawl-ready sources, 76 seed URLs,
+and covers:
 
 - OWASP Cheat Sheets, Top 10, ASVS, WSTG, API Security
-- MITRE CWE index, Top 25, and high-impact CWE definitions
 - CISA KEV catalog
 - NIST SSDF and cryptographic standards
 - Python, Rust, Go, Node.js, TypeScript
 - FastAPI, Django, pytest, PostgreSQL
-- Docker, Kubernetes, Git, GitHub Actions
-- Semgrep, CodeQL docs, OpenSSF Scorecard
+- Docker, Kubernetes, Git, OpenSSF Scorecard
 
-Use the top-class registry when the goal is better dataset diversity. Use source
-balancing with it, because large documentation sources can otherwise dominate
-training rows.
+High-value sources kept in `review_required_sources` include MITRE CWE/CAPEC,
+GitHub CodeQL docs, Semgrep docs/rules, RustSec, Go vulnerability database,
+PyPA advisory database, and real permissive-license security patch repositories.
+
+Use the ultimate registry for every local, Kaggle, Colab, and production data
+run. Keep source balancing enabled, because large documentation sources can
+otherwise dominate training rows.
+
+## Data Source Governance
+
+Files:
+
+- `src/mythos/learning/governance.py`
+- `src/mythos/learning/resource_catalog.py`
+- `config/data_sources.ultimate.json`
+
+Purpose:
+
+Provide an auditable legal/source approval workflow before high-value but
+license-sensitive sources become training data. The ultimate registry separates
+three categories:
+
+- `sources`: directly crawlable and license-gated.
+- `vulnerability_adapters`: official API-backed vulnerability feeds.
+- `review_required_sources`: valuable sources that need approval first.
+- `training_resources`: 45 external cybersecurity, security-evaluation, and
+  agentic-coding resources supplied by the project owner.
+- `training_priority_groups`: top six priority groups used to order serious
+  data work.
+
+What it stores:
+
+- source approval requests
+- approval/rejection decisions
+- human-review queue items
+- reviewer decisions and reasons
+
+Commands:
+
+```bash
+python -m src.mythos.learning.governance --store artifacts/mythos/governance report
+python -m src.mythos.learning.governance --store artifacts/mythos/governance submit-source --source-name portswigger-web-security-academy --category authorized_security_testing_labs --url https://portswigger.net/web-security --license review-required --evidence-url https://portswigger.net/web-security --requested-by security-team --justification "High-value authorized web security education source"
+python -m src.mythos.learning.resource_catalog --catalog config/data_sources.ultimate.json --output artifacts/mythos/resource_catalog_report.json
+```
+
+Why it exists:
+
+Cybersecurity data can be high-value and legally sensitive at the same time.
+This module prevents accidental ingestion of unclear sources while still giving
+the project a path to approve excellent security-testing education, advisory
+databases, and real patch repositories.
+
+## Vulnerability Database Adapters
+
+Files:
+
+- `src/mythos/learning/vulnerability_adapters.py`
+
+Supported adapters:
+
+- CISA KEV
+- NVD CVE 2.0
+- OSV
+- Go vulnerability database
+- GitHub Advisory Database
+
+What they output:
+
+Normalized defensive JSONL records with source, vulnerability ID, summary,
+details, affected packages, CWE IDs, references, severity, license, provenance,
+content hash, and text.
+
+Commands:
+
+```bash
+python -m src.mythos.learning.vulnerability_adapters --adapter cisa-kev --output artifacts/mythos/vulns/cisa-kev.jsonl --max-records 100
+python -m src.mythos.learning.vulnerability_adapters --adapter nvd-cve --output artifacts/mythos/vulns/nvd.jsonl --max-records 100
+python -m src.mythos.learning.vulnerability_adapters --adapter go-vuln --output artifacts/mythos/vulns/go.jsonl --max-records 100
+```
+
+Why it exists:
+
+Official vulnerability feeds produce cleaner cybersecurity training data than
+random scraping because they include structured IDs, references, affected
+packages, timestamps, and provenance.
 
 ## Crawl Frontier And Data Engine
 
 Files:
 
 - `src/mythos/learning/data_engine.py`
+- `src/mythos/learning/supervisor.py`
 
 Purpose:
 
@@ -805,9 +880,15 @@ What it does:
 Commands:
 
 ```bash
-python -m src.mythos.learning.data_engine --sources config/data_sources.defensive.sample.json --frontier artifacts/mythos/data-engine/frontier.sqlite3 --raw-output-dir artifacts/mythos/data-engine/raw --clean-output-dir artifacts/mythos/data-engine/clean --max-docs 1000 --workers 8 --max-depth 1
-python -m src.mythos.learning.data_engine --sources config/data_sources.production.sample.json --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --raw-output-dir artifacts/mythos/data-engine/raw --clean-output-dir artifacts/mythos/data-engine/clean --max-docs 1000000 --workers 64
+python -m src.mythos.learning.data_engine --sources config/data_sources.ultimate.json --frontier artifacts/mythos/data-engine/frontier.sqlite3 --raw-output-dir artifacts/mythos/data-engine/raw --clean-output-dir artifacts/mythos/data-engine/clean --max-docs 1000 --workers 8 --max-depth 1
+python -m src.mythos.learning.data_engine --sources config/data_sources.ultimate.json --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --raw-output-dir artifacts/mythos/data-engine/raw --clean-output-dir artifacts/mythos/data-engine/clean --max-docs 1000000 --workers 64
+python -m src.mythos.learning.supervisor --sources config/data_sources.ultimate.json --postgres-dsn "$MYTHOS_DATABASE_URL" --raw-output-dir artifacts/mythos/data-engine/raw --clean-output-dir artifacts/mythos/data-engine/clean --object-store-uri s3://mythos-datasets/pretraining --worker-replicas 8 --async-workers 64
 ```
+
+The supervisor repeatedly launches bounded crawl cycles, writes heartbeat and
+status JSON files, applies readiness checks before starting, and stops after too
+many failures. In production it runs beside distributed workers and object
+storage, not as a local-only script.
 
 Why it exists:
 
@@ -1209,7 +1290,7 @@ Checks:
 Command:
 
 ```bash
-python -m src.mythos.learning.production_check --sources config/data_sources.production.sample.json --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --object-store-uri s3://mythos-datasets/pretraining --production --worker-replicas 8 --async-workers 64
+python -m src.mythos.learning.production_check --sources config/data_sources.ultimate.json --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --object-store-uri s3://mythos-datasets/pretraining --production --worker-replicas 8 --async-workers 64
 ```
 
 Why it exists:
@@ -1266,7 +1347,7 @@ It does:
 Command:
 
 ```bash
-python -m src.mythos.learning.run_plan --sources config/data_sources.production.sample.json --output-dir artifacts/mythos/data-runs/first-serious-run --target-documents 1000000 --target-days 7 --postgres-dsn "$MYTHOS_DATABASE_URL" --object-store-uri s3://mythos-datasets/pretraining --worker-replicas 8 --async-workers 64
+python -m src.mythos.learning.run_plan --sources config/data_sources.ultimate.json --output-dir artifacts/mythos/data-runs/first-serious-run --target-documents 1000000 --target-days 7 --postgres-dsn "$MYTHOS_DATABASE_URL" --object-store-uri s3://mythos-datasets/pretraining --worker-replicas 8 --async-workers 64
 ```
 
 Why it exists:
@@ -1308,7 +1389,7 @@ Order:
 Command:
 
 ```bash
-python -m src.mythos.learning.data_pipeline --sources config/data_sources.production.sample.json --dataset-id mythos-defensive-coding-corpus --work-dir artifacts/mythos/data-pipeline --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --object-store-uri s3://mythos-datasets/pretraining --object-store-endpoint-url "$S3_ENDPOINT_URL" --max-docs 1000000 --workers 64 --max-depth 2 --vocab-size 64000 --sequence-length 2048 --shard-token-count 1000000 --skip-train
+python -m src.mythos.learning.data_pipeline --sources config/data_sources.ultimate.json --dataset-id mythos-defensive-coding-corpus --work-dir artifacts/mythos/data-pipeline --frontier-backend postgres --postgres-dsn "$MYTHOS_DATABASE_URL" --object-store-uri s3://mythos-datasets/pretraining --object-store-endpoint-url "$S3_ENDPOINT_URL" --max-docs 1000000 --workers 64 --max-depth 2 --vocab-size 64000 --sequence-length 2048 --shard-token-count 1000000 --skip-train
 ```
 
 When to use `--skip-train`:
@@ -1460,7 +1541,7 @@ Kaggle T4 smoke command:
 
 ```bash
 python deploy/gpu/run_real_data_training_pipeline.py \
-  --sources config/data_sources.production.sample.json \
+  --sources config/data_sources.ultimate.json \
   --output-dir artifacts/mythos/real-data-smoke \
   --max-docs 200 \
   --min-clean-records 25 \
@@ -1481,7 +1562,7 @@ First 10k-record command:
 
 ```bash
 python deploy/gpu/run_real_data_training_pipeline.py \
-  --sources config/data_sources.production.sample.json \
+  --sources config/data_sources.ultimate.json \
   --output-dir artifacts/mythos/real-data-10k \
   --max-docs 10000 \
   --min-clean-records 10000 \
@@ -1504,7 +1585,7 @@ Top-class balanced 20k-record command:
 
 ```bash
 python deploy/gpu/run_real_data_training_pipeline.py \
-  --sources config/data_sources.top_class.sample.json \
+  --sources config/data_sources.ultimate.json \
   --work-dir artifacts/mythos/real-data-20k-top-class-balanced \
   --target-records 20000 \
   --max-docs 50000 \
@@ -1542,7 +1623,7 @@ Kaggle memory safety:
 
 ```bash
 python deploy/gpu/run_real_data_training_pipeline.py \
-  --sources config/data_sources.production.sample.json \
+  --sources config/data_sources.ultimate.json \
   --output-dir artifacts/mythos/real-data-100k \
   --max-docs 100000 \
   --min-clean-records 100000 \
@@ -1737,13 +1818,384 @@ Interpretation:
 - `score_delta`: average score movement across the prompt suite.
 - `pass_delta`: number of tasks crossing the pass threshold.
 
+## Scratch Training Control Plane
+
+Files:
+
+- `config/eval_schedule.json`
+- `config/mix_ratios.json`
+- `config/alignment_policy.json`
+- `src/mythos/evaluation/eval_runner.py`
+- `src/mythos/learning/mixer.py`
+- `src/mythos/learning/ablation_runner.py`
+- `src/mythos/alignment/build_sft_dataset.py`
+- `src/mythos/alignment/generate_preferences.py`
+- `src/mythos/alignment/train_sft.py`
+- `src/mythos/alignment/train_dpo.py`
+- `src/mythos/alignment/safety_eval.py`
+
+Purpose:
+
+This layer controls checkpoint promotion, data composition, and safety
+alignment for Mythos-owned scratch checkpoints. It does not load external model
+weights and it does not create live-target attack workflows.
+
+Checkpoint eval loop:
+
+1. Load a scratch checkpoint manifest.
+2. Load `config/eval_schedule.json`.
+3. Run deterministic evaluation with `temperature=0` and a fixed seed.
+4. Execute built-in defensive security checks, optional JSONL benchmark
+   adapters, MCQ-style scored rows, static benchmark rows, and generation
+   suites when a tokenizer is supplied.
+5. Required missing benchmark files fail the report.
+6. Optional missing benchmark files are marked `skipped`.
+7. Compare aggregate scores against a previous report when supplied.
+8. Flag score drops over 3 percent as warnings and over 5 percent as failures.
+9. Write `eval_report.json` and `eval_report.md`.
+
+Command:
+
+```powershell
+python -m src.mythos.evaluation.eval_runner `
+  --checkpoint-manifest artifacts\mythos\train\checkpoint_manifest.json `
+  --schedule config\eval_schedule.json `
+  --output-dir artifacts\mythos\eval `
+  --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json `
+  --device cpu
+```
+
+Data mixing controller:
+
+1. Read clean JSONL rows that already passed license, contamination, quality,
+   and dedup gates.
+2. Classify each row into `general`, `code`, `cybersecurity`, or `agentic`.
+3. Exclude `eval_holdout` and `benchmark_holdout` rows from training output.
+4. Estimate token counts with the tokenizer when available.
+5. Sample rows according to the configured experiment ratios:
+   - `baseline_70_15_15`
+   - `domain_heavy_55_15_30`
+   - `domain_extreme_40_10_50`
+6. Write mixed JSONL and, when a tokenizer is supplied, compatible token
+   shards for the pretraining loop.
+7. Write `mix_manifest.json`.
+
+Command:
+
+```powershell
+python -m src.mythos.learning.mixer `
+  --inputs data\training\clean.jsonl `
+  --config config\mix_ratios.json `
+  --experiment domain_heavy_55_15_30 `
+  --output-dir artifacts\mythos\mix-domain-heavy `
+  --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json
+```
+
+Ablation runner:
+
+The ablation runner executes every configured mix experiment against the same
+clean corpus and writes `ablation_report.json` plus a Markdown summary. It is
+used to compare whether a general-heavy, domain-heavy, or domain-extreme corpus
+produces better downstream checkpoint eval results.
+
+Command:
+
+```powershell
+python -m src.mythos.learning.ablation_runner `
+  --mix-config config\mix_ratios.json `
+  --base-run-dir artifacts\mythos\data-pipeline `
+  --output-dir artifacts\mythos\mix-ablation
+```
+
+SFT dataset builder:
+
+1. Normalize `{messages}` or `{prompt, response}` records into one internal
+   SFT schema.
+2. Inject harmful-prompt refusal examples according to
+   `refusal_injection_ratio`, defaulting to 0.15.
+3. Keep defensive prompts helpful instead of over-refusing.
+4. Write a token-ready JSONL dataset plus `sft_dataset_report.json`.
+
+Command:
+
+```powershell
+python -m src.mythos.alignment.build_sft_dataset `
+  --input-tasks data\training\tasks.jsonl `
+  --policy config\alignment_policy.json `
+  --output artifacts\mythos\alignment\sft.jsonl
+```
+
+Preference pair builder:
+
+1. Read prompts and candidate outputs.
+2. Group candidates by prompt.
+3. Score outputs using safety and usefulness heuristics.
+4. Emit `{prompt, chosen, rejected, category, safety_label, source, metadata}`
+   rows.
+5. Reject malformed records instead of silently accepting them.
+6. Write `preference_pair_report.json`.
+
+Command:
+
+```powershell
+python -m src.mythos.alignment.generate_preferences `
+  --prompts data\training\prompts.jsonl `
+  --candidate-outputs data\training\candidates.jsonl `
+  --output artifacts\mythos\alignment\pairs.jsonl
+```
+
+Native SFT loop:
+
+1. Load a Mythos scratch checkpoint manifest.
+2. Load the exact tokenizer used for that checkpoint family.
+3. Train with teacher forcing over the SFT prompt/response text.
+4. Clip gradients and save a new scratch checkpoint manifest.
+5. Write `alignment_training_report.json`.
+
+Command:
+
+```powershell
+python -m src.mythos.alignment.train_sft `
+  --checkpoint-manifest artifacts\mythos\train\checkpoint_manifest.json `
+  --dataset artifacts\mythos\alignment\sft.jsonl `
+  --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json `
+  --output-dir artifacts\mythos\alignment\sft-run `
+  --device cpu `
+  --steps 10
+```
+
+Native DPO-style loop:
+
+1. Load a trainable policy checkpoint.
+2. Load a frozen reference checkpoint.
+3. Compute chosen/rejected sequence log-probabilities under both models.
+4. Apply DPO loss with configurable beta, default 0.1.
+5. Save a new Mythos scratch checkpoint and training report.
+
+Command:
+
+```powershell
+python -m src.mythos.alignment.train_dpo `
+  --policy-checkpoint artifacts\mythos\alignment\sft-run\checkpoint_manifest.json `
+  --reference-checkpoint artifacts\mythos\train\checkpoint_manifest.json `
+  --pairs artifacts\mythos\alignment\pairs.jsonl `
+  --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json `
+  --output-dir artifacts\mythos\alignment\dpo-run `
+  --device cpu `
+  --steps 10
+```
+
+Safety eval:
+
+1. Run harmful and legitimate defensive prompts through the checkpoint.
+2. Detect refusal markers.
+3. Measure harmful refusal rate and defensive false-refusal rate.
+4. Fail if harmful refusal is below 95 percent or defensive false-refusal is
+   above 5 percent, unless the policy config changes those targets.
+5. Write `safety_eval_report.json` and `safety_eval_report.md`.
+
+Command:
+
+```powershell
+python -m src.mythos.alignment.safety_eval `
+  --checkpoint-manifest artifacts\mythos\alignment\dpo-run\checkpoint_manifest.json `
+  --tokenizer-path artifacts\mythos\tokenizer\tokenizer.json `
+  --policy config\alignment_policy.json `
+  --output-dir artifacts\mythos\alignment\safety `
+  --device cpu
+```
+
+Security boundary:
+
+- Allowed: authorized labs, CTF/eval data, vulnerability metadata, defensive
+  analysis, secure patch generation, and reviewed educational material.
+- Blocked: autonomous exploit execution, malware collection, live-target attack
+  workflows, credential theft instructions, and unsupervised harmful misuse data.
+
+## Production Readiness Hardening
+
+Files:
+
+- `alembic.ini`
+- `src/mythos/db/alembic/env.py`
+- `src/mythos/db/alembic/versions/0001_initial.py`
+- `src/mythos/db/alembic/versions/0002_data_platform.py`
+- `src/mythos/learning/storage.py`
+- `src/mythos/learning/dataset_validation.py`
+- `src/mythos/deployment/k8s_validate.py`
+- `src/mythos/evaluation/benchmark_suites.py`
+- `src/mythos/security/audit.py`
+- `deploy/gpu/run_10k_training_validation.py`
+- `deploy/prod/prometheus.yml`
+- `deploy/prod/grafana-dashboard.json`
+- `deploy/prod/otel-collector.yaml`
+
+Purpose:
+
+This layer turns the architecture from local MVP code into a deployable
+production candidate. It does not magically prove billion-scale operation on a
+single laptop; it provides the gates and commands that must pass on real
+infrastructure before production promotion.
+
+Postgres migration strategy:
+
+- The existing SQL migration runner remains available for lightweight Docker
+  and CI workflows.
+- Alembic is now configured for standard production migration operations.
+- The Alembic version scripts reuse the same SQL migration files, keeping one
+  source of truth.
+- Migrations are forward-only to avoid destructive rollback surprises.
+
+Commands:
+
+```powershell
+python -m src.mythos.db.migration_runner --database-url postgresql://mythos:pass@localhost:5432/mythos --dry-run
+alembic upgrade head
+```
+
+Object storage lifecycle:
+
+- Supports local storage and S3-compatible storage such as MinIO.
+- Verifies write, head, download, checksum match, list, and delete.
+- Writes `object_store_lifecycle_report.json`.
+
+Commands:
+
+```powershell
+python -m src.mythos.learning.storage `
+  --uri local://artifacts/mythos/object-store `
+  --work-dir artifacts/mythos/object-store-lifecycle
+
+python -m src.mythos.learning.storage `
+  --uri s3://mythos-datasets/pretraining `
+  --endpoint-url http://localhost:9000 `
+  --work-dir artifacts/mythos/s3-lifecycle
+```
+
+Kubernetes validation:
+
+- Loads every YAML manifest under `deploy/k8s`.
+- Checks workload resources, probes, secret references, privileged containers,
+  privilege escalation, PVCs, HPA presence, services, and network policy.
+- Optional `--kubectl-dry-run` performs server-side validation against a real
+  cluster.
+- Placeholder secrets in `secrets.example.yaml` are warnings, not blockers.
+
+Commands:
+
+```powershell
+python -m src.mythos.deployment.k8s_validate --output-dir artifacts/mythos/k8s-validation
+python -m src.mythos.deployment.k8s_validate --kubectl-dry-run --output-dir artifacts/mythos/k8s-validation
+```
+
+Long-running crawler supervision:
+
+- `src/mythos/learning/supervisor.py` runs supervised crawl cycles against a
+  Postgres frontier.
+- It writes heartbeat and status JSON for external monitoring.
+- Docker Compose and Kubernetes include crawler worker and supervisor services.
+- The data dashboard summarizes crawl, quality, license, contamination,
+  source reputation, budget, task extraction, review, upload, and feedback
+  status.
+
+Large dataset validation:
+
+- `src/mythos/learning/dataset_validation.py` streams JSONL files and does not
+  load the full corpus into memory.
+- It checks record count, duplicate fraction, average text length, category
+  coverage, license presence, quality metadata, and holdout/train split.
+- Use it before tokenizer training and before promoting a dataset version.
+
+Command:
+
+```powershell
+python -m src.mythos.learning.dataset_validation `
+  --inputs artifacts/mythos/data-pipeline/clean/clean-000000.jsonl `
+  --output-dir artifacts/mythos/dataset-validation `
+  --min-records 100000 `
+  --max-duplicate-fraction 0.02
+```
+
+10k-step GPU validation:
+
+- `deploy/gpu/run_10k_training_validation.py` enforces at least 10,000 training
+  steps.
+- It runs the scratch pretraining loop and checkpoint eval.
+- Use this on Kaggle/Colab T4/A100/L4/P100-compatible PyTorch builds or on a
+  real GPU node.
+
+Command:
+
+```bash
+python deploy/gpu/run_10k_training_validation.py \
+  --manifest artifacts/mythos/shards/manifest.json \
+  --device cuda \
+  --steps 10000 \
+  --sequence-length 128 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 8
+```
+
+Benchmark suite adapters:
+
+- `swe_bench_style`: local SWE-Bench-like JSONL files.
+- `human_eval_style`: local HumanEval-like rows.
+- `mbpp_style`: local MBPP-like rows.
+- `cyberseceval_style`: local CyberSecEval-like rows.
+- `custom_security`: Mythos-owned security benchmark rows.
+- Benchmark files are local/explicit. The system does not automatically
+  download or mix protected eval data into training.
+
+Command:
+
+```powershell
+python -m src.mythos.evaluation.benchmark_suites `
+  --suite swe swe_bench_style data/eval/swe_style.jsonl `
+  --suite cyber cyberseceval_style data/eval/cyber.jsonl `
+  --output-dir artifacts/mythos/benchmark-suites
+```
+
+Security audit:
+
+- Scans production source and deployment assets.
+- Checks hardcoded secret patterns, SSRF sinks, path traversal sinks, risky
+  process execution sinks, dependency version bounds, optional Bandit output,
+  and Kubernetes manifest status.
+- Tests and deliberately vulnerable benchmark fixtures are excluded from the
+  default production-source scan to reduce false positives.
+
+Commands:
+
+```powershell
+python -m src.mythos.security.audit --no-bandit --output-dir artifacts/mythos/security-audit
+python -m src.mythos.security.audit --output-dir artifacts/mythos/security-audit
+```
+
+Monitoring:
+
+- Prometheus scrapes `/metrics`.
+- Grafana dashboard is defined in `deploy/prod/grafana-dashboard.json`.
+- Optional OpenTelemetry tracing is enabled when
+  `MYTHOS_OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+- Docker Compose includes Prometheus, Grafana, and an OTel collector under the
+  `monitoring` profile.
+
+Command:
+
+```powershell
+docker compose --env-file deploy/prod/.env.example -f deploy/prod/docker-compose.yml --profile monitoring up
+```
+
 ## Verification Commands
 
 Use these after major changes:
 
 ```powershell
 python -m compileall -q src\mythos tests deploy\gpu
-python -m unittest tests.test_mythos_data_engine tests.test_mythos_production_hardening
+python -m unittest tests.test_mythos_data_engine tests.test_mythos_production_hardening tests.test_mythos_training_control tests.test_mythos_enterprise_readiness
+python -m src.mythos.deployment.k8s_validate --output-dir artifacts\mythos\k8s-validation
+python -m src.mythos.learning.storage --uri local://artifacts/mythos/object-store --work-dir artifacts\mythos\object-store-lifecycle
+python -m src.mythos.security.audit --no-bandit --output-dir artifacts\mythos\security-audit
 python -m src.mythos.evaluation.release_gate
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_mythos_consolidated_smoke.ps1
 ```
@@ -1753,3 +2205,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_mythos_consolida
 Do not reintroduce numbered legacy folders. If a feature is needed, add it to
 the correct final module under `src/mythos` and update this manual with enough
 detail that the system can be understood without reading all source code.
+
