@@ -79,11 +79,26 @@ CONFIG_TOKENS = {
     "yaml",
 }
 NOISE_TERMS = {
+    "accept cookies",
+    "all rights reserved",
     "cookie policy",
     "enable javascript",
+    "main navigation",
     "privacy policy",
+    "skip to content",
     "subscribe to newsletter",
     "table of contents",
+    "terms of service",
+}
+BINARY_CONTENT_TYPES = {
+    "application/octet-stream",
+    "application/pdf",
+    "image/gif",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/svg+xml",
+    "image/webp",
 }
 
 
@@ -310,6 +325,8 @@ def quality_score(*, text: str, labels: list[str], reasons: list[str]) -> tuple[
     risk_flags: list[str] = []
     if noise_hits:
         risk_flags.append("navigation_or_boilerplate_noise")
+    if noise_hits >= 3:
+        risk_flags.append("heavy_boilerplate_noise")
     if metrics["repeated_line_ratio"] > 0.18:
         risk_flags.append("repeated_lines")
     if metrics["unique_word_ratio"] < 0.12:
@@ -333,6 +350,10 @@ class DatasetQualityGate:
         if len(compact) > self.config.max_chars:
             reasons.append("too_large")
         license_name = str(row.get("license") or row.get("metadata", {}).get("license") or "").lower()
+        metadata = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+        content_type = str(metadata.get("content_type") or row.get("content_type") or "").split(";")[0].strip().lower()
+        if content_type in BINARY_CONTENT_TYPES:
+            reasons.append("non_text_content_type")
         if self.config.require_license and license_name not in self.config.allowed_licenses:
             reasons.append("license_not_allowed")
         if self.config.reject_secrets and SECRET_RE.search(text):
@@ -356,6 +377,10 @@ class DatasetQualityGate:
         data_type = infer_data_type(text, labels)
         score, component_scores, score_flags = quality_score(text=normalized, labels=labels, reasons=reasons)
         risk_flags.extend(score_flags)
+        if "heavy_boilerplate_noise" in risk_flags and "code" not in labels and "defensive_security" not in labels:
+            reasons.append("heavy_boilerplate_noise")
+            score, component_scores, score_flags = quality_score(text=normalized, labels=labels, reasons=reasons)
+            risk_flags.extend(score_flags)
         return QualityDecision(
             accepted=not reasons,
             reasons=reasons,

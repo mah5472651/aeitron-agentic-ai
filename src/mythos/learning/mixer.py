@@ -41,6 +41,7 @@ class MixConfig(StrictModel):
     experiments: list[MixExperiment]
     progressive_curriculum: list[CurriculumStage] = Field(default_factory=list)
     holdout_policies: list[str] = Field(default_factory=lambda: ["eval_holdout", "benchmark_holdout"])
+    min_quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class MixBucketReport(StrictModel):
@@ -97,7 +98,13 @@ def _estimate_tokens(text: str, tokenizer: Any | None) -> int:
     return max(1, len(text.split()))
 
 
-def _load_rows(input_paths: list[str | Path], tokenizer: Any | None, holdout_policies: set[str]) -> tuple[dict[str, list[dict[str, Any]]], int]:
+def _load_rows(
+    input_paths: list[str | Path],
+    tokenizer: Any | None,
+    holdout_policies: set[str],
+    *,
+    min_quality_score: float,
+) -> tuple[dict[str, list[dict[str, Any]]], int]:
     buckets: dict[str, list[dict[str, Any]]] = {"general": [], "code": [], "cybersecurity": [], "agentic": []}
     excluded = 0
     seen: set[str] = set()
@@ -107,6 +114,12 @@ def _load_rows(input_paths: list[str | Path], tokenizer: Any | None, holdout_pol
             policy = str(row.get("train_policy") or metadata.get("train_policy") or "").lower()
             bucket = classify_row(row)
             if bucket == "holdout" or policy in holdout_policies:
+                excluded += 1
+                continue
+            quality = row.get("quality", {}) if isinstance(row.get("quality"), dict) else {}
+            training_gate = row.get("training_gate", {}) if isinstance(row.get("training_gate"), dict) else {}
+            quality_score = max(float(quality.get("quality_score", 0.0)), float(training_gate.get("score", 0.0)))
+            if quality_score < min_quality_score:
                 excluded += 1
                 continue
             text = _row_text(row)
@@ -140,6 +153,7 @@ def _sample_mixed_rows(
     for rows in buckets.values():
         rng.shuffle(rows)
     cursors = {bucket: 0 for bucket in buckets}
+    token_totals = {bucket: 0 for bucket in buckets}
     output: list[dict[str, Any]] = []
     total_available = sum(len(rows) for rows in buckets.values())
     limit = min(max_rows or total_available, total_available)
@@ -148,10 +162,17 @@ def _sample_mixed_rows(
         choices = [bucket for bucket in active_buckets if cursors[bucket] < len(buckets[bucket])]
         if not choices:
             break
-        weights = [normalized.get(bucket, 0.0) or 0.001 for bucket in choices]
-        bucket = rng.choices(choices, weights=weights, k=1)[0]
+        current_total_tokens = max(1, sum(token_totals.values()))
+        deficits = []
+        for candidate in choices:
+            target_ratio = normalized.get(candidate, 0.0)
+            actual_ratio = token_totals[candidate] / current_total_tokens
+            deficits.append((target_ratio - actual_ratio, rng.random(), candidate))
+        deficits.sort(reverse=True)
+        bucket = deficits[0][2]
         row = buckets[bucket][cursors[bucket]]
         cursors[bucket] += 1
+        token_totals[bucket] += int(row.get("_estimated_tokens", 1))
         output.append(row)
         active_buckets = [item for item in active_buckets if cursors[item] < len(buckets[item])]
     return output
@@ -174,7 +195,12 @@ def build_mix(
         raise ValueError(f"unknown mix experiment: {experiment}")
     active_tokenizer_path = str(tokenizer_path or config.tokenizer_path or "") or None
     tokenizer = load_tokenizer(active_tokenizer_path) if active_tokenizer_path else None
-    buckets, excluded = _load_rows(input_paths, tokenizer, set(config.holdout_policies))
+    buckets, excluded = _load_rows(
+        input_paths,
+        tokenizer,
+        set(config.holdout_policies),
+        min_quality_score=config.min_quality_score,
+    )
     rng = random.Random(config.seed)
     mixed_rows = _sample_mixed_rows(
         buckets=buckets,

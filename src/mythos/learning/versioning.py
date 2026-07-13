@@ -34,6 +34,7 @@ class DatasetVersionManifest(StrictModel):
     source_quality_report: dict[str, Any] | None = None
     source_reputation_report: dict[str, Any] | None = None
     source_budget_plan: dict[str, Any] | None = None
+    training_data_gate_report: dict[str, Any] | None = None
     source_balance_report: dict[str, Any] | None = None
     task_report: dict[str, Any] | None = None
     review_report: dict[str, Any] | None = None

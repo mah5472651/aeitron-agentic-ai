@@ -68,6 +68,8 @@ def review_task(task: dict[str, Any]) -> ReviewDecision:
         reasons.append("high_risk_action_request")
         score -= 0.6
     task_type = str(task.get("task_type") or "")
+    metadata = dict(task.get("metadata") or {})
+    training_priority = str(metadata.get("training_priority") or "normal")
     if task_type in {
         "debugging_from_error_trace",
         "implementation_planning",
@@ -82,6 +84,8 @@ def review_task(task: dict[str, Any]) -> ReviewDecision:
         status: Literal["approved", "needs_human_review", "rejected"] = "rejected"
     elif score >= 0.75 and not reasons:
         status = "approved"
+    elif training_priority == "critical" and score >= 0.50:
+        status = "needs_human_review"
     elif score >= 0.55:
         status = "needs_human_review"
     else:
@@ -92,7 +96,7 @@ def review_task(task: dict[str, Any]) -> ReviewDecision:
         score=score,
         reasons=reasons,
         source_url=task.get("source_url"),
-        metadata={"task_type": task_type, "language": task.get("language"), **dict(task.get("metadata") or {})},
+        metadata={"task_type": task_type, "language": task.get("language"), **metadata},
     )
 
 

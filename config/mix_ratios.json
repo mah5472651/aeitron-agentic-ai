@@ -2,6 +2,7 @@
   "seed": 1337,
   "tokenizer_path": null,
   "max_rows": null,
+  "min_quality_score": 0.58,
   "experiments": [
     {
       "name": "baseline_70_15_15",

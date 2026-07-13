@@ -33,6 +33,7 @@ from src.mythos.learning.source_quality import SourceQualityReport, write_source
 from src.mythos.learning.source_reputation import SourceReputationReport, write_source_reputation_report
 from src.mythos.learning.storage import ObjectStoreConfig, create_object_store, upload_paths
 from src.mythos.learning.task_extraction import TaskExtractionReport, extract_tasks
+from src.mythos.learning.training_data_gate import TrainingDataGateConfig, TrainingDataGateReport, apply_training_data_gate
 from src.mythos.learning.versioning import DatasetArtifact, DatasetLedger, DatasetVersionManifest, artifact_from_path, build_version_id
 from src.mythos.model_ops.pretrain_loop import run_pretraining_loop
 from src.mythos.model_ops.tokenizer_pipeline import (
@@ -83,6 +84,10 @@ class DataPipelineConfig(StrictModel):
     build_source_reputation: bool = True
     build_source_budget: bool = True
     source_budget_target_docs: int | None = Field(default=None, ge=1)
+    apply_training_data_gate: bool = True
+    min_training_quality_score: float = Field(default=0.58, ge=0.0, le=1.0)
+    min_source_reputation_score: float = Field(default=0.45, ge=0.0, le=1.0)
+    eval_holdout_fraction: float = Field(default=0.02, ge=0.0, le=0.5)
     balance_sources: bool = True
     max_source_fraction: float = Field(default=0.35, ge=0.05, le=1.0)
     min_source_rows: int = Field(default=25, ge=1)
@@ -118,6 +123,7 @@ class DataPipelineReport(StrictModel):
     feedback_report: dict[str, Any] | None
     source_reputation_report: dict[str, Any] | None = None
     source_budget_plan: dict[str, Any] | None = None
+    training_data_gate_report: dict[str, Any] | None = None
     source_balance_report: dict[str, Any] | None = None
     clean_files: list[str]
     training_files: list[str]
@@ -411,6 +417,47 @@ async def _run_data_pipeline_locked(
             target_total_docs=config.source_budget_target_docs or config.max_docs,
         )
         progress.emit("source_budget", "complete", budgets=len(source_budget_plan.budgets), allocated_total_docs=source_budget_plan.allocated_total_docs)
+    training_data_gate_report: TrainingDataGateReport | None = None
+    gated_train_path = root / "gated" / "training-promoted.jsonl"
+    gated_holdout_path = root / "gated" / "eval-holdout.jsonl"
+    gated_review_path = root / "gated" / "human-review-queue.jsonl"
+    gated_decisions_path = reports_dir / "training_data_gate_decisions.jsonl"
+    if config.apply_training_data_gate:
+        progress.emit(
+            "training_data_gate",
+            "started",
+            min_training_quality_score=config.min_training_quality_score,
+            min_source_reputation_score=config.min_source_reputation_score,
+            eval_holdout_fraction=config.eval_holdout_fraction,
+        )
+        training_data_gate_report = apply_training_data_gate(
+            input_paths=clean_files,
+            promoted_path=gated_train_path,
+            holdout_path=gated_holdout_path,
+            review_queue_path=gated_review_path,
+            decisions_path=gated_decisions_path,
+            reputation_report_path=source_reputation_path if source_reputation_report is not None else None,
+            config=TrainingDataGateConfig(
+                min_quality_score=config.min_training_quality_score,
+                min_source_reputation_score=config.min_source_reputation_score,
+                eval_holdout_fraction=config.eval_holdout_fraction,
+            ),
+        )
+        (reports_dir / "training_data_gate_report.json").write_text(
+            json.dumps(training_data_gate_report.model_dump(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        progress.emit(
+            "training_data_gate",
+            "complete",
+            promoted=training_data_gate_report.promoted,
+            holdout=training_data_gate_report.holdout,
+            review_queue=training_data_gate_report.review_queue,
+            rejected=training_data_gate_report.rejected,
+        )
+        if training_data_gate_report.promoted == 0:
+            raise RuntimeError("training data gate promoted zero rows; lower thresholds or improve source allowlist")
+        clean_files = [str(gated_train_path)]
     source_balance_report: SourceBalanceReport | None = None
     training_files = clean_files
     balanced_clean_path = root / "balanced" / "balanced-clean-000000.jsonl"
@@ -511,6 +558,11 @@ async def _run_data_pipeline_locked(
         artifacts.append(artifact_from_path(source_reputation_path, role="source_reputation_report"))
     if source_budget_plan is not None:
         artifacts.append(artifact_from_path(source_budget_path, role="source_budget_plan"))
+    if training_data_gate_report is not None:
+        artifacts.append(artifact_from_path(reports_dir / "training_data_gate_report.json", role="training_data_gate_report"))
+        artifacts.append(artifact_from_path(gated_train_path, role="promoted_training_jsonl"))
+        artifacts.append(artifact_from_path(gated_holdout_path, role="eval_holdout_jsonl"))
+        artifacts.append(artifact_from_path(gated_review_path, role="human_review_queue_jsonl"))
     if source_balance_report is not None:
         artifacts.append(artifact_from_path(reports_dir / "source_balance_report.json", role="source_balance_report"))
         artifacts.append(artifact_from_path(balanced_clean_path, role="balanced_clean_jsonl"))
@@ -550,6 +602,16 @@ async def _run_data_pipeline_locked(
             upload_candidates.append(str(source_reputation_path))
         if source_budget_plan is not None:
             upload_candidates.append(str(source_budget_path))
+        if training_data_gate_report is not None:
+            upload_candidates.extend(
+                [
+                    str(reports_dir / "training_data_gate_report.json"),
+                    str(gated_train_path),
+                    str(gated_holdout_path),
+                    str(gated_review_path),
+                    str(gated_decisions_path),
+                ]
+            )
         if task_report is not None:
             upload_candidates.extend([str(tasks_path), str(task_report_path)])
         if review_report is not None:
@@ -577,6 +639,7 @@ async def _run_data_pipeline_locked(
         feedback_report=feedback_report.model_dump(),
         source_reputation_report=source_reputation_report.model_dump() if source_reputation_report else None,
         source_budget_plan=source_budget_plan.model_dump() if source_budget_plan else None,
+        training_data_gate_report=training_data_gate_report.model_dump() if training_data_gate_report else None,
         checkpoint_eval_report=checkpoint_eval_report.model_dump() if checkpoint_eval_report else None,
         source_balance_report=source_balance_report.model_dump() if source_balance_report else None,
         tokenizer_path=str(trained_tokenizer),
@@ -608,6 +671,7 @@ async def _run_data_pipeline_locked(
         feedback_report=feedback_report.model_dump(),
         source_reputation_report=source_reputation_report.model_dump() if source_reputation_report else None,
         source_budget_plan=source_budget_plan.model_dump() if source_budget_plan else None,
+        training_data_gate_report=training_data_gate_report.model_dump() if training_data_gate_report else None,
         source_balance_report=source_balance_report.model_dump() if source_balance_report else None,
         clean_files=clean_files,
         training_files=training_files,
@@ -624,6 +688,7 @@ async def _run_data_pipeline_locked(
             "quality_report": str(reports_dir / "quality_report.json"),
             "source_reputation_report": str(reports_dir / "source_reputation_report.json"),
             "source_budget_plan": str(reports_dir / "source_budget_plan.json"),
+            "training_data_gate_report": str(reports_dir / "training_data_gate_report.json"),
             "checkpoint_eval_report": str(reports_dir / "checkpoint_eval" / "checkpoint_eval_report.json"),
             "progress_log": str(progress.path) if progress.path else "",
         },
@@ -682,6 +747,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-source-reputation", action="store_true")
     parser.add_argument("--no-source-budget", action="store_true")
     parser.add_argument("--source-budget-target-docs", type=int)
+    parser.add_argument("--no-training-data-gate", action="store_true")
+    parser.add_argument("--min-training-quality-score", type=float, default=0.58)
+    parser.add_argument("--min-source-reputation-score", type=float, default=0.45)
+    parser.add_argument("--eval-holdout-fraction", type=float, default=0.02)
     parser.add_argument("--no-source-balancing", action="store_true")
     parser.add_argument("--max-source-fraction", type=float, default=0.35)
     parser.add_argument("--min-source-rows", type=int, default=25)
@@ -738,6 +807,10 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         build_source_reputation=not args.no_source_reputation,
         build_source_budget=not args.no_source_budget,
         source_budget_target_docs=args.source_budget_target_docs,
+        apply_training_data_gate=not args.no_training_data_gate,
+        min_training_quality_score=args.min_training_quality_score,
+        min_source_reputation_score=args.min_source_reputation_score,
+        eval_holdout_fraction=args.eval_holdout_fraction,
         balance_sources=not args.no_source_balancing,
         max_source_fraction=args.max_source_fraction,
         min_source_rows=args.min_source_rows,

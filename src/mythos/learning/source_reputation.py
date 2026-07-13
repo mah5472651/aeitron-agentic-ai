@@ -50,7 +50,7 @@ def _clamp(value: float) -> float:
 
 def _license_trust(source: str, source_quality: dict[str, Any]) -> float:
     lowered = source.lower()
-    if any(token in lowered for token in ("nvd", "cisa", "mitre", "owasp", "osv", "github-advisory")):
+    if any(token in lowered for token in ("nvd", "cisa", "mitre", "owasp", "osv", "github-advisory", "cwe", "capec", "rustsec")):
         return 1.0
     if source_quality.get("avg_quality_score", 0.0) >= 0.65:
         return 0.85
@@ -98,26 +98,28 @@ def build_source_reputation_report(
         avg_quality = _clamp(float(item.get("avg_quality_score", 0.0)))
         license_trust = _license_trust(str(item.get("source") or "unknown"), item)
         reputation = _clamp(
-            (0.35 * avg_quality)
-            + (0.18 * security_coverage)
-            + (0.12 * code_coverage)
+            (0.42 * avg_quality)
+            + (0.20 * security_coverage)
+            + (0.14 * code_coverage)
             + (0.10 * task_coverage)
-            + (0.10 * review_approval_rate)
-            + (0.08 * license_trust)
-            + (0.07 * benchmark_feedback_score)
-            - (0.15 * contamination_rate_global)
-            - (0.10 * duplicate_rate_global)
+            + (0.06 * review_approval_rate)
+            + (0.05 * license_trust)
+            + (0.03 * benchmark_feedback_score)
+            - (0.20 * contamination_rate_global)
+            - (0.16 * duplicate_rate_global)
         )
         reasons: list[str] = []
-        if avg_quality < 0.55:
+        if avg_quality < 0.60:
             reasons.append("low_average_quality")
-        if security_coverage < 0.10:
+        if security_coverage < 0.12:
             reasons.append("low_security_coverage")
+        if code_coverage < 0.08:
+            reasons.append("low_code_coverage")
         if contamination_rate_global > 0:
             reasons.append("contamination_seen_in_run")
-        if duplicate_rate_global > 0.20:
+        if duplicate_rate_global > 0.15:
             reasons.append("high_duplicate_pressure")
-        action = "promote" if reputation >= 0.78 else "watch" if reputation >= 0.58 else "throttle" if reputation >= 0.40 else "block"
+        action = "promote" if reputation >= 0.82 else "watch" if reputation >= 0.64 else "throttle" if reputation >= 0.46 else "block"
         scores.append(
             SourceReputationScore(
                 source=str(item.get("source") or "unknown"),

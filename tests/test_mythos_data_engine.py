@@ -38,6 +38,7 @@ from src.mythos.learning.contamination import ContaminationDetector
 from src.mythos.learning.quality import iter_jsonl
 from src.mythos.learning.quality import DatasetQualityGate
 from src.mythos.learning.task_extraction import extract_tasks
+from src.mythos.learning.training_data_gate import TrainingDataGateConfig, apply_training_data_gate
 from src.mythos.evaluation.benchmarks import built_in_security_tasks
 
 
@@ -394,6 +395,79 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             tasks = list(iter_jsonl(root / "tasks.jsonl"))
             self.assertTrue(all(task["success_criteria"] for task in tasks))
             self.assertTrue(all(task["negative_constraints"] for task in tasks))
+            self.assertTrue(any(task["metadata"]["training_priority"] == "critical" for task in tasks))
+
+    def test_training_data_gate_promotes_high_signal_rows_and_separates_review_holdout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clean = root / "clean.jsonl"
+            rows = [
+                {
+                    "source": "trusted-security",
+                    "license": "mit",
+                    "text": "diff --git a/app.py b/app.py\n+ def safe_query(cursor, value):\n+     return cursor.execute('select * from t where id=?', [value])\n",
+                    "quality": {
+                        "quality_score": 0.9,
+                        "labels": ["defensive_security", "code", "patch", "tests"],
+                        "data_type": "patch",
+                        "content_hash": "patch-row",
+                    },
+                },
+                {
+                    "source": "weak-docs",
+                    "license": "mit",
+                    "text": "cookie policy privacy policy table of contents subscribe to newsletter " * 20,
+                    "quality": {
+                        "quality_score": 0.45,
+                        "labels": [],
+                        "data_type": "documentation",
+                        "risk_flags": ["navigation_or_boilerplate_noise"],
+                        "content_hash": "noise-row",
+                    },
+                },
+                {
+                    "source": "trusted-security",
+                    "license": "mit",
+                    "text": "CWE-89 defensive SQL injection analysis with parameterized query guidance.",
+                    "quality": {
+                        "quality_score": 0.66,
+                        "labels": ["defensive_security"],
+                        "data_type": "security_reference",
+                        "risk_flags": ["navigation_or_boilerplate_noise"],
+                        "content_hash": "review-row",
+                    },
+                },
+            ]
+            clean.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            reputation = root / "reputation.json"
+            reputation.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {"source": "trusted-security", "reputation_score": 0.9},
+                            {"source": "weak-docs", "reputation_score": 0.3},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = apply_training_data_gate(
+                input_paths=[clean],
+                promoted_path=root / "promoted.jsonl",
+                holdout_path=root / "holdout.jsonl",
+                review_queue_path=root / "review.jsonl",
+                decisions_path=root / "decisions.jsonl",
+                reputation_report_path=reputation,
+                config=TrainingDataGateConfig(eval_holdout_fraction=0.0, min_quality_score=0.7),
+            )
+
+            self.assertEqual(report.promoted, 1)
+            self.assertEqual(report.review_queue, 1)
+            self.assertEqual(report.rejected, 1)
+            promoted = list(iter_jsonl(root / "promoted.jsonl"))
+            self.assertEqual(promoted[0]["train_policy"], "train")
+            self.assertIn("patch_or_debug_trace", promoted[0]["training_gate"]["priority_labels"])
 
     def test_builtin_benchmark_suite_is_broader_than_smoke_static_checks(self) -> None:
         tasks = built_in_security_tasks()
@@ -557,6 +631,8 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
                 train_device="cpu",
                 train_batch_size=1,
                 dtype="fp32",
+                min_training_quality_score=0.45,
+                min_source_reputation_score=0.30,
                 object_store_uri=f"local://{root / 'object-store'}",
             )
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://example.org") as client:
@@ -585,6 +661,8 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(report.source_reputation_report["sources"])
             self.assertIsNotNone(report.source_budget_plan)
             self.assertTrue(report.source_budget_plan["budgets"])
+            self.assertIsNotNone(report.training_data_gate_report)
+            self.assertGreaterEqual(report.training_data_gate_report["promoted"], 1)
             self.assertIsNotNone(report.source_balance_report)
             self.assertTrue(report.training_files)
             self.assertTrue(Path(report.version_manifest_path).exists())

@@ -22,11 +22,17 @@ ERROR_RE = re.compile(
 SECURITY_CATEGORIES = {
     "buffer_overflow": ("buffer overflow", "strcpy", "memcpy", "out-of-bounds", "cwe-120", "cwe-787"),
     "command_injection": ("command injection", "shell=true", "os.system", "subprocess", "cwe-78"),
+    "dependency_confusion": ("dependency confusion", "typosquatting", "package takeover", "malicious package"),
     "deserialization": ("deserialization", "pickle.loads", "yaml.load", "objectinputstream", "cwe-502"),
     "hardcoded_secret": ("hardcoded secret", "api_key", "secret", "password =", "cwe-798"),
+    "insecure_auth_session": ("session fixation", "jwt none", "missing authorization", "broken access control", "cwe-287", "cwe-862"),
+    "insecure_solidity": ("reentrancy", "unchecked call", "tx.origin", "integer overflow", "solidity"),
     "path_traversal": ("path traversal", "../", "cwe-22"),
+    "prototype_pollution": ("prototype pollution", "__proto__", "constructor.prototype"),
+    "race_condition": ("race condition", "time-of-check", "time of check", "toctou", "cwe-362"),
     "sql_injection": ("sql injection", "select * from", "cursor.execute", "cwe-89"),
     "ssrf": ("ssrf", "server-side request forgery", "cwe-918"),
+    "supply_chain": ("slsa", "scorecard", "sigstore", "provenance", "software supply chain"),
     "weak_crypto": ("md5", "sha1", "weak crypto", "insecure random", "cwe-327"),
     "xss": ("cross-site scripting", "xss", "innerhtml", "cwe-79"),
 }
@@ -101,6 +107,12 @@ def _task(
 ) -> ExtractedTask:
     digest = stable_hash(task_type + "\n" + prompt)
     quality = row.get("quality", {})
+    data_type = str(quality.get("data_type") or "")
+    priority = "normal"
+    if task_type in {"security_patch_generation", "security_vulnerability_identification"}:
+        priority = "high"
+    if data_type in {"patch", "security_advisory", "security_reference", "debug_trace"}:
+        priority = "critical"
     return ExtractedTask(
         task_id=f"task-{digest[:16]}",
         task_type=task_type,
@@ -114,7 +126,8 @@ def _task(
             "license": row.get("license"),
             "content_hash": row.get("content_hash") or quality.get("content_hash"),
             "quality_score": quality.get("quality_score"),
-            "data_type": quality.get("data_type"),
+            "data_type": data_type,
+            "training_priority": priority,
             **metadata,
         },
     )
@@ -277,7 +290,7 @@ def _tasks_from_row(row: dict[str, Any]) -> list[ExtractedTask]:
 
     if security_signal:
         tasks.append(_security_finding_task(row, text, language))
-    if patch_signal or security_signal and code_candidates:
+    if patch_signal or quality.get("data_type") == "patch" or security_signal and code_candidates:
         tasks.append(_patch_generation_task(row, text, language, code_candidates[0][0] if code_candidates else None))
     if ERROR_RE.search(text):
         tasks.append(_debugging_task(row, text, language))

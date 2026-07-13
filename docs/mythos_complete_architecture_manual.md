@@ -2211,6 +2211,78 @@ Command:
 docker compose --env-file deploy/prod/.env.example -f deploy/prod/docker-compose.yml --profile monitoring up
 ```
 
+## Strict Training Data Quality Gate
+
+The data pipeline now has a promotion gate between deduplication/source
+reputation and tokenizer/shard construction. Its purpose is to keep weak
+internet text out of scratch pretraining and to preserve high-value rows for
+review instead of silently discarding them.
+
+Pipeline order:
+
+1. Crawl approved sources.
+2. Apply license filtering.
+3. Remove benchmark contamination.
+4. Remove exact and near duplicates.
+5. Scan contamination patterns.
+6. Inspect quality and source quality.
+7. Extract security/coding tasks and automated review decisions.
+8. Score source reputation and allocate future source budgets.
+9. Promote rows through `training_data_gate.py`.
+10. Balance sources, train tokenizer, build shards, and train/evaluate.
+
+The gate writes:
+
+- `gated/training-promoted.jsonl`: rows allowed into training.
+- `gated/eval-holdout.jsonl`: promoted rows reserved for local validation.
+- `gated/human-review-queue.jsonl`: high-value rows that need review.
+- `reports/training_data_gate_decisions.jsonl`: one decision per scanned row.
+- `reports/training_data_gate_report.json`: aggregate promotion/rejection
+  report.
+
+Gate scoring uses:
+
+- Row quality score.
+- Source reputation score.
+- Patch/debug/security priority labels.
+- Boilerplate and repeated-line risk flags.
+- Holdout sampling controlled by `--eval-holdout-fraction`.
+
+Default thresholds:
+
+- `--min-training-quality-score 0.58`
+- `--min-source-reputation-score 0.45`
+- `--eval-holdout-fraction 0.02`
+
+For Kaggle smoke runs on small/noisy public data, start with:
+
+```bash
+python deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.ultimate.json \
+  --work-dir artifacts/mythos/real-data-5k-quality-gated \
+  --target-records 5000 \
+  --max-docs 12000 \
+  --steps 1000 \
+  --sequence-length 128 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 8 \
+  --validation-interval 100 \
+  --early-stopping-patience 8 \
+  --min-training-quality-score 0.55 \
+  --min-source-reputation-score 0.40 \
+  --max-source-fraction 0.30 \
+  --progress-every-steps 25
+```
+
+For production dataset builds, use stricter defaults and inspect the gate
+report before accepting a dataset version. A serious run should have:
+
+- High promoted count.
+- Low boilerplate rejection after source allowlist tuning.
+- Non-empty human review queue for high-value security rows.
+- Eval holdout separated from training.
+- Source mix controlled by `config/mix_ratios.json`.
+
 ## Verification Commands
 
 Use these after major changes:
