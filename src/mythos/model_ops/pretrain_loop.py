@@ -11,7 +11,7 @@ from typing import Any
 from src.mythos.model_ops.data_loader import TokenShardStream, count_batches, load_manifest
 from src.mythos.model_ops.foundation import CheckpointManifest
 from src.mythos.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer, read_uint32_tokens
-from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, require_torch, tiny_smoke_config
+from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, model_profile, require_torch, tiny_smoke_config
 from src.mythos.shared.progress import NullProgressReporter, ProgressReporter
 
 try:
@@ -125,8 +125,15 @@ def tokenizer_vocab_size(tokenizer_path: str | Path) -> int:
     return int(load_tokenizer(tokenizer_path).get_vocab_size(with_added_tokens=True))
 
 
-def build_training_config(active_manifest: ShardManifest, *, sequence_length: int) -> ScratchDecoderConfig:
-    base = tiny_smoke_config()
+def build_training_config(
+    active_manifest: ShardManifest,
+    *,
+    sequence_length: int,
+    model_profile_name: str = "tiny",
+    attention_impl: str = "auto",
+    gradient_checkpointing: bool = False,
+) -> ScratchDecoderConfig:
+    base = model_profile(model_profile_name) if model_profile_name != "tiny" else tiny_smoke_config()
     vocab_size = base.vocab_size
     tokenizer_path = Path(active_manifest.tokenizer_path)
     if tokenizer_path.exists():
@@ -138,6 +145,8 @@ def build_training_config(active_manifest: ShardManifest, *, sequence_length: in
         update={
             "vocab_size": vocab_size,
             "max_sequence_length": max(base.max_sequence_length, sequence_length),
+            "attention_impl": attention_impl,
+            "gradient_checkpointing": gradient_checkpointing or base.gradient_checkpointing,
         }
     )
 
@@ -187,6 +196,9 @@ def run_pretraining_loop(
     resume: bool = True,
     progress: ProgressReporter | None = None,
     progress_every_steps: int = 25,
+    model_profile_name: str = "tiny",
+    attention_impl: str = "auto",
+    gradient_checkpointing: bool = False,
 ) -> dict[str, Any]:
     require_torch()
     if steps < 1:
@@ -216,7 +228,13 @@ def run_pretraining_loop(
     else:
         raise ValueError("provide --manifest, or both --token-file and --tokenizer-path")
 
-    config = build_training_config(active_manifest, sequence_length=sequence_length)
+    config = build_training_config(
+        active_manifest,
+        sequence_length=sequence_length,
+        model_profile_name=model_profile_name,
+        attention_impl=attention_impl,
+        gradient_checkpointing=gradient_checkpointing,
+    )
     available_batches = validate_training_shards(
         train_shards=active_manifest.train_shards,
         sequence_length=sequence_length,
@@ -251,6 +269,8 @@ def run_pretraining_loop(
     )
 
     model = MythosDecoderLM(config).to(selected)
+    if config.gradient_checkpointing:
+        model.enable_gradient_checkpointing()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.1)
     start_step = 0
     trained_tokens = 0
@@ -281,13 +301,17 @@ def run_pretraining_loop(
                 output = model(input_ids, labels=input_ids)
                 if output.loss is None:
                     raise RuntimeError("loss missing")
+                if not torch.isfinite(output.loss.detach()):
+                    raise FloatingPointError(f"non-finite training loss at step {current_step + 1}: {float(output.loss.detach().cpu())}")
                 loss = output.loss / gradient_accumulation_steps
             loss.backward()
             progressed = True
             if (current_step + 1) % gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            else:
+                grad_norm = torch.tensor(0.0)
             current_step += 1
             trained_tokens += batch_size * sequence_length
             train_losses.append(float(output.loss.detach().cpu()))
@@ -298,6 +322,7 @@ def run_pretraining_loop(
                     step=current_step,
                     requested_steps=steps,
                     loss=round(train_losses[-1], 6),
+                    grad_norm=round(float(grad_norm.detach().cpu()), 6),
                     trained_tokens=trained_tokens,
                     epoch=epoch,
                 )
@@ -418,6 +443,8 @@ def run_pretraining_loop(
         "early_stopped": early_stopped,
         "early_stop_reason": early_stop_reason,
         "model_config": config.model_dump(),
+        "model_profile_name": model_profile_name,
+        "attention_impl": attention_impl,
         "train_losses": train_losses,
         "validation_losses": val_losses,
         "best_validation_loss": best_val_loss,
@@ -461,6 +488,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--model-profile", default="tiny", choices=["tiny", "1b", "7b", "32b", "62b"])
+    parser.add_argument("--attention-impl", default="auto", choices=["auto", "sdpa", "eager"])
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     return parser.parse_args()
 
 
@@ -484,6 +514,9 @@ def main() -> None:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         resume=not args.no_resume,
+        model_profile_name=args.model_profile,
+        attention_impl=args.attention_impl,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

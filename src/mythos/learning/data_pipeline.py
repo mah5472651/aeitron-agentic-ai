@@ -71,6 +71,9 @@ class DataPipelineConfig(StrictModel):
     train_batch_size: int = Field(default=2, ge=1)
     gradient_accumulation_steps: int = Field(default=1, ge=1)
     dtype: str = "bf16"
+    model_profile_name: str = "tiny"
+    attention_impl: str = "auto"
+    gradient_checkpointing: bool = False
     validate_every: int = Field(default=25, ge=0)
     validation_batches: int = Field(default=4, ge=1)
     run_checkpoint_eval: bool = True
@@ -521,6 +524,9 @@ async def _run_data_pipeline_locked(
             sequence_length=config.sequence_length,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             dtype=config.dtype,
+            model_profile_name=config.model_profile_name,
+            attention_impl=config.attention_impl,
+            gradient_checkpointing=config.gradient_checkpointing,
             checkpoint_every=max(1, config.train_steps),
             validate_every=config.validate_every,
             validation_batches=config.validation_batches,
@@ -734,6 +740,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--model-profile", default="tiny", choices=["tiny", "1b", "7b", "32b", "62b"])
+    parser.add_argument("--attention-impl", default="auto", choices=["auto", "sdpa", "eager"])
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--validate-every", type=int, default=25)
     parser.add_argument("--validation-batches", type=int, default=4)
     parser.add_argument("--no-checkpoint-eval", action="store_true")
@@ -794,6 +803,9 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         dtype=args.dtype,
+        model_profile_name=args.model_profile,
+        attention_impl=args.attention_impl,
+        gradient_checkpointing=args.gradient_checkpointing,
         validate_every=args.validate_every,
         validation_batches=args.validation_batches,
         run_checkpoint_eval=not args.no_checkpoint_eval,

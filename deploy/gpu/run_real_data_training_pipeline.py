@@ -47,6 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="fp16")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cuda")
+    parser.add_argument("--model-profile", default="tiny", choices=["tiny", "1b", "7b", "32b", "62b"])
+    parser.add_argument("--attention-impl", default="auto", choices=["auto", "sdpa", "eager"])
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--validate-every", "--validation-interval", dest="validate_every", type=int, default=25)
     parser.add_argument("--validation-batches", type=int, default=4)
     parser.add_argument("--early-stopping-patience", type=int, default=8)
@@ -102,6 +105,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             train_batch_size=args.train_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             dtype=args.dtype,
+            model_profile_name=args.model_profile,
+            attention_impl=args.attention_impl,
+            gradient_checkpointing=args.gradient_checkpointing,
             validate_every=min(args.validate_every, args.train_steps) if args.validate_every > 0 else 0,
             validation_batches=args.validation_batches,
             early_stopping_patience=args.early_stopping_patience,

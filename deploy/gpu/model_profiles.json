@@ -22,6 +22,21 @@
     "training_policy": "scratch pretraining only"
   },
   {
+    "name": "mythos-62b-scratch",
+    "family": "mythos_decoder",
+    "model_path": "artifacts/mythos/checkpoints/mythos-62b",
+    "size_class": "62B",
+    "role": "long-context coding/security production target before 70B",
+    "recommended_tp_size": 4,
+    "recommended_pipeline_parallel_size": 2,
+    "recommended_zero_stage": 3,
+    "max_model_len": 262144,
+    "bf16_inference_vram_gb": 144,
+    "training_policy": "scratch pretraining only",
+    "attention_impl": "sdpa_or_flash",
+    "requires_cluster_validation": true
+  },
+  {
     "name": "mythos-70b-scratch",
     "family": "mythos_decoder",
     "model_path": "artifacts/mythos/checkpoints/mythos-70b",

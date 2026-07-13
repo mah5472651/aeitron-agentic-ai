@@ -2472,6 +2472,72 @@ Current benchmark pack validates local suite adapters and static expected-term
 contracts. Full model-generation benchmark scoring requires connecting the
 trained Mythos checkpoint generation runner to these suites.
 
+## Transformer Core
+
+Module:
+
+- `src/mythos/model_ops/torch_decoder.py`
+
+Current implemented transformer capabilities:
+
+- Decoder-only scratch LM.
+- RMSNorm.
+- SwiGLU MLP.
+- RoPE with scaling factor.
+- Grouped-query attention.
+- PyTorch SDPA attention path. On supported CUDA/PyTorch builds this can use
+  FlashAttention or memory-efficient kernels through PyTorch's SDPA dispatcher.
+- Eager attention fallback for portability and debugging.
+- Optional sliding-window attention mask through `attention_window`.
+- KV-cache inference with `past_key_values`.
+- Greedy/top-k sampling generation API.
+- Gradient checkpointing support.
+- Logit soft-cap option.
+- Finite-loss and finite-gradient checks in pretraining.
+- Export directory with `model.pt`, `config.json`, and serving compatibility
+  metadata.
+- Shape-valid scratch profiles: `tiny`, `1b`, `7b`, `32b`, `62b`.
+
+Important boundary:
+
+- The code supports large-profile construction and cluster-oriented training
+  flags.
+- Actual 62B training, DeepSpeed/Megatron/FSDP scaling, vLLM/TensorRT serving,
+  and 10k+ step multi-GPU validation still require real Linux CUDA cluster
+  hardware. Do not mark those as production-proven until cluster release gates
+  have run.
+
+Tiny transformer smoke:
+
+```powershell
+python -m unittest tests.test_mythos_scratch_decoder
+```
+
+Pretraining loop with memory-efficient settings:
+
+```bash
+python -m src.mythos.model_ops.pretrain_loop \
+  --manifest artifacts/mythos/real-tokenizer-v1/shards/manifest.json \
+  --output-dir artifacts/mythos/pretrain-eager-gc \
+  --device cuda \
+  --dtype fp16 \
+  --model-profile tiny \
+  --attention-impl auto \
+  --gradient-checkpointing \
+  --steps 1000 \
+  --batch-size 2 \
+  --sequence-length 128 \
+  --gradient-accumulation-steps 8
+```
+
+62B config dry contract:
+
+```python
+from src.mythos.model_ops.torch_decoder import model_profile
+profile = model_profile("62b")
+print(profile.parameter_estimate(), profile.model_dump())
+```
+
 ## Verification Commands
 
 Use these after major changes:

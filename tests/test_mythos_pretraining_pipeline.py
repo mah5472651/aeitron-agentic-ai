@@ -277,6 +277,40 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             self.assertEqual(report["status"], "passed")
             self.assertGreaterEqual(report["model_config"]["vocab_size"], 3001)
 
+    def test_pretrain_loop_accepts_attention_and_checkpointing_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            corpus.write_text(json.dumps({"text": "def secure(value): return validate(value) " * 80, "license": "mit"}) + "\n", encoding="utf-8")
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            build_token_shards(
+                input_paths=[corpus],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "shards",
+                config=ShardBuildConfig(shard_token_count=128, sequence_length=16, validation_fraction=0.0),
+            )
+            report = run_pretraining_loop(
+                output_dir=root / "train",
+                manifest=root / "shards" / "manifest.json",
+                device="cpu",
+                steps=1,
+                batch_size=1,
+                sequence_length=16,
+                dtype="fp32",
+                validate_every=0,
+                checkpoint_every=0,
+                resume=False,
+                attention_impl="eager",
+                gradient_checkpointing=True,
+            )
+            self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["attention_impl"], "eager")
+            self.assertTrue(report["model_config"]["gradient_checkpointing"])
+
     def test_checkpoint_comparison_writes_reports(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
