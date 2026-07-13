@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +19,125 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.mythos.learning.data_pipeline import DataPipelineConfig, run_data_pipeline  # noqa: E402
+
+
+def _read_json(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _read_recent_progress(path: Path, *, limit: int = 80) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, object]] = []
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                rows.append(json.loads(stripped))
+            except json.JSONDecodeError:
+                continue
+    return rows[-limit:]
+
+
+def _append_progress_blocked(progress_path: str, reason: str) -> None:
+    path = Path(progress_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ts_unix": time.time(),
+        "stage": "run",
+        "status": "blocked",
+        "block_reason": reason,
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _partial_report_state(output_dir: str, progress_path: str) -> dict[str, object]:
+    reports = Path(output_dir) / "reports"
+    report_files = {
+        "license_filter_report": reports / "license_filter_report.json",
+        "benchmark_contamination_filter_report": reports / "benchmark_contamination_filter_report.json",
+        "near_dedup_report": reports / "near_dedup_report.json",
+        "contamination_report": reports / "contamination_report.json",
+        "quality_report": reports / "quality_report.json",
+        "task_report": reports / "task_extraction_report.json",
+        "review_report": reports / "task_review_report.json",
+        "source_reputation_report": reports / "source_reputation_report.json",
+        "source_budget_plan": reports / "source_budget_plan.json",
+        "training_data_gate_report": reports / "training_data_gate_report.json",
+        "source_balance_report": reports / "source_balance_report.json",
+        "training_quality_report": reports / "training_quality_report.json",
+    }
+    return {
+        key: value
+        for key, value in {name: _read_json(path) for name, path in report_files.items()}.items()
+        if value
+    } | {"recent_progress": _read_recent_progress(Path(progress_path))}
+
+
+def _write_run_report(output_dir: str, payload: dict[str, object]) -> None:
+    report_dir = Path(output_dir, "reports")
+    report_dir.mkdir(parents=True, exist_ok=True)
+    Path(report_dir, "real_data_training_report.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _blocked_payload(args: argparse.Namespace, *, progress_path: str, reason: str) -> dict[str, object]:
+    _append_progress_blocked(progress_path, reason)
+    recommendation = (
+        "Strict production gates stayed closed. Increase --max-docs/source yield for production, "
+        "or rerun validation intentionally with --kaggle-validation."
+    )
+    payload: dict[str, object] = {
+        "status": "blocked",
+        "dataset_id": args.dataset_id,
+        "work_dir": args.output_dir,
+        "block_reason": reason,
+        "progress_path": progress_path,
+        "validation_profile": "kaggle" if args.kaggle_validation else "custom",
+        "thresholds": {
+            "min_clean_records": args.min_clean_records,
+            "min_training_rows": args.min_training_rows,
+            "min_train_tokens": args.min_train_tokens,
+            "min_training_quality_score": args.min_training_quality_score,
+            "min_training_average_quality_score": args.min_training_average_quality_score,
+            "min_source_reputation_score": args.min_source_reputation_score,
+            "max_source_fraction": args.max_source_fraction,
+        },
+        "recommendation": recommendation,
+        "next_commands": {
+            "inspect": f"python deploy/gpu/inspect_real_data_run.py --work-dir {Path(args.output_dir).as_posix()}",
+            "kaggle_validation_retry": (
+                "PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py "
+                f"--sources {args.sources} --work-dir {Path(args.output_dir).as_posix()} "
+                "--kaggle-validation --progress-to-stdout"
+            ),
+        },
+    }
+    payload.update(_partial_report_state(args.output_dir, progress_path))
+    _write_run_report(args.output_dir, payload)
+    return payload
+
+
+def apply_kaggle_validation_profile(args: argparse.Namespace) -> argparse.Namespace:
+    if not args.kaggle_validation:
+        return args
+    if args.production:
+        raise ValueError("--kaggle-validation cannot be combined with --production")
+    args.min_clean_records = min(args.min_clean_records, 800)
+    args.min_training_rows = min(args.min_training_rows, 800)
+    args.min_train_tokens = min(args.min_train_tokens, 100_000)
+    args.max_docs = max(args.max_docs, 16_000)
+    args.max_bytes_per_doc = min(args.max_bytes_per_doc, 250_000)
+    args.workers = min(args.workers, 6)
+    args.progress_to_stdout = True
+    return args
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,7 +194,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-every-steps", type=int, default=10)
     parser.add_argument("--production", action="store_true", help="Enable strict production data/training validation.")
     parser.add_argument("--dev-smoke", action="store_true", help="Explicitly allow tiny/dev smoke behavior under production validation.")
-    return parser.parse_args()
+    parser.add_argument("--kaggle-validation", action="store_true", help="Use explicit Kaggle-safe validation thresholds; not for production.")
+    args = parser.parse_args()
+    try:
+        return apply_kaggle_validation_profile(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 def clean_record_count(report: dict[str, object]) -> int:
@@ -141,23 +266,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             )
         )
     except RuntimeError as exc:
-        payload = {
-            "status": "blocked",
-            "dataset_id": args.dataset_id,
-            "work_dir": args.output_dir,
-            "block_reason": str(exc),
-            "progress_path": progress_path,
-            "recommendation": (
-                "Inspect progress.jsonl and reports. For strict runs, increase --max-docs or approved source yield. "
-                "For Kaggle validation-only runs, lower --min-training-rows and --min-train-tokens explicitly."
-            ),
-        }
-        Path(args.output_dir, "reports").mkdir(parents=True, exist_ok=True)
-        Path(args.output_dir, "reports", "real_data_training_report.json").write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        return payload
+        return _blocked_payload(args, progress_path=progress_path, reason=str(exc))
     payload = report.model_dump()
     accepted = clean_record_count(payload)
     if accepted < args.min_clean_records:
@@ -166,19 +275,20 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             f"accepted clean records {accepted} below required minimum {args.min_clean_records}; "
             "add approved sources, increase --max-docs, or lower --min-clean-records for a smoke run"
         )
-        Path(args.output_dir, "reports").mkdir(parents=True, exist_ok=True)
-        Path(args.output_dir, "reports", "real_data_training_report.json").write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        payload["validation_profile"] = "kaggle" if args.kaggle_validation else "custom"
+        payload["next_commands"] = {
+            "inspect": f"python deploy/gpu/inspect_real_data_run.py --work-dir {Path(args.output_dir).as_posix()}",
+            "kaggle_validation_retry": (
+                "PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py "
+                f"--sources {args.sources} --work-dir {Path(args.output_dir).as_posix()} "
+                "--kaggle-validation --progress-to-stdout"
+            ),
+        }
+        _write_run_report(args.output_dir, payload)
         return payload
     payload["status"] = "complete"
     payload["accepted_clean_records"] = accepted
-    Path(args.output_dir, "reports").mkdir(parents=True, exist_ok=True)
-    Path(args.output_dir, "reports", "real_data_training_report.json").write_text(
-        json.dumps(payload, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    _write_run_report(args.output_dir, payload)
     return payload
 
 
@@ -198,6 +308,7 @@ def main() -> None:
                 "min_training_quality_score": args.min_training_quality_score,
                 "min_training_average_quality_score": args.min_training_average_quality_score,
                 "min_train_tokens": args.min_train_tokens,
+                "validation_profile": "kaggle" if args.kaggle_validation else "custom",
             },
             sort_keys=True,
         ),

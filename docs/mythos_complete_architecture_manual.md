@@ -2089,6 +2089,25 @@ PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
 tail -n 80 artifacts/aeitron/kaggle-real-data-smoke/progress.jsonl
 ```
 
+Kaggle validation preset:
+
+```bash
+%%bash
+cd /kaggle/working/aeitron-agentic-ai
+PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.ultimate.json \
+  --work-dir artifacts/aeitron/real-data-validation-v1 \
+  --kaggle-validation \
+  --steps 1000 \
+  --sequence-length 128 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 8 \
+  --validation-interval 100 \
+  --validation-batches 4 \
+  --early-stopping-patience 5 \
+  --progress-to-stdout
+```
+
 Kaggle notebooks may buffer `%%bash` output until the process exits. For real
 live progress, run the job in the background and tail the progress file in a
 second cell.

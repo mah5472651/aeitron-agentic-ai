@@ -196,6 +196,24 @@ Watch the file from another Kaggle cell:
 tail -n 80 artifacts/aeitron/kaggle-real-data-smoke/progress.jsonl
 ```
 
+Kaggle validation preset, designed to prove the full data -> tokenizer -> shard
+-> GPU train -> eval path without pretending to be production scale:
+
+```bash
+PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.ultimate.json \
+  --work-dir artifacts/aeitron/real-data-validation-v1 \
+  --kaggle-validation \
+  --steps 1000 \
+  --sequence-length 128 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 8 \
+  --validation-interval 100 \
+  --validation-batches 4 \
+  --early-stopping-patience 5 \
+  --progress-to-stdout
+```
+
 Strict 10k-step real-data validation:
 
 ```bash
