@@ -39,6 +39,7 @@ from src.mythos.learning.quality import iter_jsonl
 from src.mythos.learning.quality import DatasetQualityGate
 from src.mythos.learning.task_extraction import extract_tasks
 from src.mythos.learning.training_data_gate import TrainingDataGateConfig, apply_training_data_gate
+from src.mythos.learning.verified_patch_dataset import build_verified_patch_dataset
 from src.mythos.evaluation.benchmarks import built_in_security_tasks
 
 
@@ -338,6 +339,38 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(report.extracted, 1)
             tasks = list(iter_jsonl(Path(temp_dir) / "patches.jsonl"))
             self.assertIn("security validation fix", tasks[0]["subject"])
+
+    def test_verified_patch_dataset_checks_patch_applies_to_parent(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git executable is not available")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.org"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Mythos Test"], check=True)
+            (repo / "app.py").write_text(
+                "def find_user(cursor, name):\n    return cursor.execute('select * from users where name=' + name)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+            (repo / "app.py").write_text(
+                "def find_user(cursor, name):\n    return cursor.execute('select * from users where name=?', [name])\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "security fix sql injection validation"], check=True, capture_output=True)
+            report = build_verified_patch_dataset(
+                repo_paths=[repo],
+                output_path=Path(temp_dir) / "verified_patches.jsonl",
+                license_name="mit",
+                max_commits_per_repo=10,
+            )
+            self.assertEqual(report.extracted, 1)
+            rows = list(iter_jsonl(Path(temp_dir) / "verified_patches.jsonl"))
+            self.assertEqual(rows[0]["verification"]["status"], "passed")
+            self.assertIn("<|patch_start|>", rows[0]["chosen"])
 
     def test_quality_gate_scores_security_code_with_components(self) -> None:
         gate = DatasetQualityGate()

@@ -11,6 +11,7 @@ from src.mythos.learning.web_ingest import allowed_url, text_from_html
 from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
 from src.mythos.model_ops.pretrain_loop import run_pretraining_loop
 from src.mythos.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints
+from src.mythos.model_ops.real_corpus_tokenizer import RealCorpusTokenizerConfig, train_real_corpus_tokenizer
 from src.mythos.model_ops.tokenizer_pipeline import (
     ShardBuildConfig,
     ShardManifest,
@@ -91,6 +92,34 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             )
             self.assertEqual(eval_report.status, "passed")
             self.assertTrue(Path(root / "checkpoint_eval" / "checkpoint_eval_report.json").exists())
+
+    def test_real_corpus_tokenizer_audits_special_tokens_and_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            corpus.write_text(
+                "\n".join(
+                    json.dumps({"text": "def secure_query(value):\n    return validate(value) 0x7ffd00ff <|compile_error|> " * 20})
+                    for _ in range(4)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = train_real_corpus_tokenizer(
+                RealCorpusTokenizerConfig(
+                    input_paths=[str(corpus)],
+                    output_dir=str(root / "tokenizer_run"),
+                    vocab_size=1200,
+                    min_frequency=1,
+                    shard_token_count=128,
+                    sequence_length=16,
+                    validation_fraction=0.0,
+                )
+            )
+            self.assertEqual(report.status, "passed")
+            self.assertFalse(report.special_tokens_missing)
+            self.assertTrue(Path(report.tokenizer_path).exists())
+            self.assertTrue(report.shard_manifest["train_shards"])
 
     def test_checkpoint_eval_reports_validation_interval_not_reached(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

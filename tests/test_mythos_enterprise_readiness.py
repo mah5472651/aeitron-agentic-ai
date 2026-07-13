@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from src.mythos.deployment.k8s_validate import validate_manifests
+from src.mythos.evaluation.benchmark_pack import BenchmarkPackConfig, run_benchmark_pack
 from src.mythos.evaluation.benchmark_suites import BenchmarkSuiteSpec, run_benchmark_suites
 from src.mythos.learning.dataset_validation import DatasetValidationConfig, validate_dataset
 from src.mythos.learning.source_balancing import balance_clean_jsonl
@@ -179,6 +180,34 @@ class MythosEnterpriseReadinessTest(unittest.TestCase):
             )
             self.assertEqual(report.status, "passed")
             self.assertEqual(report.aggregate_score, 1.0)
+
+    def test_benchmark_pack_runs_required_and_optional_local_suites(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            human = write_jsonl(
+                root / "human.jsonl",
+                [{"task_id": "h1", "prompt": "Write add", "canonical_solution": "def add(a,b): return a+b", "expected_terms": ["def"]}],
+            )
+            mbpp = write_jsonl(
+                root / "mbpp.jsonl",
+                [{"task_id": "m1", "prompt": "Reverse string", "code": "def reverse(s): return s[::-1]", "expected_terms": ["return"]}],
+            )
+            security = write_jsonl(
+                root / "security.jsonl",
+                [{"id": "s1", "code": "cursor.execute('select * from t where x=' + x)", "expected_findings": ["cursor.execute"]}],
+            )
+            report = run_benchmark_pack(
+                BenchmarkPackConfig(
+                    human_eval_path=str(human),
+                    mbpp_path=str(mbpp),
+                    cyberseceval_path=str(security),
+                    strict=True,
+                ),
+                output_dir=root / "bench",
+            )
+            self.assertEqual(report.status, "passed")
+            self.assertIn("humaneval", report.required_suites)
+            self.assertTrue((root / "bench" / "benchmark_pack_report.json").exists())
 
     def test_security_audit_detects_secret_and_can_pass_clean_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

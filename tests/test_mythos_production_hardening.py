@@ -17,6 +17,7 @@ from src.mythos.learning.capacity import CapacityPlanConfig, build_capacity_plan
 from src.mythos.memory import MemoryIngestRequest, UnifiedMemoryManager
 from src.mythos.patches import PatchVerifyRequest
 from src.mythos.patches.service import PatchService
+from src.mythos.patches.verified_loop import RepositoryPatchLoopRequest, run_repository_patch_loop
 from src.mythos.tools.sandbox import HardenedSandboxPolicy, SandboxRunRequest
 
 
@@ -71,6 +72,34 @@ class MythosProductionHardeningTest(unittest.TestCase):
                 self.assertEqual(response.verdict, "accept")
                 self.assertTrue(response.rolled_back)
                 self.assertIn("password == 'secret'", (workspace / "auth.py").read_text(encoding="utf-8"))
+
+    def test_repository_patch_loop_indexes_context_verifies_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:
+            workspace = Path(workspace_dir)
+            (workspace / "auth.py").write_text(
+                "def login_user(username, password):\n    return bool(username) and password == 'secret'\n",
+                encoding="utf-8",
+            )
+            report = run_repository_patch_loop(
+                RepositoryPatchLoopRequest(
+                    repo_path=str(workspace),
+                    goal="fix authentication validation",
+                    edits=[
+                        {
+                            "path": "auth.py",
+                            "new_content": "def login_user(username, password):\n    return bool(username) and bool(password)\n",
+                        }
+                    ],
+                    commands=[["python", "-c", "import auth; raise SystemExit(0 if auth.login_user('a','b') else 1)"]],
+                    store_path=str(Path(db_dir) / "loop.sqlite3"),
+                    apply_on_accept=False,
+                )
+            )
+            self.assertEqual(report.status, "passed")
+            self.assertEqual(report.verdict, "accept")
+            self.assertTrue(report.pre_patch_context["chunks"])
+            self.assertTrue(report.post_patch_context["chunks"])
+            self.assertIn("password == 'secret'", (workspace / "auth.py").read_text(encoding="utf-8"))
 
     def test_vector_capabilities_and_unified_memory_manager(self) -> None:
         capabilities = vector_capabilities()

@@ -19,11 +19,17 @@ from src.mythos.shared.schemas import StrictModel
 SPECIAL_TOKENS = [
     "<|thought_start|>",
     "<|thought_end|>",
+    "<|call_graph_root|>",
     "<|patch_start|>",
     "<|patch_end|>",
     "<|compile_error|>",
+    "<|exploit_success|>",
     "<|tool_call|>",
     "<|tool_result|>",
+    "<|heap_alloc|>",
+    "<|heap_free|>",
+    "<|stack_frame|>",
+    "<|memory_address|>",
 ]
 
 

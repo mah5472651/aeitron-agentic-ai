@@ -2339,6 +2339,138 @@ report before accepting a dataset version. A serious run should have:
 - Eval holdout separated from training.
 - Source mix controlled by `config/mix_ratios.json`.
 
+## Model Quality Build Blocks
+
+These modules are the current production path for improving actual model
+quality before large GPU training.
+
+### Strong Real-Corpus Tokenizer
+
+Module:
+
+- `src/mythos/model_ops/real_corpus_tokenizer.py`
+
+Purpose:
+
+- Train a code/security optimized BPE tokenizer on promoted real corpus rows.
+- Inject deterministic stress samples for indentation, hex dumps, compile
+  errors, memory markers, and Mythos control tokens.
+- Build token shards from the same corpus.
+- Write `tokenizer_audit_report.json` with special-token coverage, vocab size,
+  sample token counts, source row/character counts, and shard manifest.
+
+Command:
+
+```bash
+python -m src.mythos.model_ops.real_corpus_tokenizer \
+  --input artifacts/mythos/real-data-5k-quality-gated/gated/training-promoted.jsonl \
+  --output-dir artifacts/mythos/real-tokenizer-v1 \
+  --vocab-size 64000 \
+  --min-frequency 2 \
+  --shard-token-count 1000000 \
+  --sequence-length 128 \
+  --validation-fraction 0.02
+```
+
+### Verified Security Patch Dataset
+
+Module:
+
+- `src/mythos/learning/verified_patch_dataset.py`
+
+Purpose:
+
+- Read approved local Git repositories.
+- Find security-relevant commits.
+- Extract parent commit, patch, changed files, before/after snippets, and
+  vulnerability categories.
+- Verify the patch applies cleanly to the parent commit using `git apply
+  --check` in an isolated temporary clone.
+- Write SFT-ready JSONL records with `{prompt, chosen}` plus provenance and
+  verification metadata.
+
+Command:
+
+```bash
+python -m src.mythos.learning.verified_patch_dataset \
+  --repo /path/to/approved/permissive/repo \
+  --license mit \
+  --output artifacts/mythos/verified-patches/security_patches.jsonl \
+  --max-commits-per-repo 500
+```
+
+Only use repositories with approved licenses. This does not run exploit code or
+attack live targets.
+
+### Repository Indexing + Verified Patch Loop
+
+Module:
+
+- `src/mythos/patches/verified_loop.py`
+
+Purpose:
+
+- Index the repository.
+- Build pre-patch context with changed files pinned.
+- Preview/apply patch edits.
+- Run configured commands, secret scan, and optional Semgrep/CodeQL checks.
+- Reindex and build post-patch context.
+- Roll back by default unless `--apply-on-accept` is provided.
+
+Edits file format:
+
+```json
+{
+  "edits": [
+    {
+      "path": "src/auth.py",
+      "new_content": "def login(user, password):\n    return bool(user) and bool(password)\n"
+    }
+  ]
+}
+```
+
+Command:
+
+```bash
+python -m src.mythos.patches.verified_loop \
+  --repo /path/to/repo \
+  --goal "fix authentication validation" \
+  --edits-json artifacts/mythos/patch-edits.json \
+  --command "python -m pytest" \
+  --output artifacts/mythos/patch-loop/report.json
+```
+
+### Benchmark Pack
+
+Module:
+
+- `src/mythos/evaluation/benchmark_pack.py`
+
+Purpose:
+
+- Run local HumanEval-like, MBPP-like, SWE-Bench-like, CyberSecEval-like, and
+  Mythos-owned security suites through one strict report.
+- Required benchmark files fail if missing in strict mode.
+- Optional custom security suite is skipped if omitted.
+- Reports are explicit measured/skipped/failed states, never fake passes.
+
+Command:
+
+```bash
+python -m src.mythos.evaluation.benchmark_pack \
+  --human-eval data/eval/humaneval.jsonl \
+  --mbpp data/eval/mbpp.jsonl \
+  --swe-bench data/eval/swe_bench_style.jsonl \
+  --cyberseceval data/eval/cyberseceval_style.jsonl \
+  --custom-security data/eval/mythos_security.jsonl \
+  --output-dir artifacts/mythos/benchmark-pack
+```
+
+Current benchmark pack validates local suite adapters and static expected-term
+contracts. Full model-generation benchmark scoring requires connecting the
+trained Mythos checkpoint generation runner to these suites.
+
 ## Verification Commands
 
 Use these after major changes:
