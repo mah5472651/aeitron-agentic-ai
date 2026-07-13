@@ -11,7 +11,7 @@ from pydantic import Field
 
 from src.mythos.db import LocalStore
 from src.mythos.shared.schemas import StrictModel
-from src.mythos.tools import SecurityScanner, ToolExecuteRequest, ToolRuntime
+from src.mythos.tools import HardenedToolExecutor, SecurityScanner, ToolExecuteRequest
 from src.mythos.tools.runtime import project_root
 
 
@@ -62,7 +62,7 @@ class VerifierRuntime:
 
     def run(self, request: VerificationRequest) -> VerificationResponse:
         started = time.perf_counter()
-        tool = ToolRuntime(self.store)
+        tool = HardenedToolExecutor(self.store)
         test_results = []
         for command in request.commands:
             result = tool.execute(

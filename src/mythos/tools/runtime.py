@@ -1,9 +1,12 @@
-"""MVP tool runtime for bounded local command execution."""
+"""Compatibility tool runtime.
+
+New code should import :class:`src.mythos.tools.policy.HardenedToolExecutor`.
+This module keeps the historical public schemas stable and delegates execution
+to the hardened policy path.
+"""
 
 from __future__ import annotations
 
-import subprocess  # nosec B404
-import time
 import uuid
 from pathlib import Path
 
@@ -50,13 +53,6 @@ class ExecutionResult(ToolExecuteResponse):
     pass
 
 
-ALLOWED_TOOL_COMMANDS: dict[str, set[str]] = {
-    "git_diff": {"git"},
-    "test": {"python", "python.exe", "python3", "pytest", "pytest.exe", "npm", "npm.cmd", "node", "node.exe"},
-    "shell": {"python", "python.exe", "python3", "pytest", "pytest.exe", "git", "npm", "npm.cmd", "node", "node.exe"},
-}
-
-
 def project_root(store: LocalStore, project_id: str) -> Path:
     project = store.get_project(project_id)
     if project is None:
@@ -68,12 +64,9 @@ def project_root(store: LocalStore, project_id: str) -> Path:
 
 
 def validate_command_policy(request: ToolExecuteRequest) -> None:
-    executable = Path(request.command[0]).name.lower()
-    allowed = ALLOWED_TOOL_COMMANDS.get(request.tool, set())
-    if executable not in allowed:
-        raise ValueError(f"command {executable!r} is not allowed for tool {request.tool!r}")
-    if request.tool == "git_diff" and request.command[:2] != ["git", "diff"]:
-        raise ValueError("git_diff tool may only run: git diff")
+    from src.mythos.tools.policy import HardenedToolExecutor
+
+    HardenedToolExecutor().validate_tool_shape(request)
 
 
 class ToolRuntime:
@@ -81,42 +74,9 @@ class ToolRuntime:
         self.store = store or LocalStore()
 
     def execute(self, request: ToolExecuteRequest) -> ToolExecuteResponse:
-        root = project_root(self.store, request.project_id)
-        validate_command_policy(request)
-        started = time.perf_counter()
-        try:
-            completed = subprocess.run(  # nosec B603 - argv list, shell disabled. # nosemgrep: python.django.security.injection.command.subprocess-injection.subprocess-injection
-                request.command,
-                cwd=root,
-                capture_output=True,
-                text=True,
-                shell=False,
-                timeout=request.timeout_ms / 1000,
-                check=False,
-            )
-            return ToolExecuteResponse(
-                project_id=request.project_id,
-                run_id=request.run_id,
-                tool=request.tool,
-                status="ok" if completed.returncode == 0 else "failed",
-                stdout=completed.stdout[-20_000:],
-                stderr=completed.stderr[-20_000:],
-                exit_code=completed.returncode,
-                duration_ms=(time.perf_counter() - started) * 1000,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-            return ToolExecuteResponse(
-                project_id=request.project_id,
-                run_id=request.run_id,
-                tool=request.tool,
-                status="timeout",
-                stdout=stdout[-20_000:],
-                stderr=stderr[-20_000:],
-                exit_code=None,
-                duration_ms=(time.perf_counter() - started) * 1000,
-            )
+        from src.mythos.tools.policy import HardenedToolExecutor
+
+        return HardenedToolExecutor(self.store).execute(request)
 
 
 class SandboxEngine:

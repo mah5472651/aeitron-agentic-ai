@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   depends_on uuid[] NOT NULL DEFAULT '{}',
   input_json jsonb NOT NULL DEFAULT '{}',
   output_json jsonb NOT NULL DEFAULT '{}',
+  attempt integer NOT NULL DEFAULT 0,
+  max_attempts integer NOT NULL DEFAULT 2,
   error text,
   started_at timestamptz,
   finished_at timestamptz,

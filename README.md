@@ -3,7 +3,7 @@
 Aeitron is an AI coding-agent backend for repository understanding, code editing,
 patch verification, and model-agnostic serving.
 
-The final architecture lives under `src/Aeitron`. The old numbered
+The final architecture lives under `src/mythos`. The old numbered
 architecture has been removed.
 
 ## What Works Now
@@ -37,7 +37,7 @@ architecture has been removed.
 ## Repository Layout
 
 ```text
-src/Aeitron/
+src/mythos/
   agents/
   context/
   db/
@@ -520,5 +520,6 @@ $env:MYTHOS_REDIS_URL = "redis://redis:6379/0"
 
 ## Final Rule
 
-All new production code belongs under `src/Aeitron`.
+All new production code belongs under `src/mythos`.
+
 

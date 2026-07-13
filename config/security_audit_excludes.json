@@ -1,0 +1,16 @@
+{
+  "excludes": [
+    {
+      "path": "src/mythos/evaluation/benchmarks.py",
+      "reason": "Contains intentionally vulnerable benchmark fixture strings used by local security evaluation adapters.",
+      "risk_category": "benchmark_fixture",
+      "allow_executable_sinks": true
+    },
+    {
+      "path": "tools/codeql/python/tools/imp.py",
+      "reason": "Vendored CodeQL compatibility helper; scanned by upstream CodeQL distribution governance, not Aeitron runtime code.",
+      "risk_category": "vendored_external_tool",
+      "allow_executable_sinks": true
+    }
+  ]
+}

@@ -9,6 +9,8 @@ import re
 from collections import Counter
 from typing import Any, Literal, Protocol
 
+import httpx
+
 from pydantic import Field
 
 from src.mythos.db import LocalStore
@@ -26,6 +28,8 @@ class VectorBackendConfig(StrictModel):
     qdrant_collection: str = "mythos_code_chunks"
     postgres_dsn: str | None = None
     hnsw_space: str = "cosine"
+    embedding_url: str | None = None
+    embedding_model: str = "aeitron-code-embedding"
 
 
 class VectorIndexCapability(StrictModel):
@@ -60,6 +64,58 @@ class VectorIndexBackend(Protocol):
 
     def search(self, *, project_id: str, query: str, top_k: int = 12) -> VectorSearchReport:
         ...
+
+
+class EmbeddingProvider(Protocol):
+    dims: int
+
+    def embed(self, text: str) -> list[float]:
+        ...
+
+
+class LocalHashingEmbeddingProvider:
+    def __init__(self, *, dims: int = 384) -> None:
+        self.dims = dims
+
+    def embed(self, text: str) -> list[float]:
+        return hashed_embedding(text, dims=self.dims)
+
+
+class HttpEmbeddingProvider:
+    """Production embedding provider contract.
+
+    The endpoint must return either {"embedding": [...]} or OpenAI-style
+    {"data": [{"embedding": [...]}]}. Missing or malformed vectors fail fast.
+    """
+
+    def __init__(self, *, endpoint: str, model: str, dims: int) -> None:
+        self.endpoint = endpoint.rstrip("/")
+        self.model = model
+        self.dims = dims
+
+    def embed(self, text: str) -> list[float]:
+        response = httpx.post(
+            self.endpoint,
+            json={"model": self.model, "input": text},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        vector = payload.get("embedding")
+        if vector is None and payload.get("data"):
+            vector = payload["data"][0].get("embedding")
+        if not isinstance(vector, list) or len(vector) != self.dims:
+            raise RuntimeError(f"embedding provider returned invalid vector dimensions; expected {self.dims}")
+        return [float(item) for item in vector]
+
+
+def create_embedding_provider(config: VectorBackendConfig, *, allow_local_hashing: bool) -> EmbeddingProvider:
+    endpoint = config.embedding_url or os.environ.get("MYTHOS_EMBEDDING_URL")
+    if endpoint:
+        return HttpEmbeddingProvider(endpoint=endpoint, model=config.embedding_model, dims=config.dims)
+    if allow_local_hashing:
+        return LocalHashingEmbeddingProvider(dims=config.dims)
+    raise RuntimeError("production vector backend requires embedding_url/MYTHOS_EMBEDDING_URL")
 
 
 def text_terms(text: str) -> Counter[str]:
@@ -110,12 +166,13 @@ class LocalVectorIndex:
         self.store = store or LocalStore()
         self.config = config or VectorBackendConfig(backend="local_hashing", dims=dims)
         self.dims = self.config.dims
+        self.embedding_provider = create_embedding_provider(self.config, allow_local_hashing=True)
 
     def search(self, *, project_id: str, query: str, top_k: int = 12) -> VectorSearchReport:
-        query_vector = hashed_embedding(query, dims=self.dims)
+        query_vector = self.embedding_provider.embed(query)
         scored: list[VectorSearchResult] = []
         for chunk in self.store.list_chunks(project_id):
-            score = cosine(query_vector, hashed_embedding(chunk_search_text(chunk), dims=self.dims))
+            score = cosine(query_vector, self.embedding_provider.embed(chunk_search_text(chunk)))
             if score <= 0:
                 continue
             scored.append(
@@ -166,17 +223,62 @@ class HnswVectorIndex(LocalVectorIndex):
 
 class QdrantVectorIndex(LocalVectorIndex):
     def __init__(self, store: LocalStore | None = None, *, config: VectorBackendConfig | None = None) -> None:
-        active = config or VectorBackendConfig(backend="qdrant", qdrant_url=os.environ.get("MYTHOS_QDRANT_URL"))
+        active = config or VectorBackendConfig(
+            backend="qdrant",
+            qdrant_url=os.environ.get("MYTHOS_QDRANT_URL"),
+            embedding_url=os.environ.get("MYTHOS_EMBEDDING_URL"),
+        )
         if not active.qdrant_url:
             raise RuntimeError("Qdrant backend requested but qdrant_url/MYTHOS_QDRANT_URL is not configured")
-        super().__init__(store, config=active)
+        self.embedding_provider = create_embedding_provider(active, allow_local_hashing=False)
+        try:
+            from qdrant_client import QdrantClient  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("Qdrant backend requested but qdrant-client is not installed") from exc
+        self.store = store or LocalStore()
+        self.config = active
+        self.dims = active.dims
+        self.client = QdrantClient(url=active.qdrant_url)
+
+    def search(self, *, project_id: str, query: str, top_k: int = 12) -> VectorSearchReport:
+        vector = self.embedding_provider.embed(query)
+        try:
+            hits = self.client.search(
+                collection_name=self.config.qdrant_collection,
+                query_vector=vector,
+                limit=top_k,
+                query_filter={"must": [{"key": "project_id", "match": {"value": project_id}}]},
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Qdrant search failed: {exc}") from exc
+        results: list[VectorSearchResult] = []
+        for hit in hits:
+            payload = dict(getattr(hit, "payload", {}) or {})
+            results.append(
+                VectorSearchResult(
+                    chunk_id=str(payload.get("chunk_id") or getattr(hit, "id", "")),
+                    path=str(payload.get("path") or ""),
+                    start_line=int(payload.get("start_line") or 0),
+                    end_line=int(payload.get("end_line") or 0),
+                    symbol_name=payload.get("symbol_name"),
+                    score=round(float(getattr(hit, "score", 0.0)), 6),
+                    content=str(payload.get("content") or ""),
+                    metadata=dict(payload.get("metadata") or {}),
+                )
+            )
+        return VectorSearchReport(project_id=project_id, query=query, backend="qdrant", dims=self.dims, results=results)
 
 
 class PgVectorIndex(LocalVectorIndex):
     def __init__(self, store: LocalStore | None = None, *, config: VectorBackendConfig | None = None) -> None:
-        active = config or VectorBackendConfig(backend="pgvector", postgres_dsn=os.environ.get("MYTHOS_DATABASE_URL"))
+        active = config or VectorBackendConfig(
+            backend="pgvector",
+            postgres_dsn=os.environ.get("MYTHOS_DATABASE_URL"),
+            embedding_url=os.environ.get("MYTHOS_EMBEDDING_URL"),
+        )
         if not active.postgres_dsn:
             raise RuntimeError("pgvector backend requested but postgres_dsn/MYTHOS_DATABASE_URL is not configured")
+        create_embedding_provider(active, allow_local_hashing=False)
         super().__init__(store, config=active)
 
 
@@ -201,8 +303,8 @@ def vector_capabilities() -> list[VectorIndexCapability]:
             backend="local_hashing",
             available=True,
             reason="built-in deterministic hashed embeddings",
-            production_grade=True,
-            notes=["good fallback", "exact scan", "best for small and medium repositories"],
+            production_grade=False,
+            notes=["dev and validation fallback only", "exact scan", "not semantic enough for production"],
         )
     ]
     for backend, package, production_notes in [
@@ -228,18 +330,22 @@ def vector_capabilities() -> list[VectorIndexCapability]:
     capabilities.append(
         VectorIndexCapability(
             backend="qdrant",
-            available=bool(os.environ.get("MYTHOS_QDRANT_URL")),
-            reason="MYTHOS_QDRANT_URL configured" if os.environ.get("MYTHOS_QDRANT_URL") else "MYTHOS_QDRANT_URL not configured",
-            production_grade=True,
+            available=bool(os.environ.get("MYTHOS_QDRANT_URL") and os.environ.get("MYTHOS_EMBEDDING_URL")),
+            reason="MYTHOS_QDRANT_URL and MYTHOS_EMBEDDING_URL configured"
+            if os.environ.get("MYTHOS_QDRANT_URL") and os.environ.get("MYTHOS_EMBEDDING_URL")
+            else "MYTHOS_QDRANT_URL or MYTHOS_EMBEDDING_URL not configured",
+            production_grade=bool(os.environ.get("MYTHOS_QDRANT_URL") and os.environ.get("MYTHOS_EMBEDDING_URL")),
             notes=["distributed vector database", "best for long-term memory and many projects"],
         )
     )
     capabilities.append(
         VectorIndexCapability(
             backend="pgvector",
-            available=bool(os.environ.get("MYTHOS_DATABASE_URL")),
-            reason="MYTHOS_DATABASE_URL configured" if os.environ.get("MYTHOS_DATABASE_URL") else "MYTHOS_DATABASE_URL not configured",
-            production_grade=True,
+            available=bool(os.environ.get("MYTHOS_DATABASE_URL") and os.environ.get("MYTHOS_EMBEDDING_URL")),
+            reason="MYTHOS_DATABASE_URL and MYTHOS_EMBEDDING_URL configured"
+            if os.environ.get("MYTHOS_DATABASE_URL") and os.environ.get("MYTHOS_EMBEDDING_URL")
+            else "MYTHOS_DATABASE_URL or MYTHOS_EMBEDDING_URL not configured",
+            production_grade=bool(os.environ.get("MYTHOS_DATABASE_URL") and os.environ.get("MYTHOS_EMBEDDING_URL")),
             notes=["Postgres-native vector search", "good when relational metadata and vector search must live together"],
         )
     )

@@ -26,7 +26,7 @@ class MythosModelFoundationTest(unittest.TestCase):
         self.assertFalse(status["external_model_training"])
         presets = architecture_presets()
         self.assertIn("aeitron-7b", presets)
-        self.assertIn("mythos-100b", presets)
+        self.assertIn("aeitron-100b", presets)
         for name, spec in presets.items():
             estimate = spec.estimate_parameters()
             self.assertEqual(spec.name, name)

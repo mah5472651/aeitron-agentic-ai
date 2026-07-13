@@ -251,8 +251,8 @@ def architecture_presets() -> dict[str, DecoderArchitectureSpec]:
             intermediate_size=17920,
             context_length=131_072,
         ),
-        "mythos-70b": DecoderArchitectureSpec(
-            name="mythos-70b",
+        "aeitron-70b": DecoderArchitectureSpec(
+            name="aeitron-70b",
             parameter_target_billions=70.0,
             hidden_size=8192,
             num_layers=80,
@@ -261,8 +261,8 @@ def architecture_presets() -> dict[str, DecoderArchitectureSpec]:
             intermediate_size=28672,
             context_length=131_072,
         ),
-        "mythos-100b": DecoderArchitectureSpec(
-            name="mythos-100b",
+        "aeitron-100b": DecoderArchitectureSpec(
+            name="aeitron-100b",
             parameter_target_billions=100.0,
             hidden_size=10240,
             num_layers=88,

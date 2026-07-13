@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -23,7 +23,7 @@ from src.mythos.patches import PatchPreviewRequest, PatchService, PatchVerifyReq
 from src.mythos.runtime.engine import MythosRuntime
 from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskCompleteRequest, TaskFailRequest, TaskGraphRuntime
 from src.mythos.shared.schemas import MythosRunRequest, MythosRunReport
-from src.mythos.tools import DockerSandboxRunner, SandboxRunRequest, ToolExecuteRequest, ToolRuntime
+from src.mythos.tools import DockerSandboxRunner, HardenedToolExecutor, SandboxRunRequest, ToolExecuteRequest
 from src.mythos.verifier import VerificationRequest, VerifierRuntime
 
 app = FastAPI(title="Aeitron Consolidated Gateway", version="2.0.0")
@@ -79,6 +79,15 @@ class MemoryRetrieveRequest(BaseModel):
 class SessionCreateRequest(BaseModel):
     project_id: str = Field(min_length=1)
     title: str = Field(default="Aeitron Session", min_length=1, max_length=200)
+
+
+def require_scope(request: Request, scope: str) -> None:
+    if not AUTH_CONFIG.enabled:
+        return
+    claims = getattr(request.state, "jwt_claims", {}) or {}
+    scopes = set(str(item) for item in claims.get("scopes", []) if item)
+    if scope not in scopes and "api" not in scopes:
+        raise PermissionError(f"missing required scope: {scope}")
 
 
 @app.get("/health/ready")
@@ -357,12 +366,17 @@ async def retrieve_memory(request: MemoryRetrieveRequest) -> dict[str, Any]:
 
 
 @app.post("/v1/tools/execute")
-async def execute_tool(request: ToolExecuteRequest) -> dict[str, Any]:
+async def execute_tool(request: ToolExecuteRequest, http_request: Request) -> dict[str, Any]:
     try:
-        return ToolRuntime(STORE).execute(request).model_dump()
+        require_scope(http_request, "tools:execute")
+        return HardenedToolExecutor(STORE).execute(request).model_dump()
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project not found") from exc
     except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

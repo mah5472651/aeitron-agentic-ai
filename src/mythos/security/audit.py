@@ -24,6 +24,7 @@ SECRET_PATTERN = re.compile(r"(?i)(api[_-]?key|secret|password|token)\s*=\s*['\"
 SSRF_PATTERN = re.compile(r"(?i)(requests\.(get|post|put|delete)|httpx\.(get|post|put|delete)|urlopen)\s*\(")
 PATH_TRAVERSAL_PATTERN = re.compile(r"(?i)(open|Path)\s*\([^)]*(request|args|params|user_input|filename)")
 DANGEROUS_SUBPROCESS_PATTERN = re.compile(r"(?i)(shell\s*=\s*True|os\.system|subprocess\.(call|run|Popen)\([^)]*\+)")
+EXECUTABLE_SINK_PATTERN = re.compile(r"(?i)\b(subprocess\.(run|call|Popen)|os\.system|eval\s*\(|exec\s*\(|child_process\.exec)")
 
 
 class SecurityFinding(StrictModel):
@@ -55,13 +56,59 @@ class SecurityAuditReport(StrictModel):
         return target
 
 
-def _iter_source_files(root: Path) -> list[Path]:
+def _load_audit_excludes(root: Path) -> dict[str, dict[str, Any]]:
+    config_path = root / "config" / "security_audit_excludes.json"
+    if not config_path.exists():
+        return {}
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    excludes: dict[str, dict[str, Any]] = {}
+    for item in payload.get("excludes", []):
+        path = str(item.get("path") or "").replace("\\", "/")
+        reason = str(item.get("reason") or "").strip()
+        risk_category = str(item.get("risk_category") or "").strip()
+        if not path or path.startswith("../") or "/../" in f"/{path}/":
+            raise ValueError(f"invalid audit exclude path: {path!r}")
+        if not reason or not risk_category:
+            raise ValueError(f"audit exclude requires reason and risk_category: {path}")
+        excludes[path] = item
+    return excludes
+
+
+def _validate_audit_excludes(root: Path, excludes: dict[str, dict[str, Any]]) -> list[SecurityFinding]:
+    findings: list[SecurityFinding] = []
+    for relative, item in excludes.items():
+        target = (root / relative).resolve()
+        if not target.exists():
+            findings.append(
+                SecurityFinding(
+                    severity="fail",
+                    check="audit_exclude_missing",
+                    file=relative,
+                    message="security audit exclude points to a missing file",
+                )
+            )
+            continue
+        if bool(item.get("allow_executable_sinks")):
+            continue
+        for line_number, line in enumerate(target.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+            if EXECUTABLE_SINK_PATTERN.search(line):
+                findings.append(
+                    SecurityFinding(
+                        severity="fail",
+                        check="audit_exclude_executable_sink",
+                        file=relative,
+                        line=line_number,
+                        message="excluded file contains executable sink without explicit approval",
+                        evidence=line.strip()[:240],
+                    )
+                )
+    return findings
+
+
+def _iter_source_files(root: Path, excluded_paths: set[str] | None = None) -> list[Path]:
     suffixes = {".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java", ".yaml", ".yml", ".toml", ".env", ".txt"}
     excluded = {".git", "__pycache__", "artifacts", ".venv", "node_modules", "tests"}
-    excluded_paths = {
-        Path("src/mythos/evaluation/benchmarks.py"),
-        Path("tools/codeql/python/tools/imp.py"),
-    }
+    excluded_paths = excluded_paths or set()
     paths = []
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in suffixes:
@@ -72,15 +119,15 @@ def _iter_source_files(root: Path) -> list[Path]:
             relative = path.relative_to(root)
         except ValueError:
             relative = path
-        if relative.as_posix() in {item.as_posix() for item in excluded_paths}:
+        if relative.as_posix() in excluded_paths:
             continue
         paths.append(path)
     return paths
 
 
-def _scan_patterns(root: Path) -> list[SecurityFinding]:
+def _scan_patterns(root: Path, excluded_paths: set[str] | None = None) -> list[SecurityFinding]:
     findings: list[SecurityFinding] = []
-    for path in _iter_source_files(root):
+    for path in _iter_source_files(root, excluded_paths=excluded_paths):
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
@@ -200,10 +247,10 @@ def _run_codeql(root: Path) -> dict[str, Any]:
     base_command, missing = _resolve_codeql()
     if missing:
         return {"status": "skipped", "reason": missing}
-    database = root / "artifacts" / "mythos" / "codeql-db"
+    database = root / "artifacts" / "aeitron" / "codeql-db"
     if not database.exists():
         return {"status": "skipped", "reason": "CodeQL database missing; create it before production audit", "database": str(database)}
-    output = root / "artifacts" / "mythos" / "codeql-results.sarif"
+    output = root / "artifacts" / "aeitron" / "codeql-results.sarif"
     command = [*base_command, "database", "analyze", str(database), "--format=sarifv2.1.0", f"--output={output}", "--rerun"]
     completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
     return {
@@ -267,7 +314,9 @@ def run_security_audit(
     strict_external_tools: bool = False,
 ) -> SecurityAuditReport:
     project_root = Path(root).resolve()
-    findings = _scan_patterns(project_root)
+    audit_excludes = _load_audit_excludes(project_root)
+    findings = _validate_audit_excludes(project_root, audit_excludes)
+    findings.extend(_scan_patterns(project_root, excluded_paths=set(audit_excludes)))
     dependency_warnings = _dependency_warnings(project_root)
     bandit_report = _run_bandit(project_root) if run_bandit else None
     external_scanners: dict[str, Any] = {}

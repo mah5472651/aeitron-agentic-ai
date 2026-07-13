@@ -103,6 +103,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   depends_on_json TEXT NOT NULL DEFAULT '[]',
   input_json TEXT NOT NULL DEFAULT '{}',
   output_json TEXT NOT NULL DEFAULT '{}',
+  attempt INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 2,
   error TEXT,
   started_at REAL,
   finished_at REAL,
@@ -208,8 +210,16 @@ class LocalStore:
                 self._connection.row_factory = sqlite3.Row
                 self._connection.execute("PRAGMA foreign_keys = ON")
                 self._connection.executescript(SQLITE_SCHEMA)
+                self._ensure_runtime_columns(self._connection)
                 self._connection.commit()
             return self._connection
+
+    def _ensure_runtime_columns(self, connection: sqlite3.Connection) -> None:
+        task_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "attempt" not in task_columns:
+            connection.execute("ALTER TABLE tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0")
+        if "max_attempts" not in task_columns:
+            connection.execute("ALTER TABLE tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 2")
 
     def close(self) -> None:
         with self._lock:
@@ -346,9 +356,9 @@ class LocalStore:
                 """
                 INSERT INTO tasks(
                   id, task_graph_id, run_id, kind, title, status, depends_on_json,
-                  input_json, output_json, created_at
+                  input_json, output_json, attempt, max_attempts, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     node["node_id"],
@@ -360,6 +370,8 @@ class LocalStore:
                     json.dumps(node.get("depends_on", []), sort_keys=True),
                     json.dumps(node.get("inputs", {}), sort_keys=True),
                     json.dumps(node.get("outputs", {}), sort_keys=True),
+                    int(node.get("attempt", 0)),
+                    int(node.get("max_attempts", 2)),
                     timestamp,
                 ),
             )
@@ -388,6 +400,8 @@ class LocalStore:
                 "depends_on": json.loads(row["depends_on_json"]),
                 "inputs": json.loads(row["input_json"]),
                 "outputs": json.loads(row["output_json"]),
+                "attempt": int(row["attempt"] or 0),
+                "max_attempts": int(row["max_attempts"] or 2),
                 "error": row["error"],
                 "started_at": row["started_at"],
                 "finished_at": row["finished_at"],
@@ -415,6 +429,8 @@ class LocalStore:
         data["depends_on"] = json.loads(data.pop("depends_on_json") or "[]")
         data["inputs"] = json.loads(data.pop("input_json") or "{}")
         data["outputs"] = json.loads(data.pop("output_json") or "{}")
+        data["attempt"] = int(data.get("attempt") or 0)
+        data["max_attempts"] = int(data.get("max_attempts") or 2)
         return data
 
     def list_tasks(self, task_graph_id: str) -> list[dict[str, Any]]:
@@ -428,6 +444,8 @@ class LocalStore:
             data["depends_on"] = json.loads(data.pop("depends_on_json") or "[]")
             data["inputs"] = json.loads(data.pop("input_json") or "{}")
             data["outputs"] = json.loads(data.pop("output_json") or "{}")
+            data["attempt"] = int(data.get("attempt") or 0)
+            data["max_attempts"] = int(data.get("max_attempts") or 2)
             tasks.append(data)
         return tasks
 
@@ -461,6 +479,25 @@ class LocalStore:
                 timestamp,
                 finished,
                 timestamp,
+                task_id,
+            ),
+        )
+        self.connection.commit()
+
+    def update_task_attempt(self, task_id: str, *, attempt: int, outputs: dict[str, Any] | None = None, error: str | None = None) -> None:
+        self.connection.execute(
+            """
+            UPDATE tasks
+            SET attempt = ?,
+                output_json = CASE WHEN ? IS NULL THEN output_json ELSE ? END,
+                error = ?
+            WHERE id = ?
+            """,
+            (
+                attempt,
+                None if outputs is None else 1,
+                json.dumps(outputs or {}, sort_keys=True),
+                error,
                 task_id,
             ),
         )

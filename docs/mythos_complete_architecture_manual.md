@@ -14,7 +14,7 @@ Rule for future work: every new production feature must update this file with:
 - how to verify that it works
 
 The old numbered phase architecture has been removed. Production code belongs
-under `src/Aeitron`.
+under `src/mythos`.
 
 ## Current Status
 
@@ -80,7 +80,7 @@ Learning / Data Platform
 ## Source Layout
 
 ```text
-src/Aeitron/
+src/mythos/
   agents/        Agent routing helpers.
   context/       Workspace context helpers.
   db/            SQLite local store, Postgres schema, migrations.
@@ -115,7 +115,7 @@ tests/
 
 Files:
 
-- `src/Aeitron/gateway/api.py`
+- `src/mythos/gateway/api.py`
 
 Purpose:
 
@@ -176,8 +176,8 @@ python -m src.mythos.evaluation.release_gate
 
 Files:
 
-- `src/Aeitron/identity/auth.py`
-- `src/Aeitron/identity/quota.py`
+- `src/mythos/identity/auth.py`
+- `src/mythos/identity/quota.py`
 
 Purpose:
 
@@ -216,7 +216,7 @@ How to verify:
 
 Files:
 
-- `src/Aeitron/observability.py`
+- `src/mythos/observability.py`
 
 Purpose:
 
@@ -242,9 +242,9 @@ large agent/data jobs without metrics is too slow.
 
 Files:
 
-- `src/Aeitron/indexing/repository_indexer.py`
-- `src/Aeitron/indexing/context_builder.py`
-- `src/Aeitron/indexing/vector_index.py`
+- `src/mythos/indexing/repository_indexer.py`
+- `src/mythos/indexing/context_builder.py`
+- `src/mythos/indexing/vector_index.py`
 
 Purpose:
 
@@ -295,8 +295,8 @@ not rely only on raw file text; it needs ranked, structured code context.
 
 Files:
 
-- `src/Aeitron/indexing/context_builder.py`
-- `src/Aeitron/context/builder.py`
+- `src/mythos/indexing/context_builder.py`
+- `src/mythos/context/builder.py`
 
 Purpose:
 
@@ -347,9 +347,9 @@ context instead of dumping all files.
 
 Files:
 
-- `src/Aeitron/planning/engine.py`
-- `src/Aeitron/runtime/taskgraph.py`
-- `src/Aeitron/runtime/engine.py`
+- `src/mythos/planning/engine.py`
+- `src/mythos/runtime/taskgraph.py`
+- `src/mythos/runtime/engine.py`
 
 Purpose:
 
@@ -393,7 +393,7 @@ performance review, verification, or summary.
 
 Files:
 
-- `src/Aeitron/tools/`
+- `src/mythos/tools/`
 
 Purpose:
 
@@ -422,7 +422,7 @@ limits.
 
 Files:
 
-- `src/Aeitron/patches/service.py`
+- `src/mythos/patches/service.py`
 
 Purpose:
 
@@ -455,8 +455,8 @@ reversible lifecycle.
 
 Files:
 
-- `src/Aeitron/verifier/runtime.py`
-- `src/Aeitron/guardrails/service.py`
+- `src/mythos/verifier/runtime.py`
+- `src/mythos/guardrails/service.py`
 
 Purpose:
 
@@ -477,9 +477,9 @@ The model can be wrong. Verification is the systemâ€™s practical truth sour
 
 Files:
 
-- `src/Aeitron/evaluation/benchmarks.py`
-- `src/Aeitron/evaluation/release_gate.py`
-- `src/Aeitron/evaluation/service.py`
+- `src/mythos/evaluation/benchmarks.py`
+- `src/mythos/evaluation/release_gate.py`
+- `src/mythos/evaluation/service.py`
 
 Purpose:
 
@@ -512,10 +512,10 @@ measurable.
 
 Files:
 
-- `src/Aeitron/db/local_store.py`
-- `src/Aeitron/db/schema.sql`
-- `src/Aeitron/db/migrations/`
-- `src/Aeitron/db/migration_runner.py`
+- `src/mythos/db/local_store.py`
+- `src/mythos/db/schema.sql`
+- `src/mythos/db/migrations/`
+- `src/mythos/db/migration_runner.py`
 
 Purpose:
 
@@ -557,7 +557,7 @@ python -m src.mythos.db.migration_runner --database-url $env:MYTHOS_DATABASE_URL
 
 Files:
 
-- `src/Aeitron/memory/system.py`
+- `src/mythos/memory/system.py`
 
 Purpose:
 
@@ -611,11 +611,11 @@ from guesses and transient outputs.
 
 Files:
 
-- `src/Aeitron/model_ops/foundation.py`
-- `src/Aeitron/model_ops/torch_decoder.py`
-- `src/Aeitron/model_ops/tokenizer_pipeline.py`
-- `src/Aeitron/model_ops/data_loader.py`
-- `src/Aeitron/model_ops/pretrain_loop.py`
+- `src/mythos/model_ops/foundation.py`
+- `src/mythos/model_ops/torch_decoder.py`
+- `src/mythos/model_ops/tokenizer_pipeline.py`
+- `src/mythos/model_ops/data_loader.py`
+- `src/mythos/model_ops/pretrain_loop.py`
 - `deploy/gpu/`
 
 Purpose:
@@ -696,7 +696,7 @@ mirrors. It does not run exploits or collect unauthorized targets.
 
 Files:
 
-- `src/Aeitron/learning/source_registry.py`
+- `src/mythos/learning/source_registry.py`
 - `config/data_sources.ultimate.json`
 
 Purpose:
@@ -764,8 +764,8 @@ otherwise dominate training rows.
 
 Files:
 
-- `src/Aeitron/learning/governance.py`
-- `src/Aeitron/learning/resource_catalog.py`
+- `src/mythos/learning/governance.py`
+- `src/mythos/learning/resource_catalog.py`
 - `config/data_sources.ultimate.json`
 
 Purpose:
@@ -808,7 +808,7 @@ databases, and real patch repositories.
 
 Files:
 
-- `src/Aeitron/learning/vulnerability_adapters.py`
+- `src/mythos/learning/vulnerability_adapters.py`
 
 Supported adapters:
 
@@ -842,8 +842,8 @@ packages, timestamps, and provenance.
 
 Files:
 
-- `src/Aeitron/learning/data_engine.py`
-- `src/Aeitron/learning/supervisor.py`
+- `src/mythos/learning/data_engine.py`
+- `src/mythos/learning/supervisor.py`
 
 Purpose:
 
@@ -899,7 +899,7 @@ A simple script cannot safely collect large corpora.
 
 Files:
 
-- `src/Aeitron/learning/quality.py`
+- `src/mythos/learning/quality.py`
 
 Purpose:
 
@@ -936,7 +936,7 @@ hard filter.
 
 Files:
 
-- `src/Aeitron/learning/contamination.py`
+- `src/mythos/learning/contamination.py`
 
 Purpose:
 
@@ -964,7 +964,7 @@ If benchmark prompts leak into training, evaluation becomes fake.
 
 Files:
 
-- `src/Aeitron/learning/quality_inspector.py`
+- `src/mythos/learning/quality_inspector.py`
 
 Purpose:
 
@@ -1000,9 +1000,9 @@ not enough.
 
 Files:
 
-- `src/Aeitron/learning/quality.py`
-- `src/Aeitron/learning/quality_inspector.py`
-- `src/Aeitron/learning/source_quality.py`
+- `src/mythos/learning/quality.py`
+- `src/mythos/learning/quality_inspector.py`
+- `src/mythos/learning/source_quality.py`
 
 Purpose:
 
@@ -1054,7 +1054,7 @@ budget; noisy sources should lose budget.
 
 Files:
 
-- `src/Aeitron/learning/task_extraction.py`
+- `src/mythos/learning/task_extraction.py`
 
 Purpose:
 
@@ -1101,7 +1101,7 @@ prompts, context, and verifiable work patterns.
 
 Files:
 
-- `src/Aeitron/learning/review.py`
+- `src/mythos/learning/review.py`
 
 Purpose:
 
@@ -1142,7 +1142,7 @@ not every generated candidate.
 
 Files:
 
-- `src/Aeitron/learning/feedback.py`
+- `src/mythos/learning/feedback.py`
 
 Purpose:
 
@@ -1173,7 +1173,7 @@ or task review approval is weak, the dataset should not be promoted blindly.
 
 Files:
 
-- `src/Aeitron/learning/versioning.py`
+- `src/mythos/learning/versioning.py`
 
 Purpose:
 
@@ -1210,7 +1210,7 @@ versioning, model regressions cannot be traced.
 
 Files:
 
-- `src/Aeitron/learning/storage.py`
+- `src/mythos/learning/storage.py`
 
 Purpose:
 
@@ -1238,7 +1238,7 @@ durable artifact layer.
 
 Files:
 
-- `src/Aeitron/learning/dashboard.py`
+- `src/mythos/learning/dashboard.py`
 
 Purpose:
 
@@ -1271,7 +1271,7 @@ A dataset run should be inspectable without reading raw JSON files.
 
 Files:
 
-- `src/Aeitron/learning/production_check.py`
+- `src/mythos/learning/production_check.py`
 
 Purpose:
 
@@ -1302,7 +1302,7 @@ configuration before crawling begins.
 
 Files:
 
-- `src/Aeitron/learning/capacity.py`
+- `src/mythos/learning/capacity.py`
 
 Purpose:
 
@@ -1329,7 +1329,7 @@ Why it exists:
 
 Files:
 
-- `src/Aeitron/learning/run_plan.py`
+- `src/mythos/learning/run_plan.py`
 
 Purpose:
 
@@ -1359,7 +1359,7 @@ commands. This prevents ad hoc data runs.
 
 Files:
 
-- `src/Aeitron/learning/data_pipeline.py`
+- `src/mythos/learning/data_pipeline.py`
 
 Purpose:
 
@@ -1409,7 +1409,7 @@ When to remove `--skip-train`:
 
 Files:
 
-- `src/Aeitron/learning/worker.py`
+- `src/mythos/learning/worker.py`
 - `deploy/k8s/data-worker.yaml`
 - `deploy/k8s/data-worker-hpa.yaml`
 
@@ -1508,8 +1508,8 @@ first:
 Files:
 
 - `deploy/gpu/run_real_data_training_pipeline.py`
-- `src/Aeitron/learning/data_pipeline.py`
-- `src/Aeitron/evaluation/checkpoint_eval.py`
+- `src/mythos/learning/data_pipeline.py`
+- `src/mythos/evaluation/checkpoint_eval.py`
 
 Purpose:
 
@@ -1686,7 +1686,7 @@ Primary outputs:
 
 Checkpoint evaluation:
 
-`src/Aeitron/evaluation/checkpoint_eval.py` verifies:
+`src/mythos/evaluation/checkpoint_eval.py` verifies:
 
 - checkpoint files exist
 - checkpoint file hashes match the checkpoint manifest
@@ -1697,7 +1697,7 @@ Checkpoint evaluation:
 
 Best checkpoint and early stopping:
 
-- `src/Aeitron/model_ops/pretrain_loop.py` writes both:
+- `src/mythos/model_ops/pretrain_loop.py` writes both:
   - `train/checkpoint_manifest.json` for the final checkpoint
   - `train/best_checkpoint_manifest.json` for the best validation checkpoint
 - `training.best_validation_loss` and `training.best_validation_step` record the
@@ -1709,7 +1709,7 @@ Best checkpoint and early stopping:
 
 Source balancing:
 
-- `src/Aeitron/learning/source_balancing.py` creates
+- `src/mythos/learning/source_balancing.py` creates
   `balanced/balanced-clean-000000.jsonl` before tokenizer and shard training.
 - The default `--max-source-fraction 0.35` prevents a single source such as
   `git-documentation` from dominating model training.
@@ -1719,7 +1719,7 @@ Source balancing:
 
 Expanded built-in benchmark:
 
-- `src/Aeitron/evaluation/benchmarks.py` includes SQL injection, hardcoded
+- `src/mythos/evaluation/benchmarks.py` includes SQL injection, hardcoded
   secrets, command injection, path traversal, XSS, weak crypto, insecure random,
   unsafe deserialization, C buffer copy, SSRF, unsafe YAML loading, unsafe JWT
   settings, open redirect, Node.js command execution, TypeScript DOM XSS, Go SQL
@@ -1754,7 +1754,7 @@ python -m src.mythos.evaluation.checkpoint_eval \
 
 Files:
 
-- `src/Aeitron/model_ops/checkpoint_compare.py`
+- `src/mythos/model_ops/checkpoint_compare.py`
 - `deploy/gpu/run_checkpoint_comparison.py`
 
 Purpose:
@@ -1825,12 +1825,12 @@ Files:
 
 - `config/eval_schedule.json`
 - `config/mix_ratios.json`
-- `src/Aeitron/evaluation/eval_runner.py`
-- `src/Aeitron/learning/mixer.py`
-- `src/Aeitron/learning/ablation_runner.py`
-- `src/Aeitron/model_ops/pretrain_loop.py`
-- `src/Aeitron/model_ops/tokenizer_pipeline.py`
-- `src/Aeitron/model_ops/sharding.py`
+- `src/mythos/evaluation/eval_runner.py`
+- `src/mythos/learning/mixer.py`
+- `src/mythos/learning/ablation_runner.py`
+- `src/mythos/model_ops/pretrain_loop.py`
+- `src/mythos/model_ops/tokenizer_pipeline.py`
+- `src/mythos/model_ops/sharding.py`
 
 Purpose:
 
@@ -1945,14 +1945,14 @@ Security boundary:
 Files:
 
 - `alembic.ini`
-- `src/Aeitron/db/alembic/env.py`
-- `src/Aeitron/db/alembic/versions/0001_initial.py`
-- `src/Aeitron/db/alembic/versions/0002_data_platform.py`
-- `src/Aeitron/learning/storage.py`
-- `src/Aeitron/learning/dataset_validation.py`
-- `src/Aeitron/deployment/k8s_validate.py`
-- `src/Aeitron/evaluation/benchmark_suites.py`
-- `src/Aeitron/security/audit.py`
+- `src/mythos/db/alembic/env.py`
+- `src/mythos/db/alembic/versions/0001_initial.py`
+- `src/mythos/db/alembic/versions/0002_data_platform.py`
+- `src/mythos/learning/storage.py`
+- `src/mythos/learning/dataset_validation.py`
+- `src/mythos/deployment/k8s_validate.py`
+- `src/mythos/evaluation/benchmark_suites.py`
+- `src/mythos/security/audit.py`
 - `deploy/gpu/run_10k_training_validation.py`
 - `deploy/prod/prometheus.yml`
 - `deploy/prod/grafana-dashboard.json`
@@ -2018,7 +2018,7 @@ python -m src.mythos.deployment.k8s_validate --kubectl-dry-run --output-dir arti
 
 Long-running crawler supervision:
 
-- `src/Aeitron/learning/supervisor.py` runs supervised crawl cycles against a
+- `src/mythos/learning/supervisor.py` runs supervised crawl cycles against a
   Postgres frontier.
 - It writes heartbeat and status JSON for external monitoring.
 - Docker Compose and Kubernetes include crawler worker and supervisor services.
@@ -2028,7 +2028,7 @@ Long-running crawler supervision:
 
 Large dataset validation:
 
-- `src/Aeitron/learning/dataset_validation.py` streams JSONL files and does not
+- `src/mythos/learning/dataset_validation.py` streams JSONL files and does not
   load the full corpus into memory.
 - It checks record count, duplicate fraction, average text length, category
   coverage, license presence, quality metadata, and holdout/train split.
@@ -2318,7 +2318,7 @@ quality before large GPU training.
 
 Module:
 
-- `src/Aeitron/model_ops/tokenizer_pipeline.py`
+- `src/mythos/model_ops/tokenizer_pipeline.py`
 
 Purpose:
 
@@ -2347,7 +2347,7 @@ python -m src.mythos.model_ops.tokenizer_pipeline \
 
 Module:
 
-- `src/Aeitron/learning/verified_patch_dataset.py`
+- `src/mythos/learning/verified_patch_dataset.py`
 
 Purpose:
 
@@ -2377,7 +2377,7 @@ attack live targets.
 
 Module:
 
-- `src/Aeitron/patches/verified_loop.py`
+- `src/mythos/patches/verified_loop.py`
 
 Purpose:
 
@@ -2416,7 +2416,7 @@ python -m src.mythos.patches.verified_loop \
 
 Module:
 
-- `src/Aeitron/evaluation/benchmark_pack.py`
+- `src/mythos/evaluation/benchmark_pack.py`
 
 Purpose:
 
@@ -2446,7 +2446,7 @@ trained Aeitron checkpoint generation runner to these suites.
 
 Module:
 
-- `src/Aeitron/model_ops/torch_decoder.py`
+- `src/mythos/model_ops/torch_decoder.py`
 
 Current implemented transformer capabilities:
 
@@ -2560,7 +2560,7 @@ Those are cluster release-gate tasks, not laptop/Kaggle smoke tasks.
 
 Module:
 
-- `src/Aeitron/production_readiness.py`
+- `src/mythos/production_readiness.py`
 
 Purpose:
 
@@ -2651,7 +2651,7 @@ in-run validation.
 
 Module:
 
-- `src/Aeitron/model_ops/native_serving.py`
+- `src/mythos/model_ops/native_serving.py`
 
 Purpose:
 
@@ -2722,7 +2722,7 @@ cluster-tested.
 
 Module:
 
-- `src/Aeitron/model_ops/production_adapters.py`
+- `src/mythos/model_ops/production_adapters.py`
 
 Purpose:
 
@@ -2851,7 +2851,7 @@ fail policy.
 
 Module:
 
-- `src/Aeitron/security/audit.py`
+- `src/mythos/security/audit.py`
 
 Dev behavior:
 
@@ -2873,7 +2873,7 @@ validation block release.
 Use these after major changes:
 
 ```powershell
-python -m compileall -q src\Aeitron tests deploy\gpu
+python -m compileall -q src\mythos tests deploy\gpu
 python -m unittest tests.test_mythos_data_engine tests.test_mythos_production_hardening tests.test_mythos_training_control tests.test_mythos_enterprise_readiness
 python -m src.mythos.deployment.k8s_validate --output-dir artifacts\\aeitron\k8s-validation
 python -m src.mythos.learning.storage --uri local://artifacts/aeitron/object-store --work-dir artifacts\\aeitron\object-store-lifecycle
@@ -2885,6 +2885,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_mythos_consolida
 ## Final Rule
 
 Do not reintroduce numbered legacy folders. If a feature is needed, add it to
-the correct final module under `src/Aeitron` and update this manual with enough
+the correct final module under `src/mythos` and update this manual with enough
 detail that the system can be understood without reading all source code.
+
 

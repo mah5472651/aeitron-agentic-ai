@@ -223,13 +223,34 @@ class TaskGraphRuntime:
         task = self.store.get_task(task_id)
         if task is None:
             raise KeyError(f"unknown task: {task_id}")
+        next_attempt = int(task.get("attempt", 0)) + 1
+        max_attempts = int(task.get("max_attempts", 2))
+        retry_outputs = {
+            **request.outputs,
+            "last_error": request.error,
+            "attempt": next_attempt,
+            "max_attempts": max_attempts,
+            "retrying": next_attempt < max_attempts,
+        }
+        if next_attempt < max_attempts:
+            self.store.update_task_state(
+                task_id,
+                status="queued",
+                outputs=retry_outputs,
+                error=request.error,
+                finished=False,
+            )
+            self.store.update_task_attempt(task_id, attempt=next_attempt, outputs=retry_outputs, error=request.error)
+            self.store.update_task_graph_status(task["task_graph_id"], "running")
+            return self.advance(task["task_graph_id"])
         self.store.update_task_state(
             task_id,
             status="failed",
-            outputs=request.outputs,
+            outputs=retry_outputs,
             error=request.error,
             finished=True,
         )
+        self.store.update_task_attempt(task_id, attempt=next_attempt, outputs=retry_outputs, error=request.error)
         self.store.update_task_graph_status(task["task_graph_id"], "failed")
         return self.advance(task["task_graph_id"])
 

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import time
+import json
 from typing import Any
 
 from pydantic import Field
 
 from src.mythos.shared.schemas import StrictModel
+from src.mythos.model_ops.backends import ModelBackend
 
 
 class PlanningResult(StrictModel):
@@ -60,3 +62,57 @@ class IntentPlanningEngine:
             success_criteria=success_criteria,
             confidence=0.82,
         )
+
+    async def plan_structured(
+        self,
+        prompt: str,
+        *,
+        backend: ModelBackend,
+        run_id: str | None = None,
+        allow_dev_fallback: bool = False,
+    ) -> PlanningResult:
+        schema_prompt = (
+            "Return only valid JSON for an Aeitron coding-agent plan with keys: "
+            "goal, requirements, risks, success_criteria, expansion. "
+            "Do not write executable code in the planner output.\n\n"
+            f"User request:\n{prompt}"
+        )
+        raw = await backend.generate(schema_prompt, temperature=0.0, max_tokens=900)
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("planner output must be a JSON object")
+            requirements = self._required_string_list(payload, "requirements")
+            risks = self._required_string_list(payload, "risks")
+            success_criteria = self._required_string_list(payload, "success_criteria")
+            goal = str(payload.get("goal") or "").strip()
+            if not goal:
+                raise ValueError("planner output missing goal")
+            expansion = payload.get("expansion") if isinstance(payload.get("expansion"), dict) else {}
+            expansion = {**expansion, "source": "structured-model-planner"}
+            return PlanningResult(
+                run_id=run_id or f"aeitron-plan-{time.time_ns()}",
+                prompt=prompt,
+                expansion=expansion,
+                task_graph_brief=" -> ".join(["understand", "planner", "retrieve_context", "edit", "test", "critic_review", "security_review", "performance_review", "verify", "summarize"]),
+                goal=goal,
+                requirements=requirements,
+                risks=risks,
+                success_criteria=success_criteria,
+                confidence=0.88,
+            )
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            if allow_dev_fallback:
+                fallback = self.plan(prompt, run_id=run_id)
+                fallback.expansion["source"] = "keyword-dev-fallback"
+                fallback.risks.append(f"structured planner fallback used: {exc}")
+                fallback.confidence = min(fallback.confidence, 0.62)
+                return fallback
+            raise ValueError(f"structured planner returned invalid JSON: {exc}") from exc
+
+    @staticmethod
+    def _required_string_list(payload: dict[str, Any], key: str) -> list[str]:
+        values = payload.get(key)
+        if not isinstance(values, list) or not values or not all(isinstance(item, str) and item.strip() for item in values):
+            raise ValueError(f"planner output {key!r} must be a non-empty string list")
+        return [item.strip() for item in values]
