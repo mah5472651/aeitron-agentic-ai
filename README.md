@@ -233,6 +233,13 @@ python deploy/gpu/run_checkpoint_comparison.py \
   --device cuda
 ```
 
+Inspect any Kaggle/Colab run and get the next recommended action:
+
+```bash
+python deploy/gpu/inspect_real_data_run.py \
+  --work-dir artifacts/aeitron/real-data-validation-v1
+```
+
 Run the longer scratch pretraining loop:
 
 ```bash

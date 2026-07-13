@@ -1,4 +1,4 @@
-﻿"""Kaggle/Colab entrypoint for Mythos scratch checkpoint comparison."""
+﻿"""Kaggle/Colab entrypoint for Aeitron scratch checkpoint comparison."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from src.mythos.model_ops.checkpoint_compare import GenerationConfig, compare_ch
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compare Mythos scratch checkpoints on a fixed coding/security prompt suite.")
+    parser = argparse.ArgumentParser(description="Compare Aeitron scratch checkpoints on a fixed coding/security prompt suite.")
     parser.add_argument("--training-report", help="pretrain_report.json or real_data_training_report.json")
     parser.add_argument("--baseline-manifest")
     parser.add_argument("--candidate-manifest")

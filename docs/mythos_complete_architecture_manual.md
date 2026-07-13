@@ -2097,7 +2097,7 @@ Cell 1:
 
 ```bash
 %%bash
-cd /kaggle/working/Aeitron-agentic-ai
+cd /kaggle/working/aeitron-agentic-ai
 git pull origin master
 mkdir -p artifacts/aeitron/real-data-10k-strict-v1
 PYTHONUNBUFFERED=1 nohup python -u deploy/gpu/run_real_data_training_pipeline.py \
@@ -2136,7 +2136,7 @@ Cell 2:
 
 ```bash
 %%bash
-cd /kaggle/working/Aeitron-agentic-ai
+cd /kaggle/working/aeitron-agentic-ai
 tail -f artifacts/aeitron/real-data-10k-strict-v1/progress.jsonl
 ```
 
@@ -2144,7 +2144,7 @@ When the job finishes:
 
 ```bash
 %%bash
-cd /kaggle/working/Aeitron-agentic-ai
+cd /kaggle/working/aeitron-agentic-ai
 tail -n 80 artifacts/aeitron/real-data-10k-strict-v1/run.log
 cat artifacts/aeitron/real-data-10k-strict-v1/reports/real_data_training_report.json
 
@@ -2154,6 +2154,15 @@ python deploy/gpu/run_checkpoint_comparison.py \
   --device cuda
 ```
 
+
+Inspect the run and get the next recommended action:
+
+```bash
+%%bash
+cd /kaggle/working/aeitron-agentic-ai
+python deploy/gpu/inspect_real_data_run.py \
+  --work-dir artifacts/aeitron/real-data-validation-v1
+```
 Benchmark suite adapters:
 
 - `swe_bench_style`: local SWE-Bench-like JSONL files.
