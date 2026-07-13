@@ -33,6 +33,23 @@ class ToolExecuteResponse(StrictModel):
     duration_ms: float
 
 
+class SandboxPolicy(StrictModel):
+    timeout_ms: int = 30_000
+    network_disabled: bool = True
+
+
+class SandboxRequest(StrictModel):
+    command: list[str] = Field(min_length=1)
+
+
+class ExecutionRequest(ToolExecuteRequest):
+    pass
+
+
+class ExecutionResult(ToolExecuteResponse):
+    pass
+
+
 def project_root(store: LocalStore, project_id: str) -> Path:
     project = store.get_project(project_id)
     if project is None:
@@ -83,3 +100,9 @@ class ToolRuntime:
                 exit_code=None,
                 duration_ms=(time.perf_counter() - started) * 1000,
             )
+
+
+class SandboxEngine:
+    async def run(self, request: ExecutionRequest) -> ExecutionResult:
+        result = ToolRuntime().execute(request)
+        return ExecutionResult.model_validate(result.model_dump())
