@@ -2677,6 +2677,77 @@ frontier storage, non-local object storage, license filtering, benchmark
 contamination filtering, near-dedup, source balancing, training-data gate, and
 in-run validation.
 
+## Native Scratch Serving
+
+Module:
+
+- `src/mythos/model_ops/native_serving.py`
+
+Purpose:
+
+Serve a Mythos-owned scratch checkpoint directly before vLLM/TensorRT
+conversion exists. This is not a mock backend. It loads the checkpoint manifest,
+`model.pt`, tokenizer, validates tokenizer/model compatibility, and exposes an
+OpenAI-compatible chat endpoint.
+
+Command:
+
+```bash
+python -m src.mythos.model_ops.native_serving \
+  --checkpoint-manifest artifacts/mythos/train/checkpoint_manifest.json \
+  --tokenizer-path artifacts/mythos/tokenizer/tokenizer.json \
+  --model-name mythos-scratch \
+  --device cuda \
+  --host 0.0.0.0 \
+  --port 8001
+```
+
+Endpoints:
+
+- `GET /health/live`
+- `GET /health/ready`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+
+The endpoint supports normal JSON responses and SSE streaming. Auth, quota, and
+observability middleware are installed by default. Use `--no-auth` and
+`--no-quota` only for local validation.
+
+## DeepSpeed Runtime Status
+
+DeepSpeed ZeRO-2/ZeRO-3 is now wired as a real runtime path in the scratch
+pretraining loop. When `--distributed-strategy deepspeed_zero2` or
+`deepspeed_zero3` is selected, the loop:
+
+- imports DeepSpeed and fails immediately if it is not installed
+- initializes distributed state through DeepSpeed
+- loads and patches the ZeRO JSON config with real batch sizes
+- uses DeepSpeed engine `backward()` and `step()`
+- writes DeepSpeed engine checkpoint folders alongside the native checkpoint
+
+Example:
+
+```bash
+deepspeed --num_nodes 1 --num_gpus 8 -m src.mythos.model_ops.pretrain_loop \
+  --distributed-strategy deepspeed_zero3 \
+  --deepspeed-config deploy/gpu/deepspeed_zero3.json \
+  --manifest artifacts/mythos/shards/manifest.json \
+  --output-dir artifacts/mythos/ds-zero3-run \
+  --device cuda \
+  --model-profile 7b \
+  --dtype bf16 \
+  --sequence-length 2048 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 16 \
+  --steps 10000 \
+  --production
+```
+
+This path is built, but still not cluster-proven until an actual multi-GPU
+DeepSpeed run saves, reloads, and evaluates a checkpoint. Megatron-LM remains an
+external-checkout requirement until a real Megatron adapter is implemented and
+cluster-tested.
+
 ## Security Audit Production Behavior
 
 Module:

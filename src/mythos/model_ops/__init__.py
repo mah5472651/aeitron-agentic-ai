@@ -11,11 +11,13 @@ from src.mythos.model_ops.foundation import (
     foundation_status,
 )
 from src.mythos.model_ops.torch_decoder import MythosDecoderLM, ScratchDecoderConfig, tiny_smoke_config
+from src.mythos.model_ops.native_serving import NativeServingConfig, create_app as create_native_serving_app
 
 __all__ = [
     "CheckpointManifest",
     "DecoderArchitectureSpec",
     "MythosDecoderLM",
+    "NativeServingConfig",
     "ParallelismPlan",
     "PretrainingRunSpec",
     "ScratchDecoderConfig",
@@ -24,4 +26,5 @@ __all__ = [
     "architecture_presets",
     "foundation_status",
     "tiny_smoke_config",
+    "create_native_serving_app",
 ]

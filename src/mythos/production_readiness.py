@@ -9,6 +9,7 @@ explicit dependency states until those dependencies are present and tested.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -125,13 +126,26 @@ def _check_model_backend(mode: str) -> ReadinessCheck:
         missing.append("non-mock MYTHOS_MODEL_BACKEND")
     if backend in {"mythos_serving", "active"} and not active.get("endpoint"):
         missing.append("MYTHOS_MODEL_ENDPOINT")
+    checkpoint_manifest = os.environ.get("MYTHOS_CHECKPOINT_MANIFEST", "")
+    tokenizer_path = os.environ.get("MYTHOS_TOKENIZER_PATH", "")
+    if backend in {"mythos_serving", "active"}:
+        if not checkpoint_manifest or not Path(checkpoint_manifest).exists():
+            missing.append("MYTHOS_CHECKPOINT_MANIFEST existing file")
+        if not tokenizer_path or not Path(tokenizer_path).exists():
+            missing.append("MYTHOS_TOKENIZER_PATH existing file")
     return ReadinessCheck(
         subsystem="serving",
-        status="production_ready_requires_external_service" if not missing else "blocked_missing_dependency",
+        status="production_ready" if not missing else "blocked_missing_dependency",
         summary="Native Mythos serving backend is selected." if not missing else "Serving is still using mock/test-double configuration.",
-        required_dependencies=["MYTHOS_MODEL_BACKEND", "MYTHOS_MODEL_ENDPOINT", "Mythos scratch checkpoint"],
+        required_dependencies=["MYTHOS_MODEL_BACKEND", "MYTHOS_MODEL_ENDPOINT", "MYTHOS_CHECKPOINT_MANIFEST", "MYTHOS_TOKENIZER_PATH"],
         missing_dependencies=missing,
-        evidence={"backend": backend, "model_name": active.get("model_name"), "active_profile": profile.get("profile", {})},
+        evidence={
+            "backend": backend,
+            "model_name": active.get("model_name"),
+            "checkpoint_manifest": checkpoint_manifest,
+            "tokenizer_path": tokenizer_path,
+            "active_profile": profile.get("profile", {}),
+        },
         production_blocker=mode == "production" and bool(missing),
     )
 
@@ -196,6 +210,14 @@ def _check_training_stack(mode: str) -> list[ReadinessCheck]:
         cuda_available = bool(torch.cuda.is_available())
     except Exception:
         pass
+    deepspeed_available = importlib.util.find_spec("deepspeed") is not None
+    megatron_root = os.environ.get("MEGATRON_LM_ROOT", "")
+    megatron_available = bool(megatron_root and Path(megatron_root).exists())
+    deepspeed_missing = []
+    if not deepspeed_available:
+        deepspeed_missing.append("python module: deepspeed")
+    if not megatron_available:
+        deepspeed_missing.append("MEGATRON_LM_ROOT existing checkout")
     return [
         ReadinessCheck(
             subsystem="pretraining",
@@ -217,11 +239,15 @@ def _check_training_stack(mode: str) -> list[ReadinessCheck]:
         ),
         ReadinessCheck(
             subsystem="deepspeed_megatron",
-            status="blocked_missing_dependency",
-            summary="DeepSpeed/Megatron are launch contracts until dedicated runtime adapters pass cluster gates.",
+            status="built_not_cluster_proven" if deepspeed_available else "blocked_missing_dependency",
+            summary=(
+                "DeepSpeed ZeRO runtime adapter is wired; Megatron still requires an external checkout and cluster gate."
+                if deepspeed_available
+                else "DeepSpeed/Megatron dependencies are missing."
+            ),
             required_dependencies=["deepspeed", "Megatron-LM checkout", "cluster release gate"],
-            missing_dependencies=["runtime adapter not proven"],
-            evidence={},
+            missing_dependencies=deepspeed_missing,
+            evidence={"deepspeed_module": deepspeed_available, "megatron_root": megatron_root},
             production_blocker=mode == "production",
         ),
         ReadinessCheck(

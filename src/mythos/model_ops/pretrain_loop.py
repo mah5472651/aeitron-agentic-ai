@@ -26,6 +26,39 @@ except ImportError:  # pragma: no cover
 DistributedStrategy = Literal["none", "fsdp", "deepspeed_zero2", "deepspeed_zero3", "megatron"]
 
 
+def is_deepspeed_strategy(strategy: DistributedStrategy) -> bool:
+    return strategy in {"deepspeed_zero2", "deepspeed_zero3"}
+
+
+def default_deepspeed_config_path(strategy: DistributedStrategy) -> Path:
+    if strategy == "deepspeed_zero2":
+        return Path("deploy/gpu/deepspeed_zero2.json")
+    if strategy == "deepspeed_zero3":
+        return Path("deploy/gpu/deepspeed_zero3.json")
+    raise ValueError(f"strategy does not use DeepSpeed: {strategy}")
+
+
+def load_deepspeed_config(
+    *,
+    strategy: DistributedStrategy,
+    config_path: str | Path | None,
+    batch_size: int,
+    gradient_accumulation_steps: int,
+    dtype: str,
+) -> dict[str, Any]:
+    path = Path(config_path) if config_path else default_deepspeed_config_path(strategy)
+    if not path.exists():
+        raise FileNotFoundError(f"DeepSpeed config not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    world_size = max(1, distributed_world_size())
+    payload["train_micro_batch_size_per_gpu"] = batch_size
+    payload["gradient_accumulation_steps"] = gradient_accumulation_steps
+    payload["train_batch_size"] = batch_size * gradient_accumulation_steps * world_size
+    payload["bf16"] = {"enabled": dtype == "bf16"}
+    payload["fp16"] = {"enabled": dtype == "fp16"}
+    return payload
+
+
 def build_cluster_training_plan(
     *,
     output_dir: str | Path,
@@ -233,6 +266,24 @@ def initialize_distributed_runtime(strategy: DistributedStrategy, requested_devi
     require_torch()
     if strategy == "none":
         return {"enabled": False, "strategy": "none", "rank": 0, "world_size": 1, "local_rank": 0}
+    if is_deepspeed_strategy(strategy):
+        try:
+            import deepspeed
+        except ImportError as exc:
+            raise RuntimeError("DeepSpeed strategy requested but deepspeed is not installed") from exc
+        if not torch.distributed.is_initialized():
+            deepspeed.init_distributed()
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if requested_device.type == "cuda":
+            torch.cuda.set_device(local_rank)
+        return {
+            "enabled": True,
+            "strategy": strategy,
+            "rank": distributed_rank(),
+            "world_size": distributed_world_size(),
+            "local_rank": local_rank,
+            "backend": torch.distributed.get_backend() if torch.distributed.is_initialized() else "",
+        }
     if strategy != "fsdp":
         raise RuntimeError(
             f"{strategy} requires its dedicated engine adapter and cluster release gate. "
@@ -282,6 +333,8 @@ def wrap_for_distributed(
 
 def checkpoint_model_state_dict(model: "torch.nn.Module") -> dict[str, Any]:
     require_torch()
+    if hasattr(model, "module") and model.__class__.__name__.lower().endswith("engine"):
+        return model.module.state_dict()
     try:
         from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, StateDictType
     except ImportError:
@@ -291,6 +344,40 @@ def checkpoint_model_state_dict(model: "torch.nn.Module") -> dict[str, Any]:
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, config):
             return model.state_dict()
     return model.state_dict()
+
+
+def wrap_for_deepspeed(
+    model: "torch.nn.Module",
+    optimizer: "torch.optim.Optimizer",
+    scheduler: "torch.optim.lr_scheduler.LRScheduler",
+    *,
+    strategy: DistributedStrategy,
+    config_path: str | Path | None,
+    batch_size: int,
+    gradient_accumulation_steps: int,
+    dtype: str,
+) -> tuple["torch.nn.Module", "torch.optim.Optimizer", "torch.optim.lr_scheduler.LRScheduler"]:
+    if not is_deepspeed_strategy(strategy):
+        return model, optimizer, scheduler
+    try:
+        import deepspeed
+    except ImportError as exc:
+        raise RuntimeError("DeepSpeed strategy requested but deepspeed is not installed") from exc
+    ds_config = load_deepspeed_config(
+        strategy=strategy,
+        config_path=config_path,
+        batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        dtype=dtype,
+    )
+    engine, active_optimizer, _loader, active_scheduler = deepspeed.initialize(
+        model=model,
+        model_parameters=model.parameters(),
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        config=ds_config,
+    )
+    return engine, active_optimizer, active_scheduler
 
 
 def select_device(requested: str) -> "torch.device":
@@ -369,6 +456,8 @@ def save_training_checkpoint(
 ) -> Path:
     checkpoint_dir = output_dir / f"checkpoint-step-{step:08d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if hasattr(model, "save_checkpoint"):
+        model.save_checkpoint(str(checkpoint_dir / "deepspeed"), tag=f"step-{step:08d}")
     model_state = checkpoint_model_state_dict(model)
     manifest_path = output_dir / manifest_filename
     if distributed_rank() == 0:
@@ -573,6 +662,7 @@ def run_pretraining_loop(
     attention_impl: str = "auto",
     gradient_checkpointing: bool = False,
     distributed_strategy: DistributedStrategy = "none",
+    deepspeed_config: str | Path | None = None,
     production_mode: bool = False,
     dev_smoke: bool = False,
     max_training_loss: float = 10_000.0,
@@ -664,9 +754,21 @@ def run_pretraining_loop(
     model = MythosDecoderLM(config).to(selected)
     if config.gradient_checkpointing:
         model.enable_gradient_checkpointing()
-    model = wrap_for_distributed(model, strategy=distributed_strategy, dtype=dtype, device=selected)
+    if not is_deepspeed_strategy(distributed_strategy):
+        model = wrap_for_distributed(model, strategy=distributed_strategy, dtype=dtype, device=selected)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _step: 1.0)
+    if is_deepspeed_strategy(distributed_strategy):
+        model, optimizer, scheduler = wrap_for_deepspeed(
+            model,
+            optimizer,
+            scheduler,
+            strategy=distributed_strategy,
+            config_path=deepspeed_config,
+            batch_size=batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            dtype=dtype,
+        )
     checkpoint_environment = training_environment_report(device=selected, dtype=dtype, distributed_strategy=distributed_strategy)
     checkpoint_args = {
         "steps": steps,
@@ -684,6 +786,7 @@ def run_pretraining_loop(
         "attention_impl": attention_impl,
         "gradient_checkpointing": gradient_checkpointing,
         "distributed_strategy": distributed_strategy,
+        "deepspeed_config": str(deepspeed_config or default_deepspeed_config_path(distributed_strategy)) if is_deepspeed_strategy(distributed_strategy) else "",
         "production_mode": production_mode,
         "dev_smoke": dev_smoke,
         "max_training_loss": max_training_loss,
@@ -731,10 +834,16 @@ def run_pretraining_loop(
                         f"catastrophic training loss at step {current_step + 1}: "
                         f"{float(output.loss.detach().cpu())} > {max_training_loss}"
                     )
-                loss = output.loss / gradient_accumulation_steps
-            loss.backward()
+                loss = output.loss if is_deepspeed_strategy(distributed_strategy) else output.loss / gradient_accumulation_steps
+            if is_deepspeed_strategy(distributed_strategy):
+                model.backward(loss)
+            else:
+                loss.backward()
             progressed = True
-            if (current_step + 1) % gradient_accumulation_steps == 0:
+            if is_deepspeed_strategy(distributed_strategy):
+                model.step()
+                grad_norm = torch.tensor(0.0)
+            elif (current_step + 1) % gradient_accumulation_steps == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
                 optimizer.step()
                 scheduler.step()
@@ -896,6 +1005,7 @@ def run_pretraining_loop(
         "attention_impl": attention_impl,
         "distributed_strategy": distributed_strategy,
         "distributed": distributed_report,
+        "deepspeed_config": str(deepspeed_config or default_deepspeed_config_path(distributed_strategy)) if is_deepspeed_strategy(distributed_strategy) else "",
         "production_mode": production_mode,
         "dev_smoke": dev_smoke,
         "max_training_loss": max_training_loss,
@@ -1018,6 +1128,7 @@ def main() -> None:
         attention_impl=args.attention_impl,
         gradient_checkpointing=args.gradient_checkpointing,
         distributed_strategy=args.distributed_strategy,
+        deepspeed_config=args.deepspeed_config,
         production_mode=args.production,
         dev_smoke=args.dev_smoke,
         max_training_loss=args.max_training_loss,

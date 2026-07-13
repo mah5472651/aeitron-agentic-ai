@@ -5,11 +5,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
 from src.mythos.learning.quality import DatasetQualityGate, QualityGateConfig
 from src.mythos.evaluation.checkpoint_eval import evaluate_checkpoint
 from src.mythos.learning.web_ingest import allowed_url, text_from_html
 from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
-from src.mythos.model_ops.pretrain_loop import build_cluster_training_plan, run_pretraining_loop, validate_production_training_args
+from src.mythos.model_ops.pretrain_loop import build_cluster_training_plan, load_deepspeed_config, run_pretraining_loop, validate_production_training_args
+from src.mythos.model_ops.native_serving import NativeServingConfig, create_app
 from src.mythos.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints
 from src.mythos.model_ops.tokenizer_pipeline import (
     RealCorpusTokenizerConfig,
@@ -364,6 +367,64 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             self.assertTrue(Path(root / "compare" / "checkpoint_comparison_report.json").exists())
             self.assertTrue(Path(root / "compare" / "checkpoint_comparison_report.md").exists())
 
+    def test_native_serving_loads_scratch_checkpoint_and_returns_chat_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            text = "def validate(value): return value.strip() secure patch test " * 250
+            corpus.write_text(json.dumps({"text": text, "license": "mit"}) + "\n", encoding="utf-8")
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            build_token_shards(
+                input_paths=[corpus],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "shards",
+                config=ShardBuildConfig(shard_token_count=128, sequence_length=16, validation_fraction=0.0),
+            )
+            training = run_pretraining_loop(
+                output_dir=root / "train",
+                manifest=root / "shards" / "manifest.json",
+                device="cpu",
+                steps=1,
+                batch_size=1,
+                sequence_length=16,
+                gradient_accumulation_steps=1,
+                dtype="fp32",
+                validate_every=0,
+                checkpoint_every=0,
+                resume=False,
+            )
+            app = create_app(
+                NativeServingConfig(
+                    checkpoint_manifest=training["checkpoint_manifest"],
+                    tokenizer_path=str(tokenizer_path),
+                    model_name="mythos-test",
+                    device="cpu",
+                    auth_enabled=False,
+                    quota_enabled=False,
+                )
+            )
+            client = TestClient(app)
+            ready = client.get("/health/ready")
+            self.assertEqual(ready.status_code, 200, ready.text)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mythos-test",
+                    "messages": [{"role": "user", "content": "Write a safe validation patch."}],
+                    "max_tokens": 2,
+                    "temperature": 0.0,
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertEqual(payload["model"], "mythos-test")
+            self.assertIn("choices", payload)
+            self.assertTrue(payload["mythos"]["scratch_only"])
+
     def test_cluster_training_plan_validates_manifest_and_batch_math(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -401,6 +462,20 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             self.assertEqual(plan["total_gpus"], 8)
             self.assertEqual(plan["tokens_per_optimizer_step"], 8 * 2 * 8 * 128)
             self.assertIn("torchrun", plan["command"][0])
+
+    def test_deepspeed_config_loader_patches_runtime_batch_fields(self) -> None:
+        config = load_deepspeed_config(
+            strategy="deepspeed_zero3",
+            config_path="deploy/gpu/deepspeed_zero3.json",
+            batch_size=2,
+            gradient_accumulation_steps=4,
+            dtype="fp16",
+        )
+        self.assertEqual(config["train_micro_batch_size_per_gpu"], 2)
+        self.assertEqual(config["gradient_accumulation_steps"], 4)
+        self.assertEqual(config["train_batch_size"], 8)
+        self.assertTrue(config["fp16"]["enabled"])
+        self.assertFalse(config["bf16"]["enabled"])
 
     def test_production_training_args_reject_tiny_without_dev_smoke(self) -> None:
         manifest = ShardManifest(
