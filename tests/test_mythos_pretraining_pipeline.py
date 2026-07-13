@@ -9,7 +9,7 @@ from src.mythos.learning.quality import DatasetQualityGate, QualityGateConfig
 from src.mythos.evaluation.checkpoint_eval import evaluate_checkpoint
 from src.mythos.learning.web_ingest import allowed_url, text_from_html
 from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
-from src.mythos.model_ops.pretrain_loop import build_cluster_training_plan, run_pretraining_loop
+from src.mythos.model_ops.pretrain_loop import build_cluster_training_plan, run_pretraining_loop, validate_production_training_args
 from src.mythos.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints
 from src.mythos.model_ops.tokenizer_pipeline import (
     RealCorpusTokenizerConfig,
@@ -310,6 +310,16 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             self.assertEqual(report["status"], "passed")
             self.assertEqual(report["attention_impl"], "eager")
             self.assertTrue(report["model_config"]["gradient_checkpointing"])
+            import torch
+
+            manifest_payload = json.loads(Path(report["checkpoint_manifest"]).read_text(encoding="utf-8"))
+            checkpoint_payload = torch.load(Path(manifest_payload["checkpoint_dir"]) / "model.pt", map_location="cpu")
+            self.assertIn("scheduler", checkpoint_payload)
+            self.assertIn("training_args", checkpoint_payload)
+            self.assertIn("dataset_manifest_sha256", checkpoint_payload)
+            self.assertIn("tokenizer_sha256", checkpoint_payload)
+            self.assertIn("git_commit", checkpoint_payload)
+            self.assertIn("environment", checkpoint_payload)
 
     def test_checkpoint_comparison_writes_reports(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -391,6 +401,30 @@ class MythosPretrainingPipelineTest(unittest.TestCase):
             self.assertEqual(plan["total_gpus"], 8)
             self.assertEqual(plan["tokens_per_optimizer_step"], 8 * 2 * 8 * 128)
             self.assertIn("torchrun", plan["command"][0])
+
+    def test_production_training_args_reject_tiny_without_dev_smoke(self) -> None:
+        manifest = ShardManifest(
+            dataset_id="production-validation",
+            tokenizer_path="missing-tokenizer.json",
+            output_dir="shards",
+            train_shards=["train.bin"],
+            val_shards=[],
+            train_tokens=1024,
+            val_tokens=0,
+            sequence_length=128,
+        )
+        with self.assertRaises(ValueError):
+            validate_production_training_args(
+                production_mode=True,
+                dev_smoke=False,
+                model_profile_name="tiny",
+                manifest="manifest.json",
+                tokenizer_path=None,
+                active_manifest=manifest,
+                validate_every=10,
+                checkpoint_every=10,
+                run_steps=100,
+            )
 
 
 if __name__ == "__main__":

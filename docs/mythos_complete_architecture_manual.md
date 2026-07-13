@@ -2586,6 +2586,118 @@ What the plan does not prove:
 
 Those are cluster release-gate tasks, not laptop/Kaggle smoke tasks.
 
+## Production Readiness Contract
+
+Module:
+
+- `src/mythos/production_readiness.py`
+
+Purpose:
+
+Mythos must never silently claim production readiness when it is only locally
+smoke-tested. The readiness contract classifies each subsystem using explicit
+machine-readable states:
+
+- `production_ready`
+- `production_ready_requires_external_service`
+- `built_not_cluster_proven`
+- `blocked_missing_dependency`
+- `not_implemented`
+
+Covered subsystems:
+
+- auth and quota
+- native Mythos serving
+- Postgres, object storage, Qdrant, and OpenTelemetry config
+- Semgrep, CodeQL, Bandit, pip-audit, Docker, and kubectl availability
+- CUDA pretraining runtime
+- FSDP, DeepSpeed/Megatron, vLLM/TensorRT
+- required benchmark files
+
+Development readiness report:
+
+```powershell
+python -m src.mythos.production_readiness --mode dev --output-dir artifacts\mythos\production-readiness
+```
+
+Production readiness report:
+
+```powershell
+python -m src.mythos.production_readiness --mode production --benchmark-dir data\eval --output-dir artifacts\mythos\production-readiness
+```
+
+Production mode is expected to fail until real external infrastructure is
+configured. That is intentional. A missing Redis, Postgres, S3/MinIO, Qdrant,
+Semgrep, CodeQL, Docker, kubectl, CUDA runtime, or benchmark suite must be a
+visible blocker, not a hidden warning.
+
+## Production Training Guardrails
+
+The scratch pretraining loop now records production traceability metadata in
+each checkpoint:
+
+- optimizer state
+- scheduler state
+- model config
+- training args
+- tokenizer path and SHA-256 hash
+- shard manifest path and SHA-256 hash
+- git commit
+- environment report
+- distributed world size
+
+Production mode:
+
+```bash
+python -m src.mythos.model_ops.pretrain_loop \
+  --production \
+  --manifest artifacts/mythos/shards/manifest.json \
+  --output-dir artifacts/mythos/production-pretrain \
+  --device cuda \
+  --model-profile 7b \
+  --dtype bf16 \
+  --validate-every 100 \
+  --checkpoint-every 500 \
+  --steps 10000
+```
+
+Production mode rejects:
+
+- `model-profile=tiny` unless `--dev-smoke` is explicitly set
+- missing shard manifest
+- missing tokenizer asset
+- validation schedules that never run
+- disabled checkpointing
+- non-finite or catastrophic loss
+- incompatible checkpoint resume shape
+
+The data pipeline also has production validation. When `--production` is used
+through `deploy/gpu/run_real_data_training_pipeline.py`, it requires Postgres
+frontier storage, non-local object storage, license filtering, benchmark
+contamination filtering, near-dedup, source balancing, training-data gate, and
+in-run validation.
+
+## Security Audit Production Behavior
+
+Module:
+
+- `src/mythos/security/audit.py`
+
+Dev behavior:
+
+- missing Bandit/Semgrep/CodeQL/pip-audit is reported as `skipped`
+- skipped optional tools do not fail local dev release gates
+
+Production behavior:
+
+```powershell
+python -m src.mythos.security.audit --strict-external-tools --output-dir artifacts\mythos\security-audit
+```
+
+In strict mode, missing required scanner CLIs become release blockers. Critical
+findings, dependency warnings, failed scanner output, and failed Kubernetes
+validation block release.
+
 ## Verification Commands
 
 Use these after major changes:

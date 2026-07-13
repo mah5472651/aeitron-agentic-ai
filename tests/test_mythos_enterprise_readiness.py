@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.mythos.deployment.k8s_validate import validate_manifests
 from src.mythos.evaluation.benchmark_pack import BenchmarkPackConfig, run_benchmark_pack
@@ -11,6 +12,7 @@ from src.mythos.evaluation.benchmark_suites import BenchmarkSuiteSpec, run_bench
 from src.mythos.learning.dataset_validation import DatasetValidationConfig, validate_dataset
 from src.mythos.learning.source_balancing import balance_clean_jsonl
 from src.mythos.learning.storage import LocalObjectStore, ObjectStoreConfig, upload_paths, verify_object_store_lifecycle
+from src.mythos.production_readiness import run_production_readiness
 from src.mythos.security.audit import run_security_audit
 
 
@@ -215,13 +217,37 @@ class MythosEnterpriseReadinessTest(unittest.TestCase):
             clean = root / "src" / "mythos"
             clean.mkdir(parents=True)
             (clean / "app.py").write_text("def ok():\n    return True\n", encoding="utf-8")
-            report = run_security_audit(root=root, run_bandit=False, validate_k8s=False)
+            report = run_security_audit(root=root, run_bandit=False, validate_k8s=False, run_semgrep=False, run_codeql=False, run_pip_audit=False)
             self.assertEqual(report.status, "passed")
 
             (clean / "bad.py").write_text("API_KEY = 'abcdefghijklmnopqrstuvwxyz123456'\n", encoding="utf-8")
-            bad = run_security_audit(root=root, run_bandit=False, validate_k8s=False)
+            bad = run_security_audit(root=root, run_bandit=False, validate_k8s=False, run_semgrep=False, run_codeql=False, run_pip_audit=False)
             self.assertEqual(bad.status, "failed")
             self.assertTrue(any(item.check == "secret_pattern" for item in bad.findings))
+
+    def test_production_readiness_is_honest_about_missing_external_dependencies(self) -> None:
+        cleared = {
+            "MYTHOS_AUTH_ENABLED": "",
+            "MYTHOS_JWT_SECRET": "",
+            "MYTHOS_QUOTA_ENABLED": "",
+            "MYTHOS_REDIS_URL": "",
+            "MYTHOS_MODEL_BACKEND": "",
+            "MYTHOS_MODEL_ENDPOINT": "",
+            "MYTHOS_DATABASE_URL": "",
+            "MYTHOS_OBJECT_STORE_URI": "",
+            "MYTHOS_QDRANT_URL": "",
+        }
+        with patch.dict("os.environ", cleared, clear=False):
+            report = run_production_readiness(mode="production", benchmark_dir="definitely-missing-eval-dir")
+            self.assertEqual(report.status, "failed")
+            statuses = {check.subsystem: check.status for check in report.checks}
+            self.assertEqual(statuses["serving"], "blocked_missing_dependency")
+            self.assertEqual(statuses["benchmark_eval"], "blocked_missing_dependency")
+            self.assertTrue(any(check.production_blocker for check in report.checks))
+
+            dev_report = run_production_readiness(mode="dev", benchmark_dir="definitely-missing-eval-dir")
+            self.assertEqual(dev_report.status, "passed")
+            self.assertTrue(any(check.status == "blocked_missing_dependency" for check in dev_report.checks))
 
 
 if __name__ == "__main__":

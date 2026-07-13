@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess  # nosec B404
 import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
 from src.mythos.model_ops.data_loader import TokenShardStream, count_batches, load_manifest
-from src.mythos.model_ops.foundation import CheckpointManifest
+from src.mythos.model_ops.foundation import CheckpointManifest, sha256_file
 from src.mythos.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer, read_uint32_tokens
 from src.mythos.model_ops.torch_decoder import DecoderBlock, MythosDecoderLM, ScratchDecoderConfig, model_profile, require_torch, tiny_smoke_config
 from src.mythos.shared.progress import NullProgressReporter, ProgressReporter
@@ -314,15 +316,55 @@ def latest_checkpoint(output_dir: str | Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def git_commit(root: str | Path = ".") -> str:
+    completed = subprocess.run(  # nosec B603
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else "unknown"
+
+
+def training_environment_report(*, device: "torch.device", dtype: str, distributed_strategy: DistributedStrategy) -> dict[str, Any]:
+    require_torch()
+    cuda_available = bool(torch.cuda.is_available())
+    return {
+        "python": __import__("sys").version.split()[0],
+        "torch": str(torch.__version__),
+        "cuda_available": cuda_available,
+        "cuda_version": str(getattr(torch.version, "cuda", "")),
+        "device": str(device),
+        "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" and cuda_available else "",
+        "dtype": dtype,
+        "distributed_strategy": distributed_strategy,
+        "distributed_rank": distributed_rank(),
+        "distributed_world_size": distributed_world_size(),
+        "env": {
+            "LOCAL_RANK": os.environ.get("LOCAL_RANK", ""),
+            "RANK": os.environ.get("RANK", ""),
+            "WORLD_SIZE": os.environ.get("WORLD_SIZE", ""),
+            "MASTER_ADDR": os.environ.get("MASTER_ADDR", ""),
+            "MASTER_PORT": os.environ.get("MASTER_PORT", ""),
+        },
+    }
+
+
 def save_training_checkpoint(
     *,
     output_dir: Path,
     model: "torch.nn.Module",
     optimizer: "torch.optim.Optimizer",
+    scheduler: "torch.optim.lr_scheduler.LRScheduler | None" = None,
     config: ScratchDecoderConfig,
     step: int,
     trained_tokens: int,
     metrics: dict[str, float],
+    training_args: dict[str, Any] | None = None,
+    dataset_manifest_path: str | Path | None = None,
+    tokenizer_path: str | Path | None = None,
+    environment: dict[str, Any] | None = None,
     manifest_filename: str = "checkpoint_manifest.json",
 ) -> Path:
     checkpoint_dir = output_dir / f"checkpoint-step-{step:08d}"
@@ -330,14 +372,24 @@ def save_training_checkpoint(
     model_state = checkpoint_model_state_dict(model)
     manifest_path = output_dir / manifest_filename
     if distributed_rank() == 0:
+        dataset_manifest_hash = sha256_file(Path(dataset_manifest_path)) if dataset_manifest_path and Path(dataset_manifest_path).exists() else ""
+        tokenizer_hash = sha256_file(Path(tokenizer_path)) if tokenizer_path and Path(tokenizer_path).exists() else ""
         torch.save(
             {
                 "model": model_state,
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else {"type": "constant", "state": {}},
                 "config": config.model_dump(),
                 "step": step,
                 "trained_tokens": trained_tokens,
                 "metrics": metrics,
+                "training_args": training_args or {},
+                "dataset_manifest_path": str(dataset_manifest_path or ""),
+                "dataset_manifest_sha256": dataset_manifest_hash,
+                "tokenizer_path": str(tokenizer_path or ""),
+                "tokenizer_sha256": tokenizer_hash,
+                "git_commit": git_commit(),
+                "environment": environment or {},
                 "distributed_world_size": distributed_world_size(),
             },
             checkpoint_dir / "model.pt",
@@ -359,14 +411,58 @@ def save_training_checkpoint(
 def load_checkpoint(
     checkpoint_path: Path,
     *,
-    model: "MythosDecoderLM",
+    model: "torch.nn.Module",
     optimizer: "torch.optim.Optimizer",
+    scheduler: "torch.optim.lr_scheduler.LRScheduler | None" = None,
     device: "torch.device",
+    expected_config: ScratchDecoderConfig | None = None,
 ) -> tuple[int, int]:
     payload = torch.load(checkpoint_path, map_location=device)
+    if expected_config is not None:
+        saved_config = payload.get("config") or {}
+        if int(saved_config.get("vocab_size", expected_config.vocab_size)) != expected_config.vocab_size:
+            raise ValueError("checkpoint vocab_size does not match current training config")
+        if int(saved_config.get("hidden_size", expected_config.hidden_size)) != expected_config.hidden_size:
+            raise ValueError("checkpoint hidden_size does not match current training config")
     model.load_state_dict(payload["model"])
     optimizer.load_state_dict(payload["optimizer"])
+    if scheduler is not None and isinstance(payload.get("scheduler"), dict):
+        try:
+            scheduler.load_state_dict(payload["scheduler"])
+        except Exception as exc:
+            raise ValueError(f"checkpoint scheduler state is incompatible: {exc}") from exc
     return int(payload.get("step", 0)), int(payload.get("trained_tokens", 0))
+
+
+def validate_production_training_args(
+    *,
+    production_mode: bool,
+    dev_smoke: bool,
+    model_profile_name: str,
+    manifest: str | Path | None,
+    tokenizer_path: str | Path | None,
+    active_manifest: ShardManifest,
+    validate_every: int,
+    checkpoint_every: int,
+    run_steps: int,
+) -> None:
+    if not production_mode:
+        return
+    failures = []
+    if model_profile_name == "tiny" and not dev_smoke:
+        failures.append("production mode cannot use model-profile=tiny without --dev-smoke")
+    if not manifest:
+        failures.append("production mode requires an explicit shard manifest")
+    if not active_manifest.tokenizer_path or not Path(active_manifest.tokenizer_path).exists():
+        failures.append("production mode requires a tokenizer path in the shard manifest")
+    if tokenizer_path and not Path(tokenizer_path).exists():
+        failures.append("production mode tokenizer_path does not exist")
+    if validate_every <= 0 or validate_every > run_steps:
+        failures.append("production mode requires validation to run inside the requested step count")
+    if checkpoint_every <= 0:
+        failures.append("production mode requires checkpointing")
+    if failures:
+        raise ValueError("production training validation failed: " + "; ".join(failures))
 
 
 def tensor_batch(batch: list[list[int]], *, device: "torch.device") -> "torch.Tensor":
@@ -477,6 +573,9 @@ def run_pretraining_loop(
     attention_impl: str = "auto",
     gradient_checkpointing: bool = False,
     distributed_strategy: DistributedStrategy = "none",
+    production_mode: bool = False,
+    dev_smoke: bool = False,
+    max_training_loss: float = 10_000.0,
 ) -> dict[str, Any]:
     require_torch()
     if steps < 1:
@@ -510,6 +609,17 @@ def run_pretraining_loop(
         active_manifest = load_manifest(active_manifest_path)
     else:
         raise ValueError("provide --manifest, or both --token-file and --tokenizer-path")
+    validate_production_training_args(
+        production_mode=production_mode,
+        dev_smoke=dev_smoke,
+        model_profile_name=model_profile_name,
+        manifest=manifest,
+        tokenizer_path=tokenizer_path,
+        active_manifest=active_manifest,
+        validate_every=validate_every,
+        checkpoint_every=checkpoint_every,
+        run_steps=steps,
+    )
 
     config = build_training_config(
         active_manifest,
@@ -556,12 +666,41 @@ def run_pretraining_loop(
         model.enable_gradient_checkpointing()
     model = wrap_for_distributed(model, strategy=distributed_strategy, dtype=dtype, device=selected)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _step: 1.0)
+    checkpoint_environment = training_environment_report(device=selected, dtype=dtype, distributed_strategy=distributed_strategy)
+    checkpoint_args = {
+        "steps": steps,
+        "batch_size": batch_size,
+        "sequence_length": sequence_length,
+        "learning_rate": learning_rate,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "dtype": dtype,
+        "validate_every": validate_every,
+        "validation_batches": validation_batches,
+        "checkpoint_every": checkpoint_every,
+        "early_stopping_patience": early_stopping_patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
+        "model_profile_name": model_profile_name,
+        "attention_impl": attention_impl,
+        "gradient_checkpointing": gradient_checkpointing,
+        "distributed_strategy": distributed_strategy,
+        "production_mode": production_mode,
+        "dev_smoke": dev_smoke,
+        "max_training_loss": max_training_loss,
+    }
     start_step = 0
     trained_tokens = 0
     if resume:
         checkpoint = latest_checkpoint(root)
         if checkpoint is not None:
-            start_step, trained_tokens = load_checkpoint(checkpoint, model=model, optimizer=optimizer, device=selected)
+            start_step, trained_tokens = load_checkpoint(
+                checkpoint,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device=selected,
+                expected_config=config,
+            )
 
     model.train()
     started = time.perf_counter()
@@ -587,12 +726,18 @@ def run_pretraining_loop(
                     raise RuntimeError("loss missing")
                 if not torch.isfinite(output.loss.detach()):
                     raise FloatingPointError(f"non-finite training loss at step {current_step + 1}: {float(output.loss.detach().cpu())}")
+                if float(output.loss.detach().cpu()) > max_training_loss:
+                    raise FloatingPointError(
+                        f"catastrophic training loss at step {current_step + 1}: "
+                        f"{float(output.loss.detach().cpu())} > {max_training_loss}"
+                    )
                 loss = output.loss / gradient_accumulation_steps
             loss.backward()
             progressed = True
             if (current_step + 1) % gradient_accumulation_steps == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
             else:
                 grad_norm = torch.tensor(0.0)
@@ -635,10 +780,15 @@ def run_pretraining_loop(
                         output_dir=root,
                         model=model,
                         optimizer=optimizer,
+                        scheduler=scheduler,
                         config=config,
                         step=current_step,
                         trained_tokens=trained_tokens,
                         metrics={"train_loss": train_losses[-1], "val_loss": current_val_loss, "best_val_loss": current_val_loss},
+                        training_args=checkpoint_args,
+                        dataset_manifest_path=active_manifest_path,
+                        tokenizer_path=active_manifest.tokenizer_path,
+                        environment=checkpoint_environment,
                         manifest_filename="best_checkpoint_manifest.json",
                     )
                     active_progress.emit(
@@ -663,10 +813,15 @@ def run_pretraining_loop(
                     output_dir=root,
                     model=model,
                     optimizer=optimizer,
+                    scheduler=scheduler,
                     config=config,
                     step=current_step,
                     trained_tokens=trained_tokens,
                     metrics={"train_loss": train_losses[-1], "val_loss": val_losses[-1]["loss"] if val_losses else -1.0},
+                    training_args=checkpoint_args,
+                    dataset_manifest_path=active_manifest_path,
+                    tokenizer_path=active_manifest.tokenizer_path,
+                    environment=checkpoint_environment,
                 )
                 active_progress.emit(
                     "checkpoint",
@@ -692,10 +847,15 @@ def run_pretraining_loop(
         output_dir=root,
         model=model,
         optimizer=optimizer,
+        scheduler=scheduler,
         config=config,
         step=current_step,
         trained_tokens=trained_tokens,
         metrics={"train_loss": train_losses[-1], "val_loss": final_val_loss, "best_val_loss": best_val_loss if val_losses else -1.0},
+        training_args=checkpoint_args,
+        dataset_manifest_path=active_manifest_path,
+        tokenizer_path=active_manifest.tokenizer_path,
+        environment=checkpoint_environment,
         manifest_filename="checkpoint_manifest.json",
     )
     if best_checkpoint_manifest is None:
@@ -703,10 +863,15 @@ def run_pretraining_loop(
             output_dir=root,
             model=model,
             optimizer=optimizer,
+            scheduler=scheduler,
             config=config,
             step=current_step,
             trained_tokens=trained_tokens,
             metrics={"train_loss": train_losses[-1], "val_loss": final_val_loss, "best_val_loss": final_val_loss},
+            training_args=checkpoint_args,
+            dataset_manifest_path=active_manifest_path,
+            tokenizer_path=active_manifest.tokenizer_path,
+            environment=checkpoint_environment,
             manifest_filename="best_checkpoint_manifest.json",
         )
         best_val_loss = final_val_loss
@@ -731,6 +896,10 @@ def run_pretraining_loop(
         "attention_impl": attention_impl,
         "distributed_strategy": distributed_strategy,
         "distributed": distributed_report,
+        "production_mode": production_mode,
+        "dev_smoke": dev_smoke,
+        "max_training_loss": max_training_loss,
+        "git_commit": git_commit(),
         "train_losses": train_losses,
         "validation_losses": val_losses,
         "best_validation_loss": best_val_loss,
@@ -778,6 +947,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-profile", default="tiny", choices=["tiny", "1b", "7b", "32b", "62b"])
     parser.add_argument("--attention-impl", default="auto", choices=["auto", "sdpa", "eager"])
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--production", action="store_true", help="Enable strict production training validation.")
+    parser.add_argument("--dev-smoke", action="store_true", help="Explicitly allow tiny/dev smoke behavior under production validation.")
+    parser.add_argument("--max-training-loss", type=float, default=10_000.0)
     parser.add_argument(
         "--distributed-strategy",
         default="none",
@@ -846,6 +1018,9 @@ def main() -> None:
         attention_impl=args.attention_impl,
         gradient_checkpointing=args.gradient_checkpointing,
         distributed_strategy=args.distributed_strategy,
+        production_mode=args.production,
+        dev_smoke=args.dev_smoke,
+        max_training_loss=args.max_training_loss,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

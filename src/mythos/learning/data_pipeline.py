@@ -106,6 +106,8 @@ class DataPipelineConfig(StrictModel):
     progress_to_stdout: bool = False
     progress_every_docs: int = Field(default=25, ge=1)
     progress_every_steps: int = Field(default=25, ge=1)
+    production_mode: bool = False
+    dev_smoke: bool = False
 
 
 class DataPipelineReport(StrictModel):
@@ -185,6 +187,7 @@ async def _build_store(config: DataPipelineConfig) -> Any:
 
 
 async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncClient | None = None) -> DataPipelineReport:
+    validate_data_pipeline_production_config(config)
     root = Path(config.work_dir)
     raw_dir = root / "raw"
     clean_dir = root / "clean"
@@ -212,6 +215,36 @@ async def run_data_pipeline(config: DataPipelineConfig, *, client: httpx.AsyncCl
             reports_dir=reports_dir,
             progress=progress,
         )
+
+
+def validate_data_pipeline_production_config(config: DataPipelineConfig) -> None:
+    if not config.production_mode:
+        return
+    failures = []
+    if config.frontier_backend != "postgres":
+        failures.append("production mode requires frontier_backend='postgres'")
+    if not config.postgres_dsn:
+        failures.append("production mode requires postgres_dsn")
+    if config.object_store_uri.startswith("local://"):
+        failures.append("production mode requires S3/MinIO object storage, not local://")
+    if config.skip_train:
+        failures.append("production mode cannot skip training")
+    if config.model_profile_name == "tiny" and not config.dev_smoke:
+        failures.append("production mode cannot use model_profile_name='tiny' without dev_smoke")
+    if not config.apply_training_data_gate:
+        failures.append("production mode requires training_data_gate")
+    if not config.filter_licenses or not config.strict_unknown_licenses:
+        failures.append("production mode requires strict license filtering")
+    if not config.filter_benchmark_contamination:
+        failures.append("production mode requires benchmark contamination filtering")
+    if not config.near_dedup:
+        failures.append("production mode requires near-duplicate removal")
+    if not config.balance_sources:
+        failures.append("production mode requires source balancing")
+    if config.validate_every <= 0 or config.validate_every > config.train_steps:
+        failures.append("production mode requires validation during the training run")
+    if failures:
+        raise ValueError("production data pipeline validation failed: " + "; ".join(failures))
 
 
 async def _run_data_pipeline_locked(
@@ -535,6 +568,8 @@ async def _run_data_pipeline_locked(
             resume=True,
             progress=progress,
             progress_every_steps=config.progress_every_steps,
+            production_mode=config.production_mode,
+            dev_smoke=config.dev_smoke,
         )
         if config.run_checkpoint_eval:
             progress.emit("checkpoint_eval", "started")

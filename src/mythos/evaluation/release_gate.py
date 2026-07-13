@@ -6,8 +6,11 @@ import json
 import subprocess  # nosec B404
 import sys
 
+from src.mythos.production_readiness import run_production_readiness
+
 
 def main() -> None:
+    readiness = run_production_readiness(mode="dev").model_dump()
     completed = subprocess.run(  # nosec B603
         [
             sys.executable,
@@ -31,6 +34,7 @@ def main() -> None:
             {
                 "decision": "release" if completed.returncode == 0 else "block",
                 "passed": completed.returncode == 0,
+                "production_readiness": readiness,
                 "stdout": completed.stdout[-4000:],
                 "stderr": completed.stderr[-4000:],
             },

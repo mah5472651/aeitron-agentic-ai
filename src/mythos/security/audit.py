@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess  # nosec B404
 import time
 from pathlib import Path
@@ -36,6 +37,7 @@ class SecurityAuditReport(StrictModel):
     root: str
     findings: list[SecurityFinding]
     dependency_warnings: list[str]
+    external_scanners: dict[str, Any] = Field(default_factory=dict)
     bandit: dict[str, Any] | None = None
     k8s: dict[str, Any] | None = None
     created_at_unix: float = Field(default_factory=time.time)
@@ -120,6 +122,8 @@ def _dependency_warnings(root: Path) -> list[str]:
 
 
 def _run_bandit(root: Path) -> dict[str, Any] | None:
+    if shutil.which("bandit") is None:
+        return {"status": "skipped", "reason": "bandit executable is not installed"}
     command = ["python", "-m", "bandit", "-q", "-r", "src/mythos", "-f", "json"]
     completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)  # nosec B603
     if completed.returncode not in {0, 1}:
@@ -132,17 +136,75 @@ def _run_bandit(root: Path) -> dict[str, Any] | None:
     return {"status": "passed" if issue_count == 0 else "failed", "issue_count": issue_count, "metrics": payload.get("metrics", {})}
 
 
+def _run_semgrep(root: Path) -> dict[str, Any]:
+    if shutil.which("semgrep") is None:
+        return {"status": "skipped", "reason": "semgrep executable is not installed"}
+    command = ["semgrep", "scan", "--config", "auto", "--json", "src/mythos"]
+    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)  # nosec B603
+    if completed.returncode not in {0, 1}:
+        return {"status": "failed", "reason": completed.stderr[-2000:] or completed.stdout[-2000:]}
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return {"status": "failed", "reason": "semgrep returned invalid JSON", "stderr": completed.stderr[-1000:]}
+    findings = payload.get("results", [])
+    return {"status": "passed" if not findings else "failed", "issue_count": len(findings)}
+
+
+def _run_codeql(root: Path) -> dict[str, Any]:
+    if shutil.which("codeql") is None:
+        return {"status": "skipped", "reason": "codeql executable is not installed"}
+    database = root / "artifacts" / "mythos" / "codeql-db"
+    if not database.exists():
+        return {"status": "skipped", "reason": "CodeQL database missing; create it before production audit", "database": str(database)}
+    output = root / "artifacts" / "mythos" / "codeql-results.sarif"
+    command = ["codeql", "database", "analyze", str(database), "--format=sarifv2.1.0", f"--output={output}", "--rerun"]
+    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)  # nosec B603
+    return {
+        "status": "passed" if completed.returncode == 0 else "failed",
+        "returncode": completed.returncode,
+        "output": str(output),
+        "stderr": completed.stderr[-2000:],
+    }
+
+
+def _run_pip_audit(root: Path) -> dict[str, Any]:
+    if shutil.which("pip-audit") is None:
+        return {"status": "skipped", "reason": "pip-audit executable is not installed"}
+    command = ["pip-audit", "--format", "json"]
+    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)  # nosec B603
+    if completed.returncode not in {0, 1}:
+        return {"status": "failed", "reason": completed.stderr[-2000:] or completed.stdout[-2000:]}
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return {"status": "failed", "reason": "pip-audit returned invalid JSON", "stderr": completed.stderr[-1000:]}
+    vulnerabilities = payload.get("vulnerabilities", [])
+    return {"status": "passed" if not vulnerabilities else "failed", "vulnerability_count": len(vulnerabilities)}
+
+
 def run_security_audit(
     *,
     root: str | Path = ".",
     output_dir: str | Path | None = None,
     run_bandit: bool = True,
     validate_k8s: bool = True,
+    run_semgrep: bool = True,
+    run_codeql: bool = True,
+    run_pip_audit: bool = True,
+    strict_external_tools: bool = False,
 ) -> SecurityAuditReport:
     project_root = Path(root).resolve()
     findings = _scan_patterns(project_root)
     dependency_warnings = _dependency_warnings(project_root)
     bandit_report = _run_bandit(project_root) if run_bandit else None
+    external_scanners: dict[str, Any] = {}
+    if run_semgrep:
+        external_scanners["semgrep"] = _run_semgrep(project_root)
+    if run_codeql:
+        external_scanners["codeql"] = _run_codeql(project_root)
+    if run_pip_audit:
+        external_scanners["pip_audit"] = _run_pip_audit(project_root)
     k8s_report = None
     if validate_k8s:
         manifests = sorted((project_root / "deploy" / "k8s").glob("*.yaml"))
@@ -151,12 +213,17 @@ def run_security_audit(
     failed = any(item.severity == "fail" for item in findings)
     failed = failed or bool(dependency_warnings)
     failed = failed or bool(bandit_report and bandit_report.get("status") == "failed")
+    failed = failed or any(report.get("status") == "failed" for report in external_scanners.values())
+    if strict_external_tools:
+        failed = failed or bool(bandit_report and bandit_report.get("status") == "skipped")
+        failed = failed or any(report.get("status") == "skipped" for report in external_scanners.values())
     failed = failed or bool(k8s_report and k8s_report.get("status") == "failed")
     report = SecurityAuditReport(
         status="failed" if failed else "passed",
         root=str(project_root),
         findings=findings,
         dependency_warnings=dependency_warnings,
+        external_scanners=external_scanners,
         bandit=bandit_report,
         k8s=k8s_report,
     )
@@ -183,6 +250,11 @@ def write_markdown(report: SecurityAuditReport, path: str | Path) -> Path:
         lines.extend(["", "## Dependency Warnings", ""])
         for warning in report.dependency_warnings:
             lines.append(f"- {warning}")
+    if report.external_scanners:
+        lines.extend(["", "## External Scanners", "", "| scanner | status | detail |", "|---|---|---|"])
+        for name, payload in report.external_scanners.items():
+            detail = payload.get("reason") or payload.get("issue_count") or payload.get("vulnerability_count") or ""
+            lines.append(f"| {name} | {payload.get('status')} | {detail} |")
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return target
 
@@ -193,12 +265,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="artifacts/mythos/security-audit")
     parser.add_argument("--no-bandit", action="store_true")
     parser.add_argument("--no-k8s", action="store_true")
+    parser.add_argument("--no-semgrep", action="store_true")
+    parser.add_argument("--no-codeql", action="store_true")
+    parser.add_argument("--no-pip-audit", action="store_true")
+    parser.add_argument("--strict-external-tools", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    report = run_security_audit(root=args.root, output_dir=args.output_dir, run_bandit=not args.no_bandit, validate_k8s=not args.no_k8s)
+    report = run_security_audit(
+        root=args.root,
+        output_dir=args.output_dir,
+        run_bandit=not args.no_bandit,
+        validate_k8s=not args.no_k8s,
+        run_semgrep=not args.no_semgrep,
+        run_codeql=not args.no_codeql,
+        run_pip_audit=not args.no_pip_audit,
+        strict_external_tools=args.strict_external_tools,
+    )
     print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
     if report.status != "passed":
         raise SystemExit(2)

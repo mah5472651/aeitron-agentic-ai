@@ -69,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-progress-stdout", action="store_true")
     parser.add_argument("--progress-every-docs", type=int, default=10)
     parser.add_argument("--progress-every-steps", type=int, default=10)
+    parser.add_argument("--production", action="store_true", help="Enable strict production data/training validation.")
+    parser.add_argument("--dev-smoke", action="store_true", help="Explicitly allow tiny/dev smoke behavior under production validation.")
     return parser.parse_args()
 
 
@@ -127,6 +129,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             progress_to_stdout=args.progress_to_stdout or not args.no_progress_stdout,
             progress_every_docs=args.progress_every_docs,
             progress_every_steps=args.progress_every_steps,
+            production_mode=args.production,
+            dev_smoke=args.dev_smoke,
         )
     )
     payload = report.model_dump()
