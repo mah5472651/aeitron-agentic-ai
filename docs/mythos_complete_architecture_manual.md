@@ -2348,7 +2348,7 @@ quality before large GPU training.
 
 Module:
 
-- `src/mythos/model_ops/real_corpus_tokenizer.py`
+- `src/mythos/model_ops/tokenizer_pipeline.py`
 
 Purpose:
 
@@ -2362,7 +2362,8 @@ Purpose:
 Command:
 
 ```bash
-python -m src.mythos.model_ops.real_corpus_tokenizer \
+python -m src.mythos.model_ops.tokenizer_pipeline \
+  --real-corpus-audit \
   --input artifacts/mythos/real-data-5k-quality-gated/gated/training-promoted.jsonl \
   --output-dir artifacts/mythos/real-tokenizer-v1 \
   --vocab-size 64000 \

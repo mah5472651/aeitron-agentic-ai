@@ -11,12 +11,13 @@ from src.mythos.learning.web_ingest import allowed_url, text_from_html
 from src.mythos.model_ops.data_loader import TokenShardStream, load_manifest
 from src.mythos.model_ops.pretrain_loop import run_pretraining_loop
 from src.mythos.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints
-from src.mythos.model_ops.real_corpus_tokenizer import RealCorpusTokenizerConfig, train_real_corpus_tokenizer
 from src.mythos.model_ops.tokenizer_pipeline import (
+    RealCorpusTokenizerConfig,
     ShardBuildConfig,
     ShardManifest,
     TokenizerTrainConfig,
     build_token_shards,
+    train_real_corpus_tokenizer,
     train_bpe_tokenizer,
     write_uint32_tokens,
 )
