@@ -6,6 +6,18 @@ patch verification, and model-agnostic serving.
 The final architecture lives under `src/mythos`. The old numbered
 architecture has been removed.
 
+## Operating Roadmap
+
+Aeitron follows this roadmap for every future change:
+
+- Scratch-only model development. Do not add external foundation-model fine-tuning, SFT, DPO, GRPO, LoRA, QLoRA, or RLHF paths.
+- Production-grade code only: explicit validation, fail-fast dependency checks, secure defaults, no placeholder success paths, and no fake readiness claims.
+- Coding-agent performance first: repository indexing, context packing, TaskGraph execution, patch generation, verification, and benchmark feedback get priority over impressive but unused abstractions.
+- Cybersecurity scope stays governed: approved sources, defensive analysis, authorized labs/CTFs/eval material, security patch generation, and verification. No autonomous live-target attack workflow.
+- Data quality before scale: source reputation, license/provenance, contamination gates, deduplication, task extraction, review queues, and benchmark holdouts must run before tokenizer/sharding/training.
+- Production readiness is evidence-based: local smoke, Kaggle/Colab validation, and cluster production are separate statuses. Anything needing Redis/Postgres/S3/Qdrant/Docker/CUDA/benchmarks must say so honestly.
+- Keep the architecture consolidated. Avoid new phase explosion and tiny wrapper files unless separation is required for security, testing, deployment, or clear ownership.
+
 ## What Works Now
 
 - FastAPI gateway

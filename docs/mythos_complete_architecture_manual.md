@@ -16,6 +16,34 @@ Rule for future work: every new production feature must update this file with:
 The old numbered phase architecture has been removed. Production code belongs
 under `src/mythos`.
 
+## Operating Roadmap
+
+This roadmap is the default rule for future Aeitron work:
+
+- Scratch-only model development. Aeitron must not add external foundation-model
+  fine-tuning, SFT, DPO, GRPO, LoRA, QLoRA, or RLHF paths.
+- Production-grade implementation only. New code must use explicit validation,
+  fail-fast dependency checks, secure defaults, durable artifacts, and real
+  tests. It must not claim readiness without evidence.
+- Coding-agent performance comes first. Repository indexing, context packing,
+  TaskGraph execution, patch generation, hardened tool execution, verifier
+  loops, and benchmark feedback are higher priority than decorative
+  architecture.
+- Cybersecurity data and tooling stay governed. Allowed work includes approved
+  sources, defensive analysis, authorized labs/CTFs/evaluation material,
+  vulnerability detection, patch generation, and verification. Aeitron must not
+  add autonomous live-target attack workflows.
+- Data quality comes before data scale. Source reputation, license/provenance,
+  contamination filtering, deduplication, task extraction, human-review queues,
+  and eval holdouts must happen before tokenizer/sharding/training.
+- Production status must be evidence-based. Local smoke, Kaggle/Colab
+  validation, and real cluster production are different statuses. Dependencies
+  such as Redis, Postgres, S3/MinIO, Qdrant, Docker, CUDA, benchmark files, and
+  scanner CLIs must be checked explicitly.
+- Keep the architecture consolidated. Do not reintroduce phase explosion or many
+  tiny wrapper files unless separation is required for security, testing,
+  deployment, or clear ownership.
+
 ## Current Status
 
 Aeitron is now a consolidated agentic coding and defensive cybersecurity AI
