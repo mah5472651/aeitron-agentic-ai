@@ -31,6 +31,7 @@ class DatasetVersionManifest(StrictModel):
     near_dedup_report: dict[str, Any] | None = None
     contamination_report: dict[str, Any] | None = None
     quality_report: dict[str, Any] | None = None
+    training_quality_report: dict[str, Any] | None = None
     source_quality_report: dict[str, Any] | None = None
     source_reputation_report: dict[str, Any] | None = None
     source_budget_plan: dict[str, Any] | None = None

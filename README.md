@@ -196,6 +196,43 @@ Watch the file from another Kaggle cell:
 tail -n 80 artifacts/mythos/kaggle-real-data-smoke/progress.jsonl
 ```
 
+Strict 10k-step real-data validation:
+
+```bash
+PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.ultimate.json \
+  --work-dir artifacts/mythos/real-data-10k-strict-v1 \
+  --target-records 10000 \
+  --min-training-rows 5000 \
+  --min-train-tokens 2000000 \
+  --max-docs 16000 \
+  --max-bytes-per-doc 250000 \
+  --workers 6 \
+  --max-depth 2 \
+  --delay-seconds 0.35 \
+  --steps 10000 \
+  --sequence-length 128 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 8 \
+  --validation-interval 250 \
+  --validation-batches 8 \
+  --early-stopping-patience 12 \
+  --min-training-quality-score 0.62 \
+  --min-training-average-quality-score 0.62 \
+  --min-source-reputation-score 0.50 \
+  --eval-holdout-fraction 0.02 \
+  --max-source-fraction 0.25 \
+  --progress-path artifacts/mythos/real-data-10k-strict-v1/progress.jsonl \
+  --progress-to-stdout \
+  --progress-every-docs 10 \
+  --progress-every-steps 25
+
+python deploy/gpu/run_checkpoint_comparison.py \
+  --training-report artifacts/mythos/real-data-10k-strict-v1/reports/real_data_training_report.json \
+  --output-dir artifacts/mythos/real-data-10k-strict-v1/reports/checkpoint_compare \
+  --device cuda
+```
+
 Run the longer scratch pretraining loop:
 
 ```bash

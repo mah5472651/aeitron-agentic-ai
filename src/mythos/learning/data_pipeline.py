@@ -89,6 +89,9 @@ class DataPipelineConfig(StrictModel):
     source_budget_target_docs: int | None = Field(default=None, ge=1)
     apply_training_data_gate: bool = True
     min_training_quality_score: float = Field(default=0.58, ge=0.0, le=1.0)
+    min_training_average_quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    min_training_rows: int = Field(default=1, ge=1)
+    min_train_tokens: int = Field(default=128, ge=1)
     min_source_reputation_score: float = Field(default=0.45, ge=0.0, le=1.0)
     eval_holdout_fraction: float = Field(default=0.02, ge=0.0, le=0.5)
     balance_sources: bool = True
@@ -122,6 +125,7 @@ class DataPipelineReport(StrictModel):
     near_dedup_report: dict[str, Any] | None = None
     contamination_report: dict[str, Any] | None
     quality_report: dict[str, Any] | None
+    training_quality_report: dict[str, Any] | None = None
     source_quality_report: dict[str, Any] | None
     task_report: dict[str, Any] | None
     review_report: dict[str, Any] | None
@@ -243,6 +247,12 @@ def validate_data_pipeline_production_config(config: DataPipelineConfig) -> None
         failures.append("production mode requires source balancing")
     if config.validate_every <= 0 or config.validate_every > config.train_steps:
         failures.append("production mode requires validation during the training run")
+    if config.min_training_average_quality_score < 0.60:
+        failures.append("production mode requires min_training_average_quality_score >= 0.60")
+    if config.min_training_rows < 10_000 and not config.dev_smoke:
+        failures.append("production mode requires min_training_rows >= 10000")
+    if config.min_train_tokens < 1_000_000 and not config.dev_smoke:
+        failures.append("production mode requires min_train_tokens >= 1000000")
     if failures:
         raise ValueError("production data pipeline validation failed: " + "; ".join(failures))
 
@@ -518,6 +528,27 @@ async def _run_data_pipeline_locked(
         )
         training_files = [str(balanced_clean_path)]
 
+    training_quality_path = reports_dir / "training_quality_report.json"
+    progress.emit("training_quality_inspection", "started", input_files=len(training_files))
+    training_quality_report: QualityInspectionReport = write_quality_report(training_files, training_quality_path)
+    progress.emit(
+        "training_quality_inspection",
+        "complete",
+        rows=training_quality_report.rows,
+        avg_quality_score=training_quality_report.avg_quality_score,
+        minimum_required=config.min_training_average_quality_score,
+    )
+    if training_quality_report.rows < config.min_training_rows:
+        raise RuntimeError(
+            f"training corpus rows {training_quality_report.rows} below required minimum {config.min_training_rows}; "
+            "increase --max-docs, lower strict gates for validation runs, or add higher-yield approved sources"
+        )
+    if training_quality_report.avg_quality_score < config.min_training_average_quality_score:
+        raise RuntimeError(
+            f"training corpus average quality {training_quality_report.avg_quality_score} below required minimum "
+            f"{config.min_training_average_quality_score}; raise source quality or lower threshold only for dev validation"
+        )
+
     progress.emit("tokenizer", "started", vocab_size=config.vocab_size, input_files=len(training_files))
     trained_tokenizer = train_bpe_tokenizer(
         training_files,
@@ -545,6 +576,11 @@ async def _run_data_pipeline_locked(
         train_shards=len(manifest.train_shards),
         val_shards=len(manifest.val_shards),
     )
+    if manifest.train_tokens < config.min_train_tokens:
+        raise RuntimeError(
+            f"training tokens {manifest.train_tokens} below required minimum {config.min_train_tokens}; "
+            "increase corpus size, reduce filters only for dev validation, or lower --min-train-tokens for a smoke run"
+        )
     training_report = None
     checkpoint_eval_report: CheckpointEvalReport | None = None
     if not config.skip_train:
@@ -593,6 +629,7 @@ async def _run_data_pipeline_locked(
         artifacts.append(artifact_from_path(reports_dir / "near_dedup_report.json", role="near_dedup_report"))
     artifacts.append(artifact_from_path(contamination_path, role="contamination_report"))
     artifacts.append(artifact_from_path(quality_report_path, role="quality_report"))
+    artifacts.append(artifact_from_path(training_quality_path, role="training_quality_report"))
     artifacts.append(artifact_from_path(source_quality_path, role="source_quality_report"))
     artifacts.append(artifact_from_path(feedback_path, role="feedback_report"))
     if source_reputation_report is not None:
@@ -630,6 +667,7 @@ async def _run_data_pipeline_locked(
             str(shards_dir / "manifest.json"),
             str(contamination_path),
             str(quality_report_path),
+            str(training_quality_path),
             str(source_quality_path),
             str(feedback_path),
         ]
@@ -674,6 +712,7 @@ async def _run_data_pipeline_locked(
         near_dedup_report=near_dedup_report.model_dump() if near_dedup_report else None,
         contamination_report=contamination_report.model_dump(),
         quality_report=quality_report.model_dump(),
+        training_quality_report=training_quality_report.model_dump(),
         source_quality_report=source_quality_report.model_dump(),
         task_report=task_report.model_dump() if task_report else None,
         review_report=review_report.model_dump() if review_report else None,
@@ -706,6 +745,7 @@ async def _run_data_pipeline_locked(
         near_dedup_report=near_dedup_report.model_dump() if near_dedup_report else None,
         contamination_report=contamination_report.model_dump(),
         quality_report=quality_report.model_dump(),
+        training_quality_report=training_quality_report.model_dump(),
         source_quality_report=source_quality_report.model_dump(),
         task_report=task_report.model_dump() if task_report else None,
         review_report=review_report.model_dump() if review_report else None,
@@ -727,6 +767,7 @@ async def _run_data_pipeline_locked(
             "pipeline_report": str(reports_dir / "pipeline_report.json"),
             "dashboard": str(root / "dashboard.html"),
             "quality_report": str(reports_dir / "quality_report.json"),
+            "training_quality_report": str(reports_dir / "training_quality_report.json"),
             "source_reputation_report": str(reports_dir / "source_reputation_report.json"),
             "source_budget_plan": str(reports_dir / "source_budget_plan.json"),
             "training_data_gate_report": str(reports_dir / "training_data_gate_report.json"),
@@ -793,6 +834,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-budget-target-docs", type=int)
     parser.add_argument("--no-training-data-gate", action="store_true")
     parser.add_argument("--min-training-quality-score", type=float, default=0.58)
+    parser.add_argument("--min-training-average-quality-score", type=float, default=0.0)
+    parser.add_argument("--min-training-rows", type=int, default=1)
+    parser.add_argument("--min-train-tokens", type=int, default=128)
     parser.add_argument("--min-source-reputation-score", type=float, default=0.45)
     parser.add_argument("--eval-holdout-fraction", type=float, default=0.02)
     parser.add_argument("--no-source-balancing", action="store_true")
@@ -856,6 +900,9 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         source_budget_target_docs=args.source_budget_target_docs,
         apply_training_data_gate=not args.no_training_data_gate,
         min_training_quality_score=args.min_training_quality_score,
+        min_training_average_quality_score=args.min_training_average_quality_score,
+        min_training_rows=args.min_training_rows,
+        min_train_tokens=args.min_train_tokens,
         min_source_reputation_score=args.min_source_reputation_score,
         eval_holdout_fraction=args.eval_holdout_fraction,
         balance_sources=not args.no_source_balancing,

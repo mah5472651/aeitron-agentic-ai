@@ -55,11 +55,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-patience", type=int, default=8)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--no-training-data-gate", action="store_true")
-    parser.add_argument("--min-training-quality-score", type=float, default=0.58)
-    parser.add_argument("--min-source-reputation-score", type=float, default=0.45)
+    parser.add_argument("--min-training-quality-score", type=float, default=0.62)
+    parser.add_argument("--min-training-average-quality-score", type=float, default=0.62)
+    parser.add_argument("--min-training-rows", type=int, default=5_000)
+    parser.add_argument("--min-train-tokens", type=int, default=2_000_000)
+    parser.add_argument("--min-source-reputation-score", type=float, default=0.50)
     parser.add_argument("--eval-holdout-fraction", type=float, default=0.02)
     parser.add_argument("--no-source-balancing", action="store_true")
-    parser.add_argument("--max-source-fraction", type=float, default=0.35)
+    parser.add_argument("--max-source-fraction", type=float, default=0.25)
     parser.add_argument("--min-source-rows", type=int, default=25)
     parser.add_argument("--object-store-uri", default="local://artifacts/mythos/object-store")
     parser.add_argument("--object-store-endpoint-url")
@@ -116,6 +119,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             early_stopping_min_delta=args.early_stopping_min_delta,
             apply_training_data_gate=not args.no_training_data_gate,
             min_training_quality_score=args.min_training_quality_score,
+            min_training_average_quality_score=args.min_training_average_quality_score,
+            min_training_rows=args.min_training_rows,
+            min_train_tokens=args.min_train_tokens,
             min_source_reputation_score=args.min_source_reputation_score,
             eval_holdout_fraction=args.eval_holdout_fraction,
             balance_sources=not args.no_source_balancing,
@@ -169,6 +175,10 @@ def main() -> None:
                 "train_steps": args.train_steps,
                 "max_docs": args.max_docs,
                 "min_clean_records": args.min_clean_records,
+                "min_training_rows": args.min_training_rows,
+                "min_training_quality_score": args.min_training_quality_score,
+                "min_training_average_quality_score": args.min_training_average_quality_score,
+                "min_train_tokens": args.min_train_tokens,
             },
             sort_keys=True,
         ),

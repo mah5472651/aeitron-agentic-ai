@@ -1671,6 +1671,7 @@ Primary outputs:
 - `reports/real_data_training_report.json`
 - `reports/pipeline_report.json`
 - `reports/quality_report.json`
+- `reports/training_quality_report.json`
 - `reports/source_quality_report.json`
 - `reports/source_balance_report.json`
 - `reports/contamination_report.json`
@@ -2098,33 +2099,37 @@ Cell 1:
 %%bash
 cd /kaggle/working/mythos-agentic-ai
 git pull origin master
-mkdir -p artifacts/mythos/real-data-5k-quality-gated
+mkdir -p artifacts/mythos/real-data-10k-strict-v1
 PYTHONUNBUFFERED=1 nohup python -u deploy/gpu/run_real_data_training_pipeline.py \
   --sources config/data_sources.ultimate.json \
-  --work-dir artifacts/mythos/real-data-5k-quality-gated \
-  --target-records 5000 \
-  --max-docs 12000 \
+  --work-dir artifacts/mythos/real-data-10k-strict-v1 \
+  --target-records 10000 \
+  --min-training-rows 5000 \
+  --min-train-tokens 2000000 \
+  --max-docs 16000 \
   --max-bytes-per-doc 250000 \
   --workers 6 \
   --max-depth 2 \
   --delay-seconds 0.35 \
-  --steps 1000 \
+  --steps 10000 \
   --sequence-length 128 \
   --batch-size 2 \
   --gradient-accumulation-steps 8 \
-  --validation-interval 100 \
-  --early-stopping-patience 8 \
-  --min-training-quality-score 0.55 \
-  --min-source-reputation-score 0.40 \
+  --validation-interval 250 \
+  --validation-batches 8 \
+  --early-stopping-patience 12 \
+  --min-training-quality-score 0.62 \
+  --min-training-average-quality-score 0.62 \
+  --min-source-reputation-score 0.50 \
   --eval-holdout-fraction 0.02 \
-  --max-source-fraction 0.30 \
-  --progress-path artifacts/mythos/real-data-5k-quality-gated/progress.jsonl \
+  --max-source-fraction 0.25 \
+  --progress-path artifacts/mythos/real-data-10k-strict-v1/progress.jsonl \
   --progress-to-stdout \
   --progress-every-docs 10 \
   --progress-every-steps 25 \
-  > artifacts/mythos/real-data-5k-quality-gated/run.log 2>&1 &
-echo $! > artifacts/mythos/real-data-5k-quality-gated/run.pid
-cat artifacts/mythos/real-data-5k-quality-gated/run.pid
+  > artifacts/mythos/real-data-10k-strict-v1/run.log 2>&1 &
+echo $! > artifacts/mythos/real-data-10k-strict-v1/run.pid
+cat artifacts/mythos/real-data-10k-strict-v1/run.pid
 ```
 
 Cell 2:
@@ -2132,7 +2137,7 @@ Cell 2:
 ```bash
 %%bash
 cd /kaggle/working/mythos-agentic-ai
-tail -f artifacts/mythos/real-data-5k-quality-gated/progress.jsonl
+tail -f artifacts/mythos/real-data-10k-strict-v1/progress.jsonl
 ```
 
 When the job finishes:
@@ -2140,8 +2145,13 @@ When the job finishes:
 ```bash
 %%bash
 cd /kaggle/working/mythos-agentic-ai
-tail -n 80 artifacts/mythos/real-data-5k-quality-gated/run.log
-cat artifacts/mythos/real-data-5k-quality-gated/reports/real_data_training_report.json
+tail -n 80 artifacts/mythos/real-data-10k-strict-v1/run.log
+cat artifacts/mythos/real-data-10k-strict-v1/reports/real_data_training_report.json
+
+python deploy/gpu/run_checkpoint_comparison.py \
+  --training-report artifacts/mythos/real-data-10k-strict-v1/reports/real_data_training_report.json \
+  --output-dir artifacts/mythos/real-data-10k-strict-v1/reports/checkpoint_compare \
+  --device cuda
 ```
 
 Benchmark suite adapters:
@@ -2233,27 +2243,32 @@ Gate scoring uses:
 
 Default thresholds:
 
-- `--min-training-quality-score 0.58`
-- `--min-source-reputation-score 0.45`
+- `--min-training-quality-score 0.62` in the Kaggle real-data entrypoint.
+- `--min-training-average-quality-score 0.62` for the actual tokenizer/training corpus.
+- `--min-source-reputation-score 0.50` in the Kaggle real-data entrypoint.
 - `--eval-holdout-fraction 0.02`
 
-For Kaggle smoke runs on small/noisy public data, start with:
+For strict Kaggle validation on public approved sources, start with:
 
 ```bash
 python deploy/gpu/run_real_data_training_pipeline.py \
   --sources config/data_sources.ultimate.json \
-  --work-dir artifacts/mythos/real-data-5k-quality-gated \
-  --target-records 5000 \
-  --max-docs 12000 \
-  --steps 1000 \
+  --work-dir artifacts/mythos/real-data-10k-strict-v1 \
+  --target-records 10000 \
+  --min-training-rows 5000 \
+  --min-train-tokens 2000000 \
+  --max-docs 16000 \
+  --steps 10000 \
   --sequence-length 128 \
   --batch-size 2 \
   --gradient-accumulation-steps 8 \
-  --validation-interval 100 \
-  --early-stopping-patience 8 \
-  --min-training-quality-score 0.55 \
-  --min-source-reputation-score 0.40 \
-  --max-source-fraction 0.30 \
+  --validation-interval 250 \
+  --validation-batches 8 \
+  --early-stopping-patience 12 \
+  --min-training-quality-score 0.62 \
+  --min-training-average-quality-score 0.62 \
+  --min-source-reputation-score 0.50 \
+  --max-source-fraction 0.25 \
   --progress-every-steps 25
 ```
 

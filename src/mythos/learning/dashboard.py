@@ -17,6 +17,7 @@ def render_dashboard(report: dict[str, Any]) -> str:
     near_dedup = report.get("near_dedup_report") or {}
     contamination = report.get("contamination_report") or {}
     quality = report.get("quality_report") or {}
+    training_quality = report.get("training_quality_report") or {}
     source_quality = report.get("source_quality_report") or {}
     source_reputation = report.get("source_reputation_report") or {}
     source_budget = report.get("source_budget_plan") or {}
@@ -40,6 +41,8 @@ def render_dashboard(report: dict[str, Any]) -> str:
         ("Near Duplicates Removed", near_dedup.get("near_duplicates", 0)),
         ("Contamination Hits", len(contamination.get("hits", []))),
         ("Avg Quality Score", quality.get("avg_quality_score", 0)),
+        ("Avg Training Quality Score", training_quality.get("avg_quality_score", 0)),
+        ("Training Rows", training_quality.get("rows", 0)),
         ("Sources Scored", len(source_quality.get("sources", []))),
         ("Reputation Sources", len(source_reputation.get("sources", []))),
         ("Budgeted Sources", len(source_budget.get("budgets", []))),
