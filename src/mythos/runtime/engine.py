@@ -13,13 +13,38 @@ from src.mythos.runtime.taskgraph import AgentRunCreateRequest, TaskGraphRuntime
 from src.mythos.shared.schemas import MythosRunReport, MythosRunRequest
 
 
+class AgentRouter:
+    """Role router for the native runtime.
+
+    This is intentionally a lightweight routing policy, not a separate
+    framework or fake neural MoE. It helps the runtime choose which worker
+    roles should be active for a request.
+    """
+
+    def route(self, prompt: str, *, top_k: int = 4) -> dict[str, object]:
+        lowered = prompt.lower()
+        candidates: list[dict[str, object]] = []
+        if any(term in lowered for term in ["security", "vulnerability", "cve", "secret", "xss", "sql injection"]):
+            candidates.append({"role": "security", "score": 0.95})
+        if any(term in lowered for term in ["test", "pytest", "fail", "bug", "regression"]):
+            candidates.append({"role": "testing", "score": 0.9})
+        if any(term in lowered for term in ["code", "build", "implement", "fix", "refactor"]):
+            candidates.append({"role": "coding", "score": 0.88})
+        if any(term in lowered for term in ["design", "architecture", "plan", "system"]):
+            candidates.append({"role": "architect", "score": 0.84})
+        candidates.append({"role": "planner", "score": 0.75})
+        return {"route": candidates[:top_k], "top_role": candidates[0]["role"], "router": "native"}
+
+
 class MythosRuntime:
     def __init__(self) -> None:
         self.planner = IntentPlanningEngine()
+        self.router = AgentRouter()
 
     async def run(self, request: MythosRunRequest) -> MythosRunReport:
         started = time.perf_counter()
         plan = self.planner.plan(request.prompt)
+        route = self.router.route(request.prompt, top_k=request.max_agent_nodes or 4)
         store = LocalStore()
         workspace = str(Path(request.workspace).resolve())
         project = store.create_project(name=f"runtime-{time.time_ns()}", repo_path=workspace)
@@ -51,7 +76,7 @@ class MythosRuntime:
             prompt=request.prompt,
             workspace=workspace,
             final_answer=answer,
-            route={"intent": plan.expansion.get("intent"), "runtime": "native-single-agent"},
+            route={"intent": plan.expansion.get("intent"), "runtime": "native-single-agent", **route},
             plan=plan.model_dump(),
             memory={"context_id": context.context_id, "chunks": [chunk.model_dump(exclude={"content"}) for chunk in context.chunks]},
             verification=None,

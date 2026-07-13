@@ -48,6 +48,14 @@ class VerificationResponse(StrictModel):
     duration_ms: float
 
 
+class GuardrailReview(StrictModel):
+    accepted: bool
+    confidence: float = Field(ge=0.0, le=1.0)
+    risks: list[str]
+    issues: list[str] = Field(default_factory=list)
+    engine: str = "native"
+
+
 class VerifierRuntime:
     def __init__(self, store: LocalStore | None = None) -> None:
         self.store = store or LocalStore()
@@ -123,3 +131,24 @@ class VerifierRuntime:
             "findings": findings,
             "finding_count": len(findings),
         }
+
+    def strict_review(self, prompt: str) -> GuardrailReview:
+        lowered = prompt.lower()
+        risks = [
+            term
+            for term in ["delete", "secret", "password", "token", "unsafe", "eval", "exploit", "malware"]
+            if term in lowered
+        ]
+        confidence = 0.9 if not risks else 0.65
+        return GuardrailReview(accepted=confidence >= 0.6, confidence=confidence, risks=risks)
+
+    def critic_review(self, artifact: str, *, prompt: str = "") -> GuardrailReview:
+        issues: list[str] = []
+        if "TODO" in artifact:
+            issues.append("artifact contains TODO")
+        if len(artifact.strip()) < 20:
+            issues.append("artifact is too small to validate")
+        if prompt and "security" in prompt.lower() and "test" not in artifact.lower():
+            issues.append("security-related artifact does not mention tests")
+        confidence = 0.9 if not issues else 0.55
+        return GuardrailReview(accepted=confidence >= 0.6, confidence=confidence, risks=[], issues=issues)

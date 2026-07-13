@@ -1,6 +1,6 @@
 """Repository intelligence package for Mythos MVP."""
 
-from src.mythos.indexing.context_builder import ContextBuilder
+from src.mythos.indexing.context_builder import ContextBuilder, WorkspaceContextBuilder
 from src.mythos.indexing.repository_indexer import RepositoryIndexer
 from src.mythos.indexing.vector_index import (
     LocalVectorIndex,
@@ -20,6 +20,7 @@ __all__ = [
     "VectorIndexCapability",
     "VectorSearchReport",
     "VectorSearchResult",
+    "WorkspaceContextBuilder",
     "create_vector_index",
     "vector_capabilities",
 ]

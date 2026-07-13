@@ -7,11 +7,13 @@ import re
 import time
 import uuid
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 from pydantic import Field
 
 from src.mythos.db.local_store import LocalStore
+from src.mythos.indexing.repository_indexer import RepositoryIndexer
 from src.mythos.shared.schemas import StrictModel
 
 
@@ -221,3 +223,17 @@ class ContextBuilder:
             parts.append("</file>")
         parts.append("</files>")
         return "\n".join(parts)
+
+
+class WorkspaceContextBuilder:
+    """One-shot workspace facade backed by the real indexer and context builder."""
+
+    def __init__(self, workspace: str | Path) -> None:
+        self.workspace = Path(workspace)
+
+    def pack(self, query: str, *, budget: int = 8000) -> dict[str, Any]:
+        store = LocalStore()
+        project = store.create_project(name=f"context-{self.workspace.name}", repo_path=str(self.workspace))
+        RepositoryIndexer(store).index_project(project_id=project["id"])
+        report = ContextBuilder(store).build(project_id=project["id"], query=query, token_budget=budget)
+        return report.model_dump()

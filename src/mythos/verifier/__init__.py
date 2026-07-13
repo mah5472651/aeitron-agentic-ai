@@ -1,5 +1,5 @@
 """Verification runtime for Mythos MVP."""
 
-from src.mythos.verifier.runtime import VerificationRequest, VerificationResponse, VerifierRuntime
+from src.mythos.verifier.runtime import GuardrailReview, VerificationRequest, VerificationResponse, VerifierRuntime
 
-__all__ = ["VerificationRequest", "VerificationResponse", "VerifierRuntime"]
+__all__ = ["GuardrailReview", "VerificationRequest", "VerificationResponse", "VerifierRuntime"]
