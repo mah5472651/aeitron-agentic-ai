@@ -1,4 +1,4 @@
-"""Exact and near-duplicate removal for large JSONL corpora."""
+﻿"""Exact and near-duplicate removal for large JSONL corpora."""
 
 from __future__ import annotations
 

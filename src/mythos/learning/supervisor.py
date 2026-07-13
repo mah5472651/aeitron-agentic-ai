@@ -1,4 +1,4 @@
-"""Long-running data worker supervision with heartbeat and backoff."""
+﻿"""Long-running data worker supervision with heartbeat and backoff."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ class SupervisorConfig(StrictModel):
     raw_output_dir: str
     clean_output_dir: str
     object_store_uri: str = "s3://mythos-datasets/pretraining"
-    heartbeat_path: str = "artifacts/mythos/supervisor/heartbeat.json"
-    status_path: str = "artifacts/mythos/supervisor/status.json"
+    heartbeat_path: str = "artifacts/aeitron/supervisor/heartbeat.json"
+    status_path: str = "artifacts/aeitron/supervisor/status.json"
     worker_replicas: int = Field(default=1, ge=1)
     async_workers: int = Field(default=16, ge=1, le=256)
     batch_docs: int = Field(default=10_000, ge=1)
@@ -128,11 +128,11 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run supervised Mythos data crawl cycles.")
     parser.add_argument("--sources", default=os.environ.get("MYTHOS_DATA_SOURCES", "config/data_sources.ultimate.json"))
     parser.add_argument("--postgres-dsn", default=os.environ.get("MYTHOS_DATABASE_URL", ""))
-    parser.add_argument("--raw-output-dir", default=os.environ.get("MYTHOS_RAW_OUTPUT_DIR", "artifacts/mythos/data-engine/raw"))
-    parser.add_argument("--clean-output-dir", default=os.environ.get("MYTHOS_CLEAN_OUTPUT_DIR", "artifacts/mythos/data-engine/clean"))
+    parser.add_argument("--raw-output-dir", default=os.environ.get("MYTHOS_RAW_OUTPUT_DIR", "artifacts/aeitron/data-engine/raw"))
+    parser.add_argument("--clean-output-dir", default=os.environ.get("MYTHOS_CLEAN_OUTPUT_DIR", "artifacts/aeitron/data-engine/clean"))
     parser.add_argument("--object-store-uri", default=os.environ.get("MYTHOS_OBJECT_STORE_URI", "s3://mythos-datasets/pretraining"))
-    parser.add_argument("--heartbeat-path", default=os.environ.get("MYTHOS_HEARTBEAT_PATH", "artifacts/mythos/supervisor/heartbeat.json"))
-    parser.add_argument("--status-path", default=os.environ.get("MYTHOS_STATUS_PATH", "artifacts/mythos/supervisor/status.json"))
+    parser.add_argument("--heartbeat-path", default=os.environ.get("MYTHOS_HEARTBEAT_PATH", "artifacts/aeitron/supervisor/heartbeat.json"))
+    parser.add_argument("--status-path", default=os.environ.get("MYTHOS_STATUS_PATH", "artifacts/aeitron/supervisor/status.json"))
     parser.add_argument("--worker-replicas", type=int, default=int(os.environ.get("MYTHOS_WORKER_REPLICAS", "1")))
     parser.add_argument("--async-workers", type=int, default=int(os.environ.get("MYTHOS_ASYNC_WORKERS", "16")))
     parser.add_argument("--batch-docs", type=int, default=int(os.environ.get("MYTHOS_BATCH_DOCS", "10000")))

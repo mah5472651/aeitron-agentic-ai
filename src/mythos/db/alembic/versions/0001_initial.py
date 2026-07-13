@@ -1,4 +1,4 @@
-"""Initial Mythos schema.
+﻿"""Initial Mythos schema.
 
 Revision ID: 0001_initial
 Revises:

@@ -1,4 +1,4 @@
-"""Native Mythos JWT auth middleware.
+﻿"""Native Mythos JWT auth middleware.
 
 Quota remains a gateway policy hook, but auth is production-shaped and
 environment controlled.

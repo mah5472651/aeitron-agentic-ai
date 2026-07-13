@@ -1,4 +1,4 @@
-"""Object storage adapters for Mythos dataset artifacts."""
+﻿"""Object storage adapters for Mythos dataset artifacts."""
 
 from __future__ import annotations
 
@@ -201,7 +201,7 @@ class S3ObjectStore:
 
 
 class ObjectStoreConfig(StrictModel):
-    uri: str = Field(default="local://artifacts/mythos/object-store", min_length=1)
+    uri: str = Field(default="local://artifacts/aeitron/object-store", min_length=1)
     endpoint_url: str | None = None
     max_retries: int = Field(default=3, ge=1, le=10)
 
@@ -305,9 +305,9 @@ def verify_object_store_lifecycle(
 
 def _parse_args() -> Any:
     parser = argparse.ArgumentParser(description="Verify Mythos object storage lifecycle.")
-    parser.add_argument("--uri", default="local://artifacts/mythos/object-store")
+    parser.add_argument("--uri", default="local://artifacts/aeitron/object-store")
     parser.add_argument("--endpoint-url")
-    parser.add_argument("--work-dir", default="artifacts/mythos/object-store-lifecycle")
+    parser.add_argument("--work-dir", default="artifacts/aeitron/object-store-lifecycle")
     parser.add_argument("--key", default="lifecycle/probe.json")
     return parser.parse_args()
 

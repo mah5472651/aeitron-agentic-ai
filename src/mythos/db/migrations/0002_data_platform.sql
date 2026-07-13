@@ -1,4 +1,4 @@
--- Mythos production data platform schema.
+﻿-- Mythos production data platform schema.
 
 CREATE TABLE IF NOT EXISTS data_sources (
   id uuid PRIMARY KEY,

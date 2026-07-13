@@ -1,4 +1,4 @@
-"""Run a serious Mythos scratch GPU training validation job.
+﻿"""Run a serious Mythos scratch GPU training validation job.
 
 This script is intentionally separate from the quick smoke tests. It is meant
 for Colab/Kaggle or a real GPU node and defaults to 10,000 optimizer steps.
@@ -17,7 +17,7 @@ from src.mythos.model_ops.pretrain_loop import run_pretraining_loop
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Mythos 10k-step scratch GPU validation.")
     parser.add_argument("--manifest", required=True, help="Token shard manifest from tokenizer_pipeline/mixer.")
-    parser.add_argument("--output-dir", default="artifacts/mythos/gpu-10k-validation")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/gpu-10k-validation")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=2)

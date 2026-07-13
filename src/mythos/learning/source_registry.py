@@ -1,4 +1,4 @@
-"""Allowlisted source registry for defensive Mythos data collection."""
+﻿"""Allowlisted source registry for defensive Mythos data collection."""
 
 from __future__ import annotations
 

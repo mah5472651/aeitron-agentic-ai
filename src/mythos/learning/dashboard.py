@@ -1,4 +1,4 @@
-"""Render a lightweight dataset operations dashboard."""
+﻿"""Render a lightweight dataset operations dashboard."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def render_dashboard(report: dict[str, Any]) -> str:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Mythos Data Platform Dashboard</title>
+  <title>Aeitron Data Platform Dashboard</title>
   <style>
     body {{ font-family: system-ui, sans-serif; margin: 32px; color: #17202a; }}
     table {{ border-collapse: collapse; width: min(900px, 100%); }}
@@ -81,7 +81,7 @@ def render_dashboard(report: dict[str, Any]) -> str:
   </style>
 </head>
 <body>
-  <h1>Mythos Data Platform Dashboard</h1>
+  <h1>Aeitron Data Platform Dashboard</h1>
   <table>{table}</table>
   <h2>Top Source Reputation</h2>
   <table>

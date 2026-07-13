@@ -1,4 +1,4 @@
-"""Shared strict schemas for the consolidated Mythos runtime."""
+﻿"""Shared strict schemas for the consolidated Mythos runtime."""
 
 from __future__ import annotations
 

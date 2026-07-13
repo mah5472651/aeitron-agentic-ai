@@ -1,4 +1,4 @@
-"""Source budget allocation driven by reputation scores."""
+﻿"""Source budget allocation driven by reputation scores."""
 
 from __future__ import annotations
 

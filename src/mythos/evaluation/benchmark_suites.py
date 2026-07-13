@@ -1,4 +1,4 @@
-"""Adapters for external-style benchmark suites.
+﻿"""Adapters for external-style benchmark suites.
 
 These adapters intentionally require local files. Mythos does not silently
 download protected benchmarks into training or eval runs.
@@ -182,7 +182,7 @@ def run_benchmark_suites(specs: list[BenchmarkSuiteSpec]) -> BenchmarkSuitesRepo
 def write_markdown(report: BenchmarkSuitesReport, path: str | Path) -> Path:
     target = Path(path)
     lines = [
-        "# Mythos Benchmark Suites Report",
+        "# Aeitron Benchmark Suites Report",
         "",
         f"- status: {report.status}",
         f"- aggregate_score: {report.aggregate_score:.4f}",

@@ -1,4 +1,4 @@
-"""Verification runtime for Mythos MVP."""
+﻿"""Verification runtime for Mythos MVP."""
 
 from src.mythos.verifier.runtime import GuardrailReview, VerificationRequest, VerificationResponse, VerifierRuntime
 

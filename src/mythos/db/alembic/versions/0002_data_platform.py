@@ -1,4 +1,4 @@
-"""Data platform schema.
+﻿"""Data platform schema.
 
 Revision ID: 0002_data_platform
 Revises: 0001_initial

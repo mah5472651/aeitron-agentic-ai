@@ -1,4 +1,4 @@
-"""SQLite-backed local store for the Mythos MVP.
+﻿"""SQLite-backed local store for the Mythos MVP.
 
 The production contract is Postgres. This local store mirrors the MVP tables so
 the gateway, indexer, context builder, and tests can run immediately on a
@@ -176,7 +176,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_project_kind ON memory_entries(project_id,
 
 
 def default_store_path() -> Path:
-    return Path(os.environ.get("MYTHOS_SQLITE_PATH", "artifacts/mythos/mythos.sqlite3"))
+    return Path(os.environ.get("MYTHOS_SQLITE_PATH", "artifacts/aeitron/mythos.sqlite3"))
 
 
 def now_unix() -> float:

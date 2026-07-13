@@ -1,4 +1,4 @@
-"""Consolidated Mythos Gateway API."""
+﻿"""Consolidated Mythos Gateway API."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from src.mythos.shared.schemas import MythosRunRequest, MythosRunReport
 from src.mythos.tools import DockerSandboxRunner, SandboxRunRequest, ToolExecuteRequest, ToolRuntime
 from src.mythos.verifier import VerificationRequest, VerifierRuntime
 
-app = FastAPI(title="Mythos Consolidated Gateway", version="2.0.0")
+app = FastAPI(title="Aeitron Consolidated Gateway", version="2.0.0")
 QUOTA_CONFIG = install_quota(app)
 AUTH_CONFIG = install_auth(app)
 install_observability(app)
@@ -78,7 +78,7 @@ class MemoryRetrieveRequest(BaseModel):
 
 class SessionCreateRequest(BaseModel):
     project_id: str = Field(min_length=1)
-    title: str = Field(default="Mythos Session", min_length=1, max_length=200)
+    title: str = Field(default="Aeitron Session", min_length=1, max_length=200)
 
 
 @app.get("/health/ready")
@@ -143,7 +143,7 @@ async def model_foundation_status() -> dict[str, object]:
 
 @app.get("/v1/data/platform/status")
 async def data_platform_status() -> dict[str, object]:
-    root = Path(os.environ.get("MYTHOS_DATA_PIPELINE_DIR", "artifacts/mythos/data-pipeline"))
+    root = Path(os.environ.get("MYTHOS_DATA_PIPELINE_DIR", "artifacts/aeitron/data-pipeline"))
     latest = DatasetLedger(root / "versions" / "ledger.jsonl").latest()
     dashboard = root / "dashboard.html"
     return {

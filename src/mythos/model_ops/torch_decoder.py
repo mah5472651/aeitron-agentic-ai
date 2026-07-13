@@ -1,4 +1,4 @@
-"""PyTorch Mythos decoder-only language model.
+﻿"""PyTorch Mythos decoder-only language model.
 
 This is the scratch model implementation path. The module intentionally keeps
 the complete transformer core in one place: architecture presets, RoPE, grouped
@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - exercised only on missing torch instal
 
 
 class ScratchDecoderConfig(StrictModel):
-    name: str = "mythos-tiny-smoke"
+    name: str = "aeitron-tiny-smoke"
     vocab_size: int = Field(default=4096, ge=256)
     max_sequence_length: int = Field(default=512, ge=16)
     hidden_size: int = Field(default=256, ge=64)
@@ -447,7 +447,7 @@ def model_profile(name: str) -> ScratchDecoderConfig:
     profiles = {
         "tiny": tiny_smoke_config(),
         "1b": ScratchDecoderConfig(
-            name="mythos-1b-scratch",
+            name="aeitron-1b-scratch",
             vocab_size=64_000,
             max_sequence_length=65_536,
             hidden_size=2048,
@@ -459,7 +459,7 @@ def model_profile(name: str) -> ScratchDecoderConfig:
             rope_scaling_factor=2.0,
         ),
         "7b": ScratchDecoderConfig(
-            name="mythos-7b-scratch",
+            name="aeitron-7b-scratch",
             vocab_size=64_000,
             max_sequence_length=131_072,
             hidden_size=4096,
@@ -471,7 +471,7 @@ def model_profile(name: str) -> ScratchDecoderConfig:
             rope_scaling_factor=4.0,
         ),
         "32b": ScratchDecoderConfig(
-            name="mythos-32b-scratch",
+            name="aeitron-32b-scratch",
             vocab_size=64_000,
             max_sequence_length=131_072,
             hidden_size=6656,
@@ -483,7 +483,7 @@ def model_profile(name: str) -> ScratchDecoderConfig:
             rope_scaling_factor=4.0,
         ),
         "62b": ScratchDecoderConfig(
-            name="mythos-62b-scratch",
+            name="aeitron-62b-scratch",
             vocab_size=64_000,
             max_sequence_length=262_144,
             hidden_size=8192,
@@ -504,7 +504,7 @@ def model_profile(name: str) -> ScratchDecoderConfig:
 
 def tiny_smoke_config() -> ScratchDecoderConfig:
     return ScratchDecoderConfig(
-        name="mythos-tiny-gpu-smoke",
+        name="aeitron-tiny-gpu-smoke",
         vocab_size=2048,
         max_sequence_length=128,
         hidden_size=128,

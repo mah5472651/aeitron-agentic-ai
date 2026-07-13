@@ -1,4 +1,4 @@
-"""Production readiness gate for large Mythos data-platform runs."""
+﻿"""Production readiness gate for large Mythos data-platform runs."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ class DataPlatformReadinessConfig(StrictModel):
     sources_path: str
     frontier_backend: str = "sqlite"
     postgres_dsn: str | None = None
-    object_store_uri: str = "local://artifacts/mythos/object-store"
+    object_store_uri: str = "local://artifacts/aeitron/object-store"
     contamination_patterns_path: str | None = None
     block_contamination: bool = True
     upload_artifacts: bool = True
@@ -120,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sources", required=True)
     parser.add_argument("--frontier-backend", choices=["sqlite", "postgres"], default="sqlite")
     parser.add_argument("--postgres-dsn")
-    parser.add_argument("--object-store-uri", default="local://artifacts/mythos/object-store")
+    parser.add_argument("--object-store-uri", default="local://artifacts/aeitron/object-store")
     parser.add_argument("--contamination-patterns")
     parser.add_argument("--allow-contamination-hits", action="store_true")
     parser.add_argument("--no-upload", action="store_true")

@@ -1,4 +1,4 @@
-"""Training resource catalog and priority planning."""
+﻿"""Training resource catalog and priority planning."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pydantic import Field
 from src.mythos.shared.schemas import StrictModel
 
 
-TrainPolicy = Literal["pretrain", "sft", "agentic_task", "eval_holdout", "research_reference", "governance_review"]
+TrainPolicy = Literal["pretrain", "agentic_task", "eval_holdout", "research_reference", "governance_review"]
 
 
 class TrainingResource(StrictModel):
@@ -48,7 +48,7 @@ class ResourceCatalogReport(StrictModel):
 
 
 def _load_payload(path: str | Path) -> dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
 def load_training_resources(path: str | Path) -> list[TrainingResource]:
@@ -69,7 +69,7 @@ def build_resource_catalog_report(path: str | Path, *, train_first_limit: int = 
     if missing:
         raise ValueError(f"priority groups reference unknown resources: {sorted(set(missing))}")
 
-    trainable = [item for item in resources if item.train_policy in {"pretrain", "sft", "agentic_task"}]
+    trainable = [item for item in resources if item.train_policy in {"pretrain", "agentic_task"}]
     trainable.sort(key=lambda item: (item.priority_rank, item.resource_id))
     eval_holdout = [item for item in resources if item.train_policy == "eval_holdout"]
     eval_holdout.sort(key=lambda item: (item.priority_rank, item.resource_id))

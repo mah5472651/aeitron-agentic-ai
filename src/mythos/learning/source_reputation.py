@@ -1,4 +1,4 @@
-"""Source reputation scoring for production data acquisition."""
+﻿"""Source reputation scoring for production data acquisition."""
 
 from __future__ import annotations
 

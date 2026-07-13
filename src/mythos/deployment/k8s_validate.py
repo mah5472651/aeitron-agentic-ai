@@ -1,4 +1,4 @@
-"""Kubernetes manifest validator for Mythos production deployments."""
+﻿"""Kubernetes manifest validator for Mythos production deployments."""
 
 from __future__ import annotations
 
@@ -132,7 +132,7 @@ def validate_manifests(paths: list[str | Path], *, kubectl_dry_run: bool = False
 def write_markdown(report: K8sValidationReport, path: str | Path) -> Path:
     target = Path(path)
     lines = [
-        "# Mythos Kubernetes Validation Report",
+        "# Aeitron Kubernetes Validation Report",
         "",
         f"- status: {report.status}",
         f"- resources: {report.resources}",
@@ -149,7 +149,7 @@ def write_markdown(report: K8sValidationReport, path: str | Path) -> Path:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate Mythos Kubernetes manifests.")
     parser.add_argument("--files", nargs="+", default=[str(path) for path in sorted(Path("deploy/k8s").glob("*.yaml"))])
-    parser.add_argument("--output-dir", default="artifacts/mythos/k8s-validation")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/k8s-validation")
     parser.add_argument("--kubectl-dry-run", action="store_true")
     return parser.parse_args()
 

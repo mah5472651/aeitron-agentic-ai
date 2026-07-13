@@ -1,4 +1,4 @@
-"""Model profile, backend, serving adapters, and scratch foundation contracts."""
+﻿"""Model profile, backend, serving adapters, and scratch foundation contracts."""
 
 from src.mythos.model_ops.foundation import (
     CheckpointManifest,

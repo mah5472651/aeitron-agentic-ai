@@ -1,4 +1,4 @@
-"""Consolidated Mythos command line entrypoint."""
+﻿"""Consolidated Mythos command line entrypoint."""
 
 from __future__ import annotations
 

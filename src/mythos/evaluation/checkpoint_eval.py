@@ -1,4 +1,4 @@
-"""Post-checkpoint evaluation gates for scratch pretraining runs."""
+﻿"""Post-checkpoint evaluation gates for scratch pretraining runs."""
 
 from __future__ import annotations
 
@@ -177,7 +177,7 @@ def evaluate_checkpoint(
     *,
     checkpoint_manifest_path: str | Path,
     training_report: str | Path | dict[str, Any] | None = None,
-    output_dir: str | Path = "artifacts/mythos/checkpoint-eval",
+    output_dir: str | Path = "artifacts/aeitron/checkpoint-eval",
 ) -> CheckpointEvalReport:
     manifest_path = Path(checkpoint_manifest_path)
     manifest = CheckpointManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8-sig")))
@@ -225,7 +225,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a Mythos scratch training checkpoint.")
     parser.add_argument("--checkpoint-manifest", required=True)
     parser.add_argument("--training-report")
-    parser.add_argument("--output-dir", default="artifacts/mythos/checkpoint-eval")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/checkpoint-eval")
     return parser.parse_args()
 
 

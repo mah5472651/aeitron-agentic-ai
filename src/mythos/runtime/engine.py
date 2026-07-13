@@ -1,4 +1,4 @@
-"""Native single-agent Mythos runtime."""
+﻿"""Native single-agent Mythos runtime."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ class MythosRuntime:
         return MythosRunReport(
             run_id=agent_run.run_id,
             status="complete",
-            summary="Native Mythos runtime completed planning, indexing, context packing, and model response.",
+            summary="Native Aeitron runtime completed planning, indexing, context packing, and model response.",
             confidence=plan.confidence,
             prompt=request.prompt,
             workspace=workspace,

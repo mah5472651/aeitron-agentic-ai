@@ -1,4 +1,4 @@
-"""Strict promotion gate for Mythos training data.
+﻿"""Strict promotion gate for Mythos training data.
 
 This module sits after license/contamination/dedup filtering and before
 tokenizer/shard construction. It promotes only high-signal rows into training,

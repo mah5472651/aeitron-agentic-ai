@@ -50,7 +50,7 @@ class MythosScratchDecoderTest(unittest.TestCase):
 
     def test_large_profile_contracts_are_shape_valid_without_instantiation(self) -> None:
         profile = model_profile("62b")
-        self.assertEqual(profile.name, "mythos-62b-scratch")
+        self.assertEqual(profile.name, "aeitron-62b-scratch")
         self.assertEqual(profile.max_sequence_length, 262_144)
         self.assertEqual(profile.attention_impl, "auto")
         self.assertTrue(profile.gradient_checkpointing)

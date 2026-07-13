@@ -1,4 +1,4 @@
-"""Compare two Mythos scratch checkpoints on a fixed prompt suite."""
+﻿"""Compare two Mythos scratch checkpoints on a fixed prompt suite."""
 
 from __future__ import annotations
 
@@ -282,7 +282,7 @@ def compare_checkpoints(
     candidate_manifest: str | Path,
     tokenizer_path: str | Path,
     prompt_suite: str | Path | None = None,
-    output_dir: str | Path = "artifacts/mythos/checkpoint-compare",
+    output_dir: str | Path = "artifacts/aeitron/checkpoint-compare",
     device: str = "auto",
     generation_config: GenerationConfig | None = None,
 ) -> CheckpointComparisonReport:
@@ -353,7 +353,7 @@ def write_markdown(report: CheckpointComparisonReport, path: str | Path) -> Path
     target.parent.mkdir(parents=True, exist_ok=True)
     baseline_by_task = {item.task_id: item for item in report.baseline.results}
     lines = [
-        "# Mythos Checkpoint Comparison",
+        "# Aeitron Checkpoint Comparison",
         "",
         f"- status: {report.status}",
         f"- recommendation: {report.recommendation}",
@@ -396,7 +396,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-manifest", required=True)
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--prompt-suite")
-    parser.add_argument("--output-dir", default="artifacts/mythos/checkpoint-compare")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/checkpoint-compare")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--max-new-tokens", type=int, default=96)
     parser.add_argument("--temperature", type=float, default=0.0)

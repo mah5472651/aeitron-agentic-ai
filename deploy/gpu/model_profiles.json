@@ -1,8 +1,8 @@
-[
+﻿[
   {
-    "name": "mythos-7b-scratch",
+    "name": "aeitron-7b-scratch",
     "family": "mythos_decoder",
-    "model_path": "artifacts/mythos/checkpoints/mythos-7b",
+    "model_path": "artifacts/aeitron/checkpoints/aeitron-7b",
     "size_class": "7B",
     "role": "first scratch pretraining target",
     "recommended_tp_size": 1,
@@ -11,9 +11,9 @@
     "training_policy": "scratch pretraining only"
   },
   {
-    "name": "mythos-32b-scratch",
+    "name": "aeitron-32b-scratch",
     "family": "mythos_decoder",
-    "model_path": "artifacts/mythos/checkpoints/mythos-32b",
+    "model_path": "artifacts/aeitron/checkpoints/aeitron-32b",
     "size_class": "32B",
     "role": "serious coding/security target after 7B pipeline is stable",
     "recommended_tp_size": 2,
@@ -22,9 +22,9 @@
     "training_policy": "scratch pretraining only"
   },
   {
-    "name": "mythos-62b-scratch",
+    "name": "aeitron-62b-scratch",
     "family": "mythos_decoder",
-    "model_path": "artifacts/mythos/checkpoints/mythos-62b",
+    "model_path": "artifacts/aeitron/checkpoints/aeitron-62b",
     "size_class": "62B",
     "role": "long-context coding/security production target before 70B",
     "recommended_tp_size": 4,
@@ -37,9 +37,9 @@
     "requires_cluster_validation": true
   },
   {
-    "name": "mythos-70b-scratch",
+    "name": "aeitron-70b-scratch",
     "family": "mythos_decoder",
-    "model_path": "artifacts/mythos/checkpoints/mythos-70b",
+    "model_path": "artifacts/aeitron/checkpoints/aeitron-70b",
     "size_class": "70B",
     "role": "large-scale production quality target",
     "recommended_tp_size": 4,
@@ -48,9 +48,9 @@
     "training_policy": "scratch pretraining only"
   },
   {
-    "name": "mythos-100b-scratch",
+    "name": "aeitron-100b-scratch",
     "family": "mythos_decoder",
-    "model_path": "artifacts/mythos/checkpoints/mythos-100b",
+    "model_path": "artifacts/aeitron/checkpoints/aeitron-100b",
     "size_class": "100B",
     "role": "frontier-scale research target",
     "recommended_tp_size": 8,

@@ -1,4 +1,4 @@
-"""Dataset quality inspection reports for clean Mythos JSONL shards."""
+﻿"""Dataset quality inspection reports for clean Mythos JSONL shards."""
 
 from __future__ import annotations
 

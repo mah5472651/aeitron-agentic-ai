@@ -1,4 +1,4 @@
-"""Million-scale defensive data engine.
+﻿"""Million-scale defensive data engine.
 
 The engine is designed for large allowlisted crawls: persistent frontier,
 resume/retry, per-domain throttling, URL discovery, provenance, content hash
@@ -115,9 +115,9 @@ CREATE INDEX IF NOT EXISTS idx_urls_source ON urls(source_name);
 class DataEngineConfig(StrictModel):
     frontier_backend: str = "sqlite"
     postgres_dsn: str | None = None
-    frontier_path: str = "artifacts/mythos/data-engine/frontier.sqlite3"
-    output_dir: str = "artifacts/mythos/data-engine/raw"
-    clean_output_dir: str = "artifacts/mythos/data-engine/clean"
+    frontier_path: str = "artifacts/aeitron/data-engine/frontier.sqlite3"
+    output_dir: str = "artifacts/aeitron/data-engine/raw"
+    clean_output_dir: str = "artifacts/aeitron/data-engine/clean"
     max_docs: int = Field(default=10_000, ge=1)
     max_depth: int = Field(default=2, ge=0, le=20)
     workers: int = Field(default=8, ge=1, le=256)
@@ -128,7 +128,7 @@ class DataEngineConfig(StrictModel):
     delay_seconds: float = Field(default=1.0, ge=0.0)
     request_timeout_seconds: float = Field(default=20.0, ge=1.0)
     max_bytes_per_doc: int = Field(default=2_000_000, ge=1000)
-    user_agent: str = "MythosResearchBot/0.2 defensive AI dataset builder"
+    user_agent: str = "AeitronResearchBot/0.2 defensive AI dataset builder"
 
 
 class DataEngineReport(StrictModel):
@@ -762,9 +762,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sources", required=True)
     parser.add_argument("--frontier-backend", choices=["sqlite", "postgres"], default="sqlite")
     parser.add_argument("--postgres-dsn")
-    parser.add_argument("--frontier", default="artifacts/mythos/data-engine/frontier.sqlite3")
-    parser.add_argument("--raw-output-dir", default="artifacts/mythos/data-engine/raw")
-    parser.add_argument("--clean-output-dir", default="artifacts/mythos/data-engine/clean")
+    parser.add_argument("--frontier", default="artifacts/aeitron/data-engine/frontier.sqlite3")
+    parser.add_argument("--raw-output-dir", default="artifacts/aeitron/data-engine/raw")
+    parser.add_argument("--clean-output-dir", default="artifacts/aeitron/data-engine/clean")
     parser.add_argument("--max-docs", type=int, default=10_000)
     parser.add_argument("--max-bytes-per-doc", type=int, default=2_000_000)
     parser.add_argument("--workers", type=int, default=8)

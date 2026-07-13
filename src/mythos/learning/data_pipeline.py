@@ -1,4 +1,4 @@
-"""End-to-end Mythos data pipeline: crawl -> clean -> shard -> train."""
+"""End-to-end Aeitron data pipeline: crawl -> clean -> shard -> train."""
 
 from __future__ import annotations
 
@@ -49,8 +49,8 @@ from src.mythos.shared.schemas import StrictModel
 
 class DataPipelineConfig(StrictModel):
     sources_path: str
-    dataset_id: str = "mythos-defensive-coding-corpus"
-    work_dir: str = "artifacts/mythos/data-pipeline"
+    dataset_id: str = "aeitron-defensive-coding-corpus"
+    work_dir: str = "artifacts/aeitron/data-pipeline"
     frontier_backend: str = "sqlite"
     postgres_dsn: str | None = None
     max_docs: int = Field(default=10_000, ge=1)
@@ -102,7 +102,7 @@ class DataPipelineConfig(StrictModel):
     extract_tasks: bool = True
     review_tasks: bool = True
     max_extracted_tasks: int = Field(default=50_000, ge=1)
-    object_store_uri: str = "local://artifacts/mythos/object-store"
+    object_store_uri: str = "local://artifacts/aeitron/object-store"
     object_store_endpoint_url: str | None = None
     upload_artifacts: bool = True
     progress_path: str | None = None
@@ -792,10 +792,10 @@ async def _run_data_pipeline_locked(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Mythos crawl -> clean -> shard -> train pipeline.")
+    parser = argparse.ArgumentParser(description="Run Aeitron crawl -> clean -> shard -> train pipeline.")
     parser.add_argument("--sources", required=True)
-    parser.add_argument("--dataset-id", default="mythos-defensive-coding-corpus")
-    parser.add_argument("--work-dir", default="artifacts/mythos/data-pipeline")
+    parser.add_argument("--dataset-id", default="aeitron-defensive-coding-corpus")
+    parser.add_argument("--work-dir", default="artifacts/aeitron/data-pipeline")
     parser.add_argument("--frontier-backend", choices=["sqlite", "postgres"], default="sqlite")
     parser.add_argument("--postgres-dsn")
     parser.add_argument("--max-docs", type=int, default=10_000)
@@ -847,7 +847,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-task-extraction", action="store_true")
     parser.add_argument("--no-task-review", action="store_true")
     parser.add_argument("--max-extracted-tasks", type=int, default=50_000)
-    parser.add_argument("--object-store-uri", default="local://artifacts/mythos/object-store")
+    parser.add_argument("--object-store-uri", default="local://artifacts/aeitron/object-store")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--no-upload", action="store_true")
     parser.add_argument("--progress-path")

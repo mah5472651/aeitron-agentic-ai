@@ -1,4 +1,4 @@
-"""One-command benchmark pack runner for Mythos coding/security evaluation."""
+﻿"""One-command benchmark pack runner for Mythos coding/security evaluation."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ PUBLIC_BENCHMARK_SOURCES = {
 
 
 def _download_bytes(url: str, *, max_bytes: int = 20_000_000) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "MythosBenchmarkMaterializer/1.0"})
+    request = urllib.request.Request(url, headers={"User-Agent": "AeitronBenchmarkMaterializer/1.0"})
     with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - URLs are fixed allowlisted constants.
         payload = response.read(max_bytes + 1)
     if len(payload) > max_bytes:
@@ -186,7 +186,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--swe-bench")
     parser.add_argument("--cyberseceval")
     parser.add_argument("--custom-security")
-    parser.add_argument("--output-dir", default="artifacts/mythos/benchmark-pack")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/benchmark-pack")
     parser.add_argument("--non-strict", action="store_true")
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--min-human-eval-tasks", type=int, default=164)

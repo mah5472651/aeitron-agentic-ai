@@ -1,4 +1,4 @@
-"""Production adapter exports for Mythos scratch checkpoints.
+﻿"""Production adapter exports for Mythos scratch checkpoints.
 
 This module owns the bridge from the native Mythos checkpoint format to external
 large-model runtimes. It intentionally separates "artifact generated" from

@@ -727,7 +727,7 @@ class MythosDataEngineTest(unittest.IsolatedAsyncioTestCase):
             DataPlatformReadinessConfig(
                 sources_path="config/data_sources.ultimate.json",
                 frontier_backend="sqlite",
-                object_store_uri="local://artifacts/mythos/object-store",
+                object_store_uri="local://artifacts/aeitron/object-store",
                 production_mode=True,
                 worker_replicas=1,
                 async_workers=8,

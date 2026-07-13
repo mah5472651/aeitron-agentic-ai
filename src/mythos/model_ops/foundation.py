@@ -1,4 +1,4 @@
-"""Scratch-model foundation contracts for Mythos.
+﻿"""Scratch-model foundation contracts for Mythos.
 
 This module is intentionally not a fine-tuning wrapper. It defines the stable
 contracts Mythos will use for tokenizer assets, decoder-only architecture
@@ -128,7 +128,7 @@ class PretrainingRunSpec(StrictModel):
     warmup_tokens: int = Field(default=10_000_000_000, ge=0)
     target_train_tokens: int = Field(default=1_000_000_000_000, ge=1)
     checkpoint_interval_tokens: int = Field(default=10_000_000_000, ge=1)
-    output_dir: str = "artifacts/mythos/pretraining"
+    output_dir: str = "artifacts/aeitron/pretraining"
 
     @model_validator(mode="after")
     def validate_training_shape(self) -> "PretrainingRunSpec":
@@ -231,8 +231,8 @@ def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
 
 def architecture_presets() -> dict[str, DecoderArchitectureSpec]:
     return {
-        "mythos-7b": DecoderArchitectureSpec(
-            name="mythos-7b",
+        "aeitron-7b": DecoderArchitectureSpec(
+            name="aeitron-7b",
             parameter_target_billions=7.0,
             hidden_size=4096,
             num_layers=32,
@@ -241,8 +241,8 @@ def architecture_presets() -> dict[str, DecoderArchitectureSpec]:
             intermediate_size=11008,
             context_length=65_536,
         ),
-        "mythos-32b": DecoderArchitectureSpec(
-            name="mythos-32b",
+        "aeitron-32b": DecoderArchitectureSpec(
+            name="aeitron-32b",
             parameter_target_billions=32.0,
             hidden_size=6656,
             num_layers=64,

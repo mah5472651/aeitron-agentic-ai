@@ -1,4 +1,4 @@
-"""${message}"""
+﻿"""${message}"""
 
 from __future__ import annotations
 

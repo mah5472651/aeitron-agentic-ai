@@ -1,4 +1,4 @@
-"""Structured progress reporting for long Mythos jobs."""
+"""Structured progress reporting for long Aeitron jobs."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ class ProgressReporter:
         *,
         path: str | Path | None = None,
         to_stdout: bool = False,
-        prefix: str = "mythos-progress",
+        prefix: str = "aeitron-progress",
         stream: TextIO | None = None,
     ) -> None:
         self.path = Path(path) if path else None

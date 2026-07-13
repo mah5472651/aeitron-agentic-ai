@@ -1,4 +1,4 @@
--- Mythos MVP production Postgres schema.
+﻿-- Mythos MVP production Postgres schema.
 -- Local development uses src/mythos/db/local_store.py with equivalent SQLite tables.
 
 CREATE TABLE IF NOT EXISTS projects (

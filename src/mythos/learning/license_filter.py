@@ -1,4 +1,4 @@
-"""Strict license filtering for Mythos training corpora."""
+﻿"""Strict license filtering for Mythos training corpora."""
 
 from __future__ import annotations
 

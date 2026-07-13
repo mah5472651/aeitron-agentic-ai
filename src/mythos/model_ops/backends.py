@@ -1,4 +1,4 @@
-"""Serving adapters for Mythos-owned model checkpoints.
+﻿"""Serving adapters for Mythos-owned model checkpoints.
 
 Mythos is scratch-first. The only production serving backend here targets a
 Mythos checkpoint served locally/privately. The mock backend is a test double
@@ -30,13 +30,13 @@ class MockModelBackend(ModelBackend):
 
     async def generate(self, prompt: str, *, temperature: float = 0.2, max_tokens: int = 1024) -> str:
         return (
-            "Mock Mythos response. I inspected the request and would create a minimal, tested patch. "
+            "Mock Aeitron response. I inspected the request and would create a minimal, tested patch. "
             f"Prompt: {prompt[:500]}"
         )
 
 
 class MythosServingBackend(ModelBackend):
-    name = "mythos_serving"
+    name = "aeitron_serving"
 
     def __init__(self, *, endpoint: str, model_name: str, api_key: str | None = None) -> None:
         self.endpoint = endpoint.rstrip("/")
@@ -74,10 +74,10 @@ def _profile_payload() -> dict[str, Any]:
 def build_active_backend() -> ModelBackend:
     profile = _profile_payload()
     backend = str(profile.get("backend") or os.environ.get("MYTHOS_MODEL_BACKEND") or "mock")
-    if backend in {"mythos_serving", "active"}:
+    if backend in {"aeitron_serving", "mythos_serving", "active"}:
         return MythosServingBackend(
             endpoint=str(profile.get("endpoint") or os.environ.get("MYTHOS_MODEL_ENDPOINT") or "http://127.0.0.1:8000/v1"),
-            model_name=str(profile.get("model_name") or os.environ.get("MYTHOS_MODEL_NAME") or "mythos-scratch"),
+            model_name=str(profile.get("model_name") or os.environ.get("MYTHOS_MODEL_NAME") or "aeitron-scratch"),
             api_key=os.environ.get("MYTHOS_MODEL_API_KEY"),
         )
     return MockModelBackend()
@@ -86,11 +86,11 @@ def build_active_backend() -> ModelBackend:
 def list_model_profiles() -> dict[str, Any]:
     return {
         "mock": {"backend": "mock", "quality": "test double only, not a real model"},
-        "mythos-scratch-local": {
-            "backend": "mythos_serving",
+        "aeitron-scratch-local": {
+            "backend": "aeitron_serving",
             "endpoint": os.environ.get("MYTHOS_MODEL_ENDPOINT", "http://127.0.0.1:8000/v1"),
-            "model_name": os.environ.get("MYTHOS_MODEL_NAME", "mythos-scratch"),
-            "checkpoint_policy": "Mythos-owned scratch checkpoint only",
+            "model_name": os.environ.get("MYTHOS_MODEL_NAME", "aeitron-scratch"),
+            "checkpoint_policy": "Aeitron-owned scratch checkpoint only",
         },
     }
 

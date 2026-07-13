@@ -1,4 +1,4 @@
-"""Production readiness contract for Mythos.
+﻿"""Production readiness contract for Mythos.
 
 This module is the single source of truth for honest deployment status. It does
 not fake external infrastructure: services that require Redis, Postgres, object
@@ -149,11 +149,11 @@ def _check_model_backend(mode: str) -> ReadinessCheck:
     missing = []
     if backend == "mock":
         missing.append("non-mock MYTHOS_MODEL_BACKEND")
-    if backend in {"mythos_serving", "active"} and not active.get("endpoint"):
+    if backend in {"aeitron_serving", "mythos_serving", "active"} and not active.get("endpoint"):
         missing.append("MYTHOS_MODEL_ENDPOINT")
     checkpoint_manifest = os.environ.get("MYTHOS_CHECKPOINT_MANIFEST", "")
     tokenizer_path = os.environ.get("MYTHOS_TOKENIZER_PATH", "")
-    if backend in {"mythos_serving", "active"}:
+    if backend in {"aeitron_serving", "mythos_serving", "active"}:
         if not checkpoint_manifest or not Path(checkpoint_manifest).exists():
             missing.append("MYTHOS_CHECKPOINT_MANIFEST existing file")
         if not tokenizer_path or not Path(tokenizer_path).exists():
@@ -161,7 +161,7 @@ def _check_model_backend(mode: str) -> ReadinessCheck:
     return ReadinessCheck(
         subsystem="serving",
         status="production_ready" if not missing else "blocked_missing_dependency",
-        summary="Native Mythos serving backend is selected." if not missing else "Serving is still using mock/test-double configuration.",
+        summary="Native Aeitron serving backend is selected." if not missing else "Serving is still using mock/test-double configuration.",
         required_dependencies=["MYTHOS_MODEL_BACKEND", "MYTHOS_MODEL_ENDPOINT", "MYTHOS_CHECKPOINT_MANIFEST", "MYTHOS_TOKENIZER_PATH"],
         missing_dependencies=missing,
         evidence={
@@ -299,7 +299,7 @@ def _check_training_stack(mode: str) -> list[ReadinessCheck]:
                 if hf_export_ready
                 else "HF/vLLM/TensorRT export artifacts or runtime dependencies are missing."
             ),
-            required_dependencies=["Mythos-to-HF/vLLM converter", "TensorRT-LLM conversion plugin"],
+            required_dependencies=["Aeitron-to-HF/vLLM converter", "TensorRT-LLM conversion plugin"],
             missing_dependencies=vllm_trt_missing,
             evidence={"hf_export_dir": hf_export_dir, "hf_export_ready": hf_export_ready, "vllm_module": vllm_available, "trtllm_build": trt_build},
             production_blocker=mode == "production",
@@ -314,7 +314,7 @@ def _check_benchmark_files(mode: str, benchmark_dir: str | Path) -> ReadinessChe
         "mbpp.jsonl",
         "swe_bench_style.jsonl",
         "cyberseceval_style.jsonl",
-        "mythos_security.jsonl",
+        "aeitron_security.jsonl",
         "safety_prompts.jsonl",
     ]
     missing = [str(root / name) for name in required if not (root / name).exists()]
@@ -350,7 +350,7 @@ def run_production_readiness(
 def write_markdown(report: ProductionReadinessReport, path: str | Path) -> Path:
     target = Path(path)
     lines = [
-        "# Mythos Production Readiness Report",
+        "# Aeitron Production Readiness Report",
         "",
         f"- mode: {report.mode}",
         f"- status: {report.status}",
@@ -370,7 +370,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Mythos production readiness gate.")
     parser.add_argument("--mode", choices=["dev", "production"], default="dev")
     parser.add_argument("--benchmark-dir", default="data/eval")
-    parser.add_argument("--output-dir", default="artifacts/mythos/production-readiness")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/production-readiness")
     return parser.parse_args()
 
 

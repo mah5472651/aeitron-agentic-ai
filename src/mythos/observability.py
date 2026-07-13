@@ -1,4 +1,4 @@
-"""Production observability primitives for Mythos."""
+﻿"""Production observability primitives for Mythos."""
 
 from __future__ import annotations
 

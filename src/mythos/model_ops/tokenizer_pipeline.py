@@ -1,4 +1,4 @@
-"""Tokenizer training and token sharding pipeline for Mythos scratch pretraining."""
+"""Tokenizer training and token sharding pipeline for Aeitron scratch pretraining."""
 
 from __future__ import annotations
 
@@ -173,7 +173,7 @@ def build_token_shards(
     tokenizer_path: str | Path,
     output_dir: str | Path,
     config: ShardBuildConfig | None = None,
-    dataset_id: str = "mythos-corpus",
+    dataset_id: str = "aeitron-corpus",
 ) -> ShardManifest:
     active = config or ShardBuildConfig()
     rng = random.Random(active.seed)
@@ -322,12 +322,12 @@ def train_real_corpus_tokenizer(config: RealCorpusTokenizerConfig) -> TokenizerA
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Mythos tokenizer and build token shards.")
+    parser = argparse.ArgumentParser(description="Train Aeitron tokenizer and build token shards.")
     parser.add_argument("--input", nargs="+", required=True)
     parser.add_argument("--tokenizer-out")
     parser.add_argument("--shards-out")
     parser.add_argument("--output-dir", help="Use with --real-corpus-audit to write tokenizer, shards, and audit report.")
-    parser.add_argument("--dataset-id", default="mythos-corpus")
+    parser.add_argument("--dataset-id", default="aeitron-corpus")
     parser.add_argument("--vocab-size", type=int, default=64_000)
     parser.add_argument("--min-frequency", type=int, default=2)
     parser.add_argument("--shard-token-count", type=int, default=1_000_000)

@@ -1,4 +1,4 @@
-"""Durable MVP TaskGraph runtime."""
+﻿"""Durable MVP TaskGraph runtime."""
 
 from __future__ import annotations
 

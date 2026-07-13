@@ -1,4 +1,4 @@
-"""Lazy facade for the Mythos learning pipeline.
+﻿"""Lazy facade for the Mythos learning pipeline.
 
 The CLI modules in this package are designed to run with ``python -m``.
 Keeping this package initializer lazy prevents those modules from being

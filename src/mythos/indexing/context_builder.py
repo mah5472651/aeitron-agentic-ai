@@ -1,4 +1,4 @@
-"""Context Builder for indexed Mythos workspaces."""
+﻿"""Context Builder for indexed Mythos workspaces."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Native Mythos scratch checkpoint serving.
+﻿"""Native Mythos scratch checkpoint serving.
 
 This is the production path for serving Mythos-owned scratch checkpoints before
 vLLM/TensorRT conversion exists. It intentionally fails fast on missing assets
@@ -41,7 +41,7 @@ class ChatMessage(StrictModel):
 
 
 class ChatCompletionRequest(StrictModel):
-    model: str = "mythos-scratch"
+    model: str = "aeitron-scratch"
     messages: list[ChatMessage] = Field(min_length=1)
     temperature: float = Field(default=0.0, ge=0.0, le=5.0)
     max_tokens: int = Field(default=256, ge=1, le=4096)
@@ -52,7 +52,7 @@ class ChatCompletionRequest(StrictModel):
 class NativeServingConfig(StrictModel):
     checkpoint_manifest: str
     tokenizer_path: str
-    model_name: str = "mythos-scratch"
+    model_name: str = "aeitron-scratch"
     device: str = "auto"
     require_tokenizer_hash_match: bool = True
     auth_enabled: bool = True
@@ -134,7 +134,7 @@ def create_app(config: NativeServingConfig | None = None) -> FastAPI:
     active_config = config or NativeServingConfig(
         checkpoint_manifest=os.environ.get("MYTHOS_CHECKPOINT_MANIFEST", ""),
         tokenizer_path=os.environ.get("MYTHOS_TOKENIZER_PATH", ""),
-        model_name=os.environ.get("MYTHOS_MODEL_NAME", "mythos-scratch"),
+        model_name=os.environ.get("MYTHOS_MODEL_NAME", "aeitron-scratch"),
         device=os.environ.get("MYTHOS_SERVING_DEVICE", "auto"),
         require_tokenizer_hash_match=os.environ.get("MYTHOS_REQUIRE_TOKENIZER_HASH_MATCH", "1") == "1",
         auth_enabled=os.environ.get("MYTHOS_AUTH_ENABLED", "1") == "1",
@@ -145,7 +145,7 @@ def create_app(config: NativeServingConfig | None = None) -> FastAPI:
     if not active_config.tokenizer_path:
         raise ValueError("MYTHOS_TOKENIZER_PATH is required")
     state = NativeServingState(active_config)
-    app = FastAPI(title="Mythos Native Scratch Serving", version="1.0.0")
+    app = FastAPI(title="Aeitron Native Scratch Serving", version="1.0.0")
     if active_config.quota_enabled:
         install_quota(app)
     if active_config.auth_enabled:
@@ -214,7 +214,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve a Mythos scratch checkpoint with a native OpenAI-compatible API.")
     parser.add_argument("--checkpoint-manifest", required=True)
     parser.add_argument("--tokenizer-path", required=True)
-    parser.add_argument("--model-name", default="mythos-scratch")
+    parser.add_argument("--model-name", default="aeitron-scratch")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8001)

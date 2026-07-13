@@ -1,4 +1,4 @@
-"""Colab/Kaggle-friendly Mythos scratch GPU smoke entrypoint.
+"""Colab/Kaggle-friendly Aeitron scratch GPU smoke entrypoint.
 
 Usage:
   python deploy/gpu/run_scratch_gpu_smoke.py --device cuda
@@ -19,9 +19,9 @@ from src.mythos.model_ops.gpu_smoke import run_scratch_gpu_smoke  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Mythos scratch decoder GPU smoke.")
+    parser = argparse.ArgumentParser(description="Run Aeitron scratch decoder GPU smoke.")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--output-dir", default="artifacts/mythos/gpu-smoke")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/gpu-smoke")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--sequence-length", type=int, default=64)
     parser.add_argument("--steps", type=int, default=2)

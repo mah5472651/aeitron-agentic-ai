@@ -1,4 +1,4 @@
--- Mythos production baseline schema.
+﻿-- Mythos production baseline schema.
 -- Keep this migration append-only after release.
 
 CREATE TABLE IF NOT EXISTS schema_migrations (

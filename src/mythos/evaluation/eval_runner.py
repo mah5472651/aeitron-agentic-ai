@@ -1,4 +1,4 @@
-"""Config-driven deterministic checkpoint evaluation runner."""
+﻿"""Config-driven deterministic checkpoint evaluation runner."""
 
 from __future__ import annotations
 
@@ -382,7 +382,7 @@ def evaluate_checkpoint_with_schedule(
 def write_markdown_report(report: EvalRunReport, path: str | Path) -> Path:
     target = Path(path)
     lines = [
-        "# Mythos Checkpoint Eval Report",
+        "# Aeitron Checkpoint Eval Report",
         "",
         f"- status: {report.status}",
         f"- checkpoint: `{report.checkpoint_manifest}`",

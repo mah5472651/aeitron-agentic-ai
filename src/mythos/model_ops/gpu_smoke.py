@@ -1,4 +1,4 @@
-"""GPU smoke runner for Mythos scratch decoder training path."""
+﻿"""GPU smoke runner for Aeitron scratch decoder training path."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def gpu_name(device: "torch.device") -> str:
 def run_scratch_gpu_smoke(
     *,
     device: str = "auto",
-    output_dir: str | Path = "artifacts/mythos/gpu-smoke",
+    output_dir: str | Path = "artifacts/aeitron/gpu-smoke",
     batch_size: int = 2,
     sequence_length: int = 64,
     steps: int = 2,
@@ -130,9 +130,9 @@ def run_scratch_gpu_smoke(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a Mythos scratch decoder GPU smoke test.")
+    parser = argparse.ArgumentParser(description="Run an Aeitron scratch decoder GPU smoke test.")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--output-dir", default="artifacts/mythos/gpu-smoke")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/gpu-smoke")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--sequence-length", type=int, default=64)
     parser.add_argument("--steps", type=int, default=2)

@@ -25,7 +25,7 @@ class MythosModelFoundationTest(unittest.TestCase):
         self.assertTrue(status["scratch_only"])
         self.assertFalse(status["external_model_training"])
         presets = architecture_presets()
-        self.assertIn("mythos-7b", presets)
+        self.assertIn("aeitron-7b", presets)
         self.assertIn("mythos-100b", presets)
         for name, spec in presets.items():
             estimate = spec.estimate_parameters()
@@ -36,7 +36,7 @@ class MythosModelFoundationTest(unittest.TestCase):
 
     def test_pretraining_readiness_requires_real_assets_and_data_gates(self) -> None:
         spec = PretrainingRunSpec(
-            architecture=architecture_presets()["mythos-7b"],
+            architecture=architecture_presets()["aeitron-7b"],
             tokenizer=TokenizerContract(tokenizer_path="missing-tokenizer.json"),
             data=TrainingDataContract(manifest_path="missing-dataset.jsonl", token_count_estimate=0),
         )
@@ -55,7 +55,7 @@ class MythosModelFoundationTest(unittest.TestCase):
             checkpoint.mkdir()
             (checkpoint / "model.safetensors").write_text("weights", encoding="utf-8")
             manifest = CheckpointManifest.from_directory(
-                architecture_name="mythos-7b",
+                architecture_name="aeitron-7b",
                 run_id="run-1",
                 step=10,
                 trained_tokens=1024,
@@ -73,12 +73,12 @@ class MythosModelFoundationTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         self.assertTrue(payload["scratch_first"])
-        self.assertIn("mythos-7b", payload["presets"])
+        self.assertIn("aeitron-7b", payload["presets"])
 
     def test_model_profiles_are_scratch_only_or_test_double(self) -> None:
         profiles = list_model_profiles()
-        self.assertEqual(set(profiles), {"mock", "mythos-scratch-local"})
-        self.assertEqual(profiles["mythos-scratch-local"]["backend"], "mythos_serving")
+        self.assertEqual(set(profiles), {"mock", "aeitron-scratch-local"})
+        self.assertEqual(profiles["aeitron-scratch-local"]["backend"], "aeitron_serving")
         forbidden = " ".join(str(value) for profile in profiles.values() for value in profile.values()).lower()
         for term in ["qw" + "en", "deep" + "seek", "lla" + "ma", "openai" + "_compatible"]:
             self.assertNotIn(term, forbidden)

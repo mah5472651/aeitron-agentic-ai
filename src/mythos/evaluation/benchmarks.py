@@ -1,4 +1,4 @@
-"""Benchmark harness contracts for coding and defensive security evaluation."""
+﻿"""Benchmark harness contracts for coding and defensive security evaluation."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ class BenchmarkRunReport(StrictModel):
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         lines = [
-            f"# Mythos Benchmark Report {self.run_id}",
+            f"# Aeitron Benchmark Report {self.run_id}",
             "",
             f"- status: {self.status}",
             f"- total: {self.total}",

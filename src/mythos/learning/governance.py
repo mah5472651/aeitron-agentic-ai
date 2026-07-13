@@ -1,4 +1,4 @@
-"""Source governance, license approval, and human review operations."""
+﻿"""Source governance, license approval, and human review operations."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ class GovernanceReport(StrictModel):
 class GovernanceStore:
     """Append-only governance store for auditable data-source decisions."""
 
-    def __init__(self, root: str | Path = "artifacts/mythos/governance") -> None:
+    def __init__(self, root: str | Path = "artifacts/aeitron/governance") -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.approvals_path = self.root / "source_approvals.jsonl"
@@ -160,7 +160,7 @@ class GovernanceStore:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manage Mythos source governance and human review queues.")
-    parser.add_argument("--store", default="artifacts/mythos/governance")
+    parser.add_argument("--store", default="artifacts/aeitron/governance")
     sub = parser.add_subparsers(dest="command", required=True)
 
     submit = sub.add_parser("submit-source")

@@ -1,4 +1,4 @@
-﻿"""Run a real approved-source Mythos data -> GPU training -> eval job.
+﻿"""Run a real approved-source Aeitron data -> GPU training -> eval job.
 
 This entrypoint is intended for Kaggle/Colab smoke runs and single-node GPU
 jobs. For production-scale collection, use the same pipeline with Postgres
@@ -23,8 +23,8 @@ from src.mythos.learning.data_pipeline import DataPipelineConfig, run_data_pipel
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run real approved-source crawl, shard, scratch training, and checkpoint eval.")
     parser.add_argument("--sources", default="config/data_sources.ultimate.json")
-    parser.add_argument("--dataset-id", default="mythos-real-approved-corpus")
-    parser.add_argument("--output-dir", "--work-dir", dest="output_dir", default="artifacts/mythos/real-data-training")
+    parser.add_argument("--dataset-id", default="aeitron-real-approved-corpus")
+    parser.add_argument("--output-dir", "--work-dir", dest="output_dir", default="artifacts/aeitron/real-data-training")
     parser.add_argument("--frontier-backend", choices=["sqlite", "postgres"], default="sqlite")
     parser.add_argument("--postgres-dsn")
     parser.add_argument("--max-docs", type=int, default=10_000)
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-source-balancing", action="store_true")
     parser.add_argument("--max-source-fraction", type=float, default=0.25)
     parser.add_argument("--min-source-rows", type=int, default=25)
-    parser.add_argument("--object-store-uri", default="local://artifacts/mythos/object-store")
+    parser.add_argument("--object-store-uri", default="local://artifacts/aeitron/object-store")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--progress-path")
@@ -86,59 +86,78 @@ def clean_record_count(report: dict[str, object]) -> int:
 
 async def run(args: argparse.Namespace) -> dict[str, object]:
     progress_path = args.progress_path or str(Path(args.output_dir) / "progress.jsonl")
-    report = await run_data_pipeline(
-        DataPipelineConfig(
-            sources_path=args.sources,
-            dataset_id=args.dataset_id,
-            work_dir=args.output_dir,
-            frontier_backend=args.frontier_backend,
-            postgres_dsn=args.postgres_dsn,
-            max_docs=args.max_docs,
-            max_bytes_per_doc=args.max_bytes_per_doc,
-            workers=args.workers,
-            max_depth=args.max_depth,
-            delay_seconds=args.delay_seconds,
-            shard_rows=10_000,
-            vocab_size=args.vocab_size,
-            tokenizer_min_frequency=2,
-            shard_token_count=args.shard_token_count,
-            sequence_length=args.sequence_length,
-            validation_fraction=args.validation_fraction,
-            skip_train=args.skip_train,
-            train_steps=args.train_steps,
-            train_device=args.device,
-            train_batch_size=args.train_batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            dtype=args.dtype,
-            model_profile_name=args.model_profile,
-            attention_impl=args.attention_impl,
-            gradient_checkpointing=args.gradient_checkpointing,
-            validate_every=min(args.validate_every, args.train_steps) if args.validate_every > 0 else 0,
-            validation_batches=args.validation_batches,
-            early_stopping_patience=args.early_stopping_patience,
-            early_stopping_min_delta=args.early_stopping_min_delta,
-            apply_training_data_gate=not args.no_training_data_gate,
-            min_training_quality_score=args.min_training_quality_score,
-            min_training_average_quality_score=args.min_training_average_quality_score,
-            min_training_rows=args.min_training_rows,
-            min_train_tokens=args.min_train_tokens,
-            min_source_reputation_score=args.min_source_reputation_score,
-            eval_holdout_fraction=args.eval_holdout_fraction,
-            balance_sources=not args.no_source_balancing,
-            max_source_fraction=args.max_source_fraction,
-            min_source_rows=args.min_source_rows,
-            run_checkpoint_eval=not args.skip_train,
-            object_store_uri=args.object_store_uri,
-            object_store_endpoint_url=args.object_store_endpoint_url,
-            upload_artifacts=True,
-            progress_path=progress_path,
-            progress_to_stdout=args.progress_to_stdout or not args.no_progress_stdout,
-            progress_every_docs=args.progress_every_docs,
-            progress_every_steps=args.progress_every_steps,
-            production_mode=args.production,
-            dev_smoke=args.dev_smoke,
+    try:
+        report = await run_data_pipeline(
+            DataPipelineConfig(
+                sources_path=args.sources,
+                dataset_id=args.dataset_id,
+                work_dir=args.output_dir,
+                frontier_backend=args.frontier_backend,
+                postgres_dsn=args.postgres_dsn,
+                max_docs=args.max_docs,
+                max_bytes_per_doc=args.max_bytes_per_doc,
+                workers=args.workers,
+                max_depth=args.max_depth,
+                delay_seconds=args.delay_seconds,
+                shard_rows=10_000,
+                vocab_size=args.vocab_size,
+                tokenizer_min_frequency=2,
+                shard_token_count=args.shard_token_count,
+                sequence_length=args.sequence_length,
+                validation_fraction=args.validation_fraction,
+                skip_train=args.skip_train,
+                train_steps=args.train_steps,
+                train_device=args.device,
+                train_batch_size=args.train_batch_size,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                dtype=args.dtype,
+                model_profile_name=args.model_profile,
+                attention_impl=args.attention_impl,
+                gradient_checkpointing=args.gradient_checkpointing,
+                validate_every=min(args.validate_every, args.train_steps) if args.validate_every > 0 else 0,
+                validation_batches=args.validation_batches,
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_min_delta=args.early_stopping_min_delta,
+                apply_training_data_gate=not args.no_training_data_gate,
+                min_training_quality_score=args.min_training_quality_score,
+                min_training_average_quality_score=args.min_training_average_quality_score,
+                min_training_rows=args.min_training_rows,
+                min_train_tokens=args.min_train_tokens,
+                min_source_reputation_score=args.min_source_reputation_score,
+                eval_holdout_fraction=args.eval_holdout_fraction,
+                balance_sources=not args.no_source_balancing,
+                max_source_fraction=args.max_source_fraction,
+                min_source_rows=args.min_source_rows,
+                run_checkpoint_eval=not args.skip_train,
+                object_store_uri=args.object_store_uri,
+                object_store_endpoint_url=args.object_store_endpoint_url,
+                upload_artifacts=True,
+                progress_path=progress_path,
+                progress_to_stdout=args.progress_to_stdout or not args.no_progress_stdout,
+                progress_every_docs=args.progress_every_docs,
+                progress_every_steps=args.progress_every_steps,
+                production_mode=args.production,
+                dev_smoke=args.dev_smoke,
+            )
         )
-    )
+    except RuntimeError as exc:
+        payload = {
+            "status": "blocked",
+            "dataset_id": args.dataset_id,
+            "work_dir": args.output_dir,
+            "block_reason": str(exc),
+            "progress_path": progress_path,
+            "recommendation": (
+                "Inspect progress.jsonl and reports. For strict runs, increase --max-docs or approved source yield. "
+                "For Kaggle validation-only runs, lower --min-training-rows and --min-train-tokens explicitly."
+            ),
+        }
+        Path(args.output_dir, "reports").mkdir(parents=True, exist_ok=True)
+        Path(args.output_dir, "reports", "real_data_training_report.json").write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return payload
     payload = report.model_dump()
     accepted = clean_record_count(payload)
     if accepted < args.min_clean_records:
@@ -168,7 +187,7 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "event": "mythos_real_data_training_start",
+                "event": "aeitron_real_data_training_start",
                 "work_dir": args.output_dir,
                 "progress_path": args.progress_path or str(Path(args.output_dir) / "progress.jsonl"),
                 "progress_stdout": not args.no_progress_stdout,

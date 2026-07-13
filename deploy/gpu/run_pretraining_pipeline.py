@@ -1,4 +1,4 @@
-"""Kaggle/Colab entrypoint for Mythos scratch tokenizer->shards->pretrain pipeline."""
+﻿"""Kaggle/Colab entrypoint for Mythos scratch tokenizer->shards->pretrain pipeline."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from src.mythos.shared.progress import ProgressReporter  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Mythos scratch tokenizer, shard builder, and pretraining loop.")
     parser.add_argument("--input", required=True, help="Clean JSONL/text corpus path.")
-    parser.add_argument("--output-dir", default="artifacts/mythos/pretraining-pipeline")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/pretraining-pipeline")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--vocab-size", type=int, default=64_000)
     parser.add_argument("--shard-token-count", type=int, default=1_000_000)

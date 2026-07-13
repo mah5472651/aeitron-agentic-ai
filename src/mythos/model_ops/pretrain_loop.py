@@ -1,4 +1,4 @@
-"""Checkpoint-resumable scratch pretraining loop for Mythos decoder models."""
+﻿"""Checkpoint-resumable scratch pretraining loop for Mythos decoder models."""
 
 from __future__ import annotations
 
@@ -1046,7 +1046,7 @@ def run_pretraining_loop(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Mythos scratch pretraining loop.")
-    parser.add_argument("--output-dir", default="artifacts/mythos/pretrain-loop")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/pretrain-loop")
     parser.add_argument("--manifest")
     parser.add_argument("--token-file")
     parser.add_argument("--tokenizer-path")
@@ -1076,7 +1076,7 @@ def parse_args() -> argparse.Namespace:
         help="Validated distributed strategy contract. Use --cluster-plan-only before cluster execution.",
     )
     parser.add_argument("--cluster-plan-only", action="store_true", help="Write/print a distributed training launch plan without training.")
-    parser.add_argument("--cluster-plan-out", default="artifacts/mythos/cluster_training_plan.json")
+    parser.add_argument("--cluster-plan-out", default="artifacts/aeitron/cluster_training_plan.json")
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--gpus-per-node", type=int, default=8)
     parser.add_argument("--node-rank", type=int, default=0)

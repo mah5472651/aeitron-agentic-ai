@@ -1,4 +1,4 @@
-"""Final consolidated Mythos architecture package.
+﻿"""Final consolidated Mythos architecture package.
 
 All production code lives under this package.
 """

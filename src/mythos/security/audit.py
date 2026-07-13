@@ -1,4 +1,4 @@
-"""Production security audit for Mythos source and deployment assets."""
+﻿"""Production security audit for Mythos source and deployment assets."""
 
 from __future__ import annotations
 
@@ -242,7 +242,7 @@ def scanner_install_plan() -> dict[str, Any]:
             "local_install_dir": str(Path.home() / ".mythos" / "tools" / "codeql"),
             "env_override": "MYTHOS_CODEQL_BIN",
             "linux_note": "Install the official CodeQL CLI bundle from GitHub and add the codeql executable to PATH.",
-            "required_after_install": ["codeql database create artifacts/mythos/codeql-db --language=python --source-root=."],
+            "required_after_install": ["codeql database create artifacts/aeitron/codeql-db --language=python --source-root=."],
         },
         "strict_audit_command": [
             "python",
@@ -250,7 +250,7 @@ def scanner_install_plan() -> dict[str, Any]:
             "src.mythos.security.audit",
             "--strict-external-tools",
             "--output-dir",
-            "artifacts/mythos/security-audit",
+            "artifacts/aeitron/security-audit",
         ],
     }
 
@@ -308,7 +308,7 @@ def run_security_audit(
 def write_markdown(report: SecurityAuditReport, path: str | Path) -> Path:
     target = Path(path)
     lines = [
-        "# Mythos Security Audit Report",
+        "# Aeitron Security Audit Report",
         "",
         f"- status: {report.status}",
         f"- findings: {len(report.findings)}",
@@ -341,7 +341,7 @@ def write_markdown(report: SecurityAuditReport, path: str | Path) -> Path:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Mythos production security audit.")
     parser.add_argument("--root", default=".")
-    parser.add_argument("--output-dir", default="artifacts/mythos/security-audit")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/security-audit")
     parser.add_argument("--no-bandit", action="store_true")
     parser.add_argument("--no-k8s", action="store_true")
     parser.add_argument("--no-semgrep", action="store_true")

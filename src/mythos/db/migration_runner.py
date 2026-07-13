@@ -1,4 +1,4 @@
-"""Postgres migration runner for Mythos production deployments."""
+﻿"""Postgres migration runner for Mythos production deployments."""
 
 from __future__ import annotations
 

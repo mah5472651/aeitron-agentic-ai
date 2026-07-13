@@ -1,4 +1,4 @@
-{
+﻿{
   "description": "Canonical Mythos data source registry. The `sources` list is crawl-ready and license-gated. Other sections are advisory/API metadata and review queues; they are not crawled by SourceRegistry until promoted into `sources` after legal/source approval.",
   "sources": [
     {
@@ -413,7 +413,7 @@
       "resource_id": 1,
       "resource_type": "cybersecurity_pretraining_dataset",
       "safety_policy": "license_filter_and_defensive_security_quality_gate",
-      "section": "cybersecurity_pretraining_sft",
+      "section": "cybersecurity_pretraining",
       "train_policy": "pretrain",
       "url": "https://huggingface.co/datasets/trendmicro-ailab/Primus-Seed"
     },
@@ -426,7 +426,7 @@
       "resource_id": 2,
       "resource_type": "cybersecurity_pretraining_dataset",
       "safety_policy": "license_filter_contamination_filter_near_dedup",
-      "section": "cybersecurity_pretraining_sft",
+      "section": "cybersecurity_pretraining",
       "train_policy": "pretrain",
       "url": "https://huggingface.co/datasets/trendmicro-ailab/Primus-FineWeb"
     },
@@ -439,8 +439,8 @@
       "resource_id": 3,
       "resource_type": "cybersecurity_reasoning_dataset",
       "safety_policy": "strip_ground_truth_leakage_and_keep_defensive_framing",
-      "section": "cybersecurity_pretraining_sft",
-      "train_policy": "sft",
+      "section": "cybersecurity_pretraining",
+      "train_policy": "pretrain",
       "url": "https://huggingface.co/datasets/trendmicro-ailab/Primus-Reasoning"
     },
     {
@@ -452,7 +452,7 @@
       "resource_id": 4,
       "resource_type": "resource_collection",
       "safety_policy": "catalog_reference_only_until_individual_items_are_approved",
-      "section": "cybersecurity_pretraining_sft",
+      "section": "cybersecurity_pretraining",
       "train_policy": "research_reference",
       "url": "https://huggingface.co/collections/trendmicro-ailab/primus-67b1fd27052b802b4af9d243"
     },
@@ -465,7 +465,7 @@
       "resource_id": 5,
       "resource_type": "research_paper",
       "safety_policy": "use_for_methodology_not_training_corpus_by_default",
-      "section": "cybersecurity_pretraining_sft",
+      "section": "cybersecurity_pretraining",
       "train_policy": "research_reference",
       "url": "https://arxiv.org/abs/2502.11191"
     },
@@ -473,12 +473,12 @@
       "ingestion_mode": "model_reference",
       "license_status": "not_training_data",
       "name": "Llama-Primus-Merged 8B",
-      "notes": "Model reference only; Mythos remains scratch-training oriented.",
+      "notes": "Model reference only; Aeitron remains scratch-training oriented.",
       "priority_rank": 6,
       "resource_id": 6,
       "resource_type": "model_reference",
       "safety_policy": "do_not_import_weights_or_outputs_as_training_data",
-      "section": "cybersecurity_pretraining_sft",
+      "section": "cybersecurity_pretraining",
       "train_policy": "research_reference",
       "url": "https://huggingface.co/trendmicro-ailab/Llama-Primus-Merged"
     },
@@ -491,7 +491,7 @@
       "resource_id": 7,
       "resource_type": "model_reference",
       "safety_policy": "do_not_import_weights_or_outputs_as_training_data",
-      "section": "cybersecurity_pretraining_sft",
+      "section": "cybersecurity_pretraining",
       "train_policy": "research_reference",
       "url": "https://huggingface.co/collections/trend-cybertron/llama-primus-nemotron-70b-6805fd8a55d3c792e1bc1ec9"
     },
@@ -504,8 +504,8 @@
       "resource_id": 8,
       "resource_type": "cybersecurity_instruction_dataset",
       "safety_policy": "dual_use_filter_and_instruction_safety_review",
-      "section": "cybersecurity_pretraining_sft",
-      "train_policy": "sft",
+      "section": "cybersecurity_pretraining",
+      "train_policy": "pretrain",
       "url": "https://arxiv.org/html/2503.09334v2"
     },
     {
@@ -517,8 +517,8 @@
       "resource_id": 9,
       "resource_type": "cybersecurity_dialogue_dataset",
       "safety_policy": "license_review_and_defensive_instruction_filter",
-      "section": "cybersecurity_pretraining_sft",
-      "train_policy": "sft",
+      "section": "cybersecurity_pretraining",
+      "train_policy": "pretrain",
       "url": "https://www.innovatiana.com/en/datasets/cybersecurity-heimdall-v1-1"
     },
     {
@@ -530,7 +530,7 @@
       "resource_id": 10,
       "resource_type": "agent_reference_repo",
       "safety_policy": "clone_only_after_license_review_and_secret_scan",
-      "section": "cybersecurity_pretraining_sft",
+      "section": "cybersecurity_pretraining",
       "train_policy": "agentic_task",
       "url": "https://github.com/trendmicro/cloud-risk-assessment-agent"
     },

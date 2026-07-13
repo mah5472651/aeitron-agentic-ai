@@ -1,4 +1,4 @@
-"""Allowlisted web corpus ingestion for defensive coding/security data."""
+﻿"""Allowlisted web corpus ingestion for defensive coding/security data."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class SourceSpec(StrictModel):
 
 
 class CrawlConfig(StrictModel):
-    user_agent: str = "MythosResearchBot/0.1 defensive AI dataset builder"
+    user_agent: str = "AeitronResearchBot/0.1 defensive AI dataset builder"
     request_timeout_seconds: float = 20.0
     delay_seconds: float = Field(default=1.0, ge=0.0)
     max_docs: int = Field(default=100, ge=1)
@@ -141,7 +141,7 @@ class WebCorpusIngestor:
 
 
 def load_sources(path: str | Path) -> list[SourceSpec]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     return [SourceSpec.model_validate(item) for item in payload["sources"]]
 
 

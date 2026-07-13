@@ -1,4 +1,4 @@
-"""MVP repository indexing engine.
+﻿"""MVP repository indexing engine.
 
 This module gives Mythos a Cursor-style local repository intelligence baseline:
 file inventory, content hashes, language detection, chunking, symbol extraction,

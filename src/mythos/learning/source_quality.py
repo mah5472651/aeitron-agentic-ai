@@ -1,4 +1,4 @@
-"""Source quality scoring from clean corpus inspection."""
+﻿"""Source quality scoring from clean corpus inspection."""
 
 from __future__ import annotations
 

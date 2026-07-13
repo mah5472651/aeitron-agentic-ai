@@ -1,4 +1,4 @@
-"""Kaggle/Colab entrypoint for Mythos scratch checkpoint comparison."""
+﻿"""Kaggle/Colab entrypoint for Mythos scratch checkpoint comparison."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-manifest")
     parser.add_argument("--tokenizer")
     parser.add_argument("--prompt-suite")
-    parser.add_argument("--output-dir", default="artifacts/mythos/checkpoint-compare")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/checkpoint-compare")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cuda")
     parser.add_argument("--max-new-tokens", type=int, default=96)
     parser.add_argument("--temperature", type=float, default=0.0)

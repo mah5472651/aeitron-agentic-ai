@@ -1,4 +1,4 @@
-"""Streaming dataset validation for large Mythos training corpora."""
+﻿"""Streaming dataset validation for large Mythos training corpora."""
 
 from __future__ import annotations
 
@@ -188,7 +188,7 @@ def validate_dataset(config: DatasetValidationConfig) -> DatasetValidationReport
 def write_markdown(report: DatasetValidationReport, path: str | Path) -> Path:
     target = Path(path)
     lines = [
-        "# Mythos Dataset Validation Report",
+        "# Aeitron Dataset Validation Report",
         "",
         f"- status: {report.status}",
         f"- total_records: {report.total_records}",

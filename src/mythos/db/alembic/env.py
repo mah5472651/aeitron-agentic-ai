@@ -1,4 +1,4 @@
-"""Alembic environment for Mythos production Postgres migrations."""
+﻿"""Alembic environment for Mythos production Postgres migrations."""
 
 from __future__ import annotations
 

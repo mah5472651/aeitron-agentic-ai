@@ -1,4 +1,4 @@
-"""Native release gate entrypoint for the final Mythos architecture."""
+﻿"""Native release gate entrypoint for the final Mythos architecture."""
 
 from __future__ import annotations
 

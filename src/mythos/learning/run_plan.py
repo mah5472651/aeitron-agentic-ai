@@ -1,4 +1,4 @@
-"""Generate an executable first-run plan for serious Mythos data collection."""
+﻿"""Generate an executable first-run plan for serious Mythos data collection."""
 
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ from src.mythos.shared.schemas import StrictModel
 
 class DataRunPlanConfig(StrictModel):
     source_paths: list[str]
-    output_dir: str = "artifacts/mythos/data-runs/first-serious-run"
+    output_dir: str = "artifacts/aeitron/data-runs/first-serious-run"
     merged_registry_path: str | None = None
-    dataset_id: str = "mythos-defensive-coding-corpus"
+    dataset_id: str = "aeitron-defensive-coding-corpus"
     target_documents: int = Field(default=1_000_000, ge=1)
     target_days: float = Field(default=7.0, gt=0.0)
     frontier_backend: str = "postgres"
@@ -124,8 +124,8 @@ def build_data_run_plan(config: DataRunPlanConfig) -> DataRunPlan:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare a serious Mythos data collection run.")
     parser.add_argument("--sources", nargs="+", required=True)
-    parser.add_argument("--output-dir", default="artifacts/mythos/data-runs/first-serious-run")
-    parser.add_argument("--dataset-id", default="mythos-defensive-coding-corpus")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/data-runs/first-serious-run")
+    parser.add_argument("--dataset-id", default="aeitron-defensive-coding-corpus")
     parser.add_argument("--target-documents", type=int, default=1_000_000)
     parser.add_argument("--target-days", type=float, default=7.0)
     parser.add_argument("--frontier-backend", default="postgres", choices=["sqlite", "postgres"])
