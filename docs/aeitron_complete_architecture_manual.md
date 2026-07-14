@@ -2628,6 +2628,12 @@ Those are cluster release-gate tasks, not laptop/Kaggle smoke tasks.
 Module:
 
 - `src/aeitron/production_readiness.py`
+- `src/aeitron/shared/config_contracts.py`
+- `config/mix_ratios.json`
+- `config/eval_schedule.json`
+- `config/active_model_profile.json`
+- `config/security_audit_excludes.json`
+- `config/verifier_policy.json`
 
 Purpose:
 
@@ -2667,6 +2673,29 @@ Production mode is expected to fail until real external infrastructure is
 configured. That is intentional. A missing Redis, Postgres, S3/MinIO, Qdrant,
 Semgrep, CodeQL, Docker, kubectl, CUDA runtime, or benchmark suite must be a
 visible blocker, not a hidden warning.
+
+Configuration contract layer:
+
+- All production-critical JSON configs are validated through strict Pydantic
+  contracts before runtime use.
+- `mix_ratios.json` enforces exact ratio sums, protected holdout policies,
+  source budget metadata, scratch instruction mix ratios, and minimum bucket
+  requirements.
+- `eval_schedule.json` includes benchmark-level minimum scores, protected
+  holdout flags, repetition-collapse thresholds, promotion policy, safety
+  targets, and regression thresholds.
+- `active_model_profile.json` must declare scratch-only status, dev-only
+  status, checkpoint/tokenizer paths when applicable, and explicit production
+  blockers for local test-double profiles.
+- `security_audit_excludes.json` requires reason, owner, risk category, and
+  explicit approved executable-sink classes before an excluded file may contain
+  executable sink strings.
+- `verifier_policy.json` defines default and production profiles, allowed
+  command roots, timeouts, scanner selections, fail-closed behavior, and
+  production-readiness flags.
+- Invalid configs fail before execution: bad ratio sums, duplicate benchmark
+  names, unprotected required benchmark paths, non-scratch model profiles,
+  unsafe verifier shell shapes, and ungoverned audit excludes are rejected.
 
 ## Production Training Guardrails
 

@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from src.aeitron.shared.config_contracts import load_active_model_contract
+
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -19,9 +21,8 @@ def load_active_profile() -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
-    except (OSError, json.JSONDecodeError):
+        return load_active_model_contract(path).model_dump()
+    except (OSError, json.JSONDecodeError, ValueError):
         return {}
 
 

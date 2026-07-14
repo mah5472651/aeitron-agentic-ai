@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import Field
 
 from src.aeitron.deployment.k8s_validate import validate_manifests
+from src.aeitron.shared.config_contracts import load_security_audit_contract
 from src.aeitron.shared.schemas import StrictModel
 
 
@@ -60,7 +61,7 @@ def _load_audit_excludes(root: Path) -> dict[str, dict[str, Any]]:
     config_path = root / "config" / "security_audit_excludes.json"
     if not config_path.exists():
         return {}
-    payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    payload = load_security_audit_contract(config_path).model_dump()
     excludes: dict[str, dict[str, Any]] = {}
     for item in payload.get("excludes", []):
         path = str(item.get("path") or "").replace("\\", "/")

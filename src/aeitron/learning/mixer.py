@@ -15,6 +15,7 @@ from pydantic import Field, model_validator
 
 from src.aeitron.learning.quality import iter_jsonl, stable_hash
 from src.aeitron.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer
+from src.aeitron.shared.config_contracts import load_mix_ratios_contract
 from src.aeitron.shared.schemas import StrictModel
 
 
@@ -119,7 +120,8 @@ class ScratchInstructionMixReport(StrictModel):
 
 
 def load_mix_config(path: str | Path) -> MixConfig:
-    return MixConfig.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
+    contract = load_mix_ratios_contract(path)
+    return MixConfig.model_validate(contract.legacy_payload())
 
 
 def _row_text(row: dict[str, Any]) -> str:

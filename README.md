@@ -17,6 +17,10 @@ Aeitron follows this roadmap for every future change:
 - Data quality before scale: source reputation, license/provenance, contamination gates, deduplication, task extraction, review queues, and benchmark holdouts must run before tokenizer/sharding/training.
 - Production readiness is evidence-based: local smoke, Kaggle/Colab validation, and cluster production are separate statuses. Anything needing Redis/Postgres/S3/Qdrant/Docker/CUDA/benchmarks must say so honestly.
 - Keep the architecture consolidated. Avoid new phase explosion and tiny wrapper files unless separation is required for security, testing, deployment, or clear ownership.
+- Production-critical configs are strict contracts, not loose knobs:
+  `config/mix_ratios.json`, `config/eval_schedule.json`,
+  `config/active_model_profile.json`, `config/security_audit_excludes.json`,
+  and `config/verifier_policy.json` are validated before runtime use.
 
 ## What Works Now
 

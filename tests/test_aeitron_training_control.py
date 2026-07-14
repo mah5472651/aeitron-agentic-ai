@@ -122,10 +122,10 @@ class AeitronTrainingControlTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             rows = [
-                {"text": "general documentation about APIs", "category": "general", "content_hash": "g1"},
-                {"text": "def handler(request): return response", "category": "code", "content_hash": "c1"},
-                {"text": "SQL injection defensive patch with parameterized query", "category": "cybersecurity", "content_hash": "s1"},
-                {"text": "plan edit test verify summarize", "category": "agentic", "content_hash": "a1"},
+                {"text": "general documentation about APIs", "category": "general", "content_hash": "g1", "quality": {"quality_score": 0.9}},
+                {"text": "def handler(request): return response", "category": "code", "content_hash": "c1", "quality": {"quality_score": 0.9}},
+                {"text": "SQL injection defensive patch with parameterized query", "category": "cybersecurity", "content_hash": "s1", "quality": {"quality_score": 0.9}},
+                {"text": "plan edit test verify summarize", "category": "agentic", "content_hash": "a1", "quality": {"quality_score": 0.9}},
                 {"text": "HumanEval holdout", "metadata": {"train_policy": "eval_holdout"}, "content_hash": "h1"},
             ]
             source = write_jsonl(root / "clean.jsonl", rows)

@@ -1,17 +1,40 @@
-﻿{
+{
+  "schema_version": 2,
+  "policy": {
+    "default_action": "scan",
+    "exclude_requires_reason": true,
+    "exclude_requires_owner": true,
+    "executable_sink_exclude_requires_explicit_approval": true,
+    "production_strict_external_tools": [
+      "bandit",
+      "semgrep",
+      "pip-audit",
+      "codeql"
+    ]
+  },
   "excludes": [
     {
       "path": "src/aeitron/evaluation/benchmarks.py",
-      "reason": "Contains intentionally vulnerable benchmark fixture strings used by local security evaluation adapters.",
+      "reason": "Contains intentionally vulnerable benchmark fixture strings used by local defensive security evaluation adapters.",
       "risk_category": "benchmark_fixture",
-      "allow_executable_sinks": true
+      "owner": "security-eval",
+      "expires": null,
+      "allow_executable_sinks": true,
+      "approved_executable_sinks": [
+        "fixture_only_command_injection_strings",
+        "fixture_only_path_traversal_strings"
+      ]
     },
     {
       "path": "tools/codeql/python/tools/imp.py",
       "reason": "Vendored CodeQL compatibility helper; scanned by upstream CodeQL distribution governance, not Aeitron runtime code.",
       "risk_category": "vendored_external_tool",
-      "allow_executable_sinks": true
+      "owner": "security-tooling",
+      "expires": null,
+      "allow_executable_sinks": true,
+      "approved_executable_sinks": [
+        "vendored_external_tool_codeql_distribution"
+      ]
     }
   ]
 }
-

@@ -22,6 +22,7 @@ from src.aeitron.model_ops.checkpoint_compare import (
 )
 from src.aeitron.model_ops.foundation import CheckpointManifest
 from src.aeitron.model_ops.tokenizer_pipeline import load_tokenizer
+from src.aeitron.shared.config_contracts import load_eval_schedule_contract
 from src.aeitron.shared.schemas import StrictModel
 
 try:
@@ -99,8 +100,8 @@ class EvalRunReport(StrictModel):
 
 
 def load_schedule(path: str | Path) -> EvalSchedule:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    return EvalSchedule.model_validate(payload)
+    contract = load_eval_schedule_contract(path)
+    return EvalSchedule.model_validate(contract.runner_payload())
 
 
 def _load_manifest(path: str | Path) -> CheckpointManifest:

@@ -27,8 +27,16 @@ from src.aeitron.planning.engine import IntentPlanningEngine
 from src.aeitron.patches.verified_loop import RepositoryPatchLoopRequest, run_repository_patch_loop
 from src.aeitron.runtime.taskgraph import AgentRunCreateRequest, TaskFailRequest, TaskGraphRuntime
 from src.aeitron.security.audit import run_security_audit
+from src.aeitron.shared.config_contracts import (
+    load_active_model_contract,
+    load_eval_schedule_contract,
+    load_mix_ratios_contract,
+    load_security_audit_contract,
+    load_verifier_policy_contract,
+)
 from src.aeitron.tools import HardenedToolExecutor, ToolExecuteRequest
 from src.aeitron.tools.sandbox import HardenedSandboxPolicy, SandboxRunRequest
+from src.aeitron.verifier.runtime import VerificationRequest, VerifierRuntime, load_verifier_policy
 
 
 class AeitronProductionHardeningTest(unittest.TestCase):
@@ -170,7 +178,7 @@ class AeitronProductionHardeningTest(unittest.TestCase):
                         "excludes": [
                             {
                                 "path": "src/excluded.py",
-                                "reason": "test reason",
+                                "reason": "test fixture exclude must still scan executable sinks",
                                 "risk_category": "test_fixture",
                                 "allow_executable_sinks": False,
                             }
@@ -189,6 +197,67 @@ class AeitronProductionHardeningTest(unittest.TestCase):
             )
             self.assertEqual(report.status, "failed")
             self.assertTrue(any(finding.check == "audit_exclude_executable_sink" for finding in report.findings))
+
+    def test_production_config_contracts_validate_current_files(self) -> None:
+        mix = load_mix_ratios_contract("config/mix_ratios.json")
+        self.assertAlmostEqual(sum(mix.scratch_instruction_mix.ratios.values()), 1.0)
+        self.assertIn("benchmark_holdout", mix.holdout_policies)
+        schedule = load_eval_schedule_contract("config/eval_schedule.json")
+        self.assertTrue(schedule.strict)
+        self.assertTrue(any(item.required for item in schedule.benchmarks))
+        active = load_active_model_contract("config/active_model_profile.json")
+        self.assertTrue(active.profile.scratch_only)
+        self.assertTrue(active.profile.dev_only)
+        audit = load_security_audit_contract("config/security_audit_excludes.json")
+        self.assertTrue(all(item.reason for item in audit.excludes))
+        verifier = load_verifier_policy_contract("config/verifier_policy.json")
+        self.assertEqual(verifier.production_profile, "release")
+        self.assertTrue(verifier.profiles["release"].production_ready)
+
+    def test_config_contracts_reject_unsafe_or_ambiguous_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bad_mix = root / "bad_mix.json"
+            bad_mix.write_text(
+                json.dumps(
+                    {
+                        "experiments": [{"name": "bad_mix", "ratios": {"general": 0.9, "code": 0.1, "cybersecurity": 0.1, "agentic": 0.0}}],
+                        "holdout_policies": ["eval_holdout", "benchmark_holdout"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "sum"):
+                load_mix_ratios_contract(bad_mix)
+            bad_model = root / "bad_model.json"
+            bad_model.write_text(
+                json.dumps(
+                    {
+                        "profile": {
+                            "name": "unsafe",
+                            "kind": "local",
+                            "family": "external",
+                            "size_class": "7b",
+                            "backend": "mock",
+                            "model_name": "mock",
+                            "scratch_only": False,
+                        },
+                        "run_id": "bad",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "scratch_only"):
+                load_active_model_contract(bad_model)
+
+    def test_verifier_policy_profile_applies_fail_closed_settings(self) -> None:
+        policy = load_verifier_policy()
+        self.assertTrue(policy.profiles["release"].fail_on_tool_unavailable)
+        request = VerificationRequest(project_id="missing", policy_profile="release", timeout_ms=300_000)
+        updated = VerifierRuntime()._apply_policy_profile(request)
+        self.assertTrue(updated.run_semgrep)
+        self.assertTrue(updated.fail_on_tool_unavailable)
+        self.assertLessEqual(updated.timeout_ms, policy.profiles["release"].timeout_ms)
 
     def test_context_builder_escapes_prompt_injection_tags(self) -> None:
         with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:

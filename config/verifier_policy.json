@@ -1,8 +1,11 @@
 {
+  "schema_version": 2,
+  "default_profile": "fast",
+  "production_profile": "release",
   "profiles": {
     "fast": {
       "name": "fast",
-      "description": "Local fast verifier: rules + secrets, fixture-aware.",
+      "description": "Local fast verifier for development: native rules plus secret scan; no external scanner dependency.",
       "run_rule_security": true,
       "run_secret_scan": true,
       "run_multilang_security": false,
@@ -13,13 +16,21 @@
       "codeql_language": "python",
       "codeql_suite": "codeql/python-queries",
       "sandbox_command": "python3 -m pytest -q",
+      "allowed_command_roots": [
+        "python",
+        "python3",
+        "pytest"
+      ],
+      "timeout_ms": 60000,
       "fail_on_medium": true,
+      "fail_on_tool_unavailable": false,
       "max_files": 600,
-      "exclude_patterns": []
+      "exclude_patterns": [],
+      "production_ready": false
     },
     "security": {
       "name": "security",
-      "description": "Semgrep plus native multi-language security gate.",
+      "description": "Security verifier for stronger local gates: native rules, secret scan, multi-language rules, and Semgrep when installed.",
       "run_rule_security": true,
       "run_secret_scan": true,
       "run_multilang_security": true,
@@ -30,13 +41,25 @@
       "codeql_language": "python",
       "codeql_suite": "codeql/python-queries",
       "sandbox_command": "python3 -m pytest -q",
+      "allowed_command_roots": [
+        "python",
+        "python3",
+        "pytest",
+        "npm",
+        "node",
+        "go",
+        "cargo"
+      ],
+      "timeout_ms": 120000,
       "fail_on_medium": false,
-      "max_files": 600,
-      "exclude_patterns": []
+      "fail_on_tool_unavailable": false,
+      "max_files": 1200,
+      "exclude_patterns": [],
+      "production_ready": false
     },
     "release": {
       "name": "release",
-      "description": "Strict release gate.",
+      "description": "Strict release verifier: tests plus native security, secrets, Semgrep, and fail-closed unavailable tools.",
       "run_rule_security": true,
       "run_secret_scan": true,
       "run_multilang_security": true,
@@ -47,13 +70,21 @@
       "codeql_language": "python",
       "codeql_suite": "codeql/python-queries",
       "sandbox_command": "python3 -m pytest -q",
+      "allowed_command_roots": [
+        "python",
+        "python3",
+        "pytest"
+      ],
+      "timeout_ms": 180000,
       "fail_on_medium": true,
-      "max_files": 600,
-      "exclude_patterns": []
+      "fail_on_tool_unavailable": true,
+      "max_files": 2000,
+      "exclude_patterns": [],
+      "production_ready": true
     },
     "codeql-python": {
       "name": "codeql-python",
-      "description": "CodeQL Python deep scan.",
+      "description": "Deep CodeQL Python verification profile for production environments with a prepared CodeQL database.",
       "run_rule_security": true,
       "run_secret_scan": true,
       "run_multilang_security": false,
@@ -64,9 +95,17 @@
       "codeql_language": "python",
       "codeql_suite": "codeql/python-queries",
       "sandbox_command": "python3 -m pytest -q",
+      "allowed_command_roots": [
+        "python",
+        "python3",
+        "pytest"
+      ],
+      "timeout_ms": 180000,
       "fail_on_medium": true,
-      "max_files": 600,
-      "exclude_patterns": []
+      "fail_on_tool_unavailable": true,
+      "max_files": 2000,
+      "exclude_patterns": [],
+      "production_ready": true
     }
   }
 }

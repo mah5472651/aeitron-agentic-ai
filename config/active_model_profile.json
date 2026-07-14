@@ -1,16 +1,22 @@
-﻿{
+{
+  "schema_version": 2,
   "profile": {
     "name": "mock-local",
-    "kind": "local",
+    "kind": "dev",
     "family": "test-double",
     "size_class": "none",
     "backend": "mock",
     "model_name": "mock",
     "endpoint": "",
+    "checkpoint_manifest": "",
+    "tokenizer_path": "",
     "requires_cuda": false,
+    "dev_only": true,
+    "scratch_only": true,
     "notes": [
       "Stable local plumbing test double.",
-      "Not a model strategy and never used for training quality."
+      "Not a model strategy and never used for training quality.",
+      "Production must switch to a Aeitron-owned scratch checkpoint or serving endpoint."
     ]
   },
   "env": {
@@ -19,6 +25,11 @@
     "AEITRON_MODEL_ENDPOINT": "",
     "AEITRON_MODEL_NAME": "mock"
   },
-  "run_id": "aeitron-profile-local"
+  "run_id": "aeitron-profile-local",
+  "production_blockers": [
+    "mock backend is dev-only",
+    "no scratch checkpoint_manifest configured",
+    "no tokenizer_path configured",
+    "no production serving endpoint configured"
+  ]
 }
-

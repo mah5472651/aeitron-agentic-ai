@@ -10,6 +10,8 @@ from typing import Any
 from pydantic import Field
 
 from src.aeitron.db import LocalStore
+from src.aeitron.shared.config import ROOT
+from src.aeitron.shared.config_contracts import VerifierPolicyContract, load_verifier_policy_contract
 from src.aeitron.shared.schemas import StrictModel
 from src.aeitron.tools import HardenedToolExecutor, SecurityScanner, ToolExecuteRequest
 from src.aeitron.tools.runtime import project_root
@@ -26,6 +28,7 @@ class VerificationRequest(StrictModel):
     project_id: str
     run_id: str | None = None
     patch_id: str | None = None
+    policy_profile: str | None = None
     commands: list[list[str]] = Field(default_factory=list)
     run_secret_scan: bool = True
     run_semgrep: bool = False
@@ -62,6 +65,7 @@ class VerifierRuntime:
 
     def run(self, request: VerificationRequest) -> VerificationResponse:
         started = time.perf_counter()
+        request = self._apply_policy_profile(request)
         tool = HardenedToolExecutor(self.store)
         test_results = []
         for command in request.commands:
@@ -110,6 +114,24 @@ class VerifierRuntime:
             duration_ms=(time.perf_counter() - started) * 1000,
         )
 
+    def _apply_policy_profile(self, request: VerificationRequest) -> VerificationRequest:
+        if not request.policy_profile:
+            return request
+        policy = load_verifier_policy()
+        profile = policy.profiles.get(request.policy_profile)
+        if profile is None:
+            raise ValueError(f"unknown verifier policy profile: {request.policy_profile}")
+        updates = {
+            "run_secret_scan": profile.run_secret_scan,
+            "run_semgrep": profile.run_semgrep,
+            "run_codeql": profile.run_codeql,
+            "fail_on_tool_unavailable": profile.fail_on_tool_unavailable,
+            "timeout_ms": min(request.timeout_ms, profile.timeout_ms),
+        }
+        if profile.run_sandbox and not request.commands:
+            updates["commands"] = [profile.sandbox_command.split()]
+        return request.model_copy(update=updates)
+
     def secret_scan(self, project_id: str) -> dict[str, Any]:
         if self.store.get_project(project_id) is None:
             raise KeyError(f"unknown project: {project_id}")
@@ -152,4 +174,8 @@ class VerifierRuntime:
             issues.append("security-related artifact does not mention tests")
         confidence = 0.9 if not issues else 0.55
         return GuardrailReview(accepted=confidence >= 0.6, confidence=confidence, risks=[], issues=issues)
+
+
+def load_verifier_policy(path: str | None = None) -> VerifierPolicyContract:
+    return load_verifier_policy_contract(Path(path) if path else ROOT / "config" / "verifier_policy.json")
 

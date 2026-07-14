@@ -1,37 +1,86 @@
 {
+  "schema_version": 2,
   "seed": 1337,
   "tokenizer_path": null,
   "max_rows": null,
   "min_quality_score": 0.58,
+  "source_budget_policy": {
+    "budget_unit": "estimated_tokens",
+    "default_max_source_fraction": 0.25,
+    "high_reputation_priority_multiplier": 1.35,
+    "low_reputation_cap_fraction": 0.05,
+    "require_provenance_hash": true,
+    "require_license_decision": true,
+    "protect_eval_holdouts": true
+  },
   "experiments": [
     {
       "name": "baseline_70_15_15",
+      "description": "Foundation-heavy mix for broad syntax, documentation, and baseline coding/security awareness.",
       "ratios": {
         "general": 0.7,
         "code": 0.15,
         "cybersecurity": 0.15,
         "agentic": 0.0
+      },
+      "minimum_bucket_rows": {
+        "general": 1,
+        "code": 1,
+        "cybersecurity": 1,
+        "agentic": 0
       }
     },
     {
       "name": "domain_heavy_55_15_30",
+      "description": "Security-heavy mix for defensive vulnerability analysis and secure coding without losing general/code base.",
       "ratios": {
         "general": 0.55,
         "code": 0.15,
         "cybersecurity": 0.3,
         "agentic": 0.0
+      },
+      "minimum_bucket_rows": {
+        "general": 1,
+        "code": 1,
+        "cybersecurity": 1,
+        "agentic": 0
       }
     },
     {
       "name": "domain_extreme_40_10_50",
+      "description": "Aggressive cybersecurity curriculum experiment. Use only with eval regression gates enabled.",
       "ratios": {
         "general": 0.4,
         "code": 0.1,
         "cybersecurity": 0.5,
         "agentic": 0.0
+      },
+      "minimum_bucket_rows": {
+        "general": 1,
+        "code": 1,
+        "cybersecurity": 1,
+        "agentic": 0
       }
     }
   ],
+  "scratch_instruction_mix": {
+    "enabled_by_default": true,
+    "ratios": {
+      "instruction_security_coding": 0.4,
+      "verified_patch_tests": 0.3,
+      "high_quality_docs_code": 0.2,
+      "debugging_error_logs": 0.1
+    },
+    "min_quality_score": 0.62,
+    "minimum_bucket_rows": {
+      "instruction_security_coding": 1,
+      "verified_patch_tests": 1,
+      "high_quality_docs_code": 1,
+      "debugging_error_logs": 1
+    },
+    "report_required": true,
+    "fail_on_empty_required_bucket_in_production": true
+  },
   "progressive_curriculum": [
     {
       "name": "early_general_foundation",
