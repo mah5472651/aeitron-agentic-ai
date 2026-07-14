@@ -223,6 +223,8 @@ PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
   --validation-interval 100 \
   --validation-batches 4 \
   --early-stopping-patience 5 \
+  --checkpoint-compare-prompt-suite artifacts/aeitron/learning-validation-v1/expanded_eval_suite.jsonl \
+  --checkpoint-compare-min-score 0.20 \
   --progress-to-stdout
 ```
 
@@ -252,6 +254,8 @@ PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
   --min-source-reputation-score 0.50 \
   --eval-holdout-fraction 0.02 \
   --max-source-fraction 0.25 \
+  --checkpoint-compare-prompt-suite artifacts/aeitron/learning-validation-v1/expanded_eval_suite.jsonl \
+  --checkpoint-compare-min-score 0.20 \
   --progress-path artifacts/aeitron/real-data-10k-strict-v1/progress.jsonl \
   --progress-to-stdout \
   --progress-every-docs 10 \
@@ -262,6 +266,15 @@ python deploy/gpu/run_checkpoint_comparison.py \
   --output-dir artifacts/aeitron/real-data-10k-strict-v1/reports/checkpoint_compare \
   --device cuda
 ```
+
+The real-data training pipeline now converts promoted rows into scratch
+instruction records before tokenizer/sharding. The default token mix target is
+40% security/coding instruction examples, 30% verified patch/test examples,
+20% high-quality docs/code, and 10% debugging/error logs. Reports are written
+to `reports/instruction_mix_report.json` and included in the dataset version
+manifest. If `--checkpoint-compare-prompt-suite` is supplied, the best
+checkpoint is scored against that suite and the run is blocked when the score is
+below `--checkpoint-compare-min-score` or the checkpoint regresses.
 
 Inspect any Kaggle/Colab run and get the next recommended action:
 

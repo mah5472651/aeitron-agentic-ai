@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from src.aeitron.learning.quality import DatasetQualityGate, QualityGateConfig
+from src.aeitron.learning.mixer import ScratchMixConfig, build_scratch_instruction_mix
 from src.aeitron.evaluation.checkpoint_eval import evaluate_checkpoint
 from src.aeitron.learning.web_ingest import allowed_url, text_from_html
 from src.aeitron.model_ops.data_loader import TokenShardStream, load_manifest
@@ -76,6 +77,65 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
         self.assertEqual(profile.num_layers, 8)
         self.assertEqual(profile.max_sequence_length, 2048)
         self.assertTrue(profile.gradient_checkpointing)
+
+    def test_scratch_instruction_mix_converts_real_rows_and_reports_bucket_ratios(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "promoted.jsonl"
+            rows = [
+                {
+                    "text": "CVE-style SQL injection defensive analysis. Use parameterized queries and verify CWE mitigation.",
+                    "source": "security-reference",
+                    "license": "cc-by-4.0",
+                    "category": "cybersecurity",
+                    "quality": {"quality_score": 0.92, "labels": ["defensive_security"], "data_type": "security_reference"},
+                    "training_gate": {"decision": "train"},
+                },
+                {
+                    "text": "diff --git a/auth.py b/auth.py\n+assert password\npytest test_auth_empty_password regression verification",
+                    "source": "verified-patch",
+                    "license": "mit",
+                    "category": "agentic_coding",
+                    "quality": {"quality_score": 0.91, "labels": ["patch", "tests"], "data_type": "patch"},
+                    "training_gate": {"decision": "train"},
+                },
+                {
+                    "text": "def safe_parse(value):\n    return value.strip()\nArchitecture notes for clean repository coding.",
+                    "source": "docs-code",
+                    "license": "apache-2.0",
+                    "category": "general_docs_code",
+                    "quality": {"quality_score": 0.88, "labels": ["code"], "data_type": "code"},
+                    "training_gate": {"decision": "train"},
+                },
+                {
+                    "text": "Traceback (most recent call last): AttributeError: 'NoneType' object has no attribute 'name'. compile error stack trace",
+                    "source": "debug-log",
+                    "license": "mit",
+                    "category": "debugging",
+                    "quality": {"quality_score": 0.87, "labels": ["runtime_trace"], "data_type": "debug_trace"},
+                    "training_gate": {"decision": "train"},
+                },
+            ]
+            source.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            report = build_scratch_instruction_mix(
+                input_paths=[source],
+                output_path=root / "scratch_instruction_mix.jsonl",
+                report_path=root / "scratch_instruction_mix_report.json",
+                config=ScratchMixConfig(min_quality_score=0.6),
+            )
+            self.assertEqual(report.total_rows, 4)
+            self.assertTrue(Path(report.output_jsonl).exists())
+            buckets = {item.bucket: item.output_rows for item in report.buckets}
+            self.assertEqual(buckets["instruction_security_coding"], 1)
+            self.assertEqual(buckets["verified_patch_tests"], 1)
+            self.assertEqual(buckets["high_quality_docs_code"], 1)
+            self.assertEqual(buckets["debugging_error_logs"], 1)
+            mixed_text = Path(report.output_jsonl).read_text(encoding="utf-8")
+            self.assertIn("<|thought_start|>", mixed_text)
+            self.assertIn("<|patch_start|>", mixed_text)
+            self.assertIn("Tests:", mixed_text)
+            self.assertIn("Verification result:", mixed_text)
+            self.assertIn("target_ratios", Path(root / "scratch_instruction_mix_report.json").read_text(encoding="utf-8"))
 
     def test_quality_gate_filters_duplicates_and_secret_like_content(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

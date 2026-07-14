@@ -37,10 +37,12 @@ class DatasetVersionManifest(StrictModel):
     source_budget_plan: dict[str, Any] | None = None
     training_data_gate_report: dict[str, Any] | None = None
     source_balance_report: dict[str, Any] | None = None
+    instruction_mix_report: dict[str, Any] | None = None
     task_report: dict[str, Any] | None = None
     review_report: dict[str, Any] | None = None
     feedback_report: dict[str, Any] | None = None
     checkpoint_eval_report: dict[str, Any] | None = None
+    checkpoint_comparison_report: dict[str, Any] | None = None
     tokenizer_path: str
     shard_manifest: dict[str, Any]
     artifacts: list[DatasetArtifact]

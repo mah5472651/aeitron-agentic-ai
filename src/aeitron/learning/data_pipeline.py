@@ -23,6 +23,11 @@ from src.aeitron.learning.benchmark_contamination_filter import (
     filter_benchmark_contamination_jsonl,
 )
 from src.aeitron.learning.license_filter import LicenseFilterReport, filter_jsonl_by_license
+from src.aeitron.learning.mixer import (
+    ScratchInstructionMixReport,
+    ScratchMixConfig,
+    build_scratch_instruction_mix,
+)
 from src.aeitron.learning.near_dedup import NearDedupReport, deduplicate_jsonl
 from src.aeitron.learning.quality_inspector import QualityInspectionReport, write_quality_report
 from src.aeitron.learning.review import ReviewReport, review_tasks
@@ -35,6 +40,7 @@ from src.aeitron.learning.storage import ObjectStoreConfig, create_object_store,
 from src.aeitron.learning.task_extraction import TaskExtractionReport, extract_tasks
 from src.aeitron.learning.training_data_gate import TrainingDataGateConfig, TrainingDataGateReport, apply_training_data_gate
 from src.aeitron.learning.versioning import DatasetArtifact, DatasetLedger, DatasetVersionManifest, artifact_from_path, build_version_id
+from src.aeitron.model_ops.checkpoint_compare import CheckpointComparisonReport, GenerationConfig, compare_checkpoints
 from src.aeitron.model_ops.pretrain_loop import run_pretraining_loop
 from src.aeitron.model_ops.tokenizer_pipeline import (
     ShardBuildConfig,
@@ -97,6 +103,8 @@ class DataPipelineConfig(StrictModel):
     balance_sources: bool = True
     max_source_fraction: float = Field(default=0.35, ge=0.05, le=1.0)
     min_source_rows: int = Field(default=25, ge=1)
+    instruction_mix: bool = True
+    instruction_mix_max_rows: int | None = Field(default=None, ge=1)
     contamination_patterns_path: str | None = None
     block_contamination: bool = True
     extract_tasks: bool = True
@@ -105,6 +113,9 @@ class DataPipelineConfig(StrictModel):
     object_store_uri: str = "local://artifacts/aeitron/object-store"
     object_store_endpoint_url: str | None = None
     upload_artifacts: bool = True
+    checkpoint_compare_prompt_suite: str | None = None
+    checkpoint_compare_min_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    checkpoint_compare_max_new_tokens: int = Field(default=96, ge=1, le=2048)
     progress_path: str | None = None
     progress_to_stdout: bool = False
     progress_every_docs: int = Field(default=25, ge=1)
@@ -134,6 +145,7 @@ class DataPipelineReport(StrictModel):
     source_budget_plan: dict[str, Any] | None = None
     training_data_gate_report: dict[str, Any] | None = None
     source_balance_report: dict[str, Any] | None = None
+    instruction_mix_report: dict[str, Any] | None = None
     clean_files: list[str]
     training_files: list[str]
     tokenizer_path: str
@@ -143,6 +155,7 @@ class DataPipelineReport(StrictModel):
     uploaded_objects: list[dict[str, Any]]
     training: dict[str, Any] | None = None
     checkpoint_eval: dict[str, Any] | None = None
+    checkpoint_comparison: dict[str, Any] | None = None
     report_artifacts: dict[str, str] = Field(default_factory=dict)
 
 
@@ -245,6 +258,12 @@ def validate_data_pipeline_production_config(config: DataPipelineConfig) -> None
         failures.append("production mode requires near-duplicate removal")
     if not config.balance_sources:
         failures.append("production mode requires source balancing")
+    if not config.instruction_mix:
+        failures.append("production mode requires scratch instruction data mixing")
+    if not config.run_checkpoint_eval:
+        failures.append("production mode requires checkpoint evaluation")
+    if not config.checkpoint_compare_prompt_suite:
+        failures.append("production mode requires checkpoint_compare_prompt_suite")
     if config.validate_every <= 0 or config.validate_every > config.train_steps:
         failures.append("production mode requires validation during the training run")
     if config.min_training_average_quality_score < 0.60:
@@ -528,6 +547,40 @@ async def _run_data_pipeline_locked(
         )
         training_files = [str(balanced_clean_path)]
 
+    instruction_mix_report: ScratchInstructionMixReport | None = None
+    instruction_mix_path = root / "mixed" / "scratch-instruction-mix.jsonl"
+    instruction_mix_report_path = reports_dir / "instruction_mix_report.json"
+    if config.instruction_mix:
+        progress.emit(
+            "instruction_mix",
+            "started",
+            input_files=len(training_files),
+            instruction_security_coding=0.40,
+            verified_patch_tests=0.30,
+            high_quality_docs_code=0.20,
+            debugging_error_logs=0.10,
+        )
+        instruction_mix_report = build_scratch_instruction_mix(
+            input_paths=[Path(path) for path in training_files],
+            output_path=instruction_mix_path,
+            report_path=instruction_mix_report_path,
+            config=ScratchMixConfig(
+                max_rows=config.instruction_mix_max_rows,
+                min_quality_score=config.min_training_quality_score,
+            ),
+        )
+        if instruction_mix_report.total_rows == 0:
+            raise RuntimeError("instruction mix produced zero rows; improve approved source yield before training")
+        training_files = [str(instruction_mix_path)]
+        progress.emit(
+            "instruction_mix",
+            "complete",
+            mix_status=instruction_mix_report.status,
+            rows=instruction_mix_report.total_rows,
+            tokens=instruction_mix_report.total_tokens,
+            output_jsonl=str(instruction_mix_path),
+        )
+
     training_quality_path = reports_dir / "training_quality_report.json"
     progress.emit("training_quality_inspection", "started", input_files=len(training_files))
     training_quality_report: QualityInspectionReport = write_quality_report(training_files, training_quality_path)
@@ -583,6 +636,7 @@ async def _run_data_pipeline_locked(
         )
     training_report = None
     checkpoint_eval_report: CheckpointEvalReport | None = None
+    checkpoint_comparison_report: CheckpointComparisonReport | None = None
     if not config.skip_train:
         training_report = run_pretraining_loop(
             output_dir=train_dir,
@@ -615,6 +669,38 @@ async def _run_data_pipeline_locked(
                 output_dir=reports_dir / "checkpoint_eval",
             )
             progress.emit("checkpoint_eval", "complete", eval_status=checkpoint_eval_report.status, gates=len(checkpoint_eval_report.gates))
+        if config.checkpoint_compare_prompt_suite:
+            progress.emit(
+                "checkpoint_comparison",
+                "started",
+                prompt_suite=config.checkpoint_compare_prompt_suite,
+                min_score=config.checkpoint_compare_min_score,
+            )
+            candidate_manifest = training_report.get("best_checkpoint_manifest") or training_report["checkpoint_manifest"]
+            checkpoint_comparison_report = compare_checkpoints(
+                baseline_manifest=training_report["checkpoint_manifest"],
+                candidate_manifest=candidate_manifest,
+                tokenizer_path=trained_tokenizer,
+                prompt_suite=config.checkpoint_compare_prompt_suite,
+                output_dir=reports_dir / "checkpoint_compare",
+                device=config.train_device,
+                generation_config=GenerationConfig(max_new_tokens=config.checkpoint_compare_max_new_tokens, temperature=0.0, top_k=20),
+            )
+            progress.emit(
+                "checkpoint_comparison",
+                "complete",
+                comparison_status=checkpoint_comparison_report.status,
+                candidate_average_score=checkpoint_comparison_report.candidate.average_score,
+                score_delta=checkpoint_comparison_report.score_delta,
+            )
+            if checkpoint_comparison_report.status == "regressed":
+                raise RuntimeError("checkpoint comparison gate failed: candidate regressed against final checkpoint")
+            if checkpoint_comparison_report.candidate.average_score < config.checkpoint_compare_min_score:
+                raise RuntimeError(
+                    f"checkpoint comparison gate failed: candidate average score "
+                    f"{checkpoint_comparison_report.candidate.average_score:.4f} below minimum "
+                    f"{config.checkpoint_compare_min_score:.4f}"
+                )
 
     artifacts: list[DatasetArtifact] = []
     for path in clean_files:
@@ -644,9 +730,15 @@ async def _run_data_pipeline_locked(
     if source_balance_report is not None:
         artifacts.append(artifact_from_path(reports_dir / "source_balance_report.json", role="source_balance_report"))
         artifacts.append(artifact_from_path(balanced_clean_path, role="balanced_clean_jsonl"))
+    if instruction_mix_report is not None:
+        artifacts.append(artifact_from_path(instruction_mix_report_path, role="instruction_mix_report"))
+        artifacts.append(artifact_from_path(instruction_mix_path, role="scratch_instruction_mix_jsonl"))
     checkpoint_eval_path = reports_dir / "checkpoint_eval" / "checkpoint_eval_report.json"
     if checkpoint_eval_report is not None:
         artifacts.append(artifact_from_path(checkpoint_eval_path, role="checkpoint_eval_report"))
+    checkpoint_comparison_path = reports_dir / "checkpoint_compare" / "checkpoint_comparison_report.json"
+    if checkpoint_comparison_report is not None:
+        artifacts.append(artifact_from_path(checkpoint_comparison_path, role="checkpoint_comparison_report"))
     if task_report is not None:
         artifacts.append(artifact_from_path(tasks_path, role="extracted_tasks"))
         artifacts.append(artifact_from_path(task_report_path, role="task_extraction_report"))
@@ -699,6 +791,10 @@ async def _run_data_pipeline_locked(
             upload_candidates.append(str(checkpoint_eval_path))
         if source_balance_report is not None:
             upload_candidates.extend([str(reports_dir / "source_balance_report.json"), str(balanced_clean_path)])
+        if instruction_mix_report is not None:
+            upload_candidates.extend([str(instruction_mix_report_path), str(instruction_mix_path)])
+        if checkpoint_comparison_report is not None:
+            upload_candidates.append(str(checkpoint_comparison_path))
         upload_candidates.extend(manifest.train_shards + manifest.val_shards)
         uploaded_objects = upload_paths(store, upload_candidates, prefix=upload_prefix)
         progress.emit("artifact_upload", "complete", uploaded_objects=len(uploaded_objects))
@@ -722,6 +818,8 @@ async def _run_data_pipeline_locked(
         training_data_gate_report=training_data_gate_report.model_dump() if training_data_gate_report else None,
         checkpoint_eval_report=checkpoint_eval_report.model_dump() if checkpoint_eval_report else None,
         source_balance_report=source_balance_report.model_dump() if source_balance_report else None,
+        instruction_mix_report=instruction_mix_report.model_dump() if instruction_mix_report else None,
+        checkpoint_comparison_report=checkpoint_comparison_report.model_dump() if checkpoint_comparison_report else None,
         tokenizer_path=str(trained_tokenizer),
         shard_manifest=manifest.model_dump(),
         artifacts=artifacts,
@@ -754,6 +852,7 @@ async def _run_data_pipeline_locked(
         source_budget_plan=source_budget_plan.model_dump() if source_budget_plan else None,
         training_data_gate_report=training_data_gate_report.model_dump() if training_data_gate_report else None,
         source_balance_report=source_balance_report.model_dump() if source_balance_report else None,
+        instruction_mix_report=instruction_mix_report.model_dump() if instruction_mix_report else None,
         clean_files=clean_files,
         training_files=training_files,
         tokenizer_path=str(trained_tokenizer),
@@ -763,6 +862,7 @@ async def _run_data_pipeline_locked(
         uploaded_objects=[item.model_dump() for item in uploaded_objects],
         training=training_report,
         checkpoint_eval=checkpoint_eval_report.model_dump() if checkpoint_eval_report else None,
+        checkpoint_comparison=checkpoint_comparison_report.model_dump() if checkpoint_comparison_report else None,
         report_artifacts={
             "pipeline_report": str(reports_dir / "pipeline_report.json"),
             "dashboard": str(root / "dashboard.html"),
@@ -771,7 +871,9 @@ async def _run_data_pipeline_locked(
             "source_reputation_report": str(reports_dir / "source_reputation_report.json"),
             "source_budget_plan": str(reports_dir / "source_budget_plan.json"),
             "training_data_gate_report": str(reports_dir / "training_data_gate_report.json"),
+            "instruction_mix_report": str(reports_dir / "instruction_mix_report.json"),
             "checkpoint_eval_report": str(reports_dir / "checkpoint_eval" / "checkpoint_eval_report.json"),
+            "checkpoint_comparison_report": str(reports_dir / "checkpoint_compare" / "checkpoint_comparison_report.json"),
             "progress_log": str(progress.path) if progress.path else "",
         },
     )
@@ -842,6 +944,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-source-balancing", action="store_true")
     parser.add_argument("--max-source-fraction", type=float, default=0.35)
     parser.add_argument("--min-source-rows", type=int, default=25)
+    parser.add_argument("--no-instruction-mix", action="store_true")
+    parser.add_argument("--instruction-mix-max-rows", type=int)
     parser.add_argument("--contamination-patterns")
     parser.add_argument("--allow-contamination-hits", action="store_true")
     parser.add_argument("--no-task-extraction", action="store_true")
@@ -850,6 +954,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object-store-uri", default="local://artifacts/aeitron/object-store")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--no-upload", action="store_true")
+    parser.add_argument("--checkpoint-compare-prompt-suite")
+    parser.add_argument("--checkpoint-compare-min-score", type=float, default=0.0)
+    parser.add_argument("--checkpoint-compare-max-new-tokens", type=int, default=96)
     parser.add_argument("--progress-path")
     parser.add_argument("--progress-to-stdout", action="store_true")
     parser.add_argument("--progress-every-docs", type=int, default=25)
@@ -908,6 +1015,8 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         balance_sources=not args.no_source_balancing,
         max_source_fraction=args.max_source_fraction,
         min_source_rows=args.min_source_rows,
+        instruction_mix=not args.no_instruction_mix,
+        instruction_mix_max_rows=args.instruction_mix_max_rows,
         contamination_patterns_path=args.contamination_patterns,
         block_contamination=not args.allow_contamination_hits,
         extract_tasks=not args.no_task_extraction,
@@ -916,6 +1025,9 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         object_store_uri=args.object_store_uri,
         object_store_endpoint_url=args.object_store_endpoint_url,
         upload_artifacts=not args.no_upload,
+        checkpoint_compare_prompt_suite=args.checkpoint_compare_prompt_suite,
+        checkpoint_compare_min_score=args.checkpoint_compare_min_score,
+        checkpoint_compare_max_new_tokens=args.checkpoint_compare_max_new_tokens,
         progress_path=args.progress_path,
         progress_to_stdout=args.progress_to_stdout,
         progress_every_docs=args.progress_every_docs,

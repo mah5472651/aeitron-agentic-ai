@@ -70,7 +70,9 @@ def _partial_report_state(output_dir: str, progress_path: str) -> dict[str, obje
         "source_budget_plan": reports / "source_budget_plan.json",
         "training_data_gate_report": reports / "training_data_gate_report.json",
         "source_balance_report": reports / "source_balance_report.json",
+        "instruction_mix_report": reports / "instruction_mix_report.json",
         "training_quality_report": reports / "training_quality_report.json",
+        "checkpoint_comparison_report": reports / "checkpoint_compare" / "checkpoint_comparison_report.json",
     }
     return {
         key: value
@@ -184,8 +186,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-source-balancing", action="store_true")
     parser.add_argument("--max-source-fraction", type=float, default=0.25)
     parser.add_argument("--min-source-rows", type=int, default=25)
+    parser.add_argument("--no-instruction-mix", action="store_true")
+    parser.add_argument("--instruction-mix-max-rows", type=int)
     parser.add_argument("--object-store-uri", default="local://artifacts/aeitron/object-store")
     parser.add_argument("--object-store-endpoint-url")
+    parser.add_argument("--checkpoint-compare-prompt-suite")
+    parser.add_argument("--checkpoint-compare-min-score", type=float, default=0.0)
+    parser.add_argument("--checkpoint-compare-max-new-tokens", type=int, default=96)
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--progress-path")
     parser.add_argument("--progress-to-stdout", action="store_true", help="Explicitly stream structured progress events to stdout.")
@@ -253,9 +260,14 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 balance_sources=not args.no_source_balancing,
                 max_source_fraction=args.max_source_fraction,
                 min_source_rows=args.min_source_rows,
+                instruction_mix=not args.no_instruction_mix,
+                instruction_mix_max_rows=args.instruction_mix_max_rows,
                 run_checkpoint_eval=not args.skip_train,
                 object_store_uri=args.object_store_uri,
                 object_store_endpoint_url=args.object_store_endpoint_url,
+                checkpoint_compare_prompt_suite=args.checkpoint_compare_prompt_suite,
+                checkpoint_compare_min_score=args.checkpoint_compare_min_score,
+                checkpoint_compare_max_new_tokens=args.checkpoint_compare_max_new_tokens,
                 upload_artifacts=True,
                 progress_path=progress_path,
                 progress_to_stdout=args.progress_to_stdout or not args.no_progress_stdout,
@@ -308,6 +320,8 @@ def main() -> None:
                 "min_training_quality_score": args.min_training_quality_score,
                 "min_training_average_quality_score": args.min_training_average_quality_score,
                 "min_train_tokens": args.min_train_tokens,
+                "instruction_mix_enabled": not args.no_instruction_mix,
+                "checkpoint_compare_prompt_suite": args.checkpoint_compare_prompt_suite or "",
                 "validation_profile": "kaggle" if args.kaggle_validation else "custom",
             },
             sort_keys=True,

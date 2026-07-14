@@ -1745,6 +1745,41 @@ Source balancing:
   capped sources.
 - Disable only for diagnostic runs with `--no-source-balancing`.
 
+Scratch instruction mix:
+
+- `src/aeitron/learning/mixer.py` now owns the production scratch data mixer.
+- The real-data pipeline runs it after license filtering, benchmark
+  contamination filtering, near-deduplication, training-data promotion, and
+  source balancing.
+- Raw rows are converted into explicit scratch training records with
+  `<|thought_start|>`, analysis target, correct answer, `<|patch_start|>`,
+  code patch or patch plan, tests, and verification result.
+- Default token ratio target:
+  - 40% `instruction_security_coding`
+  - 30% `verified_patch_tests`
+  - 20% `high_quality_docs_code`
+  - 10% `debugging_error_logs`
+- Verified patch/test examples are classified before general security/coding
+  rows, so real fixes and regression evidence get priority.
+- `reports/instruction_mix_report.json` records input paths, output JSONL,
+  bucket rows, estimated token ratios, rejected rows, and recommendations for
+  under-supplied buckets.
+- The dataset version manifest includes both the instruction mix report and
+  `mixed/scratch-instruction-mix.jsonl`.
+- Disable only for diagnosis with `--no-instruction-mix`; production mode
+  requires instruction mixing.
+
+Checkpoint pass/fail gate:
+
+- `--checkpoint-compare-prompt-suite` connects the expanded prompt suite
+  directly into the real-data pipeline.
+- The pipeline evaluates the best checkpoint with deterministic generation and
+  writes `reports/checkpoint_compare/checkpoint_comparison_report.json`.
+- `--checkpoint-compare-min-score` blocks a run when the checkpoint output
+  quality is below the required minimum.
+- A regressed checkpoint also blocks the run. This keeps "training completed"
+  separate from "checkpoint should be promoted."
+
 Expanded built-in benchmark:
 
 - `src/aeitron/evaluation/benchmarks.py` includes SQL injection, hardcoded
@@ -2133,6 +2168,8 @@ PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
   --validation-interval 100 \
   --validation-batches 4 \
   --early-stopping-patience 5 \
+  --checkpoint-compare-prompt-suite artifacts/aeitron/learning-validation-v1/expanded_eval_suite.jsonl \
+  --checkpoint-compare-min-score 0.20 \
   --progress-to-stdout
 ```
 
@@ -2170,6 +2207,8 @@ PYTHONUNBUFFERED=1 nohup python -u deploy/gpu/run_real_data_training_pipeline.py
   --min-source-reputation-score 0.50 \
   --eval-holdout-fraction 0.02 \
   --max-source-fraction 0.25 \
+  --checkpoint-compare-prompt-suite artifacts/aeitron/learning-validation-v1/expanded_eval_suite.jsonl \
+  --checkpoint-compare-min-score 0.20 \
   --progress-path artifacts/aeitron/real-data-10k-strict-v1/progress.jsonl \
   --progress-to-stdout \
   --progress-every-docs 10 \

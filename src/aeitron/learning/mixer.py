@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,14 @@ from pydantic import Field, model_validator
 from src.aeitron.learning.quality import iter_jsonl, stable_hash
 from src.aeitron.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer
 from src.aeitron.shared.schemas import StrictModel
+
+
+SCRATCH_INSTRUCTION_RATIOS = {
+    "instruction_security_coding": 0.40,
+    "verified_patch_tests": 0.30,
+    "high_quality_docs_code": 0.20,
+    "debugging_error_logs": 0.10,
+}
 
 
 class MixExperiment(StrictModel):
@@ -63,6 +73,48 @@ class MixManifest(StrictModel):
     total_tokens: int
     buckets: list[MixBucketReport]
     excluded_holdout_rows: int
+    created_at_unix: float = Field(default_factory=time.time)
+
+
+class ScratchMixConfig(StrictModel):
+    ratios: dict[str, float] = Field(default_factory=lambda: SCRATCH_INSTRUCTION_RATIOS.copy())
+    seed: int = 1337
+    max_rows: int | None = Field(default=None, ge=1)
+    min_quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    preserve_raw_docs: bool = True
+
+    @model_validator(mode="after")
+    def validate_scratch_ratios(self) -> "ScratchMixConfig":
+        missing = set(SCRATCH_INSTRUCTION_RATIOS) - set(self.ratios)
+        if missing:
+            raise ValueError(f"missing scratch mix buckets: {sorted(missing)}")
+        total = sum(float(value) for value in self.ratios.values())
+        if total <= 0:
+            raise ValueError("scratch mix ratios must sum to a positive value")
+        return self
+
+
+class ScratchMixBucketReport(StrictModel):
+    bucket: str
+    input_rows: int
+    output_rows: int
+    output_tokens: int
+    target_ratio: float
+    actual_ratio: float
+
+
+class ScratchInstructionMixReport(StrictModel):
+    status: str
+    input_paths: list[str]
+    output_jsonl: str
+    total_rows: int
+    total_tokens: int
+    buckets: list[ScratchMixBucketReport]
+    rejected_rows: int
+    transformed_instruction_rows: int
+    raw_preserved_rows: int
+    target_ratios: dict[str, float]
+    recommendations: list[str] = Field(default_factory=list)
     created_at_unix: float = Field(default_factory=time.time)
 
 
@@ -263,12 +315,274 @@ def build_mix(
     return manifest
 
 
+def _quality(row: dict[str, Any]) -> dict[str, Any]:
+    quality = row.get("quality", {})
+    return quality if isinstance(quality, dict) else {}
+
+
+def _metadata(row: dict[str, Any]) -> dict[str, Any]:
+    metadata = row.get("metadata", {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _training_gate(row: dict[str, Any]) -> dict[str, Any]:
+    gate = row.get("training_gate", {})
+    return gate if isinstance(gate, dict) else {}
+
+
+def _labels(row: dict[str, Any]) -> set[str]:
+    quality = _quality(row)
+    metadata = _metadata(row)
+    labels = {str(item).lower() for item in quality.get("labels", [])}
+    labels.update(str(item).lower() for item in metadata.get("labels", []) if isinstance(metadata.get("labels", []), list))
+    category = str(row.get("category") or metadata.get("category") or "").lower()
+    if category:
+        labels.add(category)
+    return labels
+
+
+def _data_type(row: dict[str, Any]) -> str:
+    return str(_quality(row).get("data_type") or _metadata(row).get("data_type") or "").lower()
+
+
+def _source(row: dict[str, Any]) -> str:
+    return str(row.get("source") or _metadata(row).get("source") or "approved-source")
+
+
+def _license(row: dict[str, Any]) -> str:
+    return str(row.get("license") or _metadata(row).get("license") or "unknown")
+
+
+def _quality_score(row: dict[str, Any]) -> float:
+    quality = _quality(row)
+    gate = _training_gate(row)
+    return max(float(quality.get("quality_score", 0.0) or 0.0), float(gate.get("score", 0.0) or 0.0))
+
+
+def classify_scratch_bucket(row: dict[str, Any]) -> str:
+    text = _row_text(row).lower()
+    labels = _labels(row)
+    data_type = _data_type(row)
+    if data_type == "debug_trace" or any(term in text for term in ("traceback", "compile error", "undefined reference", "stack trace", "panic:", "exception")):
+        return "debugging_error_logs"
+    if data_type in {"patch", "test"} or any(term in text for term in ("diff --git", "\n+++ ", "\n--- ", "regression test", "pytest", "unittest", "assert ")):
+        return "verified_patch_tests"
+    if (
+        "defensive_security" in labels
+        or "agentic_coding" in labels
+        or data_type in {"security_advisory", "security_reference"}
+        or any(term in text for term in ("cwe-", "cve-", "vulnerability", "secure coding", "owasp", "mitigation", "authentication", "authorization"))
+    ):
+        return "instruction_security_coding"
+    return "high_quality_docs_code"
+
+
+def _sentence_excerpt(text: str, *, limit: int = 1400) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    return normalized[:limit]
+
+
+def convert_to_instruction_row(row: dict[str, Any], *, bucket: str) -> dict[str, Any]:
+    source_text = _row_text(row)
+    excerpt = _sentence_excerpt(source_text)
+    source = _source(row)
+    digest = str(row.get("content_hash") or stable_hash(source_text))
+    language = str(_quality(row).get("language_hint") or row.get("language") or "unknown")
+    prompt = "Analyze this approved source and produce a defensive coding answer."
+    correct_answer = "Summarize the risk or engineering task, propose a safe implementation direction, and include verification."
+    patch = "No direct patch is present. Provide a patch plan tied to the context."
+    tests = "Verify with regression tests, static checks, and compile/runtime checks where applicable."
+    verification = "expected: safe defensive reasoning with no live-target attack workflow"
+
+    if bucket == "instruction_security_coding":
+        prompt = "Turn this approved cybersecurity/coding context into a defensive instruction response."
+        correct_answer = (
+            "Identify vulnerability surfaces or implementation requirements, explain the defensive rationale, "
+            "and propose safe code or architecture changes."
+        )
+        patch = "Patch plan: validate inputs, preserve behavior, add narrow checks, and document security assumptions."
+        tests = "Tests: include malicious-input regression, normal behavior regression, and static-analysis verification."
+    elif bucket == "verified_patch_tests":
+        prompt = "Extract a patch-generation training example from this approved patch/test context."
+        correct_answer = "Explain the bug, the intended fix, and why the tests prove the regression is closed."
+        patch = source_text[:2500]
+        tests = "Tests: run the included or implied assertions; add a failing-before/passing-after regression case."
+        verification = "expected: patch and tests are treated as supervised scratch pretraining text"
+    elif bucket == "debugging_error_logs":
+        prompt = "Debug this runtime or compilation failure and produce the smallest safe fix plan."
+        correct_answer = "Identify the likely failing line or invariant, explain the cause, and propose a minimal safe correction."
+        patch = "Patch plan: add the missing guard, dependency, type check, or compile fix indicated by the trace."
+        tests = "Tests: reproduce the failure, apply the fix, rerun the failing command, and add a regression assertion."
+    elif bucket == "high_quality_docs_code":
+        prompt = "Convert this high-quality documentation or code context into implementation guidance."
+        correct_answer = "Extract reusable design rules, APIs, constraints, and verification steps."
+        if "def " in source_text or "class " in source_text or "function " in source_text or "fn " in source_text:
+            patch = "Implementation plan: preserve API behavior, add tests, and keep changes local to the owning module."
+
+    text = (
+        "<|thought_start|>\n"
+        f"Prompt: {prompt}\n"
+        f"Source: {source}\n"
+        f"Language: {language}\n"
+        f"Analysis target:\n{excerpt}\n\n"
+        f"Correct answer:\n{correct_answer}\n"
+        "<|thought_end|>\n"
+        "<|patch_start|>\n"
+        f"{patch}\n"
+        "<|patch_end|>\n"
+        f"Tests:\n{tests}\n"
+        f"Verification result: {verification}\n"
+    )
+    metadata = {
+        **_metadata(row),
+        "scratch_mix_bucket": bucket,
+        "source_content_hash": digest,
+        "converted_to_instruction": True,
+    }
+    return {
+        "text": text,
+        "content_hash": stable_hash(text),
+        "source": source,
+        "url": row.get("url"),
+        "license": _license(row),
+        "category": bucket,
+        "quality": _quality(row),
+        "training_gate": _training_gate(row),
+        "metadata": metadata,
+        "train_policy": "train",
+    }
+
+
+def _scratch_estimated_tokens(row: dict[str, Any], tokenizer: Any | None) -> int:
+    text = _row_text(row)
+    if tokenizer is not None:
+        return max(1, len(tokenizer.encode(text).ids))
+    return max(1, len(text) // 4)
+
+
+def build_scratch_instruction_mix(
+    *,
+    input_paths: list[str | Path],
+    output_path: str | Path,
+    report_path: str | Path,
+    config: ScratchMixConfig | None = None,
+    tokenizer_path: str | Path | None = None,
+) -> ScratchInstructionMixReport:
+    active = config or ScratchMixConfig()
+    normalized = _normalize_ratios(active.ratios)
+    tokenizer = load_tokenizer(tokenizer_path) if tokenizer_path else None
+    rng = random.Random(active.seed)
+    buckets: dict[str, list[dict[str, Any]]] = {bucket: [] for bucket in SCRATCH_INSTRUCTION_RATIOS}
+    rejected = 0
+    seen: set[str] = set()
+    for path in input_paths:
+        for row in iter_jsonl(path):
+            text = _row_text(row)
+            digest = str(row.get("content_hash") or stable_hash(text))
+            if not text or digest in seen:
+                rejected += 1
+                continue
+            seen.add(digest)
+            if _quality_score(row) < active.min_quality_score:
+                rejected += 1
+                continue
+            bucket = classify_scratch_bucket(row)
+            converted = convert_to_instruction_row(row, bucket=bucket)
+            converted["_scratch_bucket"] = bucket
+            converted["_estimated_tokens"] = _scratch_estimated_tokens(converted, tokenizer)
+            buckets[bucket].append(converted)
+
+    for rows in buckets.values():
+        rng.shuffle(rows)
+
+    cursors = {bucket: 0 for bucket in buckets}
+    token_totals: Counter[str] = Counter()
+    selected: list[dict[str, Any]] = []
+    total_available = sum(len(rows) for rows in buckets.values())
+    limit = min(active.max_rows or total_available, total_available)
+    while len(selected) < limit:
+        choices = [bucket for bucket, rows in buckets.items() if cursors[bucket] < len(rows)]
+        if not choices:
+            break
+        current_total = max(1, sum(token_totals.values()))
+        ranked = []
+        for bucket in choices:
+            actual = token_totals[bucket] / current_total
+            ranked.append((normalized.get(bucket, 0.0) - actual, rng.random(), bucket))
+        ranked.sort(reverse=True)
+        bucket = ranked[0][2]
+        row = buckets[bucket][cursors[bucket]]
+        cursors[bucket] += 1
+        token_totals[bucket] += int(row["_estimated_tokens"])
+        selected.append(row)
+
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    transformed = 0
+    raw_preserved = 0
+    with target.open("w", encoding="utf-8") as handle:
+        for row in selected:
+            bucket = str(row.pop("_scratch_bucket"))
+            tokens = int(row.pop("_estimated_tokens"))
+            if row.get("metadata", {}).get("converted_to_instruction"):
+                transformed += 1
+            else:
+                raw_preserved += 1
+                if active.preserve_raw_docs:
+                    original_text = _row_text(row)
+                    row["text"] = original_text
+            row["scratch_mix"] = {"bucket": bucket, "estimated_tokens": tokens, "target_ratio": normalized.get(bucket, 0.0)}
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+    total_tokens = sum(token_totals.values())
+    bucket_reports = [
+        ScratchMixBucketReport(
+            bucket=bucket,
+            input_rows=len(rows),
+            output_rows=sum(1 for row in selected if row.get("scratch_mix", {}).get("bucket") == bucket),
+            output_tokens=int(token_totals[bucket]),
+            target_ratio=round(normalized.get(bucket, 0.0), 6),
+            actual_ratio=round(token_totals[bucket] / max(1, total_tokens), 6),
+        )
+        for bucket, rows in sorted(buckets.items())
+    ]
+    recommendations: list[str] = []
+    for item in bucket_reports:
+        if item.output_rows == 0:
+            recommendations.append(f"bucket {item.bucket} has zero rows; add higher-yield approved sources for this class")
+        elif item.actual_ratio < item.target_ratio * 0.5:
+            recommendations.append(f"bucket {item.bucket} is under target; available source data is scarce")
+    status = "passed" if selected and not any(item.output_rows == 0 for item in bucket_reports) else "warning"
+    report = ScratchInstructionMixReport(
+        status=status,
+        input_paths=[str(path) for path in input_paths],
+        output_jsonl=str(target),
+        total_rows=len(selected),
+        total_tokens=int(total_tokens),
+        buckets=bucket_reports,
+        rejected_rows=rejected,
+        transformed_instruction_rows=transformed,
+        raw_preserved_rows=raw_preserved,
+        target_ratios={key: round(value, 6) for key, value in sorted(normalized.items())},
+        recommendations=recommendations,
+    )
+    report_target = Path(report_path)
+    report_target.parent.mkdir(parents=True, exist_ok=True)
+    report_target.write_text(json.dumps(report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
+    return report
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a Aeitron token-ratio mixed corpus.")
     parser.add_argument("--inputs", nargs="+", required=True)
     parser.add_argument("--config", default="config/mix_ratios.json")
     parser.add_argument("--experiment", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--scratch-instruction-mix", action="store_true")
+    parser.add_argument("--output-jsonl", help="Output path for --scratch-instruction-mix.")
+    parser.add_argument("--report-path", help="Report path for --scratch-instruction-mix.")
+    parser.add_argument("--max-rows", type=int)
+    parser.add_argument("--min-quality-score", type=float, default=0.0)
     parser.add_argument("--tokenizer-path")
     parser.add_argument("--shard-token-count", type=int, default=1_000_000)
     parser.add_argument("--sequence-length", type=int, default=2048)
@@ -278,6 +592,18 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if args.scratch_instruction_mix:
+        output_path = args.output_jsonl or str(Path(args.output_dir) / "scratch_instruction_mix.jsonl")
+        report_path = args.report_path or str(Path(args.output_dir) / "scratch_instruction_mix_report.json")
+        report = build_scratch_instruction_mix(
+            input_paths=args.inputs,
+            output_path=output_path,
+            report_path=report_path,
+            tokenizer_path=args.tokenizer_path,
+            config=ScratchMixConfig(max_rows=args.max_rows, min_quality_score=args.min_quality_score),
+        )
+        print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
+        raise SystemExit(0 if report.status in {"passed", "warning"} else 1)
     manifest = build_mix(
         input_paths=args.inputs,
         config_path=args.config,
