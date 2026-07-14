@@ -16,6 +16,7 @@ from src.aeitron.learning.data_pipeline import DataPipelineConfig, PipelineRunLo
 from src.aeitron.learning.license_filter import filter_jsonl_by_license
 from src.aeitron.learning.near_dedup import deduplicate_jsonl
 from src.aeitron.learning.production_check import DataPlatformReadinessConfig, run_readiness_check
+from src.aeitron.learning.production_dataset import ProductionDatasetConfig, build_production_dataset
 from src.aeitron.learning.quality_inspector import inspect_clean_jsonl
 from src.aeitron.learning.repo_patch_extraction import extract_security_patch_tasks
 from src.aeitron.learning.resource_catalog import build_resource_catalog_report
@@ -806,6 +807,157 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
         eval_names = [item.name for item in report.eval_holdout_resources]
         self.assertIn("SWE-bench Verified", eval_names)
         self.assertIn("HumanEval", eval_names)
+
+    def test_production_dataset_pack_builds_governed_dev_smoke_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw = root / "raw.jsonl"
+            verified = root / "verified_patch.jsonl"
+            reviewed = root / "human_approved.jsonl"
+            holdout = root / "holdout.jsonl"
+            safe_security_text = (
+                "Defensive secure coding reference for authentication validation, CWE mitigation, "
+                "parameterized SQL, regression tests, and patch verification. "
+                "def validate_user_input(value): return value.strip() if isinstance(value, str) else ''\n"
+            )
+            rows = [
+                {
+                    "source": "OSV.dev",
+                    "license": "mit",
+                    "category": "cybersecurity",
+                    "url": "https://osv.dev/example",
+                    "text": safe_security_text * 4,
+                    "provenance": {"source_url": "https://osv.dev/example", "license": "mit"},
+                },
+                {
+                    "source": "The Stack v2",
+                    "license": "apache-2.0",
+                    "category": "code",
+                    "url": "https://example.org/repo/auth.py",
+                    "text": (
+                        "Repository debugging task with failing test, stack trace, refactor, secure patch, "
+                        "implementation plan, and regression verification. def patched_login(user, password): "
+                        "assert user and password; return True\n"
+                    )
+                    * 4,
+                    "provenance": {"source_url": "https://example.org/repo/auth.py", "license": "apache-2.0"},
+                },
+                {
+                    "source": "OWASP ASVS",
+                    "license": "cc-by-4.0",
+                    "category": "general",
+                    "url": "https://owasp.org/asvs/example",
+                    "text": (
+                        "General secure software engineering guidance covers testing, architecture decisions, "
+                        "authorization boundaries, validation, documentation, and operational review. "
+                    )
+                    * 5,
+                    "provenance": {"source_url": "https://owasp.org/asvs/example", "license": "cc-by-4.0"},
+                },
+                {
+                    "source": "benchmark-leak",
+                    "license": "mit",
+                    "category": "code",
+                    "text": "HumanEval canonical_solution pass@1 check(candidate) " + safe_security_text * 2,
+                },
+            ]
+            raw.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
+            verified.write_text(
+                json.dumps(
+                    {
+                        "source": "approved-repo",
+                        "license": "mit",
+                        "category": "verified_security_patch",
+                        "prompt": "Fix a defensive authentication validation bug and preserve regression tests.",
+                        "chosen": "<|thought_start|>defensive fix<|thought_end|><|patch_start|>def login(u,p): return bool(u and p)<|patch_end|>",
+                        "verification": {"status": "passed"},
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            reviewed.write_text(
+                json.dumps(
+                    {
+                        "source": "human-review",
+                        "license": "mit",
+                        "category": "cybersecurity",
+                        "text": safe_security_text * 3,
+                        "review": {"status": "approved", "reviewer": "unit-test", "decision_reason": "high value defensive data"},
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            holdout.write_text(
+                json.dumps({"task_id": "h1", "prompt": "HumanEval canonical_solution pass@1 check(candidate)"}) + "\n",
+                encoding="utf-8",
+            )
+
+            manifest = build_production_dataset(
+                ProductionDatasetConfig(
+                    input_paths=[str(raw)],
+                    output_dir=str(root / "production"),
+                    benchmark_holdout_paths=[str(holdout)],
+                    verified_patch_paths=[str(verified)],
+                    human_review_approved_paths=[str(reviewed)],
+                    dev_smoke=True,
+                    min_promoted_records=100_000,
+                    min_verified_patch_records=100,
+                    min_human_review_approved_records=100,
+                    min_train_records=90_000,
+                )
+            )
+
+            self.assertEqual(manifest.status, "passed")
+            self.assertTrue(Path(manifest.artifacts["train"]).exists())
+            self.assertTrue(Path(manifest.artifacts["human_review_queue"]).exists())
+            self.assertEqual(manifest.metrics["verified_patch_records"], 1)
+            self.assertEqual(manifest.metrics["human_review_approved_records"], 1)
+            self.assertGreaterEqual(manifest.metrics["benchmark_holdout_removed_records"], 0)
+            self.assertTrue(Path(root / "production" / "reports" / "source_reputation_report.json").exists())
+            self.assertTrue(Path(root / "production" / "reports" / "train_val_test_split_manifest.json").exists())
+
+    def test_production_dataset_pack_fails_when_real_thresholds_are_not_met(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw = root / "raw.jsonl"
+            raw.write_text(
+                json.dumps(
+                    {
+                        "source": "OSV.dev",
+                        "license": "mit",
+                        "category": "cybersecurity",
+                        "text": (
+                            "Defensive secure coding guidance for CVE, CWE, patch verification, tests, "
+                            "authentication validation, and repository debugging. def secure(value): return value\n"
+                        )
+                        * 5,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            manifest = build_production_dataset(
+                ProductionDatasetConfig(
+                    input_paths=[str(raw)],
+                    output_dir=str(root / "production"),
+                    benchmark_holdout_paths=[],
+                    min_promoted_records=100_000,
+                    min_verified_patch_records=100,
+                    min_human_review_approved_records=100,
+                    min_train_records=90_000,
+                )
+            )
+
+            self.assertEqual(manifest.status, "failed")
+            self.assertTrue(any(issue.startswith("promoted_records_below_minimum") for issue in manifest.issues))
+            self.assertTrue(any(issue.startswith("verified_patch_records_below_minimum") for issue in manifest.issues))
+            self.assertTrue(any(issue.startswith("human_review_approved_records_below_minimum") for issue in manifest.issues))
 
     def test_task_review_and_feedback_loop_reports_promotion_or_blockers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

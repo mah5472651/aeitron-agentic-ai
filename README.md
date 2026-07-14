@@ -465,6 +465,31 @@ python -m src.aeitron.learning.run_plan \
   --async-workers 64
 ```
 
+Promote a governed 100k-1M production dataset pack into `data/production`:
+
+```bash
+python -m src.aeitron.learning.production_dataset \
+  --input artifacts/aeitron/data-runs/first-serious-run/clean/*.jsonl \
+  --output-dir data/production/aeitron-corpus-v1 \
+  --dataset-id aeitron-corpus-v1 \
+  --source-registry config/data_sources.ultimate.json \
+  --benchmark-holdout data/eval/humaneval.jsonl \
+  --benchmark-holdout data/eval/mbpp.jsonl \
+  --verified-patch artifacts/aeitron/verified-patches/verified_patch_tasks.jsonl \
+  --human-review-approved artifacts/aeitron/review/approved_high_value.jsonl \
+  --min-promoted-records 100000 \
+  --min-verified-patch-records 100 \
+  --min-human-review-approved-records 100 \
+  --min-train-records 90000
+```
+
+This command writes `final/train.jsonl`, `final/val.jsonl`,
+`final/test.jsonl`, `final/holdout.jsonl`, `dataset_version_manifest.json`,
+license/quality/contamination/dedup/source/gate/split/validation reports, and
+`review/human_review_queue.jsonl`. Production mode fails if required row counts,
+verified patch rows, or human-approved high-value rows are missing. Use
+`--dev-smoke` only for local plumbing checks.
+
 Training resource priority catalog:
 
 ```bash

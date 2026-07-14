@@ -1197,6 +1197,85 @@ Why it exists:
 Data quality must be tied to model/evaluation outcomes. If benchmark score drops
 or task review approval is weak, the dataset should not be promoted blindly.
 
+## Production Dataset Pack
+
+Files:
+
+- `src/aeitron/learning/production_dataset.py`
+
+Purpose:
+
+Turn crawled and cleaned JSONL rows into a governed production training corpus
+inside `data/production`. This is the final gate before tokenizer training,
+sharding, and scratch pretraining.
+
+It runs these stages:
+
+1. License allowlist filtering.
+2. Dataset quality scoring and metadata injection.
+3. Benchmark contamination filtering.
+4. Exact and near-duplicate removal.
+5. Source quality scoring.
+6. Source reputation scoring.
+7. Source budget planning for the next crawl.
+8. Training data gate promotion.
+9. Verified patch/task row normalization.
+10. Human-review approved high-value row promotion.
+11. Benchmark holdout separation.
+12. Train/validation/test split.
+13. Dataset validation.
+14. Dataset version manifest writing.
+
+Required production evidence:
+
+- 100k to 1M+ promoted clean records.
+- explicit `license` per row.
+- provenance metadata per row.
+- contamination-clean report.
+- source reputation and source budget reports.
+- near-duplicate report.
+- train/validation/test split manifest.
+- benchmark holdout separation report.
+- verified patch/task dataset report.
+- human-review approved high-value row report.
+- dataset version manifest.
+
+Command:
+
+```bash
+python -m src.aeitron.learning.production_dataset \
+  --input artifacts/aeitron/data-runs/first-serious-run/clean/*.jsonl \
+  --output-dir data/production/aeitron-corpus-v1 \
+  --dataset-id aeitron-corpus-v1 \
+  --source-registry config/data_sources.ultimate.json \
+  --benchmark-holdout data/eval/humaneval.jsonl \
+  --benchmark-holdout data/eval/mbpp.jsonl \
+  --verified-patch artifacts/aeitron/verified-patches/verified_patch_tasks.jsonl \
+  --human-review-approved artifacts/aeitron/review/approved_high_value.jsonl \
+  --min-promoted-records 100000 \
+  --min-verified-patch-records 100 \
+  --min-human-review-approved-records 100 \
+  --min-train-records 90000
+```
+
+Outputs:
+
+- `data/production/<dataset>/final/train.jsonl`
+- `data/production/<dataset>/final/val.jsonl`
+- `data/production/<dataset>/final/test.jsonl`
+- `data/production/<dataset>/final/holdout.jsonl`
+- `data/production/<dataset>/review/human_review_queue.jsonl`
+- `data/production/<dataset>/reports/*.json`
+- `data/production/<dataset>/dataset_version_manifest.json`
+- `data/production/<dataset>/dataset_version_manifest.md`
+
+Production behavior:
+
+- Missing or insufficient real data fails the command.
+- Benchmark leakage is removed before final split.
+- Dev-smoke mode is allowed only for code-path validation and cannot be treated
+  as production data proof.
+
 ## Dataset Versioning And Ledger
 
 Files:
