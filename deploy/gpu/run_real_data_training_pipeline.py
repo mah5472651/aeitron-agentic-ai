@@ -188,6 +188,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-source-rows", type=int, default=25)
     parser.add_argument("--no-instruction-mix", action="store_true")
     parser.add_argument("--instruction-mix-max-rows", type=int)
+    parser.add_argument(
+        "--curriculum-mode",
+        default="balanced",
+        choices=["balanced", "fundamentals_only", "defensive_security_only", "debug_patch_only", "agentic_coding_only"],
+    )
+    parser.add_argument("--allow-offensive-misuse-rows", action="store_true")
     parser.add_argument("--object-store-uri", default="local://artifacts/aeitron/object-store")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--checkpoint-compare-prompt-suite")
@@ -265,6 +271,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 min_source_rows=args.min_source_rows,
                 instruction_mix=not args.no_instruction_mix,
                 instruction_mix_max_rows=args.instruction_mix_max_rows,
+                curriculum_mode=args.curriculum_mode,
+                strict_offensive_filter=not args.allow_offensive_misuse_rows,
                 run_checkpoint_eval=not args.skip_train,
                 object_store_uri=args.object_store_uri,
                 object_store_endpoint_url=args.object_store_endpoint_url,
@@ -327,6 +335,7 @@ def main() -> None:
                 "min_training_average_quality_score": args.min_training_average_quality_score,
                 "min_train_tokens": args.min_train_tokens,
                 "instruction_mix_enabled": not args.no_instruction_mix,
+                "curriculum_mode": args.curriculum_mode,
                 "checkpoint_compare_prompt_suite": args.checkpoint_compare_prompt_suite or "",
                 "validation_profile": "kaggle" if args.kaggle_validation else "custom",
             },

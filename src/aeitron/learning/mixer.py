@@ -26,6 +26,50 @@ SCRATCH_INSTRUCTION_RATIOS = {
     "debugging_error_logs": 0.10,
 }
 
+CURRICULUM_RATIOS = {
+    "balanced": SCRATCH_INSTRUCTION_RATIOS,
+    "fundamentals_only": {
+        "instruction_security_coding": 0.0,
+        "verified_patch_tests": 0.0,
+        "high_quality_docs_code": 1.0,
+        "debugging_error_logs": 0.0,
+    },
+    "defensive_security_only": {
+        "instruction_security_coding": 1.0,
+        "verified_patch_tests": 0.0,
+        "high_quality_docs_code": 0.0,
+        "debugging_error_logs": 0.0,
+    },
+    "debug_patch_only": {
+        "instruction_security_coding": 0.0,
+        "verified_patch_tests": 0.65,
+        "high_quality_docs_code": 0.0,
+        "debugging_error_logs": 0.35,
+    },
+    "agentic_coding_only": {
+        "instruction_security_coding": 0.45,
+        "verified_patch_tests": 0.35,
+        "high_quality_docs_code": 0.20,
+        "debugging_error_logs": 0.0,
+    },
+}
+
+OFFENSIVE_MISUSE_PATTERNS = [
+    r"\breverse\s+shell\b",
+    r"\bshellcode\b",
+    r"\bmetasploit\b",
+    r"\bweaponiz(?:e|ed|ation)\b",
+    r"\bexfiltrat(?:e|ion)\b",
+    r"\bsteal\s+(?:cookies|tokens|passwords|credentials)\b",
+    r"\bcredential\s+dump(?:ing)?\b",
+    r"\bc2\s+(?:server|callback|beacon)\b",
+    r"\bransomware\b",
+    r"\bpersistence\s+mechanism\b",
+    r"\bexploit\s+(?:chain|payload|code)\b",
+    r"\bpayload\s+(?:to|that)\s+(?:execute|run|spawn|bypass)\b",
+    r"\bbypass\s+(?:edr|antivirus|av|waf)\b",
+]
+
 
 class MixExperiment(StrictModel):
     name: str
@@ -79,10 +123,15 @@ class MixManifest(StrictModel):
 
 class ScratchMixConfig(StrictModel):
     ratios: dict[str, float] = Field(default_factory=lambda: SCRATCH_INSTRUCTION_RATIOS.copy())
+    curriculum_mode: str = Field(
+        default="balanced",
+        pattern="^(balanced|fundamentals_only|defensive_security_only|debug_patch_only|agentic_coding_only)$",
+    )
     seed: int = 1337
     max_rows: int | None = Field(default=None, ge=1)
     min_quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
     preserve_raw_docs: bool = True
+    strict_offensive_filter: bool = True
 
     @model_validator(mode="after")
     def validate_scratch_ratios(self) -> "ScratchMixConfig":
@@ -108,10 +157,12 @@ class ScratchInstructionMixReport(StrictModel):
     status: str
     input_paths: list[str]
     output_jsonl: str
+    curriculum_mode: str
     total_rows: int
     total_tokens: int
     buckets: list[ScratchMixBucketReport]
     rejected_rows: int
+    offensive_rejected_rows: int = 0
     transformed_instruction_rows: int
     raw_preserved_rows: int
     target_ratios: dict[str, float]
@@ -194,6 +245,24 @@ def _load_rows(
 def _normalize_ratios(ratios: dict[str, float]) -> dict[str, float]:
     total = sum(max(0.0, float(value)) for value in ratios.values()) or 1.0
     return {key: max(0.0, float(value)) / total for key, value in ratios.items()}
+
+
+def curriculum_ratios(mode: str, custom_ratios: dict[str, float] | None = None) -> dict[str, float]:
+    if mode == "balanced":
+        return custom_ratios or SCRATCH_INSTRUCTION_RATIOS.copy()
+    if mode not in CURRICULUM_RATIOS:
+        raise ValueError(f"unknown curriculum mode: {mode}")
+    return CURRICULUM_RATIOS[mode].copy()
+
+
+def contains_offensive_misuse(text: str) -> bool:
+    lowered = text.lower()
+    return any(re.search(pattern, lowered) for pattern in OFFENSIVE_MISUSE_PATTERNS)
+
+
+def bucket_allowed_for_curriculum(bucket: str, mode: str) -> bool:
+    ratios = curriculum_ratios(mode)
+    return ratios.get(bucket, 0.0) > 0.0
 
 
 def _sample_mixed_rows(
@@ -365,16 +434,17 @@ def classify_scratch_bucket(row: dict[str, Any]) -> str:
     text = _row_text(row).lower()
     labels = _labels(row)
     data_type = _data_type(row)
+    if (
+        "defensive_security" in labels
+        or data_type in {"security_advisory", "security_reference"}
+        or any(term in text for term in ("cwe-", "cve-", "vulnerability", "secure coding", "owasp", "mitigation", "authentication", "authorization"))
+    ):
+        return "instruction_security_coding"
     if data_type == "debug_trace" or any(term in text for term in ("traceback", "compile error", "undefined reference", "stack trace", "panic:", "exception")):
         return "debugging_error_logs"
     if data_type in {"patch", "test"} or any(term in text for term in ("diff --git", "\n+++ ", "\n--- ", "regression test", "pytest", "unittest", "assert ")):
         return "verified_patch_tests"
-    if (
-        "defensive_security" in labels
-        or "agentic_coding" in labels
-        or data_type in {"security_advisory", "security_reference"}
-        or any(term in text for term in ("cwe-", "cve-", "vulnerability", "secure coding", "owasp", "mitigation", "authentication", "authorization"))
-    ):
+    if "agentic_coding" in labels:
         return "instruction_security_coding"
     return "high_quality_docs_code"
 
@@ -400,7 +470,7 @@ def convert_to_instruction_row(row: dict[str, Any], *, bucket: str) -> dict[str,
         prompt = "Turn this approved cybersecurity/coding context into a defensive instruction response."
         correct_answer = (
             "Identify vulnerability surfaces or implementation requirements, explain the defensive rationale, "
-            "and propose safe code or architecture changes."
+            "avoid unsupported claims, and propose safe code or architecture changes."
         )
         patch = "Patch plan: validate inputs, preserve behavior, add narrow checks, and document security assumptions."
         tests = "Tests: include malicious-input regression, normal behavior regression, and static-analysis verification."
@@ -471,11 +541,13 @@ def build_scratch_instruction_mix(
     tokenizer_path: str | Path | None = None,
 ) -> ScratchInstructionMixReport:
     active = config or ScratchMixConfig()
-    normalized = _normalize_ratios(active.ratios)
+    selected_ratios = curriculum_ratios(active.curriculum_mode, active.ratios)
+    normalized = _normalize_ratios(selected_ratios)
     tokenizer = load_tokenizer(tokenizer_path) if tokenizer_path else None
     rng = random.Random(active.seed)
     buckets: dict[str, list[dict[str, Any]]] = {bucket: [] for bucket in SCRATCH_INSTRUCTION_RATIOS}
     rejected = 0
+    offensive_rejected = 0
     seen: set[str] = set()
     for path in input_paths:
         for row in iter_jsonl(path):
@@ -489,6 +561,13 @@ def build_scratch_instruction_mix(
                 rejected += 1
                 continue
             bucket = classify_scratch_bucket(row)
+            if not bucket_allowed_for_curriculum(bucket, active.curriculum_mode):
+                rejected += 1
+                continue
+            if active.curriculum_mode == "defensive_security_only" and active.strict_offensive_filter and contains_offensive_misuse(text):
+                rejected += 1
+                offensive_rejected += 1
+                continue
             converted = convert_to_instruction_row(row, bucket=bucket)
             converted["_scratch_bucket"] = bucket
             converted["_estimated_tokens"] = _scratch_estimated_tokens(converted, tokenizer)
@@ -559,10 +638,12 @@ def build_scratch_instruction_mix(
         status=status,
         input_paths=[str(path) for path in input_paths],
         output_jsonl=str(target),
+        curriculum_mode=active.curriculum_mode,
         total_rows=len(selected),
         total_tokens=int(total_tokens),
         buckets=bucket_reports,
         rejected_rows=rejected,
+        offensive_rejected_rows=offensive_rejected,
         transformed_instruction_rows=transformed,
         raw_preserved_rows=raw_preserved,
         target_ratios={key: round(value, 6) for key, value in sorted(normalized.items())},
@@ -581,6 +662,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--scratch-instruction-mix", action="store_true")
+    parser.add_argument(
+        "--curriculum-mode",
+        default="balanced",
+        choices=["balanced", "fundamentals_only", "defensive_security_only", "debug_patch_only", "agentic_coding_only"],
+    )
+    parser.add_argument("--allow-offensive-misuse-rows", action="store_true")
     parser.add_argument("--output-jsonl", help="Output path for --scratch-instruction-mix.")
     parser.add_argument("--report-path", help="Report path for --scratch-instruction-mix.")
     parser.add_argument("--max-rows", type=int)
@@ -602,7 +689,12 @@ def main() -> None:
             output_path=output_path,
             report_path=report_path,
             tokenizer_path=args.tokenizer_path,
-            config=ScratchMixConfig(max_rows=args.max_rows, min_quality_score=args.min_quality_score),
+            config=ScratchMixConfig(
+                max_rows=args.max_rows,
+                min_quality_score=args.min_quality_score,
+                curriculum_mode=args.curriculum_mode,
+                strict_offensive_filter=not args.allow_offensive_misuse_rows,
+            ),
         )
         print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
         raise SystemExit(0 if report.status in {"passed", "warning"} else 1)

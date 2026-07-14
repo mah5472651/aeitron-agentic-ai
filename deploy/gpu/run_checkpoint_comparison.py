@@ -80,7 +80,7 @@ def main() -> None:
         ),
     )
     print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
-    raise SystemExit(0 if report.status not in {"regressed", "failed_generation_collapse"} else 1)
+    raise SystemExit(0 if report.status not in {"regressed", "failed_generation_collapse", "failed_hallucination_guardrail"} else 1)
 
 
 if __name__ == "__main__":

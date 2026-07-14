@@ -620,6 +620,63 @@ Collapse is detected from repetitive word/ngram output, and deterministic
 evaluation supports stop tokens, repetition penalty, and no-repeat ngram
 blocking.
 
+Curriculum-first scratch training:
+
+```bash
+python -m src.aeitron.model_ops.learning_validation \
+  --output-dir artifacts/aeitron/defensive-learning-validation-v1 \
+  --instruction-count 100 \
+  --curriculum-mode defensive_security_only \
+  --overfit-steps 300 \
+  --device cuda \
+  --dtype fp16
+```
+
+Available curriculum modes:
+
+- `fundamentals_only`
+- `defensive_security_only`
+- `debug_patch_only`
+- `agentic_coding_only`
+- `balanced`
+
+Defensive-only mode applies an offensive-misuse row filter and uses a
+defensive eval suite with hallucination checks:
+
+- state uncertainty when evidence is missing
+- do not invent CVE IDs
+- do not claim tests passed without verification evidence
+- do not output exploit steps
+
+Kaggle 1k defensive validation:
+
+```bash
+PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.ultimate.json \
+  --work-dir artifacts/aeitron/defensive-validation-1k-v1 \
+  --kaggle-validation \
+  --curriculum-mode defensive_security_only \
+  --model-profile t4_validation \
+  --checkpoint-compare-prompt-suite artifacts/aeitron/defensive-learning-validation-v1/expanded_eval_suite.jsonl \
+  --checkpoint-compare-repetition-penalty 1.18 \
+  --checkpoint-compare-no-repeat-ngram-size 4 \
+  --checkpoint-compare-max-repetition-ratio 0.72 \
+  --steps 1000 \
+  --sequence-length 128 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --validation-interval 100 \
+  --validation-batches 8 \
+  --early-stopping-patience 5 \
+  --gradient-checkpointing \
+  --progress-to-stdout
+```
+
+After the overfit sanity and 1k validation pass, use the same command with
+`--work-dir artifacts/aeitron/defensive-validation-10k-v1`, `--steps 10000`,
+`--sequence-length 256`, `--validation-interval 250`, and
+`--early-stopping-patience 12`.
+
 Quality gate:
 
 ```bash

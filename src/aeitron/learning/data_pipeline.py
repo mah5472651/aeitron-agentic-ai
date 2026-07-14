@@ -107,6 +107,11 @@ class DataPipelineConfig(StrictModel):
     min_source_rows: int = Field(default=25, ge=1)
     instruction_mix: bool = True
     instruction_mix_max_rows: int | None = Field(default=None, ge=1)
+    curriculum_mode: str = Field(
+        default="balanced",
+        pattern="^(balanced|fundamentals_only|defensive_security_only|debug_patch_only|agentic_coding_only)$",
+    )
+    strict_offensive_filter: bool = True
     contamination_patterns_path: str | None = None
     block_contamination: bool = True
     extract_tasks: bool = True
@@ -573,6 +578,8 @@ async def _run_data_pipeline_locked(
             config=ScratchMixConfig(
                 max_rows=config.instruction_mix_max_rows,
                 min_quality_score=config.min_training_quality_score,
+                curriculum_mode=config.curriculum_mode,
+                strict_offensive_filter=config.strict_offensive_filter,
             ),
         )
         if instruction_mix_report.total_rows == 0:
@@ -719,7 +726,11 @@ async def _run_data_pipeline_locked(
                 candidate_average_score=checkpoint_comparison_report.candidate.average_score,
                 score_delta=checkpoint_comparison_report.score_delta,
             )
-            if checkpoint_comparison_report.status in {"regressed", "failed_generation_collapse"}:
+            if checkpoint_comparison_report.status in {
+                "regressed",
+                "failed_generation_collapse",
+                "failed_hallucination_guardrail",
+            }:
                 raise RuntimeError(
                     f"checkpoint comparison gate failed: {checkpoint_comparison_report.status}"
                 )
@@ -979,6 +990,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-source-rows", type=int, default=25)
     parser.add_argument("--no-instruction-mix", action="store_true")
     parser.add_argument("--instruction-mix-max-rows", type=int)
+    parser.add_argument(
+        "--curriculum-mode",
+        default="balanced",
+        choices=["balanced", "fundamentals_only", "defensive_security_only", "debug_patch_only", "agentic_coding_only"],
+    )
+    parser.add_argument("--allow-offensive-misuse-rows", action="store_true")
     parser.add_argument("--contamination-patterns")
     parser.add_argument("--allow-contamination-hits", action="store_true")
     parser.add_argument("--no-task-extraction", action="store_true")
@@ -1053,6 +1070,8 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         min_source_rows=args.min_source_rows,
         instruction_mix=not args.no_instruction_mix,
         instruction_mix_max_rows=args.instruction_mix_max_rows,
+        curriculum_mode=args.curriculum_mode,
+        strict_offensive_filter=not args.allow_offensive_misuse_rows,
         contamination_patterns_path=args.contamination_patterns,
         block_contamination=not args.allow_contamination_hits,
         extract_tasks=not args.no_task_extraction,

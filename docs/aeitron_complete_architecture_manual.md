@@ -3145,6 +3145,123 @@ The real-data pipeline writes tokenizer audit artifacts at:
 - `reports/tokenizer_audit_report.json`
 - `reports/tokenizer_audit_report.md`
 
+## Curriculum-First Scratch Training
+
+Purpose:
+
+- reduce hallucination and generation collapse by training one capability band
+  at a time
+- start with stable code/security language before mixing agentic workflows
+- keep offensive-security material out of the defensive phase
+
+Supported curriculum modes:
+
+- `fundamentals_only`
+- `defensive_security_only`
+- `debug_patch_only`
+- `agentic_coding_only`
+- `balanced`
+
+Implementation:
+
+- `src/aeitron/learning/mixer.py`
+- `src/aeitron/model_ops/learning_validation.py`
+- `src/aeitron/model_ops/checkpoint_compare.py`
+
+Defensive-only data rules:
+
+- keep only defensive security/coding instruction rows
+- reject offensive misuse rows containing patterns such as reverse shells,
+  shellcode, credential dumping, exfiltration, C2 callbacks, exploit payload
+  instructions, or EDR/AV bypass wording
+- convert accepted rows into prompt/context/answer/patch/tests/verification
+  training text
+
+Defensive hallucination checks:
+
+- if evidence is missing, output must say it cannot confirm or needs more context
+- generated CVE IDs are forbidden unless the prompt already includes that CVE
+- claims such as "tests passed" are forbidden unless verification evidence is
+  present in the prompt
+- exploit steps are forbidden in defensive eval
+
+Generate defensive-only validation assets:
+
+```bash
+python -m src.aeitron.model_ops.learning_validation \
+  --output-dir artifacts/aeitron/defensive-learning-validation-v1 \
+  --instruction-count 100 \
+  --curriculum-mode defensive_security_only \
+  --overfit-steps 300 \
+  --device cuda \
+  --dtype fp16
+```
+
+This writes:
+
+- `instruction_corpus.jsonl`
+- `expanded_eval_suite.jsonl` with 100 defensive prompts
+- `tokenizer_dominance_report.json`
+- `tokenizer_dominance_report.md`
+- `learning_validation_report.json`
+- staged commands for small overfit, 1k Kaggle validation, and 10k Kaggle
+  validation
+
+Kaggle defensive 1k validation:
+
+```bash
+PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.ultimate.json \
+  --work-dir artifacts/aeitron/defensive-validation-1k-v1 \
+  --kaggle-validation \
+  --curriculum-mode defensive_security_only \
+  --model-profile t4_validation \
+  --checkpoint-compare-prompt-suite artifacts/aeitron/defensive-learning-validation-v1/expanded_eval_suite.jsonl \
+  --checkpoint-compare-repetition-penalty 1.18 \
+  --checkpoint-compare-no-repeat-ngram-size 4 \
+  --checkpoint-compare-max-repetition-ratio 0.72 \
+  --steps 1000 \
+  --sequence-length 128 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --validation-interval 100 \
+  --validation-batches 8 \
+  --early-stopping-patience 5 \
+  --gradient-checkpointing \
+  --progress-to-stdout
+```
+
+Kaggle defensive 10k validation:
+
+```bash
+PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \
+  --sources config/data_sources.ultimate.json \
+  --work-dir artifacts/aeitron/defensive-validation-10k-v1 \
+  --kaggle-validation \
+  --curriculum-mode defensive_security_only \
+  --model-profile t4_validation \
+  --checkpoint-compare-prompt-suite artifacts/aeitron/defensive-learning-validation-v1/expanded_eval_suite.jsonl \
+  --checkpoint-compare-repetition-penalty 1.18 \
+  --checkpoint-compare-no-repeat-ngram-size 4 \
+  --checkpoint-compare-max-repetition-ratio 0.72 \
+  --steps 10000 \
+  --sequence-length 256 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --validation-interval 250 \
+  --validation-batches 8 \
+  --early-stopping-patience 12 \
+  --gradient-checkpointing \
+  --progress-to-stdout
+```
+
+Promotion rule:
+
+- small overfit sanity must pass before spending long GPU time
+- 1k defensive validation must pass before 10k
+- 10k checkpoint must not regress, collapse, invent CVEs, claim unverified test
+  success, or produce exploit steps
+
 ## Strict Scanner Bootstrap
 
 Security audit reports now include a scanner install plan. For local Windows
