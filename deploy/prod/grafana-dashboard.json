@@ -8,7 +8,7 @@
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
       "id": 1,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "single"}},
-      "targets": [{"expr": "sum by (status) (mythos_http_requests_total)", "refId": "A"}],
+      "targets": [{"expr": "sum by (status) (aeitron_http_requests_total)", "refId": "A"}],
       "title": "HTTP Requests By Status",
       "type": "timeseries"
     },
@@ -18,16 +18,17 @@
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
       "id": 2,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "single"}},
-      "targets": [{"expr": "mythos_http_request_duration_ms{quantile=\"avg\"}", "refId": "A"}],
+      "targets": [{"expr": "aeitron_http_request_duration_ms{quantile=\"avg\"}", "refId": "A"}],
       "title": "Average HTTP Latency",
       "type": "timeseries"
     }
   ],
   "refresh": "10s",
   "schemaVersion": 39,
-  "tags": ["mythos", "production"],
+  "tags": ["aeitron", "production"],
   "templating": {"list": []},
   "time": {"from": "now-6h", "to": "now"},
   "title": "Aeitron Production Overview",
   "version": 1
 }
+

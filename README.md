@@ -3,7 +3,7 @@
 Aeitron is an AI coding-agent backend for repository understanding, code editing,
 patch verification, and model-agnostic serving.
 
-The final architecture lives under `src/mythos`. The old numbered
+The final architecture lives under `src/aeitron`. The old numbered
 architecture has been removed.
 
 ## Operating Roadmap
@@ -49,7 +49,7 @@ Aeitron follows this roadmap for every future change:
 ## Repository Layout
 
 ```text
-src/mythos/
+src/aeitron/
   agents/
   context/
   db/
@@ -76,19 +76,19 @@ docs/
 ## Quick Check
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_mythos_mvp_foundation.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_aeitron_mvp_foundation.ps1
 ```
 
 ## Start Gateway
 
 ```powershell
-python -m uvicorn src.mythos.gateway.api:app --host 127.0.0.1 --port 8090
+python -m uvicorn src.aeitron.gateway.api:app --host 127.0.0.1 --port 8090
 ```
 
 ## Run CLI
 
 ```powershell
-python -m src.mythos.cli --prompt "fix auth bug" --workspace . --agent-backend-mode mock --no-verifier --no-security
+python -m src.aeitron.cli --prompt "fix auth bug" --workspace . --agent-backend-mode mock --no-verifier --no-security
 ```
 
 ## Repository Intelligence API
@@ -112,9 +112,9 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/tasks/<task_id>/fail -Bo
 Set:
 
 ```powershell
-$env:MYTHOS_MODEL_BACKEND = "aeitron_serving"
-$env:MYTHOS_MODEL_ENDPOINT = "http://127.0.0.1:8000/v1"
-$env:MYTHOS_MODEL_NAME = "aeitron-scratch"
+$env:AEITRON_MODEL_BACKEND = "aeitron_serving"
+$env:AEITRON_MODEL_ENDPOINT = "http://127.0.0.1:8000/v1"
+$env:AEITRON_MODEL_NAME = "aeitron-scratch"
 ```
 
 Then serve a Aeitron-owned scratch checkpoint on GPU hardware.
@@ -138,9 +138,9 @@ training paths. Protected benchmarks stay eval/holdout and are not mixed into
 training.
 
 ```powershell
-python -m src.mythos.learning.mixer --inputs data\training\clean.jsonl --config config\mix_ratios.json --experiment baseline_70_15_15 --output-dir artifacts\\aeitron\mix-baseline
+python -m src.aeitron.learning.mixer --inputs data\training\clean.jsonl --config config\mix_ratios.json --experiment baseline_70_15_15 --output-dir artifacts\\aeitron\mix-baseline
 
-python -m src.mythos.evaluation.eval_runner --checkpoint-manifest artifacts\\aeitron\train\checkpoint_manifest.json --schedule config\eval_schedule.json --output-dir artifacts\\aeitron\eval --tokenizer-path artifacts\\aeitron\tokenizer\tokenizer.json --device cpu
+python -m src.aeitron.evaluation.eval_runner --checkpoint-manifest artifacts\\aeitron\train\checkpoint_manifest.json --schedule config\eval_schedule.json --output-dir artifacts\\aeitron\eval --tokenizer-path artifacts\\aeitron\tokenizer\tokenizer.json --device cpu
 ```
 
 Reports:
@@ -154,20 +154,20 @@ Reports:
 Local deterministic gates:
 
 ```powershell
-python -m src.mythos.db.migration_runner --database-url postgresql://aeitron:pass@localhost:5432/aeitron --dry-run
-python -m src.mythos.deployment.k8s_validate --output-dir artifacts\\aeitron\k8s-validation
-python -m src.mythos.learning.storage --uri local://artifacts/aeitron/object-store --work-dir artifacts\\aeitron\object-store-lifecycle
-python -m src.mythos.learning.dataset_validation --inputs data\training\clean.jsonl --output-dir artifacts\\aeitron\dataset-validation --min-records 100000
-python -m src.mythos.evaluation.benchmark_suites --suite swe swe_bench_style data\eval\swe_style.jsonl --suite cyber cyberseceval_style data\eval\cyber.jsonl --output-dir artifacts\\aeitron\benchmark-suites
-python -m src.mythos.security.audit --no-bandit --output-dir artifacts\\aeitron\security-audit
+python -m src.aeitron.db.migration_runner --database-url postgresql://aeitron:pass@localhost:5432/aeitron --dry-run
+python -m src.aeitron.deployment.k8s_validate --output-dir artifacts\\aeitron\k8s-validation
+python -m src.aeitron.learning.storage --uri local://artifacts/aeitron/object-store --work-dir artifacts\\aeitron\object-store-lifecycle
+python -m src.aeitron.learning.dataset_validation --inputs data\training\clean.jsonl --output-dir artifacts\\aeitron\dataset-validation --min-records 100000
+python -m src.aeitron.evaluation.benchmark_suites --suite swe swe_bench_style data\eval\swe_style.jsonl --suite cyber cyberseceval_style data\eval\cyber.jsonl --output-dir artifacts\\aeitron\benchmark-suites
+python -m src.aeitron.security.audit --no-bandit --output-dir artifacts\\aeitron\security-audit
 ```
 
 Real production commands:
 
 ```powershell
 alembic upgrade head
-python -m src.mythos.deployment.k8s_validate --kubectl-dry-run --output-dir artifacts\\aeitron\k8s-validation
-python -m src.mythos.learning.storage --uri s3://aeitron-datasets/pretraining --endpoint-url http://localhost:9000 --work-dir artifacts\\aeitron\s3-lifecycle
+python -m src.aeitron.deployment.k8s_validate --kubectl-dry-run --output-dir artifacts\\aeitron\k8s-validation
+python -m src.aeitron.learning.storage --uri s3://aeitron-datasets/pretraining --endpoint-url http://localhost:9000 --work-dir artifacts\\aeitron\s3-lifecycle
 python deploy\gpu\run_10k_training_validation.py --manifest artifacts\\aeitron\shards\manifest.json --device cuda --steps 10000
 ```
 
@@ -273,14 +273,14 @@ python deploy/gpu/inspect_real_data_run.py \
 Run the longer scratch pretraining loop:
 
 ```bash
-python -m src.mythos.model_ops.tokenizer_pipeline \
+python -m src.aeitron.model_ops.tokenizer_pipeline \
   --input data/training/clean.jsonl \
   --tokenizer-out artifacts/aeitron/tokenizer/tokenizer.json \
   --shards-out artifacts/aeitron/shards \
   --vocab-size 64000 \
   --sequence-length 128
 
-python -m src.mythos.model_ops.pretrain_loop \
+python -m src.aeitron.model_ops.pretrain_loop \
   --device cuda \
   --manifest artifacts/aeitron/shards/manifest.json \
   --steps 100 \
@@ -311,7 +311,7 @@ Output:
 Allowlisted one-shot ingestion:
 
 ```bash
-python -m src.mythos.learning.web_ingest \
+python -m src.aeitron.learning.web_ingest \
   --sources config/data_sources.ultimate.json \
   --output data/training/raw_web.jsonl \
   --max-docs 1000 \
@@ -322,7 +322,7 @@ Persistent million-scale ingestion with resume/retry, URL discovery, provenance,
 content deduplication, per-domain throttling, and clean JSONL sharding:
 
 ```bash
-python -m src.mythos.learning.data_engine \
+python -m src.aeitron.learning.data_engine \
   --sources config/data_sources.ultimate.json \
   --frontier artifacts/aeitron/data-engine/frontier.sqlite3 \
   --raw-output-dir artifacts/aeitron/data-engine/raw \
@@ -337,10 +337,10 @@ python -m src.mythos.learning.data_engine \
 Postgres-backed distributed frontier:
 
 ```bash
-python -m src.mythos.learning.data_engine \
+python -m src.aeitron.learning.data_engine \
   --sources config/data_sources.ultimate.json \
   --frontier-backend postgres \
-  --postgres-dsn "$MYTHOS_DATABASE_URL" \
+  --postgres-dsn "$AEITRON_DATABASE_URL" \
   --raw-output-dir artifacts/aeitron/data-engine/raw \
   --clean-output-dir artifacts/aeitron/data-engine/clean \
   --max-docs 1000000 \
@@ -350,12 +350,12 @@ python -m src.mythos.learning.data_engine \
 One command for `crawl -> clean -> shard -> train`:
 
 ```bash
-python -m src.mythos.learning.data_pipeline \
+python -m src.aeitron.learning.data_pipeline \
   --sources config/data_sources.ultimate.json \
   --dataset-id aeitron-defensive-coding-corpus \
   --work-dir artifacts/aeitron/data-pipeline \
   --frontier-backend postgres \
-  --postgres-dsn "$MYTHOS_DATABASE_URL" \
+  --postgres-dsn "$AEITRON_DATABASE_URL" \
   --object-store-uri s3://aeitron-datasets/pretraining \
   --object-store-endpoint-url "$S3_ENDPOINT_URL" \
   --max-docs 1000000 \
@@ -381,9 +381,9 @@ Supervised long-running data collection:
 
 ```bash
 docker compose -f deploy/prod/docker-compose.yml --profile data up crawler-supervisor
-python -m src.mythos.learning.supervisor \
+python -m src.aeitron.learning.supervisor \
   --sources config/data_sources.ultimate.json \
-  --postgres-dsn "$MYTHOS_DATABASE_URL" \
+  --postgres-dsn "$AEITRON_DATABASE_URL" \
   --raw-output-dir artifacts/aeitron/data-engine/raw \
   --clean-output-dir artifacts/aeitron/data-engine/clean \
   --object-store-uri s3://aeitron-datasets/pretraining \
@@ -400,10 +400,10 @@ docker compose -f deploy/prod/docker-compose.yml --profile monitoring up prometh
 Production readiness gate:
 
 ```bash
-python -m src.mythos.learning.production_check \
+python -m src.aeitron.learning.production_check \
   --sources config/data_sources.ultimate.json \
   --frontier-backend postgres \
-  --postgres-dsn "$MYTHOS_DATABASE_URL" \
+  --postgres-dsn "$AEITRON_DATABASE_URL" \
   --object-store-uri s3://aeitron-datasets/pretraining \
   --production \
   --worker-replicas 8 \
@@ -413,12 +413,12 @@ python -m src.mythos.learning.production_check \
 Prepare the first serious 100k-1M data run:
 
 ```bash
-python -m src.mythos.learning.run_plan \
+python -m src.aeitron.learning.run_plan \
   --sources config/data_sources.ultimate.json \
   --output-dir artifacts/aeitron/data-runs/first-serious-run \
   --target-documents 1000000 \
   --target-days 7 \
-  --postgres-dsn "$MYTHOS_DATABASE_URL" \
+  --postgres-dsn "$AEITRON_DATABASE_URL" \
   --object-store-uri s3://aeitron-datasets/pretraining \
   --worker-replicas 8 \
   --async-workers 64
@@ -427,7 +427,7 @@ python -m src.mythos.learning.run_plan \
 Training resource priority catalog:
 
 ```bash
-python -m src.mythos.learning.resource_catalog \
+python -m src.aeitron.learning.resource_catalog \
   --catalog config/data_sources.ultimate.json \
   --output artifacts/aeitron/resource_catalog_report.json
 ```
@@ -440,7 +440,7 @@ as evaluation/contamination holdouts instead of raw pretraining rows.
 Cluster capacity planning:
 
 ```bash
-python -m src.mythos.learning.capacity \
+python -m src.aeitron.learning.capacity \
   --target-documents 1000000000 \
   --target-days 30 \
   --worker-replicas 32 \
@@ -478,9 +478,9 @@ Pipeline outputs include:
 Manual/automated review and feedback:
 
 ```bash
-python -m src.mythos.learning.governance --store artifacts/aeitron/governance report
+python -m src.aeitron.learning.governance --store artifacts/aeitron/governance report
 
-python -m src.mythos.learning.governance --store artifacts/aeitron/governance submit-source \
+python -m src.aeitron.learning.governance --store artifacts/aeitron/governance submit-source \
   --source-name portswigger-web-security-academy \
   --category authorized_security_testing_labs \
   --url https://portswigger.net/web-security \
@@ -489,12 +489,12 @@ python -m src.mythos.learning.governance --store artifacts/aeitron/governance su
   --requested-by security-team \
   --justification "High-value authorized web security education source"
 
-python -m src.mythos.learning.review \
+python -m src.aeitron.learning.review \
   --input artifacts/aeitron/data-pipeline/tasks/tasks.jsonl \
   --decisions-out artifacts/aeitron/data-pipeline/reports/task_review_decisions.jsonl \
   --approved-out artifacts/aeitron/data-pipeline/tasks/approved_tasks.jsonl
 
-python -m src.mythos.learning.feedback \
+python -m src.aeitron.learning.feedback \
   --output artifacts/aeitron/data-pipeline/reports/feedback_report.json \
   --quality-report artifacts/aeitron/data-pipeline/reports/quality_report.json \
   --review-report artifacts/aeitron/data-pipeline/reports/task_review_report.json
@@ -508,7 +508,7 @@ Quality gate:
 
 ```bash
 python - <<'PY'
-from src.mythos.learning.quality import DatasetQualityGate
+from src.aeitron.learning.quality import DatasetQualityGate
 print(DatasetQualityGate().filter_jsonl("data/training/raw_web.jsonl", "data/training/clean.jsonl"))
 PY
 ```
@@ -516,22 +516,23 @@ PY
 ## Production Checks
 
 ```powershell
-python -m src.mythos.evaluation.release_gate
-python -m src.mythos.db.migration_runner --database-url $env:MYTHOS_DATABASE_URL --dry-run
+python -m src.aeitron.evaluation.release_gate
+python -m src.aeitron.db.migration_runner --database-url $env:AEITRON_DATABASE_URL --dry-run
 ```
 
 Production API hardening requires:
 
 ```powershell
-$env:MYTHOS_AUTH_ENABLED = "1"
-$env:MYTHOS_JWT_SECRET = "<long-random-secret>"
-$env:MYTHOS_ALLOW_TOKEN_ISSUE = "0"
-$env:MYTHOS_QUOTA_ENABLED = "1"
-$env:MYTHOS_REDIS_URL = "redis://redis:6379/0"
+$env:AEITRON_AUTH_ENABLED = "1"
+$env:AEITRON_JWT_SECRET = "<long-random-secret>"
+$env:AEITRON_ALLOW_TOKEN_ISSUE = "0"
+$env:AEITRON_QUOTA_ENABLED = "1"
+$env:AEITRON_REDIS_URL = "redis://redis:6379/0"
 ```
 
 ## Final Rule
 
-All new production code belongs under `src/mythos`.
+All new production code belongs under `src/aeitron`.
+
 
 

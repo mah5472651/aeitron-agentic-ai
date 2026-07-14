@@ -1,42 +1,42 @@
-apiVersion: apps/v1
+﻿apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mythos-api
+  name: aeitron-api
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: mythos-api
+      app: aeitron-api
   template:
     metadata:
       labels:
-        app: mythos-api
+        app: aeitron-api
     spec:
       containers:
         - name: api
-          image: mythos-api:latest
+          image: aeitron-api:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8090
           env:
-            - name: MYTHOS_AUTH_ENABLED
+            - name: AEITRON_AUTH_ENABLED
               value: "1"
-            - name: MYTHOS_QUOTA_ENABLED
+            - name: AEITRON_QUOTA_ENABLED
               value: "1"
-            - name: MYTHOS_JWT_SECRET
+            - name: AEITRON_JWT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: mythos-secrets
+                  name: aeitron-secrets
                   key: jwt-secret
-            - name: MYTHOS_ALLOW_TOKEN_ISSUE
+            - name: AEITRON_ALLOW_TOKEN_ISSUE
               value: "0"
-            - name: MYTHOS_DATABASE_URL
+            - name: AEITRON_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: mythos-secrets
+                  name: aeitron-secrets
                   key: database-url
-            - name: MYTHOS_REDIS_URL
-              value: redis://mythos-redis:6379/0
+            - name: AEITRON_REDIS_URL
+              value: redis://aeitron-redis:6379/0
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -60,10 +60,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: mythos-api
+  name: aeitron-api
 spec:
   selector:
-    app: mythos-api
+    app: aeitron-api
   ports:
     - port: 80
       targetPort: 8090
+

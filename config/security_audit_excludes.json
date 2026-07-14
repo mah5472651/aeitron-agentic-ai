@@ -1,7 +1,7 @@
-{
+﻿{
   "excludes": [
     {
-      "path": "src/mythos/evaluation/benchmarks.py",
+      "path": "src/aeitron/evaluation/benchmarks.py",
       "reason": "Contains intentionally vulnerable benchmark fixture strings used by local security evaluation adapters.",
       "risk_category": "benchmark_fixture",
       "allow_executable_sinks": true
@@ -14,3 +14,4 @@
     }
   ]
 }
+

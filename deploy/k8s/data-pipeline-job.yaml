@@ -1,7 +1,7 @@
 ﻿apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mythos-data-pipeline
+  name: aeitron-data-pipeline
 spec:
   backoffLimit: 1
   template:
@@ -9,12 +9,12 @@ spec:
       restartPolicy: Never
       containers:
         - name: pipeline
-          image: mythos-api:latest
+          image: aeitron-api:latest
           imagePullPolicy: IfNotPresent
           command:
             - python
             - -m
-            - src.mythos.learning.data_pipeline
+            - src.aeitron.learning.data_pipeline
           args:
             - --sources
             - config/data_sources.ultimate.json
@@ -25,11 +25,11 @@ spec:
             - --frontier-backend
             - postgres
             - --postgres-dsn
-            - "$(MYTHOS_DATABASE_URL)"
+            - "$(AEITRON_DATABASE_URL)"
             - --object-store-uri
-            - s3://mythos-datasets/pretraining
+            - s3://aeitron-datasets/pretraining
             - --object-store-endpoint-url
-            - http://mythos-minio:9000
+            - http://aeitron-minio:9000
             - --max-docs
             - "1000000"
             - --workers
@@ -44,20 +44,20 @@ spec:
             - "1000000"
             - --skip-train
           env:
-            - name: MYTHOS_DATABASE_URL
+            - name: AEITRON_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: mythos-secrets
+                  name: aeitron-secrets
                   key: database-url
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
-                  name: mythos-secrets
+                  name: aeitron-secrets
                   key: minio-root-user
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: mythos-secrets
+                  name: aeitron-secrets
                   key: minio-root-password
             - name: AWS_EC2_METADATA_DISABLED
               value: "true"
@@ -74,4 +74,5 @@ spec:
       volumes:
         - name: data-artifacts
           persistentVolumeClaim:
-            claimName: mythos-data-artifacts
+            claimName: aeitron-data-artifacts
+

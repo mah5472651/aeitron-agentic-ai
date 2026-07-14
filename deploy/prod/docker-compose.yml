@@ -1,11 +1,11 @@
-services:
+﻿services:
   migrator:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: ["python", "-m", "src.mythos.db.migration_runner"]
+    command: ["python", "-m", "src.aeitron.db.migration_runner"]
     environment:
-      MYTHOS_DATABASE_URL: "postgresql://mythos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/mythos"
+      AEITRON_DATABASE_URL: "postgresql://aeitron:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/aeitron"
     depends_on:
       postgres:
         condition: service_healthy
@@ -16,12 +16,12 @@ services:
     ports:
       - "8090:8090"
     environment:
-      MYTHOS_AUTH_ENABLED: "1"
-      MYTHOS_QUOTA_ENABLED: "1"
-      MYTHOS_JWT_SECRET: "${MYTHOS_JWT_SECRET:?set MYTHOS_JWT_SECRET}"
-      MYTHOS_ALLOW_TOKEN_ISSUE: "0"
-      MYTHOS_DATABASE_URL: "postgresql://mythos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/mythos"
-      MYTHOS_REDIS_URL: "redis://redis:6379/0"
+      AEITRON_AUTH_ENABLED: "1"
+      AEITRON_QUOTA_ENABLED: "1"
+      AEITRON_JWT_SECRET: "${AEITRON_JWT_SECRET:?set AEITRON_JWT_SECRET}"
+      AEITRON_ALLOW_TOKEN_ISSUE: "0"
+      AEITRON_DATABASE_URL: "postgresql://aeitron:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/aeitron"
+      AEITRON_REDIS_URL: "redis://redis:6379/0"
     depends_on:
       postgres:
         condition: service_healthy
@@ -40,15 +40,15 @@ services:
       context: ../..
       dockerfile: Dockerfile
     profiles: ["data"]
-    command: ["python", "-m", "src.mythos.learning.worker"]
+    command: ["python", "-m", "src.aeitron.learning.worker"]
     environment:
-      MYTHOS_DATABASE_URL: "postgresql://mythos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/mythos"
-      MYTHOS_DATA_SOURCES: "config/data_sources.ultimate.json"
-      MYTHOS_RAW_OUTPUT_DIR: "/data/raw"
-      MYTHOS_CLEAN_OUTPUT_DIR: "/data/clean"
-      MYTHOS_ASYNC_WORKERS: "32"
-      MYTHOS_BATCH_DOCS: "10000"
-      MYTHOS_WORKER_LOOPS: "100"
+      AEITRON_DATABASE_URL: "postgresql://aeitron:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/aeitron"
+      AEITRON_DATA_SOURCES: "config/data_sources.ultimate.json"
+      AEITRON_RAW_OUTPUT_DIR: "/data/raw"
+      AEITRON_CLEAN_OUTPUT_DIR: "/data/clean"
+      AEITRON_ASYNC_WORKERS: "32"
+      AEITRON_BATCH_DOCS: "10000"
+      AEITRON_WORKER_LOOPS: "100"
     volumes:
       - data-artifacts:/data
     depends_on:
@@ -63,16 +63,16 @@ services:
       context: ../..
       dockerfile: Dockerfile
     profiles: ["data"]
-    command: ["python", "-m", "src.mythos.learning.supervisor"]
+    command: ["python", "-m", "src.aeitron.learning.supervisor"]
     environment:
-      MYTHOS_DATABASE_URL: "postgresql://mythos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/mythos"
-      MYTHOS_DATA_SOURCES: "config/data_sources.ultimate.json"
-      MYTHOS_RAW_OUTPUT_DIR: "/data/raw"
-      MYTHOS_CLEAN_OUTPUT_DIR: "/data/clean"
-      MYTHOS_OBJECT_STORE_URI: "s3://mythos-datasets/pretraining"
-      MYTHOS_ASYNC_WORKERS: "32"
-      MYTHOS_WORKER_REPLICAS: "4"
-      MYTHOS_BATCH_DOCS: "10000"
+      AEITRON_DATABASE_URL: "postgresql://aeitron:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/aeitron"
+      AEITRON_DATA_SOURCES: "config/data_sources.ultimate.json"
+      AEITRON_RAW_OUTPUT_DIR: "/data/raw"
+      AEITRON_CLEAN_OUTPUT_DIR: "/data/clean"
+      AEITRON_OBJECT_STORE_URI: "s3://aeitron-datasets/pretraining"
+      AEITRON_ASYNC_WORKERS: "32"
+      AEITRON_WORKER_REPLICAS: "4"
+      AEITRON_BATCH_DOCS: "10000"
       AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER:?set MINIO_ROOT_USER}"
       AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
       AWS_EC2_METADATA_DISABLED: "true"
@@ -107,7 +107,7 @@ services:
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/mythos.json:ro
+      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/aeitron.json:ro
     depends_on:
       - prometheus
   otel-collector:
@@ -121,13 +121,13 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: mythos
+      POSTGRES_USER: aeitron
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
-      POSTGRES_DB: mythos
+      POSTGRES_DB: aeitron
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mythos -d mythos"]
+      test: ["CMD-SHELL", "pg_isready -U aeitron -d aeitron"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -160,9 +160,9 @@ services:
     entrypoint: ["/bin/sh", "-lc"]
     command:
       - |
-        until mc alias set mythos http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do sleep 2; done
-        mc mb --ignore-existing mythos/mythos-datasets
-        mc anonymous set none mythos/mythos-datasets
+        until mc alias set aeitron http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do sleep 2; done
+        mc mb --ignore-existing aeitron/aeitron-datasets
+        mc anonymous set none aeitron/aeitron-datasets
     environment:
       MINIO_ROOT_USER: "${MINIO_ROOT_USER:?set MINIO_ROOT_USER}"
       MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
@@ -174,3 +174,4 @@ volumes:
   data-artifacts:
   prometheus-data:
   grafana-data:
+

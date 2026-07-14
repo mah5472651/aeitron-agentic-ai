@@ -1,7 +1,7 @@
 ﻿[
   {
     "name": "aeitron-7b-scratch",
-    "family": "mythos_decoder",
+    "family": "aeitron_decoder",
     "model_path": "artifacts/aeitron/checkpoints/aeitron-7b",
     "size_class": "7B",
     "role": "first scratch pretraining target",
@@ -12,7 +12,7 @@
   },
   {
     "name": "aeitron-32b-scratch",
-    "family": "mythos_decoder",
+    "family": "aeitron_decoder",
     "model_path": "artifacts/aeitron/checkpoints/aeitron-32b",
     "size_class": "32B",
     "role": "serious coding/security target after 7B pipeline is stable",
@@ -23,7 +23,7 @@
   },
   {
     "name": "aeitron-62b-scratch",
-    "family": "mythos_decoder",
+    "family": "aeitron_decoder",
     "model_path": "artifacts/aeitron/checkpoints/aeitron-62b",
     "size_class": "62B",
     "role": "long-context coding/security production target before 70B",
@@ -38,7 +38,7 @@
   },
   {
     "name": "aeitron-70b-scratch",
-    "family": "mythos_decoder",
+    "family": "aeitron_decoder",
     "model_path": "artifacts/aeitron/checkpoints/aeitron-70b",
     "size_class": "70B",
     "role": "large-scale production quality target",
@@ -49,7 +49,7 @@
   },
   {
     "name": "aeitron-100b-scratch",
-    "family": "mythos_decoder",
+    "family": "aeitron_decoder",
     "model_path": "artifacts/aeitron/checkpoints/aeitron-100b",
     "size_class": "100B",
     "role": "frontier-scale research target",
@@ -59,3 +59,4 @@
     "training_policy": "scratch pretraining only"
   }
 ]
+

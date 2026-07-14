@@ -1,4 +1,4 @@
-name: mythos-ci
+﻿name: aeitron-ci
 
 on:
   push:
@@ -19,42 +19,43 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-local-dev.txt
       - name: Compile
-        run: python -m compileall -q src/mythos tests
+        run: python -m compileall -q src/aeitron tests
       - name: Release gate
-        run: python -m src.mythos.evaluation.release_gate
+        run: python -m src.aeitron.evaluation.release_gate
       - name: Production hardening gates
         run: |
-          python -m src.mythos.deployment.k8s_validate --output-dir artifacts/mythos/ci-k8s-validation
-          python -m src.mythos.learning.storage --uri local://artifacts/mythos/ci-object-store --work-dir artifacts/mythos/ci-storage-lifecycle
-          mkdir -p artifacts/mythos/ci-dataset
-          cat > artifacts/mythos/ci-dataset/clean.jsonl <<'JSONL'
-          {"text":"General architecture documentation for Mythos production systems.","license":"mit","category":"general","quality":{"labels":["documentation"]}}
+          python -m src.aeitron.deployment.k8s_validate --output-dir artifacts/aeitron/ci-k8s-validation
+          python -m src.aeitron.learning.storage --uri local://artifacts/aeitron/ci-object-store --work-dir artifacts/aeitron/ci-storage-lifecycle
+          mkdir -p artifacts/aeitron/ci-dataset
+          cat > artifacts/aeitron/ci-dataset/clean.jsonl <<'JSONL'
+          {"text":"General architecture documentation for Aeitron production systems.","license":"mit","category":"general","quality":{"labels":["documentation"]}}
           {"text":"def secure_query(cursor, value): return cursor.execute('select * from users where id=?', [value])","license":"apache-2.0","category":"code","quality":{"labels":["code"]}}
           {"text":"Defensive security guidance: prevent SQL injection with parameterized queries and regression tests.","license":"cc-by-4.0","category":"cybersecurity","quality":{"labels":["defensive_security"]}}
           JSONL
-          python -m src.mythos.learning.dataset_validation --inputs artifacts/mythos/ci-dataset/clean.jsonl --output-dir artifacts/mythos/ci-dataset-validation --min-records 3 --min-avg-chars 20
-          python -m src.mythos.security.audit --no-bandit --output-dir artifacts/mythos/ci-security-audit
+          python -m src.aeitron.learning.dataset_validation --inputs artifacts/aeitron/ci-dataset/clean.jsonl --output-dir artifacts/aeitron/ci-dataset-validation --min-records 3 --min-avg-chars 20
+          python -m src.aeitron.security.audit --no-bandit --output-dir artifacts/aeitron/ci-security-audit
       - name: Data platform readiness contract
         run: |
-          python -m src.mythos.learning.production_check \
+          python -m src.aeitron.learning.production_check \
             --sources config/data_sources.ultimate.json \
             --frontier-backend postgres \
-            --postgres-dsn postgresql://user:pass@postgres:5432/mythos \
-            --object-store-uri s3://mythos-datasets/pretraining \
+            --postgres-dsn postgresql://user:pass@postgres:5432/aeitron \
+            --object-store-uri s3://aeitron-datasets/pretraining \
             --production \
             --worker-replicas 4 \
             --async-workers 32
-          python -m src.mythos.learning.capacity --target-documents 1000000 --worker-replicas 4 --async-workers-per-replica 16
-          python -m src.mythos.learning.run_plan \
+          python -m src.aeitron.learning.capacity --target-documents 1000000 --worker-replicas 4 --async-workers-per-replica 16
+          python -m src.aeitron.learning.run_plan \
             --sources config/data_sources.ultimate.json \
-            --output-dir artifacts/mythos/ci-data-run \
+            --output-dir artifacts/aeitron/ci-data-run \
             --target-documents 1000 \
             --target-days 1 \
-            --postgres-dsn postgresql://user:pass@postgres:5432/mythos \
-            --object-store-uri s3://mythos-datasets/pretraining \
+            --postgres-dsn postgresql://user:pass@postgres:5432/aeitron \
+            --object-store-uri s3://aeitron-datasets/pretraining \
             --worker-replicas 4 \
             --async-workers 32
-          python -m src.mythos.learning.source_registry --sources config/data_sources.ultimate.json
-          python -m src.mythos.learning.governance --store artifacts/mythos/ci-governance report
+          python -m src.aeitron.learning.source_registry --sources config/data_sources.ultimate.json
+          python -m src.aeitron.learning.governance --store artifacts/aeitron/ci-governance report
       - name: Scratch CPU smoke
-        run: python -m src.mythos.model_ops.gpu_smoke --device cpu --steps 1 --sequence-length 16 --batch-size 1 --dtype fp32
+        run: python -m src.aeitron.model_ops.gpu_smoke --device cpu --steps 1 --sequence-length 16 --batch-size 1 --dtype fp32
+

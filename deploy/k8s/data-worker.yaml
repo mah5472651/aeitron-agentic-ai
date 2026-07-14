@@ -1,39 +1,39 @@
-apiVersion: apps/v1
+﻿apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mythos-data-worker
+  name: aeitron-data-worker
 spec:
   replicas: 4
   selector:
     matchLabels:
-      app: mythos-data-worker
+      app: aeitron-data-worker
   template:
     metadata:
       labels:
-        app: mythos-data-worker
+        app: aeitron-data-worker
     spec:
       containers:
         - name: crawler
-          image: mythos-api:latest
+          image: aeitron-api:latest
           imagePullPolicy: IfNotPresent
-          command: ["python", "-m", "src.mythos.learning.worker"]
+          command: ["python", "-m", "src.aeitron.learning.worker"]
           env:
-            - name: MYTHOS_DATABASE_URL
+            - name: AEITRON_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: mythos-secrets
+                  name: aeitron-secrets
                   key: database-url
-            - name: MYTHOS_DATA_SOURCES
+            - name: AEITRON_DATA_SOURCES
               value: config/data_sources.ultimate.json
-            - name: MYTHOS_RAW_OUTPUT_DIR
+            - name: AEITRON_RAW_OUTPUT_DIR
               value: /data/raw
-            - name: MYTHOS_CLEAN_OUTPUT_DIR
+            - name: AEITRON_CLEAN_OUTPUT_DIR
               value: /data/clean
-            - name: MYTHOS_ASYNC_WORKERS
+            - name: AEITRON_ASYNC_WORKERS
               value: "32"
-            - name: MYTHOS_BATCH_DOCS
+            - name: AEITRON_BATCH_DOCS
               value: "10000"
-            - name: MYTHOS_WORKER_LOOPS
+            - name: AEITRON_WORKER_LOOPS
               value: "100"
           volumeMounts:
             - name: data-artifacts
@@ -48,14 +48,15 @@ spec:
       volumes:
         - name: data-artifacts
           persistentVolumeClaim:
-            claimName: mythos-data-artifacts
+            claimName: aeitron-data-artifacts
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: mythos-data-artifacts
+  name: aeitron-data-artifacts
 spec:
   accessModes: ["ReadWriteMany"]
   resources:
     requests:
       storage: 1Ti
+

@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.mythos.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints  # noqa: E402
+from src.aeitron.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,3 +77,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -1,4 +1,4 @@
-{
+﻿{
   "profile": {
     "name": "mock-local",
     "kind": "local",
@@ -14,10 +14,11 @@
     ]
   },
   "env": {
-    "MYTHOS_ACTIVE_PROFILE": "mock-local",
-    "MYTHOS_MODEL_BACKEND": "mock",
-    "MYTHOS_MODEL_ENDPOINT": "",
-    "MYTHOS_MODEL_NAME": "mock"
+    "AEITRON_ACTIVE_PROFILE": "mock-local",
+    "AEITRON_MODEL_BACKEND": "mock",
+    "AEITRON_MODEL_ENDPOINT": "",
+    "AEITRON_MODEL_NAME": "mock"
   },
-  "run_id": "mythos-profile-local"
+  "run_id": "aeitron-profile-local"
 }
+

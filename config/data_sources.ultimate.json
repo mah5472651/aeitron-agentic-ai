@@ -1,5 +1,5 @@
 ﻿{
-  "description": "Canonical Mythos data source registry. The `sources` list is crawl-ready and license-gated. Other sections are advisory/API metadata and review queues; they are not crawled by SourceRegistry until promoted into `sources` after legal/source approval.",
+  "description": "Canonical Aeitron data source registry. The `sources` list is crawl-ready and license-gated. Other sections are advisory/API metadata and review queues; they are not crawled by SourceRegistry until promoted into `sources` after legal/source approval.",
   "sources": [
     {
       "allowed_domains": [
@@ -991,3 +991,4 @@
     }
   ]
 }
+

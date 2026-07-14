@@ -1,4 +1,5 @@
-$env:MYTHOS_ACTIVE_PROFILE = 'mock-local'
-$env:MYTHOS_MODEL_BACKEND = 'mock'
-$env:MYTHOS_MODEL_ENDPOINT = ''
-$env:MYTHOS_MODEL_NAME = 'mock'
+﻿$env:AEITRON_ACTIVE_PROFILE = 'mock-local'
+$env:AEITRON_MODEL_BACKEND = 'mock'
+$env:AEITRON_MODEL_ENDPOINT = ''
+$env:AEITRON_MODEL_NAME = 'mock'
+

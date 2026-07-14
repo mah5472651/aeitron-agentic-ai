@@ -1,31 +1,31 @@
-apiVersion: apps/v1
+﻿apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: mythos-postgres
+  name: aeitron-postgres
 spec:
-  serviceName: mythos-postgres
+  serviceName: aeitron-postgres
   replicas: 1
   selector:
     matchLabels:
-      app: mythos-postgres
+      app: aeitron-postgres
   template:
     metadata:
       labels:
-        app: mythos-postgres
+        app: aeitron-postgres
     spec:
       containers:
         - name: postgres
           image: postgres:16
           env:
             - name: POSTGRES_USER
-              value: mythos
+              value: aeitron
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: mythos-secrets
+                  name: aeitron-secrets
                   key: postgres-password
             - name: POSTGRES_DB
-              value: mythos
+              value: aeitron
           ports:
             - containerPort: 5432
           resources:
@@ -50,10 +50,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: mythos-postgres
+  name: aeitron-postgres
 spec:
   selector:
-    app: mythos-postgres
+    app: aeitron-postgres
   ports:
     - port: 5432
       targetPort: 5432
@@ -61,16 +61,16 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mythos-redis
+  name: aeitron-redis
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mythos-redis
+      app: aeitron-redis
   template:
     metadata:
       labels:
-        app: mythos-redis
+        app: aeitron-redis
     spec:
       containers:
         - name: redis
@@ -89,10 +89,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: mythos-redis
+  name: aeitron-redis
 spec:
   selector:
-    app: mythos-redis
+    app: aeitron-redis
   ports:
     - port: 6379
       targetPort: 6379
+
