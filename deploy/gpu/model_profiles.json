@@ -1,62 +1,74 @@
 ﻿[
-  {
-    "name": "aeitron-7b-scratch",
-    "family": "aeitron_decoder",
-    "model_path": "artifacts/aeitron/checkpoints/aeitron-7b",
-    "size_class": "7B",
-    "role": "first scratch pretraining target",
-    "recommended_tp_size": 1,
-    "max_model_len": 65536,
-    "bf16_inference_vram_gb": 24,
-    "training_policy": "scratch pretraining only"
-  },
-  {
-    "name": "aeitron-32b-scratch",
-    "family": "aeitron_decoder",
-    "model_path": "artifacts/aeitron/checkpoints/aeitron-32b",
-    "size_class": "32B",
-    "role": "serious coding/security target after 7B pipeline is stable",
-    "recommended_tp_size": 2,
-    "max_model_len": 131072,
-    "bf16_inference_vram_gb": 96,
-    "training_policy": "scratch pretraining only"
-  },
-  {
-    "name": "aeitron-62b-scratch",
-    "family": "aeitron_decoder",
-    "model_path": "artifacts/aeitron/checkpoints/aeitron-62b",
-    "size_class": "62B",
-    "role": "long-context coding/security production target before 70B",
-    "recommended_tp_size": 4,
-    "recommended_pipeline_parallel_size": 2,
-    "recommended_zero_stage": 3,
-    "max_model_len": 262144,
-    "bf16_inference_vram_gb": 144,
-    "training_policy": "scratch pretraining only",
-    "attention_impl": "sdpa_or_flash",
-    "requires_cluster_validation": true
-  },
-  {
-    "name": "aeitron-70b-scratch",
-    "family": "aeitron_decoder",
-    "model_path": "artifacts/aeitron/checkpoints/aeitron-70b",
-    "size_class": "70B",
-    "role": "large-scale production quality target",
-    "recommended_tp_size": 4,
-    "max_model_len": 131072,
-    "bf16_inference_vram_gb": 160,
-    "training_policy": "scratch pretraining only"
-  },
-  {
-    "name": "aeitron-100b-scratch",
-    "family": "aeitron_decoder",
-    "model_path": "artifacts/aeitron/checkpoints/aeitron-100b",
-    "size_class": "100B",
-    "role": "frontier-scale research target",
-    "recommended_tp_size": 8,
-    "max_model_len": 131072,
-    "bf16_inference_vram_gb": 240,
-    "training_policy": "scratch pretraining only"
-  }
+    {
+        "name":  "aeitron-t4-validation",
+        "family":  "aeitron_decoder",
+        "model_path":  "artifacts/aeitron/checkpoints/aeitron-t4-validation",
+        "size_class":  "T4-validation",
+        "role":  "single-GPU learning validation after overfit sanity passes",
+        "recommended_tp_size":  1,
+        "max_model_len":  2048,
+        "hidden_size":  512,
+        "num_layers":  8,
+        "bf16_inference_vram_gb":  2,
+        "training_policy":  "scratch pretraining validation only"
+    },
+    {
+        "name":  "aeitron-7b-scratch",
+        "family":  "aeitron_decoder",
+        "model_path":  "artifacts/aeitron/checkpoints/aeitron-7b",
+        "size_class":  "7B",
+        "role":  "first scratch pretraining target",
+        "recommended_tp_size":  1,
+        "max_model_len":  65536,
+        "bf16_inference_vram_gb":  24,
+        "training_policy":  "scratch pretraining only"
+    },
+    {
+        "name":  "aeitron-32b-scratch",
+        "family":  "aeitron_decoder",
+        "model_path":  "artifacts/aeitron/checkpoints/aeitron-32b",
+        "size_class":  "32B",
+        "role":  "serious coding/security target after 7B pipeline is stable",
+        "recommended_tp_size":  2,
+        "max_model_len":  131072,
+        "bf16_inference_vram_gb":  96,
+        "training_policy":  "scratch pretraining only"
+    },
+    {
+        "name":  "aeitron-62b-scratch",
+        "family":  "aeitron_decoder",
+        "model_path":  "artifacts/aeitron/checkpoints/aeitron-62b",
+        "size_class":  "62B",
+        "role":  "long-context coding/security production target before 70B",
+        "recommended_tp_size":  4,
+        "recommended_pipeline_parallel_size":  2,
+        "recommended_zero_stage":  3,
+        "max_model_len":  262144,
+        "bf16_inference_vram_gb":  144,
+        "training_policy":  "scratch pretraining only",
+        "attention_impl":  "sdpa_or_flash",
+        "requires_cluster_validation":  true
+    },
+    {
+        "name":  "aeitron-70b-scratch",
+        "family":  "aeitron_decoder",
+        "model_path":  "artifacts/aeitron/checkpoints/aeitron-70b",
+        "size_class":  "70B",
+        "role":  "large-scale production quality target",
+        "recommended_tp_size":  4,
+        "max_model_len":  131072,
+        "bf16_inference_vram_gb":  160,
+        "training_policy":  "scratch pretraining only"
+    },
+    {
+        "name":  "aeitron-100b-scratch",
+        "family":  "aeitron_decoder",
+        "model_path":  "artifacts/aeitron/checkpoints/aeitron-100b",
+        "size_class":  "100B",
+        "role":  "frontier-scale research target",
+        "recommended_tp_size":  8,
+        "max_model_len":  131072,
+        "bf16_inference_vram_gb":  240,
+        "training_policy":  "scratch pretraining only"
+    }
 ]
-

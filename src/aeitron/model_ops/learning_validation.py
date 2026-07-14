@@ -1,0 +1,598 @@
+"""Learning validation control plane for Aeitron scratch checkpoints.
+
+This module owns the practical question after a training run: did the scratch
+model learn anything useful, or did the pipeline merely run?  It intentionally
+keeps the validation pieces together so the operator can run one command and
+receive concrete evidence:
+
+* a structured instruction-style scratch corpus,
+* tokenizer dominance/efficiency audit,
+* overfit sanity training on a controlled corpus,
+* expanded coding/security/debugging prompt suite,
+* a larger single-GPU validation profile plan for T4/L4/A100 class hardware.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import statistics
+import time
+from collections import Counter
+from pathlib import Path
+from typing import Any, Iterable
+
+from pydantic import Field
+
+from src.aeitron.model_ops.pretrain_loop import run_pretraining_loop
+from src.aeitron.model_ops.tokenizer_pipeline import (
+    ShardBuildConfig,
+    TokenizerTrainConfig,
+    build_token_shards,
+    load_tokenizer,
+    train_bpe_tokenizer,
+)
+from src.aeitron.shared.schemas import StrictModel
+
+
+INSTRUCTION_CATEGORIES = [
+    "defensive_security",
+    "agentic_coding",
+    "debugging",
+    "patch_generation",
+    "repository_reasoning",
+]
+
+SECURITY_PATTERNS = [
+    {
+        "name": "sql_injection",
+        "bug": "string-concatenated SQL query",
+        "risk": "SQL injection can alter query intent and expose user data",
+        "bad_code": "cursor.execute('SELECT * FROM users WHERE name=' + user_input)",
+        "patch": "cursor.execute('SELECT * FROM users WHERE name = ?', (user_input,))",
+        "tests": "assert query_uses_bound_parameters(); assert malicious_input_is_treated_as_data()",
+        "terms": ["sql", "injection", "parameter", "query"],
+    },
+    {
+        "name": "xss_inner_html",
+        "bug": "untrusted hash copied into innerHTML",
+        "risk": "DOM XSS can execute attacker-controlled script in the browser",
+        "bad_code": "document.body.innerHTML = location.hash.substring(1)",
+        "patch": "document.body.textContent = location.hash.substring(1)",
+        "tests": "assert script_tags_render_as_text(); assert textContent_is_used()",
+        "terms": ["xss", "escape", "textcontent", "sanitize"],
+    },
+    {
+        "name": "empty_password",
+        "bug": "login accepts empty passwords",
+        "risk": "authentication bypass or weak account validation",
+        "bad_code": "if verify(user, password): return create_session(user)",
+        "patch": "if not password: raise ValueError('password required')\nif verify(user, password): return create_session(user)",
+        "tests": "assert empty_password_is_rejected(); assert valid_password_still_logs_in()",
+        "terms": ["password", "empty", "validation", "test"],
+    },
+    {
+        "name": "path_traversal",
+        "bug": "user-controlled path is joined without canonical root check",
+        "risk": "path traversal can read files outside the workspace",
+        "bad_code": "return Path(root, user_path).read_text()",
+        "patch": "target = Path(root, user_path).resolve()\nif not target.is_relative_to(Path(root).resolve()): raise ValueError('outside root')\nreturn target.read_text()",
+        "tests": "assert dotdot_paths_are_rejected(); assert normal_project_file_reads()",
+        "terms": ["path", "traversal", "resolve", "root"],
+    },
+    {
+        "name": "command_injection",
+        "bug": "shell command includes raw user input",
+        "risk": "command injection can run unintended host commands",
+        "bad_code": "subprocess.run('grep ' + pattern + ' file.txt', shell=True)",
+        "patch": "subprocess.run(['grep', '--', pattern, 'file.txt'], shell=False, check=False)",
+        "tests": "assert shell_false(); assert metacharacters_are_literals()",
+        "terms": ["command", "injection", "argv", "shell"],
+    },
+    {
+        "name": "none_attribute_error",
+        "bug": "None object is dereferenced before validation",
+        "risk": "runtime crash and missing defensive input checks",
+        "bad_code": "print(user.name)",
+        "patch": "if user is None: raise ValueError('user required')\nprint(user.name)",
+        "tests": "assert none_user_raises_clear_error(); assert real_user_prints_name()",
+        "terms": ["none", "attributeerror", "check", "fix"],
+    },
+    {
+        "name": "jwt_middleware",
+        "bug": "API lacks authenticated request verification",
+        "risk": "unauthorized users can call protected routes",
+        "bad_code": "app.post('/admin')(admin_handler)",
+        "patch": "Add JWT middleware that validates signature, expiry, issuer, audience, and required scopes before route execution.",
+        "tests": "assert missing_token_is_401(); assert invalid_scope_is_403(); assert valid_token_passes()",
+        "terms": ["jwt", "middleware", "scope", "verify"],
+    },
+    {
+        "name": "ssrf_fetch",
+        "bug": "server fetches arbitrary user-provided URL",
+        "risk": "SSRF can access internal metadata or private services",
+        "bad_code": "return httpx.get(user_url).text",
+        "patch": "Validate scheme and host against an allowlist, block private IP ranges, and apply timeouts before fetching.",
+        "tests": "assert_private_ip_blocked(); assert_allowed_host_succeeds(); assert_timeout_is_set()",
+        "terms": ["ssrf", "allowlist", "private", "timeout"],
+    },
+]
+
+
+class InstructionRecord(StrictModel):
+    task_id: str
+    category: str
+    prompt: str
+    analysis_target: str
+    correct_answer: str
+    code_patch: str
+    tests: str
+    verification_result: str
+    expected_terms: list[str]
+    source: str = "aeitron_controlled_instruction_corpus"
+    license: str = "internal-validation"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def training_text(self) -> str:
+        return (
+            "<|thought_start|>\n"
+            f"Task: {self.prompt}\n"
+            f"Analysis target: {self.analysis_target}\n"
+            f"Correct answer: {self.correct_answer}\n"
+            "<|thought_end|>\n"
+            "<|patch_start|>\n"
+            f"{self.code_patch}\n"
+            "<|patch_end|>\n"
+            f"Tests:\n{self.tests}\n"
+            f"Verification result: {self.verification_result}\n"
+        )
+
+
+class TokenDominance(StrictModel):
+    total_tokens: int
+    unique_tokens: int
+    top_tokens: list[dict[str, Any]]
+    dot_fraction: float
+    whitespace_fraction: float
+    newline_fraction: float
+    alphanumeric_fraction: float
+    special_token_missing: list[str]
+    sample_efficiency: dict[str, int]
+    status: str
+    warnings: list[str]
+
+
+class OverfitSanityReport(StrictModel):
+    status: str
+    reason: str
+    corpus_path: str
+    tokenizer_path: str
+    shard_manifest: str
+    training_report: dict[str, Any]
+    loss_first: float
+    loss_final: float
+    loss_best: float
+    relative_loss_drop: float
+    required_relative_loss_drop: float
+    eval_suite_path: str
+
+
+class LearningValidationReport(StrictModel):
+    status: str
+    output_dir: str
+    created_at_unix: float
+    instruction_corpus_path: str
+    expanded_eval_suite_path: str
+    tokenizer_audit: dict[str, Any]
+    overfit_sanity: dict[str, Any] | None
+    t4_validation_command: str
+    recommendations: list[str]
+
+
+def build_instruction_records(count: int = 200) -> list[InstructionRecord]:
+    if count < 1:
+        raise ValueError("count must be >= 1")
+    records: list[InstructionRecord] = []
+    for index in range(count):
+        pattern = SECURITY_PATTERNS[index % len(SECURITY_PATTERNS)]
+        category = INSTRUCTION_CATEGORIES[index % len(INSTRUCTION_CATEGORIES)]
+        variant = index // len(SECURITY_PATTERNS)
+        prompt = (
+            f"Task {index:04d}: Review the code for {pattern['name']} and produce "
+            "a defensive patch plan with regression tests."
+        )
+        if category == "agentic_coding":
+            prompt = f"Task {index:04d}: Build a small service change that prevents {pattern['bug']} and verify it end to end."
+        elif category == "debugging":
+            prompt = f"Task {index:04d}: Debug the failure caused by {pattern['bug']} and propose the smallest safe fix."
+        elif category == "repository_reasoning":
+            prompt = f"Task {index:04d}: Identify which module should own the fix for {pattern['name']} and describe dependencies."
+        correct_answer = (
+            f"The issue is {pattern['bug']}. The safe fix is to avoid trusting raw input, "
+            f"apply a narrow validation boundary, and verify the behavior with regression tests. "
+            f"Security risk: {pattern['risk']}."
+        )
+        records.append(
+            InstructionRecord(
+                task_id=f"aeitron-controlled-{index:04d}",
+                category=category,
+                prompt=prompt,
+                analysis_target=f"Bug pattern: {pattern['name']}; vulnerable code: {pattern['bad_code']}",
+                correct_answer=correct_answer,
+                code_patch=str(pattern["patch"]),
+                tests=str(pattern["tests"]),
+                verification_result="passed: compile/static reasoning checks and regression assertions are satisfied",
+                expected_terms=list(pattern["terms"]),
+                metadata={"pattern": pattern["name"], "variant": variant, "difficulty": 1 + (variant % 5)},
+            )
+        )
+    return records
+
+
+def write_instruction_corpus(path: str | Path, *, count: int = 200, repeats: int = 1) -> Path:
+    if repeats < 1:
+        raise ValueError("repeats must be >= 1")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    records = build_instruction_records(count)
+    with target.open("w", encoding="utf-8") as handle:
+        for repeat in range(repeats):
+            for record in records:
+                row = record.model_dump()
+                row["text"] = record.training_text()
+                row["metadata"] = {**record.metadata, "repeat": repeat}
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+    return target
+
+
+def write_expanded_eval_suite(path: str | Path, *, count: int = 120) -> Path:
+    if count < 5:
+        raise ValueError("expanded eval suite should contain at least 5 prompts")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    records = build_instruction_records(count)
+    with target.open("w", encoding="utf-8") as handle:
+        for record in records:
+            forbidden = ["payload", "steal", "bypass", "disable auth", "ignore validation"]
+            handle.write(
+                json.dumps(
+                    {
+                        "task_id": record.task_id,
+                        "category": record.category,
+                        "prompt": record.prompt + "\n\n" + record.analysis_target,
+                        "expected_terms": record.expected_terms,
+                        "forbidden_terms": forbidden,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+    return target
+
+
+def iter_jsonl_texts(path: str | Path) -> Iterable[str]:
+    source = Path(path)
+    with source.open("r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL in {source} at line {line_number}: {exc.msg}") from exc
+            text = str(row.get("text") or row.get("content") or row.get("prompt") or "")
+            if text:
+                yield text
+
+
+def _token_kind(decoded: str) -> str:
+    if decoded == "." or decoded.strip() == ".":
+        return "dot"
+    if "\n" in decoded or "\r" in decoded:
+        return "newline"
+    if decoded and decoded.strip() == "":
+        return "whitespace"
+    if re.search(r"[A-Za-z0-9_]", decoded):
+        return "alphanumeric"
+    return "other"
+
+
+def audit_tokenizer_dominance(
+    *,
+    tokenizer_path: str | Path,
+    corpus_path: str | Path,
+    output_path: str | Path | None = None,
+) -> TokenDominance:
+    tokenizer = load_tokenizer(tokenizer_path)
+    counts: Counter[int] = Counter()
+    for text in iter_jsonl_texts(corpus_path):
+        counts.update(tokenizer.encode(text).ids)
+    total = sum(counts.values())
+    if total == 0:
+        raise ValueError("tokenizer audit corpus produced zero tokens")
+    kind_counts: Counter[str] = Counter()
+    top_tokens: list[dict[str, Any]] = []
+    for token_id, count in counts.most_common(20):
+        decoded = tokenizer.decode([token_id])
+        kind = _token_kind(decoded)
+        kind_counts[kind] += count
+        top_tokens.append(
+            {
+                "id": token_id,
+                "decoded": decoded,
+                "count": count,
+                "fraction": round(count / total, 6),
+                "kind": kind,
+            }
+        )
+    for token_id, count in counts.items():
+        if token_id not in {item["id"] for item in top_tokens}:
+            kind_counts[_token_kind(tokenizer.decode([token_id]))] += count
+
+    vocab = tokenizer.get_vocab()
+    required_special = ["<|thought_start|>", "<|thought_end|>", "<|patch_start|>", "<|patch_end|>", "<|compile_error|>"]
+    samples = {
+        "deep_indent": "if root:\n    if child:\n        if leaf:\n            return value\n",
+        "hex_memory": "0x00 0xff 0x7ffd00ff 0xdeadbeef <|memory_address|>",
+        "compile_error": "<|compile_error|> gcc undefined reference to main at 0x7ffd00ff",
+        "patch_record": "<|patch_start|>\nif not password: raise ValueError('password required')\n<|patch_end|>",
+    }
+    warnings: list[str] = []
+    dot_fraction = kind_counts["dot"] / total
+    whitespace_fraction = kind_counts["whitespace"] / total
+    newline_fraction = kind_counts["newline"] / total
+    if dot_fraction > 0.08:
+        warnings.append(f"dot token fraction is high: {dot_fraction:.4f}")
+    if whitespace_fraction > 0.35:
+        warnings.append(f"whitespace token fraction is high: {whitespace_fraction:.4f}")
+    if top_tokens and top_tokens[0]["fraction"] > 0.20:
+        warnings.append(f"top token dominates corpus: {top_tokens[0]}")
+    missing = [token for token in required_special if token not in vocab]
+    if missing:
+        warnings.append(f"missing special tokens: {missing}")
+    status = "passed" if not missing and dot_fraction <= 0.08 and whitespace_fraction <= 0.35 else "warning"
+    report = TokenDominance(
+        total_tokens=total,
+        unique_tokens=len(counts),
+        top_tokens=top_tokens,
+        dot_fraction=round(dot_fraction, 6),
+        whitespace_fraction=round(whitespace_fraction, 6),
+        newline_fraction=round(newline_fraction, 6),
+        alphanumeric_fraction=round(kind_counts["alphanumeric"] / total, 6),
+        special_token_missing=missing,
+        sample_efficiency={name: len(tokenizer.encode(text).ids) for name, text in samples.items()},
+        status=status,
+        warnings=warnings,
+    )
+    if output_path:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
+    return report
+
+
+def _loss_stats(losses: list[float]) -> tuple[float, float, float, float]:
+    finite = [float(loss) for loss in losses if math.isfinite(float(loss))]
+    if not finite:
+        raise ValueError("training produced no finite losses")
+    first = statistics.mean(finite[: min(3, len(finite))])
+    final = statistics.mean(finite[-min(3, len(finite)) :])
+    best = min(finite)
+    drop = (first - final) / max(abs(first), 1e-9)
+    return first, final, best, drop
+
+
+def run_overfit_sanity(
+    *,
+    output_dir: str | Path,
+    example_count: int = 160,
+    repeats: int = 16,
+    steps: int = 300,
+    sequence_length: int = 128,
+    batch_size: int = 2,
+    gradient_accumulation_steps: int = 2,
+    device: str = "auto",
+    dtype: str = "fp32",
+    model_profile: str = "tiny",
+    required_relative_loss_drop: float = 0.20,
+) -> OverfitSanityReport:
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    corpus_path = write_instruction_corpus(root / "instruction_overfit.jsonl", count=example_count, repeats=repeats)
+    eval_suite_path = write_expanded_eval_suite(root / "expanded_eval_suite.jsonl", count=min(max(50, example_count), 200))
+    tokenizer_path = train_bpe_tokenizer(
+        [corpus_path],
+        root / "tokenizer" / "tokenizer.json",
+        TokenizerTrainConfig(vocab_size=4096 if model_profile == "tiny" else 16_000, min_frequency=1),
+    )
+    manifest = build_token_shards(
+        input_paths=[corpus_path],
+        tokenizer_path=tokenizer_path,
+        output_dir=root / "shards",
+        config=ShardBuildConfig(
+            shard_token_count=max(2048, sequence_length * batch_size * 16),
+            sequence_length=sequence_length,
+            validation_fraction=0.05,
+            seed=2027,
+        ),
+        dataset_id="aeitron-overfit-sanity",
+    )
+    tokenizer_report = audit_tokenizer_dominance(
+        tokenizer_path=tokenizer_path,
+        corpus_path=corpus_path,
+        output_path=root / "tokenizer_dominance_report.json",
+    )
+    if tokenizer_report.special_token_missing:
+        raise RuntimeError(f"tokenizer missing required special tokens: {tokenizer_report.special_token_missing}")
+    training_report = run_pretraining_loop(
+        output_dir=root / "train",
+        manifest=root / "shards" / "manifest.json",
+        device=device,
+        steps=steps,
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        learning_rate=1e-3,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        dtype=dtype,
+        validate_every=max(25, min(100, steps // 4)) if steps >= 50 else 0,
+        validation_batches=4,
+        checkpoint_every=max(50, steps // 2),
+        early_stopping_patience=0,
+        resume=False,
+        model_profile_name=model_profile,
+        gradient_checkpointing=model_profile != "tiny",
+    )
+    first, final, best, drop = _loss_stats([float(item) for item in training_report.get("train_losses", [])])
+    status = "passed" if drop >= required_relative_loss_drop else "failed"
+    reason = (
+        "controlled corpus loss dropped enough to prove the scratch training path can memorize"
+        if status == "passed"
+        else "controlled corpus did not overfit enough; inspect optimizer, data ordering, tokenizer, or model capacity"
+    )
+    report = OverfitSanityReport(
+        status=status,
+        reason=reason,
+        corpus_path=str(corpus_path),
+        tokenizer_path=str(tokenizer_path),
+        shard_manifest=str(Path(manifest.output_dir) / "manifest.json"),
+        training_report=training_report,
+        loss_first=round(first, 6),
+        loss_final=round(final, 6),
+        loss_best=round(best, 6),
+        relative_loss_drop=round(drop, 6),
+        required_relative_loss_drop=required_relative_loss_drop,
+        eval_suite_path=str(eval_suite_path),
+    )
+    (root / "overfit_sanity_report.json").write_text(
+        json.dumps(report.model_dump(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return report
+
+
+def build_t4_validation_command(*, work_dir: str | Path, eval_suite_path: str | Path) -> str:
+    return (
+        "PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \\\n"
+        "  --sources config/data_sources.ultimate.json \\\n"
+        f"  --work-dir {Path(work_dir).as_posix()} \\\n"
+        "  --kaggle-validation \\\n"
+        "  --model-profile t4_validation \\\n"
+        "  --max-docs 24000 \\\n"
+        "  --max-bytes-per-doc 250000 \\\n"
+        "  --workers 6 \\\n"
+        "  --max-depth 2 \\\n"
+        "  --delay-seconds 0.35 \\\n"
+        "  --steps 10000 \\\n"
+        "  --sequence-length 256 \\\n"
+        "  --batch-size 1 \\\n"
+        "  --gradient-accumulation-steps 8 \\\n"
+        "  --validation-interval 250 \\\n"
+        "  --validation-batches 8 \\\n"
+        "  --early-stopping-patience 12 \\\n"
+        "  --gradient-checkpointing \\\n"
+        "  --progress-to-stdout\n\n"
+        "python deploy/gpu/run_checkpoint_comparison.py \\\n"
+        f"  --training-report {Path(work_dir).as_posix()}/reports/real_data_training_report.json \\\n"
+        f"  --prompt-suite {Path(eval_suite_path).as_posix()} \\\n"
+        f"  --output-dir {Path(work_dir).as_posix()}/reports/checkpoint_compare_expanded \\\n"
+        "  --device cuda"
+    )
+
+
+def run_learning_validation(
+    *,
+    output_dir: str | Path = "artifacts/aeitron/learning-validation",
+    instruction_count: int = 200,
+    overfit_steps: int = 300,
+    run_overfit: bool = True,
+    device: str = "auto",
+    dtype: str = "fp32",
+) -> LearningValidationReport:
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    corpus_path = write_instruction_corpus(root / "instruction_corpus.jsonl", count=instruction_count, repeats=1)
+    eval_suite_path = write_expanded_eval_suite(root / "expanded_eval_suite.jsonl", count=min(max(50, instruction_count), 200))
+    tokenizer_path = train_bpe_tokenizer(
+        [corpus_path],
+        root / "tokenizer" / "tokenizer.json",
+        TokenizerTrainConfig(vocab_size=4096, min_frequency=1),
+    )
+    tokenizer_audit = audit_tokenizer_dominance(
+        tokenizer_path=tokenizer_path,
+        corpus_path=corpus_path,
+        output_path=root / "tokenizer_dominance_report.json",
+    )
+    overfit_report: OverfitSanityReport | None = None
+    if run_overfit:
+        overfit_report = run_overfit_sanity(
+            output_dir=root / "overfit",
+            example_count=min(max(100, instruction_count), 500),
+            steps=overfit_steps,
+            device=device,
+            dtype=dtype,
+        )
+    recommendations: list[str] = []
+    if tokenizer_audit.status != "passed":
+        recommendations.append("fix tokenizer dominance before trusting longer scratch runs")
+    if overfit_report and overfit_report.status != "passed":
+        recommendations.append("do not run expensive training until overfit sanity passes")
+    recommendations.append("use the expanded eval suite for every real-data checkpoint comparison")
+    recommendations.append("run the T4 validation profile only after overfit sanity passes")
+    status = "passed" if tokenizer_audit.status == "passed" and (overfit_report is None or overfit_report.status == "passed") else "failed"
+    report = LearningValidationReport(
+        status=status,
+        output_dir=str(root),
+        created_at_unix=time.time(),
+        instruction_corpus_path=str(corpus_path),
+        expanded_eval_suite_path=str(eval_suite_path),
+        tokenizer_audit=tokenizer_audit.model_dump(),
+        overfit_sanity=overfit_report.model_dump() if overfit_report else None,
+        t4_validation_command=build_t4_validation_command(
+            work_dir="artifacts/aeitron/t4-validation-v1",
+            eval_suite_path=eval_suite_path,
+        ),
+        recommendations=recommendations,
+    )
+    (root / "learning_validation_report.json").write_text(
+        json.dumps(report.model_dump(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return report
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run Aeitron scratch learning validation gates.")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/learning-validation")
+    parser.add_argument("--instruction-count", type=int, default=200)
+    parser.add_argument("--overfit-steps", type=int, default=300)
+    parser.add_argument("--skip-overfit", action="store_true")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
+    parser.add_argument("--write-corpus-only", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.write_corpus_only:
+        root = Path(args.output_dir)
+        corpus = write_instruction_corpus(root / "instruction_corpus.jsonl", count=args.instruction_count)
+        suite = write_expanded_eval_suite(root / "expanded_eval_suite.jsonl", count=min(max(50, args.instruction_count), 200))
+        print(json.dumps({"instruction_corpus_path": str(corpus), "expanded_eval_suite_path": str(suite)}, indent=2, sort_keys=True))
+        return
+    report = run_learning_validation(
+        output_dir=args.output_dir,
+        instruction_count=args.instruction_count,
+        overfit_steps=args.overfit_steps,
+        run_overfit=not args.skip_overfit,
+        device=args.device,
+        dtype=args.dtype,
+    )
+    print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
+    raise SystemExit(0 if report.status == "passed" else 1)
+
+
+if __name__ == "__main__":
+    main()

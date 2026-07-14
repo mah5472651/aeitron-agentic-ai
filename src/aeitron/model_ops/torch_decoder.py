@@ -446,6 +446,19 @@ class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
 def model_profile(name: str) -> ScratchDecoderConfig:
     profiles = {
         "tiny": tiny_smoke_config(),
+        "t4_validation": ScratchDecoderConfig(
+            name="aeitron-t4-validation",
+            vocab_size=64_000,
+            max_sequence_length=2048,
+            hidden_size=512,
+            num_layers=8,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            intermediate_size=2048,
+            attention_impl="auto",
+            rope_scaling_factor=1.0,
+            gradient_checkpointing=True,
+        ),
         "1b": ScratchDecoderConfig(
             name="aeitron-1b-scratch",
             vocab_size=64_000,

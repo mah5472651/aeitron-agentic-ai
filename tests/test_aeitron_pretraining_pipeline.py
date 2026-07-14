@@ -15,6 +15,12 @@ from src.aeitron.model_ops.pretrain_loop import build_cluster_training_plan, loa
 from src.aeitron.model_ops.native_serving import NativeServingConfig, create_app
 from src.aeitron.model_ops.production_adapters import build_megatron_launch_plan, build_tensorrt_llm_plan, export_hf_llama_package, validate_vllm_package
 from src.aeitron.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints
+from src.aeitron.model_ops.learning_validation import (
+    audit_tokenizer_dominance,
+    run_learning_validation,
+    write_expanded_eval_suite,
+    write_instruction_corpus,
+)
 from src.aeitron.model_ops.tokenizer_pipeline import (
     RealCorpusTokenizerConfig,
     ShardBuildConfig,
@@ -25,9 +31,52 @@ from src.aeitron.model_ops.tokenizer_pipeline import (
     train_bpe_tokenizer,
     write_uint32_tokens,
 )
+from src.aeitron.model_ops.torch_decoder import model_profile
 
 
 class AeitronPretrainingPipelineTest(unittest.TestCase):
+    def test_learning_validation_generates_instruction_corpus_and_tokenizer_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = write_instruction_corpus(root / "instruction.jsonl", count=24, repeats=2)
+            suite = write_expanded_eval_suite(root / "suite.jsonl", count=50)
+            self.assertEqual(len(corpus.read_text(encoding="utf-8").splitlines()), 48)
+            self.assertEqual(len(suite.read_text(encoding="utf-8").splitlines()), 50)
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            audit = audit_tokenizer_dominance(
+                tokenizer_path=tokenizer_path,
+                corpus_path=corpus,
+                output_path=root / "tokenizer_audit.json",
+            )
+            self.assertGreater(audit.total_tokens, 0)
+            self.assertFalse(audit.special_token_missing)
+            self.assertLess(audit.dot_fraction, 0.08)
+            self.assertTrue(Path(root / "tokenizer_audit.json").exists())
+
+    def test_learning_validation_report_can_skip_expensive_overfit_for_local_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = run_learning_validation(
+                output_dir=Path(temp_dir) / "learning_validation",
+                instruction_count=30,
+                run_overfit=False,
+                device="cpu",
+            )
+            self.assertEqual(report.status, "passed")
+            self.assertTrue(Path(report.instruction_corpus_path).exists())
+            self.assertTrue(Path(report.expanded_eval_suite_path).exists())
+            self.assertIn("--model-profile t4_validation", report.t4_validation_command)
+
+    def test_t4_validation_profile_is_registered_for_non_tiny_gpu_checks(self) -> None:
+        profile = model_profile("t4_validation")
+        self.assertEqual(profile.hidden_size, 512)
+        self.assertEqual(profile.num_layers, 8)
+        self.assertEqual(profile.max_sequence_length, 2048)
+        self.assertTrue(profile.gradient_checkpointing)
+
     def test_quality_gate_filters_duplicates_and_secret_like_content(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

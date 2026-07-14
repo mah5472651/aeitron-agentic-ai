@@ -27,7 +27,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--validate-every", type=int, default=250)
     parser.add_argument("--validation-batches", type=int, default=8)
     parser.add_argument("--early-stopping-patience", type=int, default=20)
-    parser.add_argument("--model-profile", default="tiny", choices=["tiny", "1b", "7b", "32b", "62b"])
+    parser.add_argument("--model-profile", default="tiny", choices=["tiny", "t4_validation", "1b", "7b", "32b", "62b"])
     parser.add_argument("--attention-impl", default="auto", choices=["auto", "sdpa", "eager"])
     parser.add_argument("--gradient-checkpointing", action="store_true")
     return parser.parse_args()

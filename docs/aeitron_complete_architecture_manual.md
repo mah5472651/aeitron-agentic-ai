@@ -2860,6 +2860,76 @@ Default production minimums:
 - SWE-style suite: at least 1 local governed task file
 - CyberSecEval-style suite: at least 1 local governed task file
 
+## Scratch Learning Validation Layer
+
+Purpose:
+
+- detect whether a scratch checkpoint actually learns instead of merely running
+- catch tokenizer collapse such as dot/newline/space dominance
+- prove the optimizer/model/data path can overfit a controlled high-signal corpus
+- replace the 5-prompt smoke comparison with a 50-200 prompt coding/security suite
+- provide a non-tiny T4 validation profile before expensive 7B+ cluster runs
+
+Main module:
+
+- `src/aeitron/model_ops/learning_validation.py`
+
+What it builds:
+
+- `InstructionRecord` schema with `prompt`, `analysis_target`, `correct_answer`, `code_patch`, `tests`, and `verification_result`
+- deterministic controlled instruction corpus for defensive security, agentic coding, debugging, patch generation, and repository reasoning
+- tokenizer dominance report with total tokens, top tokens, dot fraction, whitespace fraction, newline fraction, special-token checks, and sample efficiency
+- overfit sanity report with first/final/best loss and required relative loss drop
+- expanded checkpoint comparison suite compatible with `run_checkpoint_comparison.py`
+- T4 validation command using the real scratch profile `t4_validation`
+
+Run controlled validation:
+
+```bash
+python -m src.aeitron.model_ops.learning_validation \
+  --output-dir artifacts/aeitron/learning-validation-v1 \
+  --instruction-count 200 \
+  --overfit-steps 300 \
+  --device cuda \
+  --dtype fp16
+```
+
+Fast local check:
+
+```bash
+python -m src.aeitron.model_ops.learning_validation \
+  --output-dir artifacts/aeitron/learning-validation-smoke \
+  --instruction-count 50 \
+  --skip-overfit \
+  --device cpu
+```
+
+Interpretation:
+
+- if tokenizer audit fails, fix tokenizer/data before training longer
+- if overfit sanity fails, do not spend serious GPU time yet
+- if overfit passes but real-data eval still emits repetitive punctuation, improve instruction-style data mix and generation settings
+- if expanded eval remains near zero, the model is still too small or undertrained for reasoning quality
+
+T4 validation profile:
+
+- model profile: `t4_validation`
+- hidden size: 512
+- layers: 8
+- sequence length target: 256 for Kaggle run, max model context 2048
+- gradient checkpointing: enabled
+- intended run: 1k-10k steps on Kaggle/Colab T4/L4/A100 after overfit sanity passes
+
+Expanded comparison command:
+
+```bash
+python deploy/gpu/run_checkpoint_comparison.py \
+  --training-report artifacts/aeitron/real-data-validation-v1/reports/real_data_training_report.json \
+  --prompt-suite artifacts/aeitron/learning-validation-v1/expanded_eval_suite.jsonl \
+  --output-dir artifacts/aeitron/real-data-validation-v1/reports/checkpoint_compare_expanded \
+  --device cuda
+```
+
 ## Strict Scanner Bootstrap
 
 Security audit reports now include a scanner install plan. For local Windows

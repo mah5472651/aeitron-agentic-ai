@@ -167,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="fp16")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cuda")
-    parser.add_argument("--model-profile", default="tiny", choices=["tiny", "1b", "7b", "32b", "62b"])
+    parser.add_argument("--model-profile", default="tiny", choices=["tiny", "t4_validation", "1b", "7b", "32b", "62b"])
     parser.add_argument("--attention-impl", default="auto", choices=["auto", "sdpa", "eager"])
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--validate-every", "--validation-interval", dest="validate_every", type=int, default=25)

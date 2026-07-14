@@ -504,6 +504,48 @@ The data engine is defensive and allowlist-first. It is for public documentation
 licensed code, security guidance, benchmark corpora, and approved repository
 mirrors; it does not perform exploit execution or unauthorized collection.
 
+## Scratch Learning Validation
+
+After a real-data run, Aeitron must prove that the model can learn before larger
+GPU time is spent. Run the controlled validation gate first:
+
+```bash
+python -m src.aeitron.model_ops.learning_validation \
+  --output-dir artifacts/aeitron/learning-validation-v1 \
+  --instruction-count 200 \
+  --overfit-steps 300 \
+  --device cuda \
+  --dtype fp16
+```
+
+This writes:
+
+- `instruction_corpus.jsonl` with prompt, analysis target, correct answer, code patch, tests, and verification result
+- `expanded_eval_suite.jsonl` with 50-200 coding/security/debugging prompts
+- `tokenizer_dominance_report.json` checking dot/newline/space dominance and special-token coverage
+- `overfit/overfit_sanity_report.json` proving whether the scratch model can memorize a controlled corpus
+- a T4 validation command using `--model-profile t4_validation`
+
+Fast local command without expensive training:
+
+```bash
+python -m src.aeitron.model_ops.learning_validation \
+  --output-dir artifacts/aeitron/learning-validation-smoke \
+  --instruction-count 50 \
+  --skip-overfit \
+  --device cpu
+```
+
+Use the expanded suite for checkpoint comparison:
+
+```bash
+python deploy/gpu/run_checkpoint_comparison.py \
+  --training-report artifacts/aeitron/real-data-validation-v1/reports/real_data_training_report.json \
+  --prompt-suite artifacts/aeitron/learning-validation-v1/expanded_eval_suite.jsonl \
+  --output-dir artifacts/aeitron/real-data-validation-v1/reports/checkpoint_compare_expanded \
+  --device cuda
+```
+
 Quality gate:
 
 ```bash
