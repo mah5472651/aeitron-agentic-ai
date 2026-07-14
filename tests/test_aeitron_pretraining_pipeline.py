@@ -134,7 +134,7 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
             self.assertIn("<|thought_start|>", mixed_text)
             self.assertIn("<|patch_start|>", mixed_text)
             self.assertIn("Tests:", mixed_text)
-            self.assertIn("Verification result:", mixed_text)
+            self.assertIn("Verification:", mixed_text)
             self.assertIn("target_ratios", Path(root / "scratch_instruction_mix_report.json").read_text(encoding="utf-8"))
 
     def test_quality_gate_filters_duplicates_and_secret_like_content(self) -> None:
@@ -470,12 +470,52 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
                 tokenizer_path=tokenizer_path,
                 output_dir=root / "compare",
                 device="cpu",
-                generation_config=GenerationConfig(max_new_tokens=8),
+                generation_config=GenerationConfig(max_new_tokens=8, max_repetition_ratio=1.0),
             )
             self.assertEqual(comparison.status, "neutral")
             self.assertEqual(comparison.baseline.total, 5)
             self.assertTrue(Path(root / "compare" / "checkpoint_comparison_report.json").exists())
             self.assertTrue(Path(root / "compare" / "checkpoint_comparison_report.md").exists())
+
+    def test_checkpoint_comparison_flags_generation_collapse(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            corpus.write_text(json.dumps({"text": "'''''''''''''''''''''''''''''''' " * 100, "license": "mit"}) + "\n", encoding="utf-8")
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            build_token_shards(
+                input_paths=[corpus],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "shards",
+                config=ShardBuildConfig(shard_token_count=128, sequence_length=16, validation_fraction=0.0),
+            )
+            training = run_pretraining_loop(
+                output_dir=root / "train",
+                manifest=root / "shards" / "manifest.json",
+                device="cpu",
+                steps=1,
+                batch_size=1,
+                sequence_length=16,
+                gradient_accumulation_steps=1,
+                dtype="fp32",
+                validate_every=0,
+                checkpoint_every=0,
+                resume=False,
+            )
+            comparison = compare_checkpoints(
+                baseline_manifest=training["checkpoint_manifest"],
+                candidate_manifest=training["checkpoint_manifest"],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "compare",
+                device="cpu",
+                generation_config=GenerationConfig(max_new_tokens=16, max_repetition_ratio=0.05),
+            )
+            self.assertEqual(comparison.status, "failed_generation_collapse")
+            self.assertTrue(any(item.collapsed for item in comparison.candidate.results))
 
     def test_native_serving_loads_scratch_checkpoint_and_returns_chat_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

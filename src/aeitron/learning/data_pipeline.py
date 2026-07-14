@@ -42,6 +42,7 @@ from src.aeitron.learning.task_extraction import TaskExtractionReport, extract_t
 from src.aeitron.learning.training_data_gate import TrainingDataGateConfig, TrainingDataGateReport, apply_training_data_gate
 from src.aeitron.learning.versioning import DatasetArtifact, DatasetLedger, DatasetVersionManifest, artifact_from_path, build_version_id
 from src.aeitron.model_ops.checkpoint_compare import CheckpointComparisonReport, GenerationConfig, compare_checkpoints
+from src.aeitron.model_ops.learning_validation import TokenDominance, audit_tokenizer_dominance
 from src.aeitron.model_ops.pretrain_loop import run_pretraining_loop
 from src.aeitron.model_ops.tokenizer_pipeline import (
     ShardBuildConfig,
@@ -117,6 +118,9 @@ class DataPipelineConfig(StrictModel):
     checkpoint_compare_prompt_suite: str | None = None
     checkpoint_compare_min_score: float = Field(default=0.0, ge=0.0, le=1.0)
     checkpoint_compare_max_new_tokens: int = Field(default=96, ge=1, le=2048)
+    checkpoint_compare_repetition_penalty: float = Field(default=1.12, ge=1.0, le=5.0)
+    checkpoint_compare_no_repeat_ngram_size: int = Field(default=4, ge=0, le=20)
+    checkpoint_compare_max_repetition_ratio: float = Field(default=0.72, ge=0.0, le=1.0)
     progress_path: str | None = None
     progress_to_stdout: bool = False
     progress_every_docs: int = Field(default=25, ge=1)
@@ -157,6 +161,7 @@ class DataPipelineReport(StrictModel):
     training: dict[str, Any] | None = None
     checkpoint_eval: dict[str, Any] | None = None
     checkpoint_comparison: dict[str, Any] | None = None
+    tokenizer_audit_report: dict[str, Any] | None = None
     report_artifacts: dict[str, str] = Field(default_factory=dict)
 
 
@@ -610,6 +615,19 @@ async def _run_data_pipeline_locked(
         TokenizerTrainConfig(vocab_size=config.vocab_size, min_frequency=config.tokenizer_min_frequency),
     )
     progress.emit("tokenizer", "complete", tokenizer_path=str(trained_tokenizer))
+    tokenizer_audit_report: TokenDominance = audit_tokenizer_dominance(
+        tokenizer_path=trained_tokenizer,
+        corpus_path=training_files[0],
+        output_path=reports_dir / "tokenizer_audit_report.json",
+    )
+    progress.emit(
+        "tokenizer_audit",
+        tokenizer_audit_report.status,
+        dot_fraction=tokenizer_audit_report.dot_fraction,
+        whitespace_fraction=tokenizer_audit_report.whitespace_fraction,
+        single_char_fraction=tokenizer_audit_report.single_char_fraction,
+        warnings=len(tokenizer_audit_report.warnings),
+    )
     progress.emit("sharding", "started", shard_token_count=config.shard_token_count, sequence_length=config.sequence_length)
     manifest: ShardManifest = build_token_shards(
         input_paths=training_files,
@@ -685,7 +703,14 @@ async def _run_data_pipeline_locked(
                 prompt_suite=config.checkpoint_compare_prompt_suite,
                 output_dir=reports_dir / "checkpoint_compare",
                 device=config.train_device,
-                generation_config=GenerationConfig(max_new_tokens=config.checkpoint_compare_max_new_tokens, temperature=0.0, top_k=20),
+                generation_config=GenerationConfig(
+                    max_new_tokens=config.checkpoint_compare_max_new_tokens,
+                    temperature=0.0,
+                    top_k=20,
+                    repetition_penalty=config.checkpoint_compare_repetition_penalty,
+                    no_repeat_ngram_size=config.checkpoint_compare_no_repeat_ngram_size,
+                    max_repetition_ratio=config.checkpoint_compare_max_repetition_ratio,
+                ),
             )
             progress.emit(
                 "checkpoint_comparison",
@@ -694,8 +719,10 @@ async def _run_data_pipeline_locked(
                 candidate_average_score=checkpoint_comparison_report.candidate.average_score,
                 score_delta=checkpoint_comparison_report.score_delta,
             )
-            if checkpoint_comparison_report.status == "regressed":
-                raise RuntimeError("checkpoint comparison gate failed: candidate regressed against final checkpoint")
+            if checkpoint_comparison_report.status in {"regressed", "failed_generation_collapse"}:
+                raise RuntimeError(
+                    f"checkpoint comparison gate failed: {checkpoint_comparison_report.status}"
+                )
             if checkpoint_comparison_report.candidate.average_score < config.checkpoint_compare_min_score:
                 raise RuntimeError(
                     f"checkpoint comparison gate failed: candidate average score "
@@ -717,6 +744,7 @@ async def _run_data_pipeline_locked(
     artifacts.append(artifact_from_path(contamination_path, role="contamination_report"))
     artifacts.append(artifact_from_path(quality_report_path, role="quality_report"))
     artifacts.append(artifact_from_path(training_quality_path, role="training_quality_report"))
+    artifacts.append(artifact_from_path(reports_dir / "tokenizer_audit_report.json", role="tokenizer_audit_report"))
     artifacts.append(artifact_from_path(source_quality_path, role="source_quality_report"))
     artifacts.append(artifact_from_path(feedback_path, role="feedback_report"))
     if source_reputation_report is not None:
@@ -796,6 +824,7 @@ async def _run_data_pipeline_locked(
             upload_candidates.extend([str(instruction_mix_report_path), str(instruction_mix_path)])
         if checkpoint_comparison_report is not None:
             upload_candidates.append(str(checkpoint_comparison_path))
+        upload_candidates.append(str(reports_dir / "tokenizer_audit_report.json"))
         upload_candidates.extend(manifest.train_shards + manifest.val_shards)
         uploaded_objects = upload_paths(store, upload_candidates, prefix=upload_prefix)
         progress.emit("artifact_upload", "complete", uploaded_objects=len(uploaded_objects))
@@ -864,6 +893,7 @@ async def _run_data_pipeline_locked(
         training=training_report,
         checkpoint_eval=checkpoint_eval_report.model_dump() if checkpoint_eval_report else None,
         checkpoint_comparison=checkpoint_comparison_report.model_dump() if checkpoint_comparison_report else None,
+        tokenizer_audit_report=tokenizer_audit_report.model_dump(),
         report_artifacts={
             "pipeline_report": str(reports_dir / "pipeline_report.json"),
             "dashboard": str(root / "dashboard.html"),
@@ -873,6 +903,8 @@ async def _run_data_pipeline_locked(
             "source_budget_plan": str(reports_dir / "source_budget_plan.json"),
             "training_data_gate_report": str(reports_dir / "training_data_gate_report.json"),
             "instruction_mix_report": str(reports_dir / "instruction_mix_report.json"),
+            "tokenizer_audit_report": str(reports_dir / "tokenizer_audit_report.json"),
+            "tokenizer_audit_markdown": str(reports_dir / "tokenizer_audit_report.md"),
             "checkpoint_eval_report": str(reports_dir / "checkpoint_eval" / "checkpoint_eval_report.json"),
             "checkpoint_comparison_report": str(reports_dir / "checkpoint_compare" / "checkpoint_comparison_report.json"),
             "progress_log": str(progress.path) if progress.path else "",
@@ -958,6 +990,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-compare-prompt-suite")
     parser.add_argument("--checkpoint-compare-min-score", type=float, default=0.0)
     parser.add_argument("--checkpoint-compare-max-new-tokens", type=int, default=96)
+    parser.add_argument("--checkpoint-compare-repetition-penalty", type=float, default=1.12)
+    parser.add_argument("--checkpoint-compare-no-repeat-ngram-size", type=int, default=4)
+    parser.add_argument("--checkpoint-compare-max-repetition-ratio", type=float, default=0.72)
     parser.add_argument("--progress-path")
     parser.add_argument("--progress-to-stdout", action="store_true")
     parser.add_argument("--progress-every-docs", type=int, default=25)
@@ -1029,6 +1064,9 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         checkpoint_compare_prompt_suite=args.checkpoint_compare_prompt_suite,
         checkpoint_compare_min_score=args.checkpoint_compare_min_score,
         checkpoint_compare_max_new_tokens=args.checkpoint_compare_max_new_tokens,
+        checkpoint_compare_repetition_penalty=args.checkpoint_compare_repetition_penalty,
+        checkpoint_compare_no_repeat_ngram_size=args.checkpoint_compare_no_repeat_ngram_size,
+        checkpoint_compare_max_repetition_ratio=args.checkpoint_compare_max_repetition_ratio,
         progress_path=args.progress_path,
         progress_to_stdout=args.progress_to_stdout,
         progress_every_docs=args.progress_every_docs,

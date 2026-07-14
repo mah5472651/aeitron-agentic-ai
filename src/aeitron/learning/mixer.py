@@ -426,14 +426,14 @@ def convert_to_instruction_row(row: dict[str, Any], *, bucket: str) -> dict[str,
         f"Prompt: {prompt}\n"
         f"Source: {source}\n"
         f"Language: {language}\n"
-        f"Analysis target:\n{excerpt}\n\n"
-        f"Correct answer:\n{correct_answer}\n"
+        f"Context:\n{excerpt}\n\n"
+        f"Answer:\n{correct_answer}\n"
         "<|thought_end|>\n"
         "<|patch_start|>\n"
         f"{patch}\n"
         "<|patch_end|>\n"
-        f"Tests:\n{tests}\n"
-        f"Verification result: {verification}\n"
+        f"Tests: {tests}\n"
+        f"Verification: {verification}\n"
     )
     metadata = {
         **_metadata(row),

@@ -586,9 +586,9 @@ python -m src.aeitron.model_ops.learning_validation \
 
 This writes:
 
-- `instruction_corpus.jsonl` with prompt, analysis target, correct answer, code patch, tests, and verification result
+- `instruction_corpus.jsonl` with prompt, context, answer, code patch, tests, and verification
 - `expanded_eval_suite.jsonl` with 50-200 coding/security/debugging prompts
-- `tokenizer_dominance_report.json` checking dot/newline/space dominance and special-token coverage
+- `tokenizer_dominance_report.json` and `.md` checking token frequency, dot/quote/space/newline dominance, unknown/single-character token rates, special-token coverage, and code/security pattern efficiency
 - `overfit/overfit_sanity_report.json` proving whether the scratch model can memorize a controlled corpus
 - a T4 validation command using `--model-profile t4_validation`
 
@@ -609,8 +609,16 @@ python deploy/gpu/run_checkpoint_comparison.py \
   --training-report artifacts/aeitron/real-data-validation-v1/reports/real_data_training_report.json \
   --prompt-suite artifacts/aeitron/learning-validation-v1/expanded_eval_suite.jsonl \
   --output-dir artifacts/aeitron/real-data-validation-v1/reports/checkpoint_compare_expanded \
-  --device cuda
+  --device cuda \
+  --repetition-penalty 1.18 \
+  --no-repeat-ngram-size 4 \
+  --max-repetition-ratio 0.72
 ```
+
+The comparison gate now fails on generation collapse as well as regression.
+Collapse is detected from repetitive word/ngram output, and deterministic
+evaluation supports stop tokens, repetition penalty, and no-repeat ngram
+blocking.
 
 Quality gate:
 

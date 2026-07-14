@@ -75,6 +75,10 @@ class GenerationConfig(StrictModel):
     temperature: float = Field(default=0.0, ge=0.0, le=5.0)
     top_k: int = Field(default=20, ge=0, le=500)
     seed: int = 1337
+    repetition_penalty: float = Field(default=1.12, ge=1.0, le=5.0)
+    no_repeat_ngram_size: int = Field(default=4, ge=0, le=20)
+    stop_tokens: list[str] = Field(default_factory=lambda: ["<|thought_end|>", "<|patch_end|>", "<|tool_call|>"])
+    max_repetition_ratio: float = Field(default=0.72, ge=0.0, le=1.0)
 
 
 class CandidateResult(StrictModel):
@@ -87,6 +91,7 @@ class CandidateResult(StrictModel):
     missing_expected_terms: list[str] = Field(default_factory=list)
     forbidden_hits: list[str] = Field(default_factory=list)
     repetition_ratio: float
+    collapsed: bool = False
     token_count: int
     latency_ms: float
 
@@ -170,6 +175,48 @@ def _repetition_ratio(text: str) -> float:
     return 1.0 - (len(set(words)) / len(words))
 
 
+def _banned_next_tokens(tokens: list[int], ngram_size: int) -> set[int]:
+    if ngram_size <= 0 or len(tokens) + 1 < ngram_size:
+        return set()
+    prefix = tuple(tokens[-(ngram_size - 1) :])
+    banned: set[int] = set()
+    for index in range(0, len(tokens) - ngram_size + 1):
+        ngram = tuple(tokens[index : index + ngram_size])
+        if ngram[:-1] == prefix:
+            banned.add(ngram[-1])
+    return banned
+
+
+def _apply_repetition_controls(logits: Any, generated: list[int], config: GenerationConfig) -> Any:
+    if not generated:
+        return logits
+    if config.repetition_penalty > 1.0:
+        unique_tokens = set(generated)
+        for token_id in unique_tokens:
+            token_logit = logits[:, token_id]
+            logits[:, token_id] = torch.where(
+                token_logit < 0,
+                token_logit * config.repetition_penalty,
+                token_logit / config.repetition_penalty,
+            )
+    if config.no_repeat_ngram_size > 0 and logits.size(-1) > 0:
+        banned = list(_banned_next_tokens(generated, config.no_repeat_ngram_size))
+        if banned and len(banned) < logits.size(-1):
+            logits[:, banned] = -float("inf")
+    return logits
+
+
+def _contains_stop_token(text: str, stop_tokens: list[str]) -> bool:
+    return any(token and token in text for token in stop_tokens)
+
+
+def _decode(tokenizer: Any, ids: list[int], *, skip_special_tokens: bool = False) -> str:
+    try:
+        return tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
+    except TypeError:
+        return tokenizer.decode(ids)
+
+
 def _score_output(output: str, case: PromptCase) -> tuple[float, list[str], list[str], list[str], float]:
     lowered = output.lower()
     expected = [term.lower() for term in case.expected_terms]
@@ -211,6 +258,7 @@ def generate_text(
         if active.size(1) > model.config.max_sequence_length:
             active = active[:, -model.config.max_sequence_length :]
         logits = model(active).logits[:, -1, :]
+        logits = _apply_repetition_controls(logits, generated, config)
         if config.temperature <= 0:
             next_token = int(torch.argmax(logits, dim=-1).item())
         else:
@@ -223,7 +271,9 @@ def generate_text(
                 probs = torch.softmax(logits, dim=-1)
                 next_token = int(torch.multinomial(probs[0], 1).item())
         generated.append(next_token)
-    return tokenizer.decode(generated), len(generated)
+        if config.stop_tokens and _contains_stop_token(_decode(tokenizer, generated, skip_special_tokens=False), config.stop_tokens):
+            break
+    return _decode(tokenizer, generated, skip_special_tokens=False), len(generated)
 
 
 def _evaluate_side(
@@ -248,6 +298,7 @@ def _evaluate_side(
         )
         latency_ms = (time.perf_counter() - started) * 1000
         score, expected_hits, missing, forbidden_hits, repetition = _score_output(output, case)
+        collapsed = repetition > generation_config.max_repetition_ratio
         results.append(
             CandidateResult(
                 task_id=case.task_id,
@@ -259,6 +310,7 @@ def _evaluate_side(
                 missing_expected_terms=missing,
                 forbidden_hits=forbidden_hits,
                 repetition_ratio=repetition,
+                collapsed=collapsed,
                 token_count=token_count,
                 latency_ms=round(latency_ms, 3),
             )
@@ -321,7 +373,11 @@ def compare_checkpoints(
             unchanged.append(item.task_id)
     score_delta = round(candidate.average_score - baseline.average_score, 6)
     pass_delta = candidate.pass_count - baseline.pass_count
-    if score_delta > 0.03 and not regressed:
+    collapsed_count = sum(1 for item in candidate.results if item.collapsed)
+    if collapsed_count:
+        recommendation = "generation_collapse_detected"
+        status = "failed_generation_collapse"
+    elif score_delta > 0.03 and not regressed:
         recommendation = "candidate_improved"
         status = "improved"
     elif score_delta < -0.03 or pass_delta < 0:
@@ -358,6 +414,7 @@ def write_markdown(report: CheckpointComparisonReport, path: str | Path) -> Path
         f"- status: {report.status}",
         f"- recommendation: {report.recommendation}",
         f"- device: {report.device}",
+        f"- generation: `{json.dumps(report.generation, sort_keys=True)}`",
         f"- baseline average: {report.baseline.average_score:.4f}",
         f"- candidate average: {report.candidate.average_score:.4f}",
         f"- score delta: {report.score_delta:.4f}",
@@ -377,6 +434,8 @@ def write_markdown(report: CheckpointComparisonReport, path: str | Path) -> Path
                 f"### {item.task_id}",
                 "",
                 f"- score: {item.score:.3f}",
+                f"- repetition ratio: {item.repetition_ratio:.3f}",
+                f"- collapsed: {item.collapsed}",
                 f"- expected hits: {', '.join(item.expected_hits) if item.expected_hits else 'none'}",
                 f"- missing: {', '.join(item.missing_expected_terms) if item.missing_expected_terms else 'none'}",
                 "",
@@ -402,6 +461,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--repetition-penalty", type=float, default=1.12)
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=4)
+    parser.add_argument("--stop-token", action="append", dest="stop_tokens")
+    parser.add_argument("--max-repetition-ratio", type=float, default=0.72)
     return parser.parse_args()
 
 
@@ -419,10 +482,14 @@ def main() -> None:
             temperature=args.temperature,
             top_k=args.top_k,
             seed=args.seed,
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            stop_tokens=args.stop_tokens or GenerationConfig().stop_tokens,
+            max_repetition_ratio=args.max_repetition_ratio,
         ),
     )
     print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
-    raise SystemExit(0 if report.status != "regressed" else 1)
+    raise SystemExit(0 if report.status not in {"regressed", "failed_generation_collapse"} else 1)
 
 
 if __name__ == "__main__":

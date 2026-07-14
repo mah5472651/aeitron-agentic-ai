@@ -3073,9 +3073,10 @@ Main module:
 
 What it builds:
 
-- `InstructionRecord` schema with `prompt`, `analysis_target`, `correct_answer`, `code_patch`, `tests`, and `verification_result`
+- `InstructionRecord` schema with `prompt`, `context`, `answer`, `code_patch`, `tests`, and `verification`
 - deterministic controlled instruction corpus for defensive security, agentic coding, debugging, patch generation, and repository reasoning
-- tokenizer dominance report with total tokens, top tokens, dot fraction, whitespace fraction, newline fraction, special-token checks, and sample efficiency
+- tokenizer dominance report with total tokens, top tokens, dot fraction, quote fraction, whitespace fraction, newline fraction, unknown-token rate, single-character token rate, special-token checks, sample efficiency, and code/security pattern coverage
+- tokenizer audit Markdown report for quick human inspection
 - overfit sanity report with first/final/best loss and required relative loss drop
 - expanded checkpoint comparison suite compatible with `run_checkpoint_comparison.py`
 - T4 validation command using the real scratch profile `t4_validation`
@@ -3107,6 +3108,7 @@ Interpretation:
 - if overfit sanity fails, do not spend serious GPU time yet
 - if overfit passes but real-data eval still emits repetitive punctuation, improve instruction-style data mix and generation settings
 - if expanded eval remains near zero, the model is still too small or undertrained for reasoning quality
+- if checkpoint comparison returns `failed_generation_collapse`, the model is repeating patterns above the allowed threshold and must not be promoted
 
 T4 validation profile:
 
@@ -3124,8 +3126,24 @@ python deploy/gpu/run_checkpoint_comparison.py \
   --training-report artifacts/aeitron/real-data-validation-v1/reports/real_data_training_report.json \
   --prompt-suite artifacts/aeitron/learning-validation-v1/expanded_eval_suite.jsonl \
   --output-dir artifacts/aeitron/real-data-validation-v1/reports/checkpoint_compare_expanded \
-  --device cuda
+  --device cuda \
+  --repetition-penalty 1.18 \
+  --no-repeat-ngram-size 4 \
+  --max-repetition-ratio 0.72
 ```
+
+The deterministic comparison path now supports:
+
+- `repetition_penalty`
+- `no_repeat_ngram_size`
+- stop tokens
+- generation collapse detection
+- fail-fast comparison status when repetitive output exceeds the threshold
+
+The real-data pipeline writes tokenizer audit artifacts at:
+
+- `reports/tokenizer_audit_report.json`
+- `reports/tokenizer_audit_report.md`
 
 ## Strict Scanner Bootstrap
 

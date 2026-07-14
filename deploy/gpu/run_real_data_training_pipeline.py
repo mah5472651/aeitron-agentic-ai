@@ -193,6 +193,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-compare-prompt-suite")
     parser.add_argument("--checkpoint-compare-min-score", type=float, default=0.0)
     parser.add_argument("--checkpoint-compare-max-new-tokens", type=int, default=96)
+    parser.add_argument("--checkpoint-compare-repetition-penalty", type=float, default=1.12)
+    parser.add_argument("--checkpoint-compare-no-repeat-ngram-size", type=int, default=4)
+    parser.add_argument("--checkpoint-compare-max-repetition-ratio", type=float, default=0.72)
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--progress-path")
     parser.add_argument("--progress-to-stdout", action="store_true", help="Explicitly stream structured progress events to stdout.")
@@ -268,6 +271,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 checkpoint_compare_prompt_suite=args.checkpoint_compare_prompt_suite,
                 checkpoint_compare_min_score=args.checkpoint_compare_min_score,
                 checkpoint_compare_max_new_tokens=args.checkpoint_compare_max_new_tokens,
+                checkpoint_compare_repetition_penalty=args.checkpoint_compare_repetition_penalty,
+                checkpoint_compare_no_repeat_ngram_size=args.checkpoint_compare_no_repeat_ngram_size,
+                checkpoint_compare_max_repetition_ratio=args.checkpoint_compare_max_repetition_ratio,
                 upload_artifacts=True,
                 progress_path=progress_path,
                 progress_to_stdout=args.progress_to_stdout or not args.no_progress_stdout,

@@ -27,6 +27,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--repetition-penalty", type=float, default=1.12)
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=4)
+    parser.add_argument("--stop-token", action="append", dest="stop_tokens")
+    parser.add_argument("--max-repetition-ratio", type=float, default=0.72)
     return parser.parse_args()
 
 
@@ -69,10 +73,14 @@ def main() -> None:
             temperature=args.temperature,
             top_k=args.top_k,
             seed=args.seed,
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            stop_tokens=args.stop_tokens or GenerationConfig().stop_tokens,
+            max_repetition_ratio=args.max_repetition_ratio,
         ),
     )
     print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
-    raise SystemExit(0 if report.status != "regressed" else 1)
+    raise SystemExit(0 if report.status not in {"regressed", "failed_generation_collapse"} else 1)
 
 
 if __name__ == "__main__":

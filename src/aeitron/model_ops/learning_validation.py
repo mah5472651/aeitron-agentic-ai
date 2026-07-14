@@ -118,6 +118,78 @@ SECURITY_PATTERNS = [
         "tests": "assert_private_ip_blocked(); assert_allowed_host_succeeds(); assert_timeout_is_set()",
         "terms": ["ssrf", "allowlist", "private", "timeout"],
     },
+    {
+        "name": "csrf_state_change",
+        "bug": "state-changing route lacks CSRF protection",
+        "risk": "cross-site requests can trigger unauthorized user actions",
+        "bad_code": "@app.post('/email/change')\ndef change_email(): update_email(request.form['email'])",
+        "patch": "Require a signed CSRF token or same-site protected session check before accepting the mutation.",
+        "tests": "assert_missing_csrf_is_403(); assert_valid_csrf_allows_change(); assert_get_does_not_mutate()",
+        "terms": ["csrf", "token", "same-site", "mutation"],
+    },
+    {
+        "name": "weak_crypto_hash",
+        "bug": "passwords are stored with a fast unsalted hash",
+        "risk": "offline cracking becomes cheap after credential database exposure",
+        "bad_code": "stored = hashlib.md5(password.encode()).hexdigest()",
+        "patch": "Use Argon2id, bcrypt, or scrypt with a unique salt and calibrated work factor.",
+        "tests": "assert_unique_salts(); assert_legacy_hash_migrates(); assert_password_verification_still_passes()",
+        "terms": ["argon2", "salt", "password", "hash"],
+    },
+    {
+        "name": "hardcoded_secret",
+        "bug": "secret key is hardcoded in source",
+        "risk": "repository exposure leaks credentials and breaks rotation",
+        "bad_code": "settings.jwt_signing_key = '<static-demo-value>'",
+        "patch": "Load secrets from a managed secret store or environment variable and fail if missing in production.",
+        "tests": "assert_default_secret_rejected(); assert_env_secret_loaded(); assert_rotation_documented()",
+        "terms": ["secret", "environment", "rotation", "fail"],
+    },
+    {
+        "name": "open_redirect",
+        "bug": "redirect target is accepted directly from a query parameter",
+        "risk": "phishing flows can abuse trusted domains",
+        "bad_code": "return redirect(request.args['next'])",
+        "patch": "Only allow relative paths or exact allowlisted redirect hosts after URL parsing.",
+        "tests": "assert_external_redirect_blocked(); assert_relative_redirect_allowed(); assert_encoded_host_blocked()",
+        "terms": ["redirect", "allowlist", "relative", "host"],
+    },
+    {
+        "name": "unsafe_deserialization",
+        "bug": "untrusted bytes are deserialized with pickle",
+        "risk": "attacker-controlled payloads can execute code during object loading",
+        "bad_code": "obj = pickle.loads(request.data)",
+        "patch": "Use a typed JSON schema or a safe parser and reject unknown fields.",
+        "tests": "assert_pickle_rejected(); assert_schema_valid_json_accepts(); assert_unknown_fields_fail()",
+        "terms": ["deserialization", "pickle", "schema", "reject"],
+    },
+    {
+        "name": "buffer_overflow_copy",
+        "bug": "C code copies unbounded input into a fixed-size buffer",
+        "risk": "memory corruption can crash the process or corrupt control flow",
+        "bad_code": "char buf[16]; strcpy(buf, argv[1]);",
+        "patch": "Bound the copy, validate length before use, and prefer safer APIs with explicit sizes.",
+        "tests": "assert_long_input_rejected(); assert_boundary_length_passes(); assert_asan_clean()",
+        "terms": ["buffer", "overflow", "length", "bound"],
+    },
+    {
+        "name": "idor_missing_owner_check",
+        "bug": "object lookup trusts an id without verifying ownership",
+        "risk": "users can access another user's records by changing identifiers",
+        "bad_code": "invoice = db.get_invoice(request.args['id']); return invoice",
+        "patch": "Fetch by both object id and authenticated user id or enforce an authorization policy check.",
+        "tests": "assert_cross_user_invoice_is_403(); assert_owner_can_read(); assert_admin_scope_logged()",
+        "terms": ["idor", "owner", "authorization", "scope"],
+    },
+    {
+        "name": "sensitive_logging",
+        "bug": "request logs include credentials or tokens",
+        "risk": "logs become a secondary secret store and widen breach impact",
+        "bad_code": "logger.info('login payload=%s', request.json)",
+        "patch": "Redact credentials and tokens before logging and add structured allowlisted fields only.",
+        "tests": "assert_password_redacted(); assert_token_redacted(); assert_request_id_preserved()",
+        "terms": ["log", "redact", "token", "password"],
+    },
 ]
 
 
@@ -138,15 +210,15 @@ class InstructionRecord(StrictModel):
     def training_text(self) -> str:
         return (
             "<|thought_start|>\n"
-            f"Task: {self.prompt}\n"
-            f"Analysis target: {self.analysis_target}\n"
-            f"Correct answer: {self.correct_answer}\n"
+            f"Prompt: {self.prompt}\n"
+            f"Context: {self.analysis_target}\n"
+            f"Answer: {self.correct_answer}\n"
             "<|thought_end|>\n"
             "<|patch_start|>\n"
             f"{self.code_patch}\n"
             "<|patch_end|>\n"
-            f"Tests:\n{self.tests}\n"
-            f"Verification result: {self.verification_result}\n"
+            f"Tests: {self.tests}\n"
+            f"Verification: {self.verification_result}\n"
         )
 
 
@@ -155,11 +227,15 @@ class TokenDominance(StrictModel):
     unique_tokens: int
     top_tokens: list[dict[str, Any]]
     dot_fraction: float
+    quote_fraction: float
     whitespace_fraction: float
     newline_fraction: float
+    single_char_fraction: float
+    unknown_fraction: float
     alphanumeric_fraction: float
     special_token_missing: list[str]
     sample_efficiency: dict[str, int]
+    pattern_coverage: dict[str, dict[str, Any]]
     status: str
     warnings: list[str]
 
@@ -195,13 +271,19 @@ def build_instruction_records(count: int = 200) -> list[InstructionRecord]:
     if count < 1:
         raise ValueError("count must be >= 1")
     records: list[InstructionRecord] = []
+    prompt_templates = [
+        "Review the code for {name} and produce a defensive patch plan with regression tests.",
+        "Find the smallest safe fix for {bug}; include tests and verification.",
+        "Act as a code reviewer: identify the risk in this snippet and write a safe remediation plan.",
+        "Convert this vulnerability context into implementation steps, patch guidance, and acceptance checks.",
+    ]
     for index in range(count):
         pattern = SECURITY_PATTERNS[index % len(SECURITY_PATTERNS)]
         category = INSTRUCTION_CATEGORIES[index % len(INSTRUCTION_CATEGORIES)]
         variant = index // len(SECURITY_PATTERNS)
-        prompt = (
-            f"Task {index:04d}: Review the code for {pattern['name']} and produce "
-            "a defensive patch plan with regression tests."
+        prompt = f"Task {index:04d}: " + prompt_templates[index % len(prompt_templates)].format(
+            name=pattern["name"],
+            bug=pattern["bug"],
         )
         if category == "agentic_coding":
             prompt = f"Task {index:04d}: Build a small service change that prevents {pattern['bug']} and verify it end to end."
@@ -210,8 +292,8 @@ def build_instruction_records(count: int = 200) -> list[InstructionRecord]:
         elif category == "repository_reasoning":
             prompt = f"Task {index:04d}: Identify which module should own the fix for {pattern['name']} and describe dependencies."
         correct_answer = (
-            f"The issue is {pattern['bug']}. The safe fix is to avoid trusting raw input, "
-            f"apply a narrow validation boundary, and verify the behavior with regression tests. "
+            f"The issue is {pattern['bug']}. Use a narrow validation or authorization boundary, "
+            f"preserve legitimate behavior, and prove the change with targeted regression tests. "
             f"Security risk: {pattern['risk']}."
         )
         records.append(
@@ -223,7 +305,7 @@ def build_instruction_records(count: int = 200) -> list[InstructionRecord]:
                 correct_answer=correct_answer,
                 code_patch=str(pattern["patch"]),
                 tests=str(pattern["tests"]),
-                verification_result="passed: compile/static reasoning checks and regression assertions are satisfied",
+                verification_result="passed: static reasoning, regression assertions, and safety constraints are satisfied",
                 expected_terms=list(pattern["terms"]),
                 metadata={"pattern": pattern["name"], "variant": variant, "difficulty": 1 + (variant % 5)},
             )
@@ -288,15 +370,82 @@ def iter_jsonl_texts(path: str | Path) -> Iterable[str]:
 
 
 def _token_kind(decoded: str) -> str:
+    if decoded == "<unk>":
+        return "unknown"
     if decoded == "." or decoded.strip() == ".":
         return "dot"
+    if decoded in {"'", '"', "`"} or decoded.strip() in {"'", '"', "`"}:
+        return "quote"
     if "\n" in decoded or "\r" in decoded:
         return "newline"
     if decoded and decoded.strip() == "":
         return "whitespace"
+    if len(decoded) == 1:
+        return "single_char"
     if re.search(r"[A-Za-z0-9_]", decoded):
         return "alphanumeric"
     return "other"
+
+
+def _pattern_coverage(tokenizer: Any) -> dict[str, dict[str, Any]]:
+    samples = {
+        "hex_byte": "0x00 0xff 0x7f",
+        "memory_address": "0x7ffd00ff 0xdeadbeefcafebabe",
+        "compile_error": "<|compile_error|> gcc error: undefined reference to main",
+        "python_indent": "def f():\n    if ok:\n        return value\n",
+        "rust_fn": "fn checked_add(a: u64, b: u64) -> Option<u64> { a.checked_add(b) }",
+        "bash_pipefail": "#!/usr/bin/env bash\nset -euo pipefail\n",
+        "security_terms": "CVE-2024-0001 CWE-89 SQL injection XSS SSRF path traversal command injection",
+    }
+    report: dict[str, dict[str, Any]] = {}
+    for name, text in samples.items():
+        encoded = tokenizer.encode(text)
+        decoded_tokens = [tokenizer.decode([token_id]) for token_id in encoded.ids]
+        single_char_tokens = sum(1 for token in decoded_tokens if len(token) == 1)
+        report[name] = {
+            "token_count": len(encoded.ids),
+            "chars": len(text),
+            "chars_per_token": round(len(text) / max(1, len(encoded.ids)), 6),
+            "single_char_token_fraction": round(single_char_tokens / max(1, len(encoded.ids)), 6),
+            "tokens_preview": decoded_tokens[:24],
+        }
+    return report
+
+
+def write_tokenizer_audit_markdown(report: TokenDominance, path: str | Path) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Aeitron Tokenizer Audit",
+        "",
+        f"- status: {report.status}",
+        f"- total tokens: {report.total_tokens}",
+        f"- unique tokens: {report.unique_tokens}",
+        f"- dot fraction: {report.dot_fraction:.6f}",
+        f"- quote fraction: {report.quote_fraction:.6f}",
+        f"- whitespace fraction: {report.whitespace_fraction:.6f}",
+        f"- newline fraction: {report.newline_fraction:.6f}",
+        f"- single-character fraction: {report.single_char_fraction:.6f}",
+        f"- unknown fraction: {report.unknown_fraction:.6f}",
+        "",
+        "## Warnings",
+        "",
+    ]
+    if report.warnings:
+        lines.extend(f"- {warning}" for warning in report.warnings)
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Top Tokens", "", "| decoded | count | fraction | kind |", "|---|---:|---:|---|"])
+    for item in report.top_tokens:
+        decoded = str(item["decoded"]).replace("|", "\\|").replace("\n", "\\n")
+        lines.append(f"| `{decoded}` | {item['count']} | {item['fraction']} | {item['kind']} |")
+    lines.extend(["", "## Pattern Coverage", "", "| pattern | tokens | chars/token | single-char fraction |", "|---|---:|---:|---:|"])
+    for name, item in sorted(report.pattern_coverage.items()):
+        lines.append(
+            f"| {name} | {item['token_count']} | {item['chars_per_token']} | {item['single_char_token_fraction']} |"
+        )
+    target.write_text("\n".join(lines), encoding="utf-8")
+    return target
 
 
 def audit_tokenizer_dominance(
@@ -314,6 +463,7 @@ def audit_tokenizer_dominance(
         raise ValueError("tokenizer audit corpus produced zero tokens")
     kind_counts: Counter[str] = Counter()
     top_tokens: list[dict[str, Any]] = []
+    top_token_ids = {token_id for token_id, _count in counts.most_common(20)}
     for token_id, count in counts.most_common(20):
         decoded = tokenizer.decode([token_id])
         kind = _token_kind(decoded)
@@ -328,7 +478,7 @@ def audit_tokenizer_dominance(
             }
         )
     for token_id, count in counts.items():
-        if token_id not in {item["id"] for item in top_tokens}:
+        if token_id not in top_token_ids:
             kind_counts[_token_kind(tokenizer.decode([token_id]))] += count
 
     vocab = tokenizer.get_vocab()
@@ -341,28 +491,59 @@ def audit_tokenizer_dominance(
     }
     warnings: list[str] = []
     dot_fraction = kind_counts["dot"] / total
+    quote_fraction = kind_counts["quote"] / total
     whitespace_fraction = kind_counts["whitespace"] / total
     newline_fraction = kind_counts["newline"] / total
+    single_char_fraction = kind_counts["single_char"] / total
+    unknown_fraction = kind_counts["unknown"] / total
+    coverage = _pattern_coverage(tokenizer)
     if dot_fraction > 0.08:
         warnings.append(f"dot token fraction is high: {dot_fraction:.4f}")
+    if quote_fraction > 0.08:
+        warnings.append(f"quote token fraction is high: {quote_fraction:.4f}")
     if whitespace_fraction > 0.35:
         warnings.append(f"whitespace token fraction is high: {whitespace_fraction:.4f}")
+    if single_char_fraction > 0.18:
+        warnings.append(f"single-character token fraction is high: {single_char_fraction:.4f}")
+    if unknown_fraction > 0.0:
+        warnings.append(f"unknown token fraction must be zero for byte-level source-code tokenizer: {unknown_fraction:.4f}")
+    inefficient = [
+        name
+        for name, item in coverage.items()
+        if float(item["single_char_token_fraction"]) > 0.55 or float(item["chars_per_token"]) < 1.5
+    ]
+    if inefficient:
+        warnings.append(f"inefficient code/security pattern tokenization: {', '.join(sorted(inefficient))}")
     if top_tokens and top_tokens[0]["fraction"] > 0.20:
         warnings.append(f"top token dominates corpus: {top_tokens[0]}")
     missing = [token for token in required_special if token not in vocab]
     if missing:
         warnings.append(f"missing special tokens: {missing}")
-    status = "passed" if not missing and dot_fraction <= 0.08 and whitespace_fraction <= 0.35 else "warning"
+    status = (
+        "passed"
+        if not missing
+        and dot_fraction <= 0.08
+        and quote_fraction <= 0.08
+        and whitespace_fraction <= 0.35
+        and single_char_fraction <= 0.18
+        and unknown_fraction == 0.0
+        and not inefficient
+        else "warning"
+    )
     report = TokenDominance(
         total_tokens=total,
         unique_tokens=len(counts),
         top_tokens=top_tokens,
         dot_fraction=round(dot_fraction, 6),
+        quote_fraction=round(quote_fraction, 6),
         whitespace_fraction=round(whitespace_fraction, 6),
         newline_fraction=round(newline_fraction, 6),
+        single_char_fraction=round(single_char_fraction, 6),
+        unknown_fraction=round(unknown_fraction, 6),
         alphanumeric_fraction=round(kind_counts["alphanumeric"] / total, 6),
         special_token_missing=missing,
         sample_efficiency={name: len(tokenizer.encode(text).ids) for name, text in samples.items()},
+        pattern_coverage=coverage,
         status=status,
         warnings=warnings,
     )
@@ -370,6 +551,7 @@ def audit_tokenizer_dominance(
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
+        write_tokenizer_audit_markdown(report, target.with_suffix(".md"))
     return report
 
 
@@ -473,12 +655,21 @@ def run_overfit_sanity(
 
 
 def build_t4_validation_command(*, work_dir: str | Path, eval_suite_path: str | Path) -> str:
+    eval_suite = Path(eval_suite_path)
     return (
+        "python -m src.aeitron.model_ops.learning_validation \\\n"
+        f"  --output-dir {eval_suite.parent.as_posix()} \\\n"
+        "  --instruction-count 200 \\\n"
+        "  --skip-overfit\n\n"
         "PYTHONUNBUFFERED=1 python -u deploy/gpu/run_real_data_training_pipeline.py \\\n"
         "  --sources config/data_sources.ultimate.json \\\n"
         f"  --work-dir {Path(work_dir).as_posix()} \\\n"
         "  --kaggle-validation \\\n"
         "  --model-profile t4_validation \\\n"
+        f"  --checkpoint-compare-prompt-suite {eval_suite.as_posix()} \\\n"
+        "  --checkpoint-compare-repetition-penalty 1.18 \\\n"
+        "  --checkpoint-compare-no-repeat-ngram-size 4 \\\n"
+        "  --checkpoint-compare-max-repetition-ratio 0.72 \\\n"
         "  --max-docs 24000 \\\n"
         "  --max-bytes-per-doc 250000 \\\n"
         "  --workers 6 \\\n"
@@ -495,9 +686,12 @@ def build_t4_validation_command(*, work_dir: str | Path, eval_suite_path: str | 
         "  --progress-to-stdout\n\n"
         "python deploy/gpu/run_checkpoint_comparison.py \\\n"
         f"  --training-report {Path(work_dir).as_posix()}/reports/real_data_training_report.json \\\n"
-        f"  --prompt-suite {Path(eval_suite_path).as_posix()} \\\n"
+        f"  --prompt-suite {eval_suite.as_posix()} \\\n"
         f"  --output-dir {Path(work_dir).as_posix()}/reports/checkpoint_compare_expanded \\\n"
-        "  --device cuda"
+        "  --device cuda \\\n"
+        "  --repetition-penalty 1.18 \\\n"
+        "  --no-repeat-ngram-size 4 \\\n"
+        "  --max-repetition-ratio 0.72"
     )
 
 
@@ -540,7 +734,8 @@ def run_learning_validation(
         recommendations.append("do not run expensive training until overfit sanity passes")
     recommendations.append("use the expanded eval suite for every real-data checkpoint comparison")
     recommendations.append("run the T4 validation profile only after overfit sanity passes")
-    status = "passed" if tokenizer_audit.status == "passed" and (overfit_report is None or overfit_report.status == "passed") else "failed"
+    hard_failures = bool(tokenizer_audit.special_token_missing) or (overfit_report is not None and overfit_report.status != "passed")
+    status = "failed" if hard_failures else "passed"
     report = LearningValidationReport(
         status=status,
         output_dir=str(root),
