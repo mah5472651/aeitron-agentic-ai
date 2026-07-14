@@ -11,8 +11,8 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
-    "ContaminationDetector": ("src.aeitron.learning.contamination", "ContaminationDetector"),
-    "ContaminationReport": ("src.aeitron.learning.contamination", "ContaminationReport"),
+    "ContaminationDetector": ("src.aeitron.learning.benchmark_contamination_filter", "ContaminationDetector"),
+    "ContaminationReport": ("src.aeitron.learning.benchmark_contamination_filter", "ContaminationReport"),
     "CrawlConfig": ("src.aeitron.learning.web_ingest", "CrawlConfig"),
     "DataEngine": ("src.aeitron.learning.data_engine", "DataEngine"),
     "DataEngineConfig": ("src.aeitron.learning.data_engine", "DataEngineConfig"),

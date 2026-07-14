@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import Field
 
 from src.aeitron.db.local_store import LocalStore
-from src.aeitron.indexing.repository_indexer import RepositoryIndexer
+from src.aeitron.indexing.repository_indexer import RepositoryIndexer, estimate_tokens
 from src.aeitron.shared.schemas import StrictModel
 
 
@@ -82,10 +82,6 @@ def cosine_sparse(left: Counter[str], right: Counter[str]) -> float:
     if left_norm == 0 or right_norm == 0:
         return 0.0
     return dot / (left_norm * right_norm)
-
-
-def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
 
 
 class ContextBuilder:

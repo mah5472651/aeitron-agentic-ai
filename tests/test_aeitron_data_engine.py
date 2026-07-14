@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 
-from src.aeitron.learning.benchmark_contamination_filter import filter_benchmark_contamination_jsonl
+from src.aeitron.learning.benchmark_contamination_filter import ContaminationDetector, filter_benchmark_contamination_jsonl
 from src.aeitron.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore, is_supported_text_response
 from src.aeitron.learning.data_engine import ShardedJsonlWriter
 from src.aeitron.learning.data_pipeline import DataPipelineConfig, PipelineRunLock, run_data_pipeline
@@ -35,7 +35,6 @@ from src.aeitron.learning.vulnerability_adapters import (
     VulnerabilityFetchConfig,
 )
 from src.aeitron.learning.web_ingest import SourceSpec
-from src.aeitron.learning.contamination import ContaminationDetector
 from src.aeitron.learning.quality import iter_jsonl
 from src.aeitron.learning.quality import DatasetQualityGate
 from src.aeitron.learning.task_extraction import extract_tasks

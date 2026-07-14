@@ -14,14 +14,15 @@ import httpx
 from pydantic import Field
 
 from src.aeitron.evaluation.checkpoint_eval import CheckpointEvalReport, evaluate_checkpoint
-from src.aeitron.learning.contamination import ContaminationDetector, load_patterns
+from src.aeitron.learning.benchmark_contamination_filter import (
+    BenchmarkContaminationFilterReport,
+    ContaminationDetector,
+    filter_benchmark_contamination_jsonl,
+    load_patterns,
+)
 from src.aeitron.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore, PostgresFrontierStore
 from src.aeitron.learning.dashboard import write_dashboard
 from src.aeitron.learning.feedback import BenchmarkFeedbackReport, write_feedback_report
-from src.aeitron.learning.benchmark_contamination_filter import (
-    BenchmarkContaminationFilterReport,
-    filter_benchmark_contamination_jsonl,
-)
 from src.aeitron.learning.license_filter import LicenseFilterReport, filter_jsonl_by_license
 from src.aeitron.learning.mixer import (
     ScratchInstructionMixReport,

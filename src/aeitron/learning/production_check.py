@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from pydantic import Field
 
 from src.aeitron.db.migration_runner import load_migrations
-from src.aeitron.learning.contamination import load_patterns
+from src.aeitron.learning.benchmark_contamination_filter import load_patterns
 from src.aeitron.learning.source_registry import SourceRegistry
 from src.aeitron.shared.schemas import StrictModel
 
