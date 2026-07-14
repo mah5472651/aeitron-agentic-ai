@@ -2674,6 +2674,56 @@ configured. That is intentional. A missing Redis, Postgres, S3/MinIO, Qdrant,
 Semgrep, CodeQL, Docker, kubectl, CUDA runtime, or benchmark suite must be a
 visible blocker, not a hidden warning.
 
+Live production proof:
+
+`production_readiness` tells you whether configuration claims are valid.
+`production_proof` actually touches the running dependencies and writes measured
+evidence. It verifies:
+
+- Postgres migration dry-run or live migration apply
+- Redis regenerative quota execution through the Lua-backed quota store
+- local or S3/MinIO object-store write/read/delete lifecycle
+- Qdrant HTTP health
+- native Aeitron serving health and model listing
+- optional OpenAI-compatible chat load test
+- governed benchmark pack presence and minimum production coverage
+- security audit report
+
+Validation mode:
+
+```powershell
+python -m src.aeitron.deployment.production_proof `
+  --object-store-uri local://artifacts/aeitron/proof-object-store `
+  --output-dir artifacts\\aeitron\production-proof-validation
+```
+
+Validation mode is for local/Kaggle proof of code paths. Missing external
+services are marked `skipped`, not `passed`.
+
+Strict production mode:
+
+```powershell
+python -m src.aeitron.deployment.production_proof `
+  --strict `
+  --postgres-url "$env:AEITRON_DATABASE_URL" `
+  --apply-postgres-migrations `
+  --redis-url "$env:AEITRON_REDIS_URL" `
+  --object-store-uri "$env:AEITRON_OBJECT_STORE_URI" `
+  --object-store-endpoint-url "$env:AEITRON_OBJECT_STORE_ENDPOINT_URL" `
+  --qdrant-url "$env:AEITRON_QDRANT_URL" `
+  --serving-url "$env:AEITRON_SERVING_URL" `
+  --serving-api-key "$env:AEITRON_MODEL_API_KEY" `
+  --load-test-requests 100 `
+  --benchmark-dir data\eval `
+  --run-security-audit `
+  --strict-security-tools `
+  --output-dir artifacts\\aeitron\production-proof
+```
+
+Strict mode fails if required dependencies are missing or unhealthy. This is the
+command to use after starting the production Docker Compose stack or a
+Kubernetes deployment.
+
 Configuration contract layer:
 
 - All production-critical JSON configs are validated through strict Pydantic

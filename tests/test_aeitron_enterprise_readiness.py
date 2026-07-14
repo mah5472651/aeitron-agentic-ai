@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -7,6 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.aeitron.deployment.k8s_validate import validate_manifests
+from src.aeitron.deployment.production_proof import (
+    ProductionProofConfig,
+    run_native_serving_load_test,
+    run_production_proof,
+)
 from src.aeitron.evaluation.benchmark_pack import BenchmarkPackConfig, run_benchmark_pack
 from src.aeitron.evaluation.benchmark_suites import BenchmarkSuiteSpec, run_benchmark_suites
 from src.aeitron.learning.dataset_validation import DatasetValidationConfig, validate_dataset
@@ -43,6 +49,79 @@ class AeitronEnterpriseReadinessTest(unittest.TestCase):
             self.assertEqual(report.status, "passed")
             self.assertTrue(report.checksum_match)
             self.assertTrue(report.deleted)
+
+    def test_production_proof_validation_mode_skips_missing_external_infra(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            report = asyncio.run(
+                run_production_proof(
+                    ProductionProofConfig(
+                        strict=False,
+                        output_dir=str(root / "proof"),
+                        object_store_uri=f"local://{root / 'objects'}",
+                    )
+                )
+            )
+
+            checks = {item.name: item for item in report.checks}
+            self.assertEqual(report.status, "passed")
+            self.assertEqual(checks["object_store_lifecycle"].status, "passed")
+            self.assertEqual(checks["postgres_migrations"].status, "skipped")
+            self.assertEqual(checks["qdrant_health"].status, "skipped")
+            self.assertTrue((root / "proof" / "production_proof_report.json").exists())
+
+    def test_production_proof_strict_mode_fails_without_required_infra(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = asyncio.run(
+                run_production_proof(
+                    ProductionProofConfig(
+                        strict=True,
+                        output_dir=str(Path(temp_dir) / "proof"),
+                    )
+                )
+            )
+
+            self.assertEqual(report.status, "failed")
+            self.assertTrue(any(item.status == "failed" and item.required for item in report.checks))
+
+    def test_native_serving_load_test_scores_mocked_openai_compatible_endpoint(self) -> None:
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        class FakeClient:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                return None
+
+            async def __aenter__(self) -> "FakeClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def post(self, *args: object, **kwargs: object) -> FakeResponse:
+                return FakeResponse()
+
+        with patch("src.aeitron.deployment.production_proof.httpx.AsyncClient", FakeClient):
+            report = asyncio.run(
+                run_native_serving_load_test(
+                    endpoint="http://serving.test",
+                    model="aeitron-scratch",
+                    api_key="token",
+                    requests=5,
+                    concurrency=2,
+                    timeout_seconds=5.0,
+                )
+            )
+
+        self.assertEqual(report.status, "passed")
+        self.assertEqual(report.passed, 5)
+        self.assertEqual(report.failed, 0)
 
     def test_object_store_upload_paths_keeps_duplicate_shard_names(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

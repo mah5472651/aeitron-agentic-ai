@@ -175,6 +175,30 @@ python -m src.aeitron.learning.storage --uri s3://aeitron-datasets/pretraining -
 python deploy\gpu\run_10k_training_validation.py --manifest artifacts\\aeitron\shards\manifest.json --device cuda --steps 10000
 ```
 
+Live production proof gate:
+
+```powershell
+python -m src.aeitron.deployment.production_proof `
+  --strict `
+  --postgres-url "$env:AEITRON_DATABASE_URL" `
+  --apply-postgres-migrations `
+  --redis-url "$env:AEITRON_REDIS_URL" `
+  --object-store-uri "$env:AEITRON_OBJECT_STORE_URI" `
+  --object-store-endpoint-url "$env:AEITRON_OBJECT_STORE_ENDPOINT_URL" `
+  --qdrant-url "$env:AEITRON_QDRANT_URL" `
+  --serving-url "$env:AEITRON_SERVING_URL" `
+  --serving-api-key "$env:AEITRON_MODEL_API_KEY" `
+  --load-test-requests 100 `
+  --benchmark-dir data\eval `
+  --run-security-audit `
+  --strict-security-tools `
+  --output-dir artifacts\\aeitron\production-proof
+```
+
+For local or Kaggle validation without live services, omit `--strict`; missing
+Postgres/Redis/Qdrant/serving/benchmark inputs are marked as skipped, never as
+production-ready.
+
 The production stack includes Prometheus, Grafana, and optional OpenTelemetry:
 
 ```powershell
