@@ -703,6 +703,66 @@ $env:AEITRON_QUOTA_ENABLED = "1"
 $env:AEITRON_REDIS_URL = "redis://redis:6379/0"
 ```
 
+## Training Workspace
+
+The same governed control path now covers direct-kernel notebook validation,
+single-node jobs, Kubernetes Jobs, Kubeflow PyTorchJobs, and Slurm. Clients can
+select immutable profiles and bounded overrides only; arbitrary shell commands
+are never accepted.
+
+```text
+SDK / CLI / React UI
+  -> FastAPI + short-lived JWT
+  -> Postgres job/audit state
+  -> Redis Streams live events
+  -> S3/MinIO logs, reports, and checkpoints
+  -> controller -> notebook | Kubernetes | PyTorchJob | Slurm
+```
+
+Notebook secrets:
+
+```text
+AEITRON_WORKSPACE_URL=https://workspace.example.com
+AEITRON_BOOTSTRAP_TOKEN=<secret-manager-value>
+```
+
+Direct-kernel Kaggle/Colab validation with immediate output:
+
+```python
+%run -i deploy/gpu/run_workspace_validation.py --profile defensive-1k
+```
+
+SDK and CLI:
+
+```python
+from aeitron_client import Workspace
+
+workspace = Workspace.from_environment()
+run = await workspace.train(profile="defensive-1k", follow=True)
+```
+
+```bash
+python -m pip install -e . --no-deps
+aeitron train --profile defensive-1k --follow
+aeitron jobs list
+aeitron jobs inspect JOB_ID
+aeitron jobs cancel JOB_ID
+aeitron jobs resume JOB_ID
+```
+
+If a local Python installation does not add its Scripts directory to `PATH`,
+`python -m src.aeitron.training_client ...` is the equivalent fallback.
+
+Local production-service proof:
+
+```bash
+docker compose -f deploy/prod/docker-compose.yml --profile training up --build
+```
+
+The workspace UI is exposed at `http://localhost:8088`. Production ingress must
+terminate HTTPS. Profile status remains `built_not_cluster_proven` until its
+actual scheduler, topology, checkpoint reload, and scale gate pass.
+
 ## Final Rule
 
 All new production code belongs under `src/aeitron`.

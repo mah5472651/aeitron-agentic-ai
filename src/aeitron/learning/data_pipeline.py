@@ -934,6 +934,7 @@ async def _run_data_pipeline_locked(
         training_files=len(training_files),
         dashboard_path=str(root / "dashboard.html"),
     )
+    progress.close()
     return report_payload
 
 

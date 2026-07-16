@@ -1,5 +1,8 @@
 ﻿name: aeitron-ci
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [master, main]
@@ -18,6 +21,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-local-dev.txt
+          pip install --upgrade bandit semgrep pip-audit
+          pip install -e . --no-deps
+      - name: Client package smoke
+        run: |
+          aeitron --help
+          python -c "from aeitron_client import Workspace; assert Workspace.__name__ == 'Workspace'"
       - name: Compile
         run: python -m compileall -q src/aeitron tests
       - name: Release gate
@@ -33,7 +42,7 @@ jobs:
           {"text":"Defensive security guidance: prevent SQL injection with parameterized queries and regression tests.","license":"cc-by-4.0","category":"cybersecurity","quality":{"labels":["defensive_security"]}}
           JSONL
           python -m src.aeitron.learning.dataset_validation --inputs artifacts/aeitron/ci-dataset/clean.jsonl --output-dir artifacts/aeitron/ci-dataset-validation --min-records 3 --min-avg-chars 20
-          python -m src.aeitron.security.audit --no-bandit --output-dir artifacts/aeitron/ci-security-audit
+          python -m src.aeitron.security.audit --strict-external-tools --no-codeql --output-dir artifacts/aeitron/ci-security-audit
       - name: Data platform readiness contract
         run: |
           python -m src.aeitron.learning.production_check \
@@ -58,4 +67,34 @@ jobs:
           python -m src.aeitron.learning.governance --store artifacts/aeitron/ci-governance report
       - name: Scratch CPU smoke
         run: python -m src.aeitron.model_ops.gpu_smoke --device cpu --steps 1 --sequence-length 16 --batch-size 1 --dtype fp32
+
+  workspace-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/training-workspace/package-lock.json
+      - name: Install locked dependencies
+        working-directory: apps/training-workspace
+        run: npm ci
+      - name: Production build
+        working-directory: apps/training-workspace
+        run: npm run build
+
+  codeql:
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:python
 

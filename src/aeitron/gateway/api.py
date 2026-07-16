@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.aeitron.db import LocalStore
@@ -24,6 +25,19 @@ from src.aeitron.runtime.engine import AeitronRuntime
 from src.aeitron.runtime.taskgraph import AgentRunCreateRequest, TaskCompleteRequest, TaskFailRequest, TaskGraphRuntime
 from src.aeitron.shared.schemas import AeitronRunRequest, AeitronRunReport
 from src.aeitron.tools import DockerSandboxRunner, HardenedToolExecutor, SandboxRunRequest, ToolExecuteRequest
+from src.aeitron.training_workspace import (
+    ArtifactUploadRequest,
+    CheckpointCommitRequest,
+    EvaluationCommitRequest,
+    JobStatus,
+    ServiceAccount,
+    TrainingArtifact,
+    TrainingEventBatch,
+    TrainingJob,
+    TrainingJobCreateRequest,
+    TrainingWorkspaceService,
+    workspace_readiness,
+)
 from src.aeitron.verifier import VerificationRequest, VerifierRuntime
 
 app = FastAPI(title="Aeitron Consolidated Gateway", version="2.0.0")
@@ -31,6 +45,7 @@ QUOTA_CONFIG = install_quota(app)
 AUTH_CONFIG = install_auth(app)
 install_observability(app)
 STORE = LocalStore()
+TRAINING_WORKSPACE = TrainingWorkspaceService.from_environment()
 
 
 class AuthTokenRequest(BaseModel):
@@ -81,23 +96,67 @@ class SessionCreateRequest(BaseModel):
     title: str = Field(default="Aeitron Session", min_length=1, max_length=200)
 
 
+class TrainingServiceAccountRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    scopes: list[str] = Field(min_length=1, max_length=16)
+
+
+class TrainingTokenExchangeRequest(BaseModel):
+    bootstrap_token: str = Field(min_length=32, max_length=512)
+
+
+class TrainingTokenRefreshRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    refresh_token: str = Field(min_length=32, max_length=512)
+
+
+class TrainingArtifactRegistrationRequest(BaseModel):
+    upload: ArtifactUploadRequest
+    uri: str = Field(min_length=1, max_length=4096)
+
+
 def require_scope(request: Request, scope: str) -> None:
     if not AUTH_CONFIG.enabled:
         return
     claims = getattr(request.state, "jwt_claims", {}) or {}
     scopes = set(str(item) for item in claims.get("scopes", []) if item)
-    if scope not in scopes and "api" not in scopes:
+    if scope.startswith("training:"):
+        allowed = scope in scopes or "training:admin" in scopes
+    else:
+        allowed = scope in scopes or "api" in scopes
+    if not allowed:
         raise PermissionError(f"missing required scope: {scope}")
+
+
+def request_scopes(request: Request) -> set[str]:
+    claims = getattr(request.state, "jwt_claims", {}) or {}
+    return {str(item) for item in claims.get("scopes", []) if item}
+
+
+def request_owner(request: Request) -> str:
+    return str(getattr(request.state, "user_id", "") or "local-user")
+
+
+async def require_training_job_access(request: Request, job_id: str, scope: str) -> TrainingJob:
+    require_scope(request, scope)
+    job = await TRAINING_WORKSPACE.get_job(job_id)
+    claims = getattr(request.state, "jwt_claims", {}) or {}
+    job_bound = str(claims.get("job_id") or "") == job_id
+    if AUTH_CONFIG.enabled and "training:admin" not in request_scopes(request) and not job_bound and job.owner_id != request_owner(request):
+        raise PermissionError("training job belongs to a different workspace identity")
+    return job
 
 
 @app.get("/health/ready")
 async def health_ready() -> dict[str, object]:
+    training = workspace_readiness(TRAINING_WORKSPACE)
     return {
         "status": "ready",
         "model_ops": active_model_health(),
         "auth": auth_status(AUTH_CONFIG),
         "quota": {"enabled": QUOTA_CONFIG.enabled, "capacity": QUOTA_CONFIG.capacity},
         "database": {"ok": True, "engine": "sqlite-local", "path": str(STORE.path)},
+        "training_workspace": training,
     }
 
 
@@ -133,6 +192,403 @@ async def issue_auth_token(request: AuthTokenRequest) -> dict[str, object]:
         "expires_in": request.ttl_seconds,
         "user_id": request.user_id,
     }
+
+
+def training_access_token(account: ServiceAccount) -> str:
+    if not AUTH_CONFIG.jwt_secret:
+        raise HTTPException(status_code=503, detail="AEITRON_JWT_SECRET is required for workspace tokens")
+    return create_jwt(
+        subject=account.service_account_id,
+        secret=AUTH_CONFIG.jwt_secret,
+        issuer=AUTH_CONFIG.issuer,
+        audience=AUTH_CONFIG.audience,
+        scopes=account.scopes,
+        ttl_seconds=900,
+    )
+
+
+@app.get("/v1/training/readiness")
+async def training_workspace_readiness() -> dict[str, Any]:
+    return workspace_readiness(TRAINING_WORKSPACE)
+
+
+@app.post("/v1/training/service-accounts")
+async def create_training_service_account(request: TrainingServiceAccountRequest, http_request: Request) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "training:admin")
+        credential = await TRAINING_WORKSPACE.create_service_account(name=request.name, scopes=request.scopes)
+        return credential.model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/token/exchange")
+async def exchange_training_token(request: TrainingTokenExchangeRequest) -> dict[str, Any]:
+    account = await TRAINING_WORKSPACE.authenticate_bootstrap(request.bootstrap_token)
+    if account is None:
+        raise HTTPException(status_code=401, detail="invalid workspace bootstrap credential")
+    session = await TRAINING_WORKSPACE.create_refresh_session(account)
+    return {
+        "token_type": "Bearer",  # nosec B105 - OAuth token type label, not a credential.
+        "access_token": training_access_token(account),
+        "expires_in": 900,
+        "session_id": session.session_id,
+        "refresh_token": session.refresh_token,
+        "refresh_expires_at": session.expires_at.isoformat(),
+        "service_account_id": account.service_account_id,
+        "scopes": account.scopes,
+    }
+
+
+@app.post("/v1/training/token/refresh")
+async def refresh_training_token(request: TrainingTokenRefreshRequest) -> dict[str, Any]:
+    account = await TRAINING_WORKSPACE.authenticate_refresh(request.session_id, request.refresh_token)
+    if account is None:
+        raise HTTPException(status_code=401, detail="refresh session is invalid, expired, or revoked")
+    return {
+        "token_type": "Bearer",  # nosec B105 - OAuth token type label, not a credential.
+        "access_token": training_access_token(account),
+        "expires_in": 900,
+        "service_account_id": account.service_account_id,
+        "scopes": account.scopes,
+    }
+
+
+@app.post("/v1/training/token/revoke")
+async def revoke_training_token(request: TrainingTokenRefreshRequest, http_request: Request) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "training:jobs:read")
+        revoked = await TRAINING_WORKSPACE.revoke_refresh(request.session_id, request.refresh_token)
+        if not revoked:
+            raise HTTPException(status_code=404, detail="refresh session was not found")
+        return {"revoked": True}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.get("/v1/training/profiles")
+async def training_profiles(http_request: Request) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "training:jobs:read")
+        return {"profiles": TRAINING_WORKSPACE.profile_report()}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs")
+async def create_training_job(request: TrainingJobCreateRequest, http_request: Request) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "training:jobs:create")
+        job = await TRAINING_WORKSPACE.create_job(request, owner_id=request_owner(http_request))
+        METRICS.inc("aeitron_training_jobs_total", profile=job.spec.profile_id, status=job.status.value)
+        return job.model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/training/jobs")
+async def list_training_jobs(http_request: Request, limit: int = 100) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "training:jobs:read")
+        owner = None if "training:admin" in request_scopes(http_request) else request_owner(http_request)
+        jobs = await TRAINING_WORKSPACE.list_jobs(owner_id=owner, limit=limit)
+        return {"jobs": [job.model_dump(mode="json") for job in jobs]}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.get("/v1/training/jobs/{job_id}")
+async def get_training_job(job_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        job = await require_training_job_access(http_request, job_id, "training:jobs:read")
+        return job.model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs/{job_id}/cancel")
+async def cancel_training_job(job_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:jobs:cancel")
+        job = await TRAINING_WORKSPACE.cancel_job(job_id, actor_id=request_owner(http_request))
+        METRICS.inc("aeitron_training_job_transitions_total", target="cancelled")
+        return job.model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs/{job_id}/resume")
+async def resume_training_job(job_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:jobs:create")
+        job = await TRAINING_WORKSPACE.resume_job(job_id, actor_id=request_owner(http_request))
+        METRICS.inc("aeitron_training_job_transitions_total", target="queued")
+        return job.model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs/{job_id}/worker-token")
+async def issue_training_worker_token(job_id: str, http_request: Request, ttl_seconds: int = 21_600) -> dict[str, Any]:
+    try:
+        job = await require_training_job_access(http_request, job_id, "training:jobs:create")
+        if not AUTH_CONFIG.jwt_secret:
+            raise HTTPException(status_code=503, detail="AEITRON_JWT_SECRET is required for worker tokens")
+        ttl = min(max(ttl_seconds, 900), 86_400)
+        token = create_jwt(
+            subject=f"worker:{job.job_id}",
+            secret=AUTH_CONFIG.jwt_secret,
+            issuer=AUTH_CONFIG.issuer,
+            audience=AUTH_CONFIG.audience,
+            scopes=["training:events:write", "training:artifacts:write", "training:jobs:read"],
+            ttl_seconds=ttl,
+            extra_claims={"job_id": job.job_id, "token_class": "training_worker"},
+        )
+        return {"token_type": "Bearer", "access_token": token, "expires_in": ttl, "job_id": job.job_id}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs/{job_id}/claim")
+async def claim_notebook_training_job(job_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:jobs:create")
+        job, attempt = await TRAINING_WORKSPACE.claim_notebook_job(job_id)
+        if not AUTH_CONFIG.jwt_secret:
+            raise HTTPException(status_code=503, detail="AEITRON_JWT_SECRET is required for notebook worker tokens")
+        token = create_jwt(
+            subject=f"worker:{job.job_id}",
+            secret=AUTH_CONFIG.jwt_secret,
+            issuer=AUTH_CONFIG.issuer,
+            audience=AUTH_CONFIG.audience,
+            scopes=["training:events:write", "training:artifacts:write", "training:jobs:read"],
+            ttl_seconds=21_600,
+            extra_claims={"job_id": job.job_id, "token_class": "notebook_worker"},
+        )
+        return {
+            "job": job.model_dump(mode="json"),
+            "attempt": attempt.model_dump(mode="json"),
+            "worker_access_token": token,
+            "worker_token_expires_in": 21_600,
+        }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs/{job_id}/events:batch")
+async def ingest_training_events(job_id: str, request: TrainingEventBatch, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:events:write")
+        events = await TRAINING_WORKSPACE.ingest_events(job_id, request)
+        METRICS.inc("aeitron_training_events_total", value=float(len(events)), kind="batch")
+        if not events:
+            METRICS.inc("aeitron_training_event_duplicates_total", value=float(len(request.events)))
+            return {"accepted": 0, "duplicates": len(request.events), "first_sequence": None, "last_sequence": None, "last_event_id": None}
+        profile_id = (await TRAINING_WORKSPACE.get_job(job_id)).spec.profile_id
+        for event in events:
+            if event.loss is not None:
+                METRICS.observe("aeitron_training_loss", event.loss, profile=profile_id)
+            if event.validation_loss is not None:
+                METRICS.observe("aeitron_training_validation_loss", event.validation_loss)
+            if event.tokens_per_second is not None:
+                METRICS.observe("aeitron_training_tokens_per_second", event.tokens_per_second)
+        return {
+            "accepted": len(events),
+            "duplicates": len(request.events) - len(events),
+            "first_sequence": events[0].sequence,
+            "last_sequence": events[-1].sequence,
+            "last_event_id": events[-1].event_id,
+        }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/training/jobs/{job_id}/audit")
+async def list_training_audit(job_id: str, http_request: Request, limit: int = 100) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:jobs:read")
+        events = await TRAINING_WORKSPACE.list_audit_events(job_id, limit=limit)
+        return {"audit_events": [event.model_dump(mode="json") for event in events]}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/v1/training/jobs/{job_id}/events")
+async def stream_training_events(job_id: str, http_request: Request, after_sequence: int = 0) -> StreamingResponse:
+    try:
+        await require_training_job_access(http_request, job_id, "training:jobs:read")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    header_cursor = http_request.headers.get("last-event-id", "").strip()
+    if header_cursor:
+        try:
+            after_sequence = max(after_sequence, int(header_cursor))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Last-Event-ID must be an integer sequence") from exc
+
+    async def generate() -> Any:
+        async for event in TRAINING_WORKSPACE.stream_events(job_id, after_sequence=after_sequence):
+            if await http_request.is_disconnected():
+                return
+            if event is None:
+                yield ": heartbeat\n\n"
+                continue
+            payload = json.dumps(event.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+            yield f"id: {event.sequence}\nevent: {event.kind}\ndata: {payload}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/v1/training/jobs/{job_id}/artifacts")
+async def list_training_artifacts(job_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:artifacts:read")
+        artifacts = await TRAINING_WORKSPACE.list_artifacts(job_id)
+        return {"artifacts": [artifact.model_dump(mode="json") for artifact in artifacts]}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs/{job_id}/artifacts/presign")
+async def presign_training_artifact(job_id: str, request: ArtifactUploadRequest, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:artifacts:write")
+        return await TRAINING_WORKSPACE.presign_artifact_upload(job_id, request)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs/{job_id}/artifacts/register")
+async def register_training_artifact(
+    job_id: str,
+    request: TrainingArtifactRegistrationRequest,
+    http_request: Request,
+) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:artifacts:write")
+        artifact = await TRAINING_WORKSPACE.verify_and_register_artifact(job_id, request.upload, uri=request.uri)
+        return artifact.model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs/{job_id}/checkpoints")
+async def commit_training_checkpoint(job_id: str, request: CheckpointCommitRequest, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:artifacts:write")
+        checkpoint = await TRAINING_WORKSPACE.commit_checkpoint(job_id, request)
+        METRICS.inc("aeitron_training_checkpoints_total", status="committed")
+        return checkpoint.model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/v1/training/jobs/{job_id}/checkpoints")
+async def list_training_checkpoints(job_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:artifacts:read")
+        rows = await TRAINING_WORKSPACE.list_checkpoints(job_id)
+        return {"checkpoints": [item.model_dump(mode="json") for item in rows]}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs/{job_id}/evaluations")
+async def commit_training_evaluation(job_id: str, request: EvaluationCommitRequest, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:artifacts:write")
+        evaluation = await TRAINING_WORKSPACE.commit_evaluation(job_id, request)
+        METRICS.inc("aeitron_training_evaluations_total", decision=evaluation.decision)
+        return evaluation.model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/v1/training/jobs/{job_id}/evaluations")
+async def list_training_evaluations(job_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:artifacts:read")
+        rows = await TRAINING_WORKSPACE.list_evaluations(job_id)
+        return {"evaluations": [item.model_dump(mode="json") for item in rows]}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/v1/training/jobs/{job_id}/checkpoints/{checkpoint_id}/promote")
+async def promote_training_checkpoint(job_id: str, checkpoint_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        await require_training_job_access(http_request, job_id, "training:admin")
+        checkpoint = await TRAINING_WORKSPACE.promote_checkpoint(
+            job_id,
+            checkpoint_id,
+            actor_id=request_owner(http_request),
+        )
+        METRICS.inc("aeitron_training_checkpoints_total", status="promoted")
+        return checkpoint.model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/v1/model/profiles")

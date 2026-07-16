@@ -1,0 +1,189 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aeitron-training
+  labels:
+    app.kubernetes.io/part-of: aeitron
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aeitron-training-controller
+  namespace: aeitron-training
+automountServiceAccountToken: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aeitron-training-worker
+  namespace: aeitron-training
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aeitron-training-controller
+  namespace: aeitron-training
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "jobs/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["kubeflow.org"]
+    resources: ["pytorchjobs", "pytorchjobs/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aeitron-training-controller
+  namespace: aeitron-training
+subjects:
+  - kind: ServiceAccount
+    name: aeitron-training-controller
+    namespace: aeitron-training
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aeitron-training-controller
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aeitron-training-config
+  namespace: aeitron-training
+data:
+  workspace-url: "http://aeitron-api.default.svc.cluster.local"
+  training-git-commit: "replace-with-immutable-git-commit"
+  training-image-digest: "replace-with-sha256-image-digest"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aeitron-training-controller
+  namespace: aeitron-training
+  labels:
+    app: aeitron-training-controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: aeitron-training-controller
+  template:
+    metadata:
+      labels:
+        app: aeitron-training-controller
+        app.kubernetes.io/part-of: aeitron
+    spec:
+      serviceAccountName: aeitron-training-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: aeitron-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-u", "-m", "src.aeitron.training_workspace", "controller", "--poll-seconds", "5"]
+          env:
+            - name: AEITRON_ENV
+              value: production
+            - name: AEITRON_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-training-secrets
+                  key: jwt-secret
+            - name: AEITRON_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-training-secrets
+                  key: database-url
+            - name: AEITRON_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-training-secrets
+                  key: redis-url
+            - name: AEITRON_OBJECT_STORE_URI
+              value: s3://aeitron-datasets/training-workspace
+            - name: AEITRON_OBJECT_STORE_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-training-secrets
+                  key: object-store-endpoint
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-training-secrets
+                  key: object-store-access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-training-secrets
+                  key: object-store-secret-key
+            - name: AEITRON_TRAINING_GIT_COMMIT
+              valueFrom:
+                configMapKeyRef:
+                  name: aeitron-training-config
+                  key: training-git-commit
+            - name: AEITRON_TRAINING_IMAGE_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: aeitron-training-config
+                  key: training-image-digest
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: runtime
+              mountPath: /app/artifacts
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Mi
+        - name: runtime
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aeitron-training-control-plane
+  namespace: aeitron-training
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["aeitron-training-controller", "aeitron-training"]
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+        - {protocol: TCP, port: 80}
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 5432}
+        - {protocol: TCP, port: 6379}
+        - {protocol: TCP, port: 9000}

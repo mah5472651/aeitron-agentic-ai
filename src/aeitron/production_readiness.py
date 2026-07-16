@@ -25,6 +25,7 @@ from src.aeitron.identity.quota import QuotaConfig
 from src.aeitron.model_ops.backends import active_model_health
 from src.aeitron.shared.config import load_active_profile
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.training_workspace import TrainingProfileRegistry
 
 
 ReadinessStatus = Literal[
@@ -307,6 +308,50 @@ def _check_training_stack(mode: str) -> list[ReadinessCheck]:
     ]
 
 
+def _check_training_workspace(mode: str) -> ReadinessCheck:
+    database_url = os.environ.get("AEITRON_DATABASE_URL", "")
+    redis_url = os.environ.get("AEITRON_REDIS_URL", "")
+    object_uri = os.environ.get("AEITRON_OBJECT_STORE_URI", "")
+    jwt_secret = os.environ.get("AEITRON_JWT_SECRET", "")
+    missing = []
+    if not database_url.startswith(("postgres://", "postgresql://")):
+        missing.append("AEITRON_DATABASE_URL=postgresql://...")
+    if not redis_url.startswith(("redis://", "rediss://")):
+        missing.append("AEITRON_REDIS_URL=redis[s]://...")
+    if not object_uri.startswith("s3://"):
+        missing.append("AEITRON_OBJECT_STORE_URI=s3://...")
+    if len(jwt_secret) < 32:
+        missing.append("AEITRON_JWT_SECRET length >= 32")
+    profile_count = 0
+    try:
+        profile_count = len(TrainingProfileRegistry.from_file().profiles)
+    except (FileNotFoundError, ValueError):
+        missing.append("valid config/training_profiles.json")
+    kubernetes_client = importlib.util.find_spec("kubernetes") is not None or shutil.which("kubectl") is not None
+    if not kubernetes_client:
+        missing.append("kubernetes Python client or kubectl")
+    return ReadinessCheck(
+        subsystem="training_workspace",
+        status="built_not_cluster_proven" if not missing else "blocked_missing_dependency",
+        summary=(
+            "Durable training control-plane dependencies are configured; scheduler paths still require live cluster proof."
+            if not missing
+            else "Training workspace production dependencies are incomplete."
+        ),
+        required_dependencies=["Postgres", "Redis Streams", "S3/MinIO", "JWT signing key", "Kubernetes scheduler client"],
+        missing_dependencies=missing,
+        evidence={
+            "profile_count": profile_count,
+            "postgres_configured": database_url.startswith(("postgres://", "postgresql://")),
+            "redis_configured": redis_url.startswith(("redis://", "rediss://")),
+            "object_storage_configured": object_uri.startswith("s3://"),
+            "scheduler_client_present": kubernetes_client,
+            "cluster_proof": False,
+        },
+        production_blocker=mode == "production" and bool(missing),
+    )
+
+
 def _check_benchmark_files(mode: str, benchmark_dir: str | Path) -> ReadinessCheck:
     root = Path(benchmark_dir)
     required = [
@@ -341,6 +386,7 @@ def run_production_readiness(
         *_check_external_services(mode),
         *_check_cli_tools(mode),
         *_check_training_stack(mode),
+        _check_training_workspace(mode),
         _check_benchmark_files(mode, benchmark_dir),
     ]
     failed = any(check.production_blocker for check in checks)

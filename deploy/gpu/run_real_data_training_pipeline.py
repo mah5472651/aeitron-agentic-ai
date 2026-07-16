@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -148,7 +149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-id", default="aeitron-real-approved-corpus")
     parser.add_argument("--output-dir", "--work-dir", dest="output_dir", default="artifacts/aeitron/real-data-training")
     parser.add_argument("--frontier-backend", choices=["sqlite", "postgres"], default="sqlite")
-    parser.add_argument("--postgres-dsn")
+    parser.add_argument("--postgres-dsn", default=os.environ.get("AEITRON_DATABASE_URL"))
     parser.add_argument("--max-docs", type=int, default=10_000)
     parser.add_argument(
         "--max-bytes-per-doc",
@@ -194,8 +195,8 @@ def parse_args() -> argparse.Namespace:
         choices=["balanced", "fundamentals_only", "defensive_security_only", "debug_patch_only", "agentic_coding_only"],
     )
     parser.add_argument("--allow-offensive-misuse-rows", action="store_true")
-    parser.add_argument("--object-store-uri", default="local://artifacts/aeitron/object-store")
-    parser.add_argument("--object-store-endpoint-url")
+    parser.add_argument("--object-store-uri", default=os.environ.get("AEITRON_OBJECT_STORE_URI", "local://artifacts/aeitron/object-store"))
+    parser.add_argument("--object-store-endpoint-url", default=os.environ.get("AEITRON_OBJECT_STORE_ENDPOINT_URL"))
     parser.add_argument("--checkpoint-compare-prompt-suite")
     parser.add_argument("--checkpoint-compare-min-score", type=float, default=0.0)
     parser.add_argument("--checkpoint-compare-max-new-tokens", type=int, default=96)

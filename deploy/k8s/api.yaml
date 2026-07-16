@@ -12,6 +12,13 @@ spec:
       labels:
         app: aeitron-api
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: api
           image: aeitron-api:latest
@@ -19,6 +26,8 @@ spec:
           ports:
             - containerPort: 8090
           env:
+            - name: AEITRON_ENV
+              value: production
             - name: AEITRON_AUTH_ENABLED
               value: "1"
             - name: AEITRON_QUOTA_ENABLED
@@ -28,6 +37,11 @@ spec:
                 secretKeyRef:
                   name: aeitron-secrets
                   key: jwt-secret
+            - name: AEITRON_WORKSPACE_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-secrets
+                  key: workspace-bootstrap-token
             - name: AEITRON_ALLOW_TOKEN_ISSUE
               value: "0"
             - name: AEITRON_DATABASE_URL
@@ -37,6 +51,44 @@ spec:
                   key: database-url
             - name: AEITRON_REDIS_URL
               value: redis://aeitron-redis:6379/0
+            - name: AEITRON_QDRANT_URL
+              value: http://aeitron-qdrant:6333
+            - name: AEITRON_OBJECT_STORE_URI
+              value: s3://aeitron-datasets/training-workspace
+            - name: AEITRON_OBJECT_STORE_ENDPOINT_URL
+              value: http://aeitron-minio:9000
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-secrets
+                  key: minio-root-user
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-secrets
+                  key: minio-root-password
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
+            - name: AEITRON_TRAINING_GIT_COMMIT
+              valueFrom:
+                configMapKeyRef:
+                  name: aeitron-training-build
+                  key: git-commit
+            - name: AEITRON_TRAINING_IMAGE_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: aeitron-training-build
+                  key: image-digest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: runtime
+              mountPath: /app/artifacts
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -56,6 +108,14 @@ spec:
             limits:
               cpu: "2"
               memory: 4Gi
+      volumes:
+        - name: runtime
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Mi
 ---
 apiVersion: v1
 kind: Service
@@ -67,4 +127,12 @@ spec:
   ports:
     - port: 80
       targetPort: 8090
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aeitron-training-build
+data:
+  git-commit: "replace-with-immutable-git-commit"
+  image-digest: "replace-with-sha256-image-digest"
 

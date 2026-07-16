@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aeitron-training-workspace
+  namespace: default
+  labels:
+    app: aeitron-training-workspace
+    app.kubernetes.io/part-of: aeitron
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: aeitron-training-workspace
+  template:
+    metadata:
+      labels:
+        app: aeitron-training-workspace
+        app.kubernetes.io/part-of: aeitron
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: workspace
+          image: aeitron-training-workspace:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - {name: cache, mountPath: /var/cache/nginx}
+            - {name: run, mountPath: /var/run}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: cache, emptyDir: {sizeLimit: 64Mi}}
+        - {name: run, emptyDir: {medium: Memory, sizeLimit: 8Mi}}
+        - {name: tmp, emptyDir: {medium: Memory, sizeLimit: 16Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aeitron-training-workspace
+  namespace: default
+  labels:
+    app: aeitron-training-workspace
+spec:
+  selector:
+    app: aeitron-training-workspace
+  ports:
+    - {name: http, port: 80, targetPort: http}

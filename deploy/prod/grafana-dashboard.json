@@ -1,4 +1,4 @@
-﻿{
+{
   "annotations": {"list": []},
   "editable": true,
   "panels": [
@@ -20,6 +20,42 @@
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "single"}},
       "targets": [{"expr": "aeitron_http_request_duration_ms{quantile=\"avg\"}", "refId": "A"}],
       "title": "Average HTTP Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+      "id": 3,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "sum by (status, profile) (aeitron_training_jobs_total)", "refId": "A"}],
+      "title": "Training Jobs",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+      "id": 4,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "aeitron_training_loss{quantile=\"avg\"}", "legendFormat": "train {{profile}}", "refId": "A"},
+        {"expr": "aeitron_training_validation_loss{quantile=\"avg\"}", "legendFormat": "validation", "refId": "B"}
+      ],
+      "title": "Training and Validation Loss",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "id": 5,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "aeitron_training_tokens_per_second{quantile=\"avg\"}", "legendFormat": "tokens/sec", "refId": "A"},
+        {"expr": "avg(DCGM_FI_DEV_GPU_UTIL)", "legendFormat": "GPU utilization", "refId": "B"}
+      ],
+      "title": "Data and GPU Throughput",
       "type": "timeseries"
     }
   ],

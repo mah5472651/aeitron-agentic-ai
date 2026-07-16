@@ -42,9 +42,21 @@ def configure_logging(level: int = logging.INFO) -> None:
 
 
 @dataclass
+class HistogramAggregate:
+    count: int = 0
+    total: float = 0.0
+    maximum: float = float("-inf")
+
+    def observe(self, value: float) -> None:
+        self.count += 1
+        self.total += value
+        self.maximum = max(self.maximum, value)
+
+
+@dataclass
 class MetricsRegistry:
     counters: dict[str, float] = field(default_factory=lambda: defaultdict(float))
-    histograms: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
+    histograms: dict[str, HistogramAggregate] = field(default_factory=lambda: defaultdict(HistogramAggregate))
     lock: RLock = field(default_factory=RLock)
 
     def inc(self, name: str, value: float = 1.0, **labels: str) -> None:
@@ -55,7 +67,7 @@ class MetricsRegistry:
     def observe(self, name: str, value: float, **labels: str) -> None:
         key = self._key(name, labels)
         with self.lock:
-            self.histograms[key].append(value)
+            self.histograms[key].observe(value)
 
     def render_prometheus(self) -> str:
         lines = [
@@ -71,19 +83,22 @@ class MetricsRegistry:
                     "# TYPE aeitron_http_request_duration_ms summary",
                 ]
             )
-            for key, values in sorted(self.histograms.items()):
-                if not values:
+            for key, aggregate in sorted(self.histograms.items()):
+                if not aggregate.count:
                     continue
-                lines.append(f'{self._with_labels(key, {"quantile": "avg"})} {sum(values) / len(values):.6f}')
-                lines.append(f'{self._with_labels(key, {"quantile": "max"})} {max(values):.6f}')
-                lines.append(f"{self._count_key(key)} {len(values)}")
+                lines.append(f'{self._with_labels(key, {"quantile": "avg"})} {aggregate.total / aggregate.count:.6f}')
+                lines.append(f'{self._with_labels(key, {"quantile": "max"})} {aggregate.maximum:.6f}')
+                lines.append(f"{self._count_key(key)} {aggregate.count}")
         return "\n".join(lines) + "\n"
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
                 "counters": dict(self.counters),
-                "histograms": {key: {"count": len(values), "max": max(values) if values else 0.0} for key, values in self.histograms.items()},
+                "histograms": {
+                    key: {"count": value.count, "max": value.maximum if value.count else 0.0}
+                    for key, value in self.histograms.items()
+                },
             }
 
     def _key(self, name: str, labels: dict[str, str]) -> str:

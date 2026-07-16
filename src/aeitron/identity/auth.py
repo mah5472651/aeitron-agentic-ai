@@ -41,6 +41,8 @@ class AuthConfig:
         "/health/ready",
         "/v1/auth/status",
         "/v1/auth/token",
+        "/v1/training/token/exchange",
+        "/v1/training/token/refresh",
     )
 
     @classmethod
@@ -89,6 +91,7 @@ def create_jwt(
     audience: str,
     scopes: list[str] | None = None,
     ttl_seconds: int = 3600,
+    extra_claims: dict[str, Any] | None = None,
 ) -> str:
     issued_at = int(time.time())
     header = {"alg": "HS256", "typ": "JWT"}
@@ -101,6 +104,11 @@ def create_jwt(
         "exp": issued_at + ttl_seconds,
         "scopes": scopes or ["api"],
     }
+    reserved = {"sub", "iss", "aud", "iat", "nbf", "exp", "scopes"}
+    for key, value in (extra_claims or {}).items():
+        if key in reserved:
+            raise ValueError(f"cannot override reserved JWT claim: {key}")
+        payload[key] = value
     signing_input = f"{json_b64(header)}.{json_b64(payload)}"
     return f"{signing_input}.{sign_hs256(signing_input, secret)}"
 

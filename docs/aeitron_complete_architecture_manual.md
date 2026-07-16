@@ -3312,6 +3312,413 @@ python -m src.aeitron.evaluation.release_gate
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_aeitron_consolidated_smoke.ps1
 ```
 
+## Training Workspace And Scale Control Plane
+
+### Purpose
+
+The Training Workspace is the operational control plane between a researcher
+and scratch pretraining compute. It solves three separate problems without
+mixing their responsibilities:
+
+1. The client submits a validated training profile and follows progress.
+2. The control plane owns identity, durable state, scheduling, audit, and
+   artifact promotion.
+3. Trusted workers own data processing, model computation, checkpoint writing,
+   and measured evaluation.
+
+Kaggle and Colab are validation clients. They are not represented as 7B-60B
+production training infrastructure. Large synchronous pretraining belongs on a
+trusted Kubernetes or Slurm cluster with pinned containers and private service
+connectivity.
+
+No external model weights or post-training adaptation path is introduced. The
+workspace accepts Aeitron scratch pretraining, evaluation, and checkpoint
+lifecycle jobs only.
+
+### Canonical Components
+
+- `src/aeitron/training_workspace.py`: schemas, state machine, Postgres and
+  in-memory stores, Redis event bus, scheduler adapters, controller, event
+  archiver, checkpoint/evaluation promotion, and readiness.
+- `src/aeitron/training_client.py`: async SDK, short-lived token refresh, SSE
+  replay, and CLI.
+- `src/aeitron/shared/progress.py`: non-blocking worker event batching,
+  heartbeat, coalescing, local WAL, retry, and WAL replay.
+- `config/training_profiles.json`: append-only versioned profile contracts.
+- `deploy/gpu/run_workspace_validation.py`: direct-kernel notebook validation
+  launcher.
+- `apps/training-workspace`: React and TypeScript workspace UI.
+- `src/aeitron/db/migrations/0004_training_workspace.sql`: durable control
+  plane schema.
+- `deploy/k8s/training-workspace.yaml`: controller identity, RBAC, network
+  policy, and deployment.
+- `deploy/k8s/training-workspace-ui.yaml`: hardened workspace UI deployment.
+- `deploy/k8s/training-monitoring.yaml`: DCGM GPU telemetry.
+
+### Request Flow
+
+```text
+SDK / CLI / Web UI
+    -> bootstrap exchange
+    -> 15-minute scoped access token + <=12-hour refresh session
+    -> immutable profile resolution
+    -> idempotent job creation
+    -> Postgres state transition
+    -> controller validation
+    -> scheduler submission
+    -> trusted worker
+    -> Redis live events + local WAL fallback
+    -> S3/MinIO durable artifacts
+    -> checkpoint reload proof
+    -> evaluation gate
+    -> audited checkpoint promotion
+```
+
+The notebook receives only `AEITRON_WORKSPACE_URL` and
+`AEITRON_BOOTSTRAP_TOKEN`. It never receives Postgres, Redis, Qdrant, or
+object-store administration credentials. Cluster workers receive a job-bound
+token through a mounted Secret or a mode-0600 Slurm token file. The controller
+rotates worker credentials before expiry.
+
+### Immutable Profiles
+
+The registry currently includes:
+
+- `defensive-1k`: direct notebook validation.
+- `defensive-10k`: serious single-GPU Kubernetes validation.
+- `fundamentals-validation`: coding-fundamentals notebook validation.
+- `aeitron-1b-single-node`: single-node cluster proof.
+- `aeitron-7b-fsdp`: multi-node native FSDP.
+- `aeitron-32b-zero3`: multi-node DeepSpeed ZeRO-3.
+- `aeitron-60b-hybrid`: Slurm and hybrid/Megatron target.
+
+A profile version is immutable. Postgres uses `(profile_id, version)` as the
+identity and stores its SHA-256. Synchronization fails if content changes
+without a version bump. A job stores the exact profile hash, spec hash, Git
+commit, image digest, tokenizer hash, and dataset manifest hash.
+
+Allowed overrides have explicit integer ranges. A client cannot submit an
+executable, shell fragment, environment secret, mount, image, or scheduler
+argument. `build_training_command()` creates argv from validated schema fields
+only.
+
+Production mode takes the Git commit and image digest from trusted server
+configuration:
+
+```text
+AEITRON_TRAINING_GIT_COMMIT
+AEITRON_TRAINING_IMAGE_DIGEST
+```
+
+Zero/placeholder values block submission. Images are scheduled by digest, not
+mutable tag.
+
+### Job State Machine
+
+```text
+validating -> queued -> provisioning -> running
+running -> checkpointing -> running
+running/checkpointing -> evaluating -> running/succeeded
+
+terminal: succeeded | failed | blocked | cancelled
+resumable: infrastructure failed or cancelled -> queued
+not resumable: blocked
+```
+
+`blocked` is used for data, tokenizer, non-finite-loss, quality, compatibility,
+or security failures. Automatic resume is deliberately unavailable for these
+failures. `failed` is reserved for infrastructure/runtime failure. Resume
+requires a promoted checksum-verified checkpoint.
+
+Every transition uses optimistic version checks. Concurrent writers cannot
+silently overwrite state. Attempt state, start time, and finish time follow the
+job state. Every create, scheduler submit/failure, transition, cancel, resume,
+checkpoint, evaluation, and promotion event is written to the audit table.
+
+### Postgres Schema
+
+- `training_profiles`: immutable versioned profile JSON and hash.
+- `training_jobs`: canonical spec, optimistic version, state, active attempt,
+  scheduler binding, failure classification, and event cursors.
+- `training_attempts`: scheduler attempt and resume checkpoint.
+- `training_event_ingress`: `(attempt, rank, source_sequence)` deduplication.
+- `training_artifacts`: verified object URI, size, SHA-256, kind, and promotion
+  status.
+- `checkpoint_versions`: step, immutable hashes, topology, metrics, reload
+  proof, and promotion state.
+- `evaluation_runs`: checkpoint decision and verified report.
+- `service_accounts`: scoped identity and bootstrap token hash.
+- `service_account_sessions`: expiring/revocable refresh sessions.
+- `training_audit_events`: actor, action, outcome, request, and redacted
+  metadata.
+
+Migrations run through the existing migration runner or Alembic chain. The
+database is the source of truth. Redis is never used as durable job state.
+
+### Live Event Protocol
+
+Workers emit versioned events with job, attempt, source sequence, rank,
+world-size, node, stage, status, step, loss, validation loss, tokens/second,
+and GPU memory.
+
+Delivery behavior:
+
+- up to 25 events or one second per batch;
+- five-second heartbeat even when the trainer emits nothing;
+- bounded in-memory queue;
+- metric updates coalesce to their latest value under pressure;
+- error, checkpoint, and evaluation events are persisted to WAL rather than
+  dropped;
+- failed HTTP delivery writes fsync-backed JSONL WAL;
+- exponential retry uses jitter;
+- restart-safe source sequences and transactional server deduplication;
+- WAL replay is safe after an ambiguous network response;
+- rank zero emits global metrics; non-zero ranks retain heartbeat, checkpoint,
+  and fatal diagnostics.
+
+The SSE endpoint accepts `Last-Event-ID`. SDK and web clients reconnect from
+the last acknowledged sequence. The API sends `X-Accel-Buffering: no`; the UI
+Nginx proxy disables response buffering. Redis holds the hot stream while the
+archiver writes ordered gzip JSONL chunks to object storage.
+
+### Artifact And Checkpoint Lifecycle
+
+Workers request short-lived S3/MinIO presigned PUT URLs. The request binds the
+object path, content type, size declaration, and SHA-256 metadata. The notebook
+never sees permanent object-store credentials.
+
+Promotion sequence:
+
+```text
+write shards and temporary checkpoint prefix
+  -> upload manifest through a presigned request
+  -> server HEAD size/SHA verification
+  -> checkpoint commit
+  -> dataset/tokenizer hash comparison with job spec
+  -> reload smoke proof
+  -> verified evaluation artifact commit
+  -> pass/release decision
+  -> admin promotion
+  -> atomic jobs/{job}/checkpoints/latest.json update
+```
+
+Validation-only notebook checkpoints cannot become release checkpoints. A
+checkpoint cannot promote without both `reload_verified=true` and a committed
+passing evaluation. Promotion is an audited `training:admin` operation.
+
+### Scheduler Safety
+
+`NotebookValidationAdapter` supports one node and no distributed strategy. It
+is explicitly validation-only.
+
+`KubernetesSchedulerAdapter` creates a structured `batch/v1 Job`. Before
+submission it checks the Kubernetes client, node readiness, GPU count, GPU
+memory label, and RDMA label. Nodes must be labeled:
+
+```bash
+kubectl label node GPU_NODE aeitron.ai/gpu-memory-gib=80
+kubectl label node GPU_NODE aeitron.ai/rdma=true
+```
+
+`KubernetesPyTorchAdapter` additionally requires the Kubeflow Training Operator
+and its `PyTorchJob` CRD. Multi-node profiles fail before provisioning when the
+operator or sufficient eligible nodes are absent.
+
+Worker pods use:
+
+- pinned image digest;
+- non-root UID/GID 10001;
+- runtime-default seccomp;
+- no privilege escalation;
+- all Linux capabilities dropped;
+- read-only root filesystem;
+- bounded memory-backed `/tmp`;
+- node-local `/workspace` cache;
+- profile-owned Secret references only;
+- job-scoped token mounted read-only;
+- explicit CPU, memory, and GPU requests/limits.
+
+`SlurmSchedulerAdapter` uses argv-only `sbatch`, `sacct`, `sinfo`, and
+`scancel`. Generated scripts use `set -euo pipefail`; no `eval` exists. The
+preflight requires enough nodes with the requested GPU GRES and features
+`gpu-memory-<N>g,rdma`. Slurm production workers require an HTTPS workspace
+URL.
+
+### Identity And Authorization
+
+Roles are represented by scopes:
+
+- `training:jobs:create`
+- `training:jobs:read`
+- `training:jobs:cancel`
+- `training:events:write`
+- `training:artifacts:write`
+- `training:artifacts:read`
+- `training:admin`
+
+Generic API scope does not grant training scope. Non-admin users see only jobs
+they own. Worker tokens are bound to a single `job_id` claim. Event payloads
+are limited to 64 KiB, batches to 100, and known secret keys/values are
+redacted before Redis, audit, or object storage.
+
+The initial environment bootstrap credential is materialized as a reserved
+hashed service account before a refresh session is issued. Rotation updates
+the hash and revokes its existing refresh sessions. Explicit logout/revocation
+is supported. Production ingress must use HTTPS.
+
+### APIs
+
+```text
+POST /v1/training/token/exchange
+POST /v1/training/token/refresh
+POST /v1/training/token/revoke
+GET  /v1/training/profiles
+POST /v1/training/jobs
+GET  /v1/training/jobs
+GET  /v1/training/jobs/{job_id}
+POST /v1/training/jobs/{job_id}/claim
+POST /v1/training/jobs/{job_id}/cancel
+POST /v1/training/jobs/{job_id}/resume
+GET  /v1/training/jobs/{job_id}/events
+POST /v1/training/jobs/{job_id}/events:batch
+GET  /v1/training/jobs/{job_id}/artifacts
+POST /v1/training/jobs/{job_id}/artifacts/presign
+POST /v1/training/jobs/{job_id}/artifacts/register
+GET/POST /v1/training/jobs/{job_id}/checkpoints
+GET/POST /v1/training/jobs/{job_id}/evaluations
+POST /v1/training/jobs/{job_id}/checkpoints/{checkpoint_id}/promote
+GET  /v1/training/jobs/{job_id}/audit
+```
+
+### Notebook Operation
+
+Place only these values in Kaggle/Colab Secrets:
+
+```text
+AEITRON_WORKSPACE_URL=https://workspace.example.com
+AEITRON_BOOTSTRAP_TOKEN=<bootstrap-value>
+```
+
+Clone the repository once, then use direct-kernel execution:
+
+```python
+%run -i deploy/gpu/run_workspace_validation.py --profile defensive-1k
+```
+
+`%run -i` avoids a nested buffered shell process. The same kernel displays
+each progress line immediately. If workspace secrets are absent, the launcher
+runs standalone validation and labels that condition in output.
+
+SDK:
+
+```python
+from aeitron_client import Workspace
+
+workspace = Workspace.from_environment()
+run = await workspace.train(profile="defensive-1k", follow=True)
+```
+
+CLI:
+
+```bash
+python -m pip install -e . --no-deps
+aeitron train --profile defensive-1k --follow
+aeitron jobs list
+aeitron jobs inspect JOB_ID
+aeitron jobs cancel JOB_ID
+aeitron jobs resume JOB_ID
+```
+
+When the Python Scripts directory is not on `PATH`, use
+`python -m src.aeitron.training_client` with the same arguments.
+
+### Deployment
+
+Local integration proof:
+
+```bash
+cp deploy/prod/.env.example deploy/prod/.env
+docker compose --env-file deploy/prod/.env -f deploy/prod/docker-compose.yml --profile training up --build
+```
+
+The API is on port 8090 and UI on port 8088. Example/default secrets are
+invalid for production and must be replaced.
+
+Kubernetes:
+
+```bash
+kubectl apply -f deploy/k8s/postgres-redis.yaml
+kubectl apply -f deploy/k8s/minio.yaml
+kubectl apply -f deploy/k8s/api.yaml
+kubectl apply -f deploy/k8s/training-workspace.yaml
+kubectl apply -f deploy/k8s/training-workspace-ui.yaml
+kubectl apply -f deploy/k8s/training-monitoring.yaml
+```
+
+Secret examples are templates, not deployable credentials. Use External
+Secrets, Vault, cloud workload identity, or another approved secret manager in
+the real cluster.
+
+### Observability
+
+Control-plane metrics include HTTP rate/latency, job submissions/transitions,
+event ingestion and deduplication, training/validation loss, token throughput,
+checkpoint commits/promotions, and evaluation decisions. Histogram storage is
+constant-memory; the process does not retain every observation.
+
+DCGM Exporter exposes GPU utilization, memory, and temperature. The Kubernetes
+Service carries Prometheus scrape annotations. The Grafana production
+dashboard includes jobs, loss, throughput, and GPU utilization.
+
+Alerts still require the production Prometheus/Alertmanager policy to be
+installed and tested. Missing heartbeat, non-finite loss, OOM, NCCL timeout,
+data starvation, checkpoint failure, dependency outage, and evaluation
+regression are the required alert classes.
+
+### Honest Readiness
+
+Locally tested code is not cluster proof. Status rules:
+
+- notebook direct-kernel path: `validation_ready`;
+- configured Postgres/Redis/S3 workspace: `production_ready_requires_external_service`;
+- Kubernetes/PyTorchJob/Slurm profiles before live proof: `built_not_cluster_proven`;
+- missing dependency or placeholder image/commit: `blocked_missing_dependency`.
+
+The following cannot be honestly completed on this Windows workstation:
+
+- 24-hour single-GPU soak;
+- 10k-step T4/L4/A100 proof;
+- two-GPU FSDP save/reload;
+- multi-node node-loss recovery;
+- one-million-event Redis interruption test;
+- Postgres failover;
+- MinIO checkpoint interruption;
+- 7B, 32B, or 60B scratch pretraining.
+
+The code paths and fail-fast gates exist, but these statuses remain
+`built_not_cluster_proven` until the corresponding infrastructure test report
+is produced.
+
+### Workspace Verification
+
+```powershell
+python -m compileall -q src\aeitron tests deploy\gpu
+python -m unittest tests.test_aeitron_training_workspace
+python -m src.aeitron.training_workspace profiles
+python -m src.aeitron.training_workspace readiness
+python -m src.aeitron.evaluation.release_gate
+python -m src.aeitron.security.audit --output-dir artifacts\aeitron\security-audit
+python -m src.aeitron.deployment.k8s_validate --output-dir artifacts\aeitron\k8s-validation
+```
+
+Frontend:
+
+```powershell
+cd apps\training-workspace
+npm ci
+npm run build
+```
+
 ## Final Rule
 
 Do not reintroduce numbered legacy folders. If a feature is needed, add it to

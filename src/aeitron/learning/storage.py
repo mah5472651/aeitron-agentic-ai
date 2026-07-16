@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import argparse
 import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -135,19 +136,34 @@ class S3ObjectStore:
     def put_file(self, path: str | Path, *, key: str | None = None) -> StoredObject:
         source = Path(path)
         object_key = self._object_key(key or source.name)
-        retry_sync(lambda: self.client.upload_file(str(source), self.bucket, object_key), max_retries=self.max_retries)
+        digest = file_sha256(source)
+        retry_sync(
+            lambda: self.client.upload_file(
+                str(source),
+                self.bucket,
+                object_key,
+                ExtraArgs={"Metadata": {"sha256": digest}},
+            ),
+            max_retries=self.max_retries,
+        )
         return StoredObject(
             source_path=str(source),
             uri=f"s3://{self.bucket}/{object_key}",
             size_bytes=source.stat().st_size,
-            sha256=file_sha256(source),
+            sha256=digest,
         )
 
     def put_json(self, payload: dict[str, Any], *, key: str) -> StoredObject:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         object_key = self._object_key(key)
         retry_sync(
-            lambda: self.client.put_object(Bucket=self.bucket, Key=object_key, Body=body, ContentType="application/json"),
+            lambda: self.client.put_object(
+                Bucket=self.bucket,
+                Key=object_key,
+                Body=body,
+                ContentType="application/json",
+                Metadata={"sha256": hashlib.sha256(body).hexdigest()},
+            ),
             max_retries=self.max_retries,
         )
         digest = hashlib.sha256(body).hexdigest()
@@ -198,6 +214,38 @@ class S3ObjectStore:
                 )
             )
         return objects
+
+    def presign_put(
+        self,
+        *,
+        key: str,
+        sha256: str,
+        content_type: str = "application/octet-stream",
+        expires_seconds: int = 900,
+    ) -> dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise ValueError("presigned upload requires a SHA-256 digest")
+        object_key = self._object_key(key)
+        params = {
+            "Bucket": self.bucket,
+            "Key": object_key,
+            "ContentType": content_type,
+            "Metadata": {"sha256": sha256},
+        }
+        url = self.client.generate_presigned_url(
+            "put_object",
+            Params=params,
+            ExpiresIn=min(max(expires_seconds, 60), 3600),
+            HttpMethod="PUT",
+        )
+        return {
+            "method": "PUT",
+            "url": url,
+            "uri": f"s3://{self.bucket}/{object_key}",
+            "key": key,
+            "expires_in": min(max(expires_seconds, 60), 3600),
+            "headers": {"Content-Type": content_type, "x-amz-meta-sha256": sha256},
+        }
 
 
 class ObjectStoreConfig(StrictModel):

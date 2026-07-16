@@ -16,16 +16,23 @@
     ports:
       - "8090:8090"
     environment:
+      AEITRON_ENV: "production"
       AEITRON_AUTH_ENABLED: "1"
       AEITRON_QUOTA_ENABLED: "1"
       AEITRON_JWT_SECRET: "${AEITRON_JWT_SECRET:?set AEITRON_JWT_SECRET}"
+      AEITRON_WORKSPACE_BOOTSTRAP_TOKEN: "${AEITRON_WORKSPACE_BOOTSTRAP_TOKEN:?set AEITRON_WORKSPACE_BOOTSTRAP_TOKEN}"
       AEITRON_ALLOW_TOKEN_ISSUE: "0"
       AEITRON_DATABASE_URL: "postgresql://aeitron:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/aeitron"
       AEITRON_REDIS_URL: "redis://redis:6379/0"
       AEITRON_QDRANT_URL: "http://qdrant:6333"
-      AEITRON_OBJECT_STORE_URI: "s3://aeitron-datasets/pretraining"
+      AEITRON_OBJECT_STORE_URI: "s3://aeitron-datasets/training-workspace"
       AEITRON_OBJECT_STORE_ENDPOINT_URL: "http://minio:9000"
       AEITRON_OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318/v1/traces"
+      AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER:?set MINIO_ROOT_USER}"
+      AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
+      AWS_EC2_METADATA_DISABLED: "true"
+      AEITRON_TRAINING_GIT_COMMIT: "${AEITRON_TRAINING_GIT_COMMIT:?set AEITRON_TRAINING_GIT_COMMIT}"
+      AEITRON_TRAINING_IMAGE_DIGEST: "${AEITRON_TRAINING_IMAGE_DIGEST:?set AEITRON_TRAINING_IMAGE_DIGEST}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,6 +50,50 @@
       timeout: 10s
       retries: 3
       start_period: 30s
+    networks:
+      default:
+        aliases: ["aeitron-api"]
+  training-workspace-ui:
+    build:
+      context: ../..
+      dockerfile: apps/training-workspace/Dockerfile
+    profiles: ["training"]
+    restart: unless-stopped
+    ports:
+      - "8088:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+  training-controller:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    profiles: ["training"]
+    command: ["python", "-u", "-m", "src.aeitron.training_workspace", "controller", "--poll-seconds", "5"]
+    restart: unless-stopped
+    environment:
+      AEITRON_ENV: "production"
+      AEITRON_JWT_SECRET: "${AEITRON_JWT_SECRET:?set AEITRON_JWT_SECRET}"
+      AEITRON_DATABASE_URL: "postgresql://aeitron:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/aeitron"
+      AEITRON_REDIS_URL: "redis://redis:6379/0"
+      AEITRON_OBJECT_STORE_URI: "s3://aeitron-datasets/training-workspace"
+      AEITRON_OBJECT_STORE_ENDPOINT_URL: "http://minio:9000"
+      AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER:?set MINIO_ROOT_USER}"
+      AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
+      AWS_EC2_METADATA_DISABLED: "true"
+      AEITRON_TRAINING_GIT_COMMIT: "${AEITRON_TRAINING_GIT_COMMIT:?set AEITRON_TRAINING_GIT_COMMIT}"
+      AEITRON_TRAINING_IMAGE_DIGEST: "${AEITRON_TRAINING_IMAGE_DIGEST:?set AEITRON_TRAINING_IMAGE_DIGEST}"
+    volumes:
+      - training-runtime:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
   crawler-worker:
     build:
       context: ../..
@@ -173,7 +224,7 @@
       retries: 12
   minio-bootstrap:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
-    profiles: ["data"]
+    profiles: ["data", "training"]
     depends_on:
       - minio
     entrypoint: ["/bin/sh", "-lc"]
@@ -194,4 +245,5 @@ volumes:
   prometheus-data:
   grafana-data:
   qdrant-data:
+  training-runtime:
 
