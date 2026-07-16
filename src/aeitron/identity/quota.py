@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -32,6 +33,8 @@ redis.call('HSET', key, 'tokens_balance', tokens, 'last_updated_timestamp', now)
 redis.call('EXPIRE', key, 2592000)
 return {allowed, tokens}
 """
+
+LOGGER = logging.getLogger("aeitron.quota")
 
 
 @dataclass(frozen=True)
@@ -122,8 +125,9 @@ class QuotaMiddleware(BaseHTTPMiddleware):
                 capacity=self.config.capacity,
                 cost=cost,
             )
-        except Exception as exc:
-            return JSONResponse(status_code=503, content={"error": "quota_backend_unavailable", "detail": str(exc)})
+        except Exception:
+            LOGGER.exception("quota_backend_unavailable", extra={"subject": subject, "path": request.url.path})
+            return JSONResponse(status_code=503, content={"error": "quota_backend_unavailable"})
         if not allowed:
             return JSONResponse(
                 status_code=429,

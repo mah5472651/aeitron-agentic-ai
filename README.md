@@ -793,6 +793,38 @@ are connected; the proof report never substitutes a local mock pass.
 Missing Kubernetes, Slurm, CUDA, DeepSpeed, or Megatron dependencies are
 recorded as `blocked`; they are never converted to a passing proof.
 
+Real scheduler and recovery proofs use immutable dataset/tokenizer bindings:
+
+```powershell
+$common = @(
+  "--skip-infrastructure", "--skip-disaster-recovery", "--skip-capability-probes",
+  "--dataset-manifest-uri", $env:AEITRON_PROOF_DATASET_URI,
+  "--dataset-manifest-sha256", $env:AEITRON_PROOF_DATASET_SHA256,
+  "--tokenizer-uri", $env:AEITRON_PROOF_TOKENIZER_URI,
+  "--tokenizer-sha256", $env:AEITRON_PROOF_TOKENIZER_SHA256,
+  "--git-commit", $env:AEITRON_TRAINING_GIT_COMMIT,
+  "--container-digest", $env:AEITRON_TRAINING_IMAGE_DIGEST,
+  "--inject-worker-loss"
+)
+python -m src.aeitron.training_proofs --live-profile aeitron-7b-fsdp @common
+python -m src.aeitron.training_proofs --live-profile aeitron-32b-zero3 @common
+python -m src.aeitron.training_proofs --live-profile aeitron-60b-hybrid @common
+```
+
+The disruptive self-hosted Kubernetes recovery drill is opt-in. It writes
+durable Postgres, Redis, and S3 markers, restarts the declared workloads, then
+requires all markers to survive:
+
+```powershell
+python -m src.aeitron.training_proofs --skip-infrastructure `
+  --skip-disaster-recovery --skip-capability-probes `
+  --inject-kubernetes-disaster-recovery
+```
+
+Redis is deployed as an authenticated persistent StatefulSet. The API accepts
+repository paths only beneath `AEITRON_PROJECT_ROOTS`; the production manifest
+binds that root to a shared workspace PVC.
+
 The workspace UI is exposed at `http://localhost:8088`. Production ingress must
 terminate HTTPS. Profile status remains `built_not_cluster_proven` until its
 actual scheduler, topology, checkpoint reload, and scale gate pass.

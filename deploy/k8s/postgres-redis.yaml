@@ -59,10 +59,11 @@ spec:
       targetPort: 5432
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: aeitron-redis
 spec:
+  serviceName: aeitron-redis
   replicas: 1
   selector:
     matchLabels:
@@ -75,9 +76,28 @@ spec:
       containers:
         - name: redis
           image: redis:7
-          command: ["redis-server", "--appendonly", "yes"]
+          command:
+            - /bin/sh
+            - -ec
+            - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-secrets
+                  key: redis-password
           ports:
             - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping | grep -qx PONG"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping | grep -qx PONG"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
           resources:
             requests:
               cpu: "250m"
@@ -85,6 +105,17 @@ spec:
             limits:
               cpu: "1"
               memory: 2Gi
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
 ---
 apiVersion: v1
 kind: Service

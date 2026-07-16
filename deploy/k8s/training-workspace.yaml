@@ -6,6 +6,20 @@ metadata:
     app.kubernetes.io/part-of: aeitron
 ---
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aeitron-training-checkpoints
+  namespace: aeitron-training
+  labels:
+    app.kubernetes.io/part-of: aeitron
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: aeitron-checkpoints
+  resources:
+    requests:
+      storage: 10Ti
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: aeitron-training-controller

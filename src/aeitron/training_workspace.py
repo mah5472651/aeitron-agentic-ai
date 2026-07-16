@@ -100,6 +100,14 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     result = dict(base)
     for key, value in override.items():
@@ -302,6 +310,7 @@ class SchedulerPolicy(StrictModel):
     queue: str = Field(min_length=1, max_length=128)
     account: str | None = Field(default=None, max_length=128)
     storage_class: str = Field(min_length=1, max_length=128)
+    shared_checkpoint_claim: str | None = Field(default=None, max_length=253)
     priority_class: str = Field(min_length=1, max_length=128)
     gang_scheduling: bool = False
     topology_key: str = Field(default="kubernetes.io/hostname", min_length=1, max_length=253)
@@ -311,6 +320,13 @@ class SchedulerPolicy(StrictModel):
     def validate_scheduler_identifier(cls, value: str | None) -> str | None:
         if value is not None and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}", value):
             raise ValueError("scheduler policy contains an unsafe identifier")
+        return value
+
+    @field_validator("shared_checkpoint_claim")
+    @classmethod
+    def validate_shared_checkpoint_claim(cls, value: str | None) -> str | None:
+        if value and not re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?", value):
+            raise ValueError("shared checkpoint claim must be a DNS-compatible name")
         return value
 
 
@@ -383,6 +399,8 @@ class TrainingProfile(StrictModel):
     def validate_distributed_topology(self) -> "TrainingProfile":
         if self.distributed_strategy != "none" and self.resources.gpus_per_node < 1:
             raise ValueError("distributed profiles require GPUs")
+        if self.scheduler in {"kubernetes", "kubernetes_pytorch"} and not self.scheduler_policy.shared_checkpoint_claim:
+            raise ValueError("Kubernetes training profiles require a shared RWX checkpoint claim")
         if self.scheduler == "notebook" and not self.dev_only:
             raise ValueError("notebook profiles must be dev_only validation profiles")
         if self.model_profile in {"32b", "62b"} and not self.resources.rdma_required:
@@ -800,6 +818,7 @@ class ArtifactUploadRequest(StrictModel):
     attempt_id: str | None = Field(default=None, max_length=128)
     kind: Literal["log", "checkpoint", "evaluation", "report", "dataset", "tokenizer"]
     filename: str = Field(min_length=1, max_length=255)
+    relative_path: str | None = Field(default=None, max_length=1024)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     size_bytes: int = Field(ge=0, le=10 * 1024**4)
     content_type: str = Field(default="application/octet-stream", min_length=1, max_length=128)
@@ -810,6 +829,19 @@ class ArtifactUploadRequest(StrictModel):
         if Path(value).name != value or value in {".", ".."} or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}", value):
             raise ValueError("artifact filename is unsafe")
         return value
+
+    @field_validator("relative_path")
+    @classmethod
+    def validate_relative_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.replace("\\", "/").strip("/")
+        parts = normalized.split("/")
+        if not normalized or len(parts) > 32 or any(part in {"", ".", ".."} for part in parts):
+            raise ValueError("artifact relative_path is unsafe")
+        if any(not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}", part) for part in parts):
+            raise ValueError("artifact relative_path contains an unsafe component")
+        return normalized
 
 
 class SchedulerBinding(StrictModel):
@@ -2001,6 +2033,12 @@ def build_training_command(spec: TrainingJobSpec, *, output_dir: str) -> list[st
             str(spec.dataset_manifest_uri),
             "--tokenizer-path",
             str(spec.tokenizer_uri),
+            "--manifest-sha256",
+            str(spec.dataset_manifest_sha256),
+            "--tokenizer-sha256",
+            str(spec.tokenizer_sha256),
+            "--artifact-cache-dir",
+            spec.dataloader.cache_path,
             "--output-dir",
             output_dir,
             "--device",
@@ -2064,6 +2102,27 @@ def build_training_command(spec: TrainingJobSpec, *, output_dir: str) -> list[st
             "--gradient-checkpointing",
         ]
     raise ValueError(f"scheduler does not execute run_type={spec.run_type}")
+
+
+def scheduler_worker_command(spec: TrainingJobSpec, *, output_dir: str, scheduler: Literal["kubernetes", "slurm"]) -> list[str]:
+    command = build_training_command(spec, output_dir=output_dir)
+    prefix = [sys.executable, "-u", "-m", "src.aeitron.model_ops.pretrain_loop"]
+    if command[: len(prefix)] != prefix:
+        raise ValueError("distributed scheduler workers only support the native Aeitron pretraining module")
+    return [
+        sys.executable,
+        "-u",
+        "-m",
+        "src.aeitron.model_ops.distributed_worker",
+        "--scheduler",
+        scheduler,
+        "--nodes",
+        str(spec.resources.nodes),
+        "--processes-per-node",
+        str(spec.resources.gpus_per_node),
+        "--",
+        *command[len(prefix) :],
+    ]
 
 
 async def _run_argv(argv: list[str], *, stdin_text: str | None = None, timeout: float = 30.0) -> tuple[int, str, str]:
@@ -2340,7 +2399,7 @@ class KubernetesSchedulerAdapter(SchedulerAdapter):
 
     def manifest(self, job: TrainingJob, attempt: TrainingAttempt) -> dict[str, Any]:
         name = f"aeitron-{job.job_id[:8]}-a{attempt.attempt_number}"
-        output_dir = f"/workspace/jobs/{job.job_id}/attempts/{attempt.attempt_number}"
+        output_dir = f"/workspace/jobs/{job.job_id}/training"
         command = build_training_command(job.spec, output_dir=output_dir)
         image = job.spec.container_digest
         if "@" not in image:
@@ -2393,6 +2452,7 @@ class KubernetesSchedulerAdapter(SchedulerAdapter):
                                 "volumeMounts": [
                                     {"name": "workspace-token", "mountPath": "/var/run/secrets/aeitron", "readOnly": True},
                                     {"name": "workspace", "mountPath": "/workspace"},
+                                    {"name": "cache", "mountPath": job.spec.dataloader.cache_path},
                                     {"name": "tmp", "mountPath": "/tmp"},  # nosec B108 - memory-backed emptyDir
                                 ],
                             }
@@ -2408,16 +2468,12 @@ class KubernetesSchedulerAdapter(SchedulerAdapter):
                             {"name": "workspace-token", "secret": {"secretName": f"aeitron-job-{job.job_id[:8]}"}},
                             {
                                 "name": "workspace",
-                                "ephemeral": {
-                                    "volumeClaimTemplate": {
-                                        "spec": {
-                                            "accessModes": ["ReadWriteOnce"],
-                                            "storageClassName": job.spec.scheduler_policy.storage_class,
-                                            "resources": {"requests": {"storage": f"{job.spec.cost_quota.maximum_storage_gib}Gi"}},
-                                        }
-                                    }
+                                "persistentVolumeClaim": {
+                                    "claimName": job.spec.scheduler_policy.shared_checkpoint_claim,
+                                    "readOnly": False,
                                 },
                             },
+                            {"name": "cache", "emptyDir": {"sizeLimit": f"{job.spec.dataloader.local_cache_gib}Gi"}},
                             {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "8Gi"}},
                         ],
                     },
@@ -2609,8 +2665,8 @@ class KubernetesPyTorchAdapter(KubernetesSchedulerAdapter):
 
     def manifest(self, job: TrainingJob, attempt: TrainingAttempt) -> dict[str, Any]:
         name = f"aeitron-{job.job_id[:8]}-a{attempt.attempt_number}"
-        output_dir = f"/workspace/jobs/{job.job_id}/attempts/{attempt.attempt_number}"
-        base_command = build_training_command(job.spec, output_dir=output_dir)
+        output_dir = f"/workspace/jobs/{job.job_id}/training"
+        base_command = scheduler_worker_command(job.spec, output_dir=output_dir, scheduler="kubernetes")
         image = job.spec.container_digest
         if "@" not in image:
             image = job.spec.runtime_image.repository + "@" + image
@@ -2641,6 +2697,7 @@ class KubernetesPyTorchAdapter(KubernetesSchedulerAdapter):
             "volumeMounts": [
                 {"name": "workspace-token", "mountPath": "/var/run/secrets/aeitron", "readOnly": True},
                 {"name": "workspace", "mountPath": "/workspace"},
+                {"name": "cache", "mountPath": job.spec.dataloader.cache_path},
                 {"name": "tmp", "mountPath": "/tmp"},  # nosec B108 - memory-backed emptyDir
             ],
         }
@@ -2665,15 +2722,14 @@ class KubernetesPyTorchAdapter(KubernetesSchedulerAdapter):
                         {"name": "workspace-token", "secret": {"secretName": f"aeitron-job-{job.job_id[:8]}"}},
                         {
                             "name": "workspace",
-                            "ephemeral": {
-                                "volumeClaimTemplate": {
-                                    "spec": {
-                                        "accessModes": ["ReadWriteOnce"],
-                                        "storageClassName": job.spec.scheduler_policy.storage_class,
-                                        "resources": {"requests": {"storage": f"{job.spec.cost_quota.maximum_storage_gib}Gi"}},
-                                    }
-                                }
+                            "persistentVolumeClaim": {
+                                "claimName": job.spec.scheduler_policy.shared_checkpoint_claim,
+                                "readOnly": False,
                             },
+                        },
+                        {
+                            "name": "cache",
+                            "emptyDir": {"sizeLimit": f"{job.spec.dataloader.local_cache_gib}Gi"},
                         },
                         {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "8Gi"}},
                     ],
@@ -2737,6 +2793,12 @@ class SlurmSchedulerAdapter(SchedulerAdapter):
         workspace_url = os.environ.get("AEITRON_WORKSPACE_URL", "")
         if not workspace_url.startswith("https://"):
             raise RuntimeError("Slurm production workers require an HTTPS AEITRON_WORKSPACE_URL")
+        shared_root_value = os.environ.get("AEITRON_SHARED_CHECKPOINT_ROOT", "")
+        shared_root = Path(shared_root_value).expanduser().resolve() if shared_root_value else None
+        if shared_root is None or not shared_root.is_absolute() or not shared_root.is_dir():
+            raise RuntimeError("AEITRON_SHARED_CHECKPOINT_ROOT must be a mounted shared filesystem directory")
+        if not os.access(shared_root, os.W_OK):
+            raise RuntimeError("AEITRON_SHARED_CHECKPOINT_ROOT is not writable")
         code, stdout, stderr = await _run_argv(["sinfo", "-N", "-h", "-o", "%N|%t|%G|%f"])
         if code != 0:
             raise RuntimeError(f"Slurm topology inventory failed: {redact_text(stderr)[-2000:]}")
@@ -2767,8 +2829,28 @@ class SlurmSchedulerAdapter(SchedulerAdapter):
         return {"status": "ready", "commands": ["sbatch", "sacct", "scancel", "sinfo"], "eligible_nodes": sorted(set(eligible))}
 
     def script(self, job: TrainingJob, attempt: TrainingAttempt) -> str:
-        output_dir = f"artifacts/aeitron/workspace/jobs/{job.job_id}/attempts/{attempt.attempt_number}"
-        command = build_training_command(job.spec, output_dir=output_dir)
+        shared_root = Path(os.environ.get("AEITRON_SHARED_CHECKPOINT_ROOT", "")).expanduser().resolve()
+        output_dir = str(shared_root / "jobs" / job.job_id / "training")
+        if job.spec.distributed_strategy == "megatron":
+            megatron_command = self._megatron_command(job, output_dir=output_dir)
+            command = [
+                sys.executable,
+                "-u",
+                "-m",
+                "src.aeitron.model_ops.distributed_worker",
+                "--scheduler",
+                "slurm",
+                "--target",
+                "megatron",
+                "--nodes",
+                str(job.spec.resources.nodes),
+                "--processes-per-node",
+                str(job.spec.resources.gpus_per_node),
+                "--",
+                *megatron_command[1:],
+            ]
+        else:
+            command = scheduler_worker_command(job.spec, output_dir=output_dir, scheduler="slurm")
         quoted = " ".join(shlex.quote(item) for item in command)
         token_path = self.work_dir / f"{job.job_id}-token"
         wall_seconds = job.spec.runtime_limits.maximum_wall_time_seconds
@@ -2799,10 +2881,104 @@ class SlurmSchedulerAdapter(SchedulerAdapter):
                 f"export AEITRON_TRAINING_ATTEMPT_ID={shlex.quote(attempt.attempt_id)}",
                 f"export AEITRON_WORKSPACE_TOKEN_FILE={shlex.quote(str(token_path))}",
                 f"export AEITRON_WORKSPACE_URL={shlex.quote(os.environ.get('AEITRON_WORKSPACE_URL', ''))}",
+                "export MASTER_PORT=${MASTER_PORT:-29500}",
                 f"srun {quoted}",
                 "",
             ]
         )
+
+    def _megatron_command(self, job: TrainingJob, *, output_dir: str) -> list[str]:
+        root_value = os.environ.get("AEITRON_MEGATRON_ROOT", "")
+        if not root_value:
+            raise RuntimeError("AEITRON_MEGATRON_ROOT is required for Megatron jobs")
+        root = Path(root_value).expanduser().resolve()
+        pretrain = (root / "pretrain_gpt.py").resolve()
+        if not pretrain.is_file() or root not in pretrain.parents:
+            raise RuntimeError("AEITRON_MEGATRON_ROOT does not contain pretrain_gpt.py")
+        manifest_value = str(job.spec.dataset_manifest_uri or "")
+        tokenizer = str(job.spec.tokenizer_uri or "")
+        if (
+            (urlparse(manifest_value).scheme and not Path(manifest_value).is_absolute())
+            or (urlparse(tokenizer).scheme and not Path(tokenizer).is_absolute())
+        ):
+            raise ValueError("Megatron Slurm jobs require cluster-mounted immutable dataset and tokenizer paths")
+        dataset_manifest = Path(manifest_value).expanduser().resolve()
+        tokenizer_path = Path(tokenizer).expanduser().resolve()
+        if not dataset_manifest.is_file() or sha256_path(dataset_manifest) != job.spec.dataset_manifest_sha256:
+            raise ValueError("Megatron dataset manifest is missing or does not match its immutable checksum")
+        try:
+            manifest_payload = json.loads(dataset_manifest.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError("Megatron dataset manifest is invalid JSON") from exc
+        prefix_value = str(manifest_payload.get("megatron_data_prefix") or "")
+        data_path = Path(prefix_value).expanduser().resolve()
+        allowed_root = dataset_manifest.parent.resolve()
+        if data_path != allowed_root and allowed_root not in data_path.parents:
+            raise ValueError("Megatron data prefix must remain inside the immutable dataset directory")
+        if not data_path.with_suffix(".bin").is_file() or not data_path.with_suffix(".idx").is_file():
+            raise FileNotFoundError("Megatron data prefix must resolve to existing .bin and .idx files")
+        if not tokenizer_path.is_file() or sha256_path(tokenizer_path) != job.spec.tokenizer_sha256:
+            raise ValueError("Megatron tokenizer is missing or does not match its immutable checksum")
+        world_size = job.spec.resources.nodes * job.spec.resources.gpus_per_node
+        tensor_parallel = int(job.spec.metadata.get("tensor_parallel", 8))
+        pipeline_parallel = int(job.spec.metadata.get("pipeline_parallel", 4))
+        if tensor_parallel < 1 or pipeline_parallel < 1 or world_size % (tensor_parallel * pipeline_parallel):
+            raise ValueError("Megatron tensor/pipeline parallel topology does not divide world size")
+        return [
+            sys.executable,
+            "-u",
+            str(pretrain),
+            "--tensor-model-parallel-size",
+            str(tensor_parallel),
+            "--pipeline-model-parallel-size",
+            str(pipeline_parallel),
+            "--sequence-parallel",
+            "--use-distributed-optimizer",
+            "--overlap-grad-reduce",
+            "--overlap-param-gather",
+            "--ckpt-format",
+            "torch_dist",
+            "--dist-ckpt-optim-fully-reshardable",
+            "--seq-length",
+            str(job.spec.sequence_length),
+            "--max-position-embeddings",
+            str(job.spec.sequence_length),
+            "--micro-batch-size",
+            str(job.spec.batch_size),
+            "--global-batch-size",
+            str(job.spec.token_budget.global_batch_sequences),
+            "--train-iters",
+            str(job.spec.steps),
+            "--lr",
+            str(job.spec.optimizer.learning_rate),
+            "--min-lr",
+            str(job.spec.optimizer.learning_rate * job.spec.learning_rate.minimum_learning_rate_ratio),
+            "--lr-decay-style",
+            job.spec.learning_rate.schedule,
+            "--lr-warmup-iters",
+            str(job.spec.learning_rate.warmup_steps),
+            "--weight-decay",
+            str(job.spec.optimizer.weight_decay),
+            "--clip-grad",
+            str(job.spec.optimizer.gradient_clip_norm),
+            "--bf16",
+            "--data-path",
+            str(data_path),
+            "--tokenizer-type",
+            "HuggingFaceTokenizer",
+            "--tokenizer-model",
+            str(tokenizer_path),
+            "--save",
+            str(Path(output_dir).resolve() / "checkpoints"),
+            "--load",
+            str(Path(output_dir).resolve() / "checkpoints"),
+            "--save-interval",
+            str(job.spec.checkpoint.interval_steps),
+            "--eval-interval",
+            str(job.spec.evaluation.interval_steps),
+            "--eval-iters",
+            str(job.spec.evaluation.validation_batches),
+        ]
 
     async def submit(self, job: TrainingJob, attempt: TrainingAttempt) -> SchedulerBinding:
         await self.validate(job.spec)
@@ -3351,7 +3527,8 @@ class TrainingWorkspaceService:
         if not isinstance(self.object_store, S3ObjectStore):
             raise RuntimeError("presigned artifact uploads require production S3/MinIO object storage")
         attempt_segment = request.attempt_id or job.current_attempt_id or "job"
-        key = f"jobs/{job_id}/attempts/{attempt_segment}/{request.kind}/{request.filename}"
+        object_name = request.relative_path or request.filename
+        key = f"jobs/{job_id}/attempts/{attempt_segment}/{request.kind}/{object_name}"
         return await asyncio.to_thread(
             self.object_store.presign_put,
             key=key,

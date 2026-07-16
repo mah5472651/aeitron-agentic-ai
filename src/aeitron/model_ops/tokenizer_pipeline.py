@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -55,7 +56,16 @@ class ShardManifest(StrictModel):
     train_tokens: int
     val_tokens: int
     sequence_length: int
+    shard_sha256: dict[str, str] = Field(default_factory=dict)
     created_at_unix: float = Field(default_factory=time.time)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 TOKENIZER_STRESS_TEXT = """
@@ -186,6 +196,7 @@ def build_token_shards(
     train_tokens = val_tokens = 0
     train_buffer: list[int] = []
     val_buffer: list[int] = []
+    shard_sha256: dict[str, str] = {}
 
     def flush(buffer: list[int], split: str) -> None:
         nonlocal train_tokens, val_tokens
@@ -195,6 +206,7 @@ def build_token_shards(
         index = len(train_shards) if split == "train" else len(val_shards)
         path = directory / f"shard-{index:06d}.bin"
         write_uint32_tokens(path, buffer.copy())
+        shard_sha256[str(path)] = sha256_file(path)
         if split == "train":
             train_shards.append(str(path))
             train_tokens += len(buffer)
@@ -224,6 +236,7 @@ def build_token_shards(
         train_tokens=train_tokens,
         val_tokens=val_tokens,
         sequence_length=active.sequence_length,
+        shard_sha256=shard_sha256,
     )
     (root / "manifest.json").write_text(json.dumps(manifest.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
     return manifest

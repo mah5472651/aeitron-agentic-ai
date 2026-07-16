@@ -311,17 +311,86 @@ def _run_codeql(root: Path) -> dict[str, Any]:
     base_command, missing = _resolve_codeql()
     if missing:
         return {"status": "skipped", "reason": missing}
+    source_root = root / "src"
+    if not source_root.is_dir():
+        return {"status": "failed", "phase": "source_validation", "reason": f"missing source directory: {source_root}"}
     database = root / "artifacts" / "aeitron" / "codeql-db"
-    if not database.exists():
-        return {"status": "skipped", "reason": "CodeQL database missing; create it before production audit", "database": str(database)}
     output = root / "artifacts" / "aeitron" / "codeql-results.sarif"
-    command = [*base_command, "database", "analyze", str(database), "--format=sarifv2.1.0", f"--output={output}", "--rerun"]
-    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
+    database.parent.mkdir(parents=True, exist_ok=True)
+    create_command = [
+        *base_command,
+        "database",
+        "create",
+        str(database),
+        "--language=python",
+        "--build-mode=none",
+        f"--source-root={source_root}",
+        "--threads=0",
+        "--overwrite",
+    ]
+    try:
+        created = subprocess.run(  # nosec B603
+            create_command,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1800,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "failed", "phase": "database_create", "reason": "CodeQL database creation exceeded 1800 seconds"}
+    if created.returncode != 0:
+        return {
+            "status": "failed",
+            "phase": "database_create",
+            "returncode": created.returncode,
+            "database": str(database),
+            "stderr": created.stderr[-4000:],
+        }
+    command = [
+        *base_command,
+        "database",
+        "analyze",
+        str(database),
+        "codeql/python-queries:codeql-suites/python-security-extended.qls",
+        "--format=sarif-latest",
+        f"--output={output}",
+        "--threads=0",
+        "--rerun",
+    ]
+    try:
+        completed = subprocess.run(  # nosec B603
+            command,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1800,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "failed", "phase": "database_analyze", "reason": "CodeQL analysis exceeded 1800 seconds"}
+    blocking = []
+    if completed.returncode == 0 and output.is_file():
+        try:
+            sarif = json.loads(output.read_text(encoding="utf-8-sig"))
+            blocking = [result for run in sarif.get("runs", []) for result in run.get("results", [])]
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            return {"status": "failed", "phase": "sarif_parse", "reason": str(exc), "output": str(output)}
     return {
-        "status": "passed" if completed.returncode == 0 else "failed",
+        "status": "passed" if completed.returncode == 0 and not blocking else "failed",
+        "phase": "database_analyze",
         "returncode": completed.returncode,
+        "blocking_issue_count": len(blocking),
+        "blocking_rules": sorted({str(item.get("ruleId") or "unknown") for item in blocking}),
+        "source_root": str(source_root),
+        "query_suite": "python-security-extended.qls",
+        "database": str(database),
         "output": str(output),
-        "stderr": completed.stderr[-2000:],
+        "stderr": completed.stderr[-4000:],
     }
 
 

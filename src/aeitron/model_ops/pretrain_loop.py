@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import os
+import shutil
 import subprocess  # nosec B404
 import sys
 import time
@@ -13,7 +15,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
-from src.aeitron.model_ops.data_loader import TokenShardStream, count_batches, load_manifest
+from src.aeitron.model_ops.data_loader import ArtifactCache, TokenShardStream, count_batches, load_manifest
 from src.aeitron.model_ops.foundation import CheckpointManifest, sha256_file
 from src.aeitron.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer, read_uint32_tokens
 from src.aeitron.model_ops.torch_decoder import (
@@ -469,8 +471,216 @@ def autocast_dtype(name: str) -> "torch.dtype":
 
 def latest_checkpoint(output_dir: str | Path) -> Path | None:
     root = Path(output_dir)
-    candidates = sorted(root.glob("checkpoint-step-*/model.pt"))
-    return candidates[-1] if candidates else None
+    candidates: list[tuple[int, Path]] = []
+    for directory in root.glob("checkpoint-step-*"):
+        try:
+            step = int(directory.name.rsplit("-", 1)[-1])
+        except ValueError:
+            continue
+        if (directory / "dcp" / ".metadata").is_file():
+            candidates.append((step, directory / "dcp"))
+        elif (directory / "deepspeed" / "latest").is_file():
+            candidates.append((step, directory / "deepspeed"))
+        elif (directory / "model.pt").is_file():
+            candidates.append((step, directory / "model.pt"))
+    return max(candidates, default=(0, None), key=lambda item: item[0])[1]
+
+
+def _json_state(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_state(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_state(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    raise TypeError(f"checkpoint state contains unsupported JSON value: {type(value).__name__}")
+
+
+def _save_dcp_checkpoint(
+    *,
+    checkpoint_dir: Path,
+    model: "torch.nn.Module",
+    optimizer: "torch.optim.Optimizer",
+    scheduler: "torch.optim.lr_scheduler.LRScheduler | None",
+    trainer_state: dict[str, Any],
+) -> None:
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import get_state_dict
+
+    temporary = checkpoint_dir.with_name(checkpoint_dir.name + ".incomplete")
+    if distributed_rank() == 0:
+        shutil.rmtree(temporary, ignore_errors=True)
+        temporary.mkdir(parents=True, exist_ok=False)
+    distributed_barrier()
+    model_state, optimizer_state = get_state_dict(model, optimizer)
+    dcp.save(
+        {"model": model_state, "optimizer": optimizer_state},
+        checkpoint_id=str(temporary / "dcp"),
+    )
+    rank_state = {
+        "rank": distributed_rank(),
+        "world_size": distributed_world_size(),
+        "torch_rng_state": torch.get_rng_state().tolist(),
+        "cuda_rng_states": [state.tolist() for state in torch.cuda.get_rng_state_all()] if torch.cuda.is_available() else [],
+    }
+    (temporary / f"rank-{distributed_rank():05d}.json").write_text(
+        json.dumps(rank_state, sort_keys=True), encoding="utf-8"
+    )
+    distributed_barrier()
+    if distributed_rank() == 0:
+        common = dict(trainer_state)
+        common["scheduler"] = _json_state(scheduler.state_dict()) if scheduler is not None else {}
+        (temporary / "trainer_state.json").write_text(
+            json.dumps(common, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir)
+        os.replace(temporary, checkpoint_dir)
+    distributed_barrier()
+
+
+def _load_dcp_checkpoint(
+    *,
+    checkpoint_path: Path,
+    model: "torch.nn.Module",
+    optimizer: "torch.optim.Optimizer",
+    scheduler: "torch.optim.lr_scheduler.LRScheduler | None",
+    expected_config: ScratchDecoderConfig | None = None,
+) -> tuple[int, int]:
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+
+    model_state, optimizer_state = get_state_dict(model, optimizer)
+    state = {"model": model_state, "optimizer": optimizer_state}
+    dcp.load(state, checkpoint_id=str(checkpoint_path))
+    set_state_dict(
+        model,
+        optimizer,
+        model_state_dict=state["model"],
+        optim_state_dict=state["optimizer"],
+    )
+    root = checkpoint_path.parent
+    trainer_state = json.loads((root / "trainer_state.json").read_text(encoding="utf-8"))
+    if expected_config is not None:
+        saved = trainer_state.get("config") or {}
+        if int(saved.get("vocab_size", -1)) != expected_config.vocab_size:
+            raise ValueError("distributed checkpoint vocab_size does not match current training config")
+        if int(saved.get("hidden_size", -1)) != expected_config.hidden_size:
+            raise ValueError("distributed checkpoint hidden_size does not match current training config")
+    if scheduler is not None and trainer_state.get("scheduler"):
+        scheduler.load_state_dict(trainer_state["scheduler"])
+    rank_path = root / f"rank-{distributed_rank():05d}.json"
+    if not rank_path.is_file():
+        raise FileNotFoundError(f"distributed checkpoint has no RNG state for rank {distributed_rank()}")
+    rank_state = json.loads(rank_path.read_text(encoding="utf-8"))
+    torch.set_rng_state(torch.tensor(rank_state["torch_rng_state"], dtype=torch.uint8))
+    if torch.cuda.is_available() and rank_state.get("cuda_rng_states"):
+        torch.cuda.set_rng_state_all(
+            [torch.tensor(value, dtype=torch.uint8, device="cpu") for value in rank_state["cuda_rng_states"]]
+        )
+    return int(trainer_state.get("step", 0)), int(trainer_state.get("trained_tokens", 0))
+
+
+def publish_checkpoint_to_workspace(
+    *,
+    manifest_path: Path,
+    attempt_id: str,
+    dataset_sha256: str,
+    tokenizer_sha256: str,
+    topology: dict[str, Any],
+    metrics: dict[str, Any],
+    reload_verified: bool,
+    maximum_workers: int = 8,
+) -> dict[str, Any] | None:
+    workspace_url = os.environ.get("AEITRON_WORKSPACE_URL", "").rstrip("/")
+    job_id = os.environ.get("AEITRON_TRAINING_JOB_ID", "")
+    token_file = os.environ.get("AEITRON_WORKSPACE_TOKEN_FILE", "")
+    access_token = os.environ.get("AEITRON_WORKSPACE_ACCESS_TOKEN", "")
+    if not workspace_url or not job_id or not attempt_id or not (token_file or access_token):
+        return None
+    token = Path(token_file).read_text(encoding="utf-8").strip() if token_file else access_token
+    if not token:
+        raise RuntimeError("workspace checkpoint publication token is empty")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    checkpoint_dir = Path(payload["checkpoint_dir"]).resolve()
+    step = int(payload["step"])
+    files = list(payload.get("files") or [])
+    if not files or len(files) > 100_000:
+        raise ValueError("checkpoint manifest file count is outside publication limits")
+    headers = {"Authorization": f"Bearer {token}"}
+    prefix = f"step-{step:08d}"
+
+    def upload(path: Path, relative_path: str, digest: str, size_bytes: int) -> str:
+        import httpx
+
+        request = {
+            "attempt_id": attempt_id,
+            "kind": "checkpoint",
+            "filename": path.name,
+            "relative_path": f"{prefix}/{relative_path}",
+            "sha256": digest,
+            "size_bytes": size_bytes,
+            "content_type": "application/json" if path.suffix == ".json" else "application/octet-stream",
+        }
+        with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+            response = client.post(
+                f"{workspace_url}/v1/training/jobs/{job_id}/artifacts/presign",
+                headers=headers,
+                json=request,
+            )
+            response.raise_for_status()
+            presigned = response.json()
+            with path.open("rb") as handle:
+                uploaded = client.put(presigned["url"], headers=presigned["headers"], content=handle)
+            uploaded.raise_for_status()
+            registered = client.post(
+                f"{workspace_url}/v1/training/jobs/{job_id}/artifacts/register",
+                headers=headers,
+                json={"upload": request, "uri": presigned["uri"]},
+            )
+            registered.raise_for_status()
+            return str(presigned["uri"])
+
+    manifest_digest = sha256_file(manifest_path)
+    manifest_uri = upload(
+        manifest_path,
+        "checkpoint_manifest.json",
+        manifest_digest,
+        manifest_path.stat().st_size,
+    )
+    work: list[tuple[Path, str, str, int]] = []
+    for entry in files:
+        relative = str(entry["path"])
+        source = (checkpoint_dir / relative).resolve()
+        if checkpoint_dir != source and checkpoint_dir not in source.parents:
+            raise ValueError("checkpoint manifest path escapes checkpoint directory")
+        if not source.is_file() or sha256_file(source) != str(entry["sha256"]):
+            raise ValueError(f"checkpoint file failed publication preflight: {relative}")
+        work.append((source, relative.replace("\\", "/"), str(entry["sha256"]), int(entry["size_bytes"])))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(maximum_workers, len(work))) as executor:
+        futures = [executor.submit(upload, *item) for item in work]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+    import httpx
+
+    with httpx.Client(timeout=60.0) as client:
+        committed = client.post(
+            f"{workspace_url}/v1/training/jobs/{job_id}/checkpoints",
+            headers=headers,
+            json={
+                "attempt_id": attempt_id,
+                "step": step,
+                "manifest_uri": manifest_uri,
+                "manifest_sha256": manifest_digest,
+                "dataset_sha256": dataset_sha256,
+                "tokenizer_sha256": tokenizer_sha256,
+                "topology": topology,
+                "metrics": metrics,
+                "reload_verified": reload_verified,
+            },
+        )
+        committed.raise_for_status()
+        return committed.json()
 
 
 def git_commit(root: str | Path = ".") -> str:
@@ -525,34 +735,58 @@ def save_training_checkpoint(
     manifest_filename: str = "checkpoint_manifest.json",
 ) -> Path:
     checkpoint_dir = output_dir / f"checkpoint-step-{step:08d}"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    if hasattr(model, "save_checkpoint"):
-        model.save_checkpoint(str(checkpoint_dir / "deepspeed"), tag=f"step-{step:08d}")
-    model_state = checkpoint_model_state_dict(model)
     manifest_path = output_dir / manifest_filename
-    if distributed_rank() == 0:
-        dataset_manifest_hash = sha256_file(Path(dataset_manifest_path)) if dataset_manifest_path and Path(dataset_manifest_path).exists() else ""
-        tokenizer_hash = sha256_file(Path(tokenizer_path)) if tokenizer_path and Path(tokenizer_path).exists() else ""
+    dataset_manifest_hash = sha256_file(Path(dataset_manifest_path)) if dataset_manifest_path and Path(dataset_manifest_path).exists() else ""
+    tokenizer_hash = sha256_file(Path(tokenizer_path)) if tokenizer_path and Path(tokenizer_path).exists() else ""
+    trainer_state = {
+        "config": config.model_dump(),
+        "step": step,
+        "trained_tokens": trained_tokens,
+        "metrics": metrics,
+        "training_args": training_args or {},
+        "dataset_manifest_path": str(dataset_manifest_path or ""),
+        "dataset_manifest_sha256": dataset_manifest_hash,
+        "tokenizer_path": str(tokenizer_path or ""),
+        "tokenizer_sha256": tokenizer_hash,
+        "git_commit": git_commit(),
+        "environment": environment or {},
+        "distributed_world_size": distributed_world_size(),
+    }
+    is_fsdp = model.__class__.__name__ == "FullyShardedDataParallel"
+    is_deepspeed = hasattr(model, "save_checkpoint") and model.__class__.__name__.lower().endswith("engine")
+    if is_fsdp:
+        _save_dcp_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            trainer_state=trainer_state,
+        )
+    elif is_deepspeed:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        saved = model.save_checkpoint(
+            str(checkpoint_dir / "deepspeed"),
+            tag=f"step-{step:08d}",
+            client_state=trainer_state,
+        )
+        if saved is False:
+            raise RuntimeError("DeepSpeed rejected distributed checkpoint save")
+        distributed_barrier()
+    elif distributed_world_size() > 1:
+        raise RuntimeError("distributed checkpointing requires FSDP or DeepSpeed engine sharding")
+    elif distributed_rank() == 0:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        model_state = checkpoint_model_state_dict(model)
         save_trusted_checkpoint(
             {
                 "model": model_state,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict() if scheduler is not None else {"type": "constant", "state": {}},
-                "config": config.model_dump(),
-                "step": step,
-                "trained_tokens": trained_tokens,
-                "metrics": metrics,
-                "training_args": training_args or {},
-                "dataset_manifest_path": str(dataset_manifest_path or ""),
-                "dataset_manifest_sha256": dataset_manifest_hash,
-                "tokenizer_path": str(tokenizer_path or ""),
-                "tokenizer_sha256": tokenizer_hash,
-                "git_commit": git_commit(),
-                "environment": environment or {},
-                "distributed_world_size": distributed_world_size(),
+                **trainer_state,
             },
             checkpoint_dir / "model.pt",
         )
+    if distributed_rank() == 0:
         (checkpoint_dir / "config.json").write_text(json.dumps(config.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
         manifest = CheckpointManifest.from_directory(
             architecture_name=config.name,
@@ -576,6 +810,19 @@ def load_checkpoint(
     device: "torch.device",
     expected_config: ScratchDecoderConfig | None = None,
 ) -> tuple[int, int]:
+    if checkpoint_path.is_dir() and (checkpoint_path / ".metadata").is_file():
+        return _load_dcp_checkpoint(
+            checkpoint_path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_config=expected_config,
+        )
+    if checkpoint_path.is_dir() and (checkpoint_path / "latest").exists() and hasattr(model, "load_checkpoint"):
+        loaded_path, client_state = model.load_checkpoint(str(checkpoint_path))
+        if not loaded_path:
+            raise RuntimeError("DeepSpeed checkpoint reload failed")
+        return int(client_state.get("step", 0)), int(client_state.get("trained_tokens", 0))
     payload = load_trusted_checkpoint(checkpoint_path, map_location=device)
     if expected_config is not None:
         saved_config = payload.get("config") or {}
@@ -628,13 +875,29 @@ def tensor_batch(batch: list[list[int]], *, device: "torch.device") -> "torch.Te
     return torch.tensor(batch, dtype=torch.long, device=device)
 
 
-def validate_training_shards(*, train_shards: list[str], sequence_length: int, batch_size: int) -> int:
+def validate_training_shards(
+    *,
+    train_shards: list[str],
+    sequence_length: int,
+    batch_size: int,
+    artifact_cache: ArtifactCache | None = None,
+    expected_sha256: dict[str, str] | None = None,
+) -> int:
     if not train_shards:
         raise ValueError("manifest has no training shards; provide a corpus that produces at least one train shard")
     required_tokens = sequence_length * batch_size
-    available_batches = count_batches(train_shards, sequence_length=sequence_length, batch_size=batch_size)
+    available_batches = count_batches(
+        train_shards,
+        sequence_length=sequence_length,
+        batch_size=batch_size,
+        artifact_cache=artifact_cache,
+        expected_sha256=expected_sha256,
+    )
     if available_batches < 1:
-        total_tokens = sum(len(Path(path).read_bytes()) // 4 for path in train_shards)
+        total_tokens = sum(
+            len((artifact_cache.materialize(path) if artifact_cache else Path(path)).read_bytes()) // 4
+            for path in train_shards
+        )
         raise ValueError(
             "not enough training tokens for one batch: "
             f"train_tokens={total_tokens}, required_tokens={required_tokens} "
@@ -644,10 +907,10 @@ def validate_training_shards(*, train_shards: list[str], sequence_length: int, b
     return available_batches
 
 
-def max_token_id(shard_paths: list[str]) -> int:
+def max_token_id(shard_paths: list[str], *, artifact_cache: ArtifactCache | None = None) -> int:
     maximum = -1
     for path in shard_paths:
-        tokens = read_uint32_tokens(path)
+        tokens = read_uint32_tokens(artifact_cache.materialize(path) if artifact_cache else path)
         if tokens:
             maximum = max(maximum, max(tokens))
     return maximum
@@ -664,13 +927,17 @@ def build_training_config(
     model_profile_name: str = "tiny",
     attention_impl: str = "auto",
     gradient_checkpointing: bool = False,
+    artifact_cache: ArtifactCache | None = None,
 ) -> ScratchDecoderConfig:
     base = model_profile(model_profile_name) if model_profile_name != "tiny" else tiny_smoke_config()
     vocab_size = base.vocab_size
     tokenizer_path = Path(active_manifest.tokenizer_path)
     if tokenizer_path.exists():
         vocab_size = max(vocab_size, tokenizer_vocab_size(tokenizer_path))
-    highest_token_id = max_token_id(active_manifest.train_shards + active_manifest.val_shards)
+    highest_token_id = max_token_id(
+        active_manifest.train_shards + active_manifest.val_shards,
+        artifact_cache=artifact_cache,
+    )
     if highest_token_id >= vocab_size:
         vocab_size = highest_token_id + 1
     return base.model_copy(
@@ -713,6 +980,10 @@ def run_pretraining_loop(
     manifest: str | Path | None = None,
     token_file: str | Path | None = None,
     tokenizer_path: str | Path | None = None,
+    manifest_sha256: str | None = None,
+    tokenizer_sha256: str | None = None,
+    artifact_cache_dir: str | Path | None = None,
+    object_store_endpoint_url: str | None = None,
     device: str = "auto",
     steps: int = 100,
     batch_size: int = 2,
@@ -785,7 +1056,13 @@ def run_pretraining_loop(
         active_progress = NullProgressReporter()
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    active_manifest_path: Path | None = Path(manifest).resolve() if manifest else None
+    artifact_cache = ArtifactCache(
+        artifact_cache_dir or os.environ.get("AEITRON_ARTIFACT_CACHE_DIR", root / "artifact-cache"),
+        s3_endpoint_url=object_store_endpoint_url or os.environ.get("AEITRON_OBJECT_STORE_ENDPOINT_URL"),
+    )
+    active_manifest_path: Path | None = (
+        artifact_cache.materialize(manifest, expected_sha256=manifest_sha256) if manifest else None
+    )
     if active_manifest_path is None and token_file and tokenizer_path:
         active_manifest = build_token_shards(
             input_paths=[token_file],
@@ -801,6 +1078,9 @@ def run_pretraining_loop(
         active_manifest = load_manifest(active_manifest_path)
     else:
         raise ValueError("provide --manifest, or both --token-file and --tokenizer-path")
+    immutable_tokenizer = tokenizer_path or active_manifest.tokenizer_path
+    local_tokenizer = artifact_cache.materialize(immutable_tokenizer, expected_sha256=tokenizer_sha256)
+    active_manifest = active_manifest.model_copy(update={"tokenizer_path": str(local_tokenizer)})
     validate_production_training_args(
         production_mode=production_mode,
         dev_smoke=dev_smoke,
@@ -819,11 +1099,14 @@ def run_pretraining_loop(
         model_profile_name=model_profile_name,
         attention_impl=attention_impl,
         gradient_checkpointing=gradient_checkpointing,
+        artifact_cache=artifact_cache,
     )
     available_batches = validate_training_shards(
         train_shards=active_manifest.train_shards,
         sequence_length=sequence_length,
         batch_size=batch_size,
+        artifact_cache=artifact_cache,
+        expected_sha256=active_manifest.shard_sha256,
     )
     active_progress.emit(
         "training",
@@ -847,6 +1130,8 @@ def run_pretraining_loop(
         seed=dataloader_seed,
         shuffle=True,
         prefetch_batches=dataloader_prefetch_batches,
+        artifact_cache=artifact_cache,
+        expected_sha256=active_manifest.shard_sha256,
     )
     val_stream = (
         TokenShardStream(
@@ -856,6 +1141,8 @@ def run_pretraining_loop(
             seed=dataloader_seed + 5994,
             shuffle=False,
             prefetch_batches=dataloader_prefetch_batches,
+            artifact_cache=artifact_cache,
+            expected_sha256=active_manifest.shard_sha256,
         )
         if active_manifest.val_shards
         else None
@@ -1126,6 +1413,34 @@ def run_pretraining_loop(
         )
         best_val_loss = final_val_loss
         best_val_step = current_step
+    reload_source = latest_checkpoint(root)
+    if reload_source is None:
+        raise RuntimeError("final checkpoint was not discoverable for reload verification")
+    reloaded_step, reloaded_tokens = load_checkpoint(
+        reload_source,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=selected,
+        expected_config=config,
+    )
+    if reloaded_step != current_step or reloaded_tokens != trained_tokens:
+        raise RuntimeError(
+            "checkpoint reload state mismatch: "
+            f"step={reloaded_step}/{current_step}, tokens={reloaded_tokens}/{trained_tokens}"
+        )
+    distributed_barrier()
+    checkpoint_publication = None
+    if distributed_rank() == 0:
+        checkpoint_publication = publish_checkpoint_to_workspace(
+            manifest_path=manifest_path,
+            attempt_id=os.environ.get("AEITRON_TRAINING_ATTEMPT_ID", ""),
+            dataset_sha256=sha256_file(active_manifest_path) if active_manifest_path else "",
+            tokenizer_sha256=sha256_file(local_tokenizer),
+            topology=distributed_report,
+            metrics={"train_loss": train_losses[-1], "validation_loss": final_val_loss},
+            reload_verified=True,
+        )
     report = {
         "status": "early_stopped" if early_stopped else "passed",
         "scratch_only": True,
@@ -1160,6 +1475,8 @@ def run_pretraining_loop(
         "target_tokens": target_tokens,
         "runtime_versions": runtime_versions,
         "checkpoint_manifest": str(manifest_path),
+        "checkpoint_reload_verified": True,
+        "checkpoint_publication": checkpoint_publication,
         "duration_ms": round((time.perf_counter() - started) * 1000, 3),
     }
     if distributed_rank() == 0:
@@ -1184,6 +1501,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest")
     parser.add_argument("--token-file")
     parser.add_argument("--tokenizer-path")
+    parser.add_argument("--manifest-sha256")
+    parser.add_argument("--tokenizer-sha256")
+    parser.add_argument("--artifact-cache-dir")
+    parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -1269,6 +1590,10 @@ def main() -> None:
         manifest=args.manifest,
         token_file=args.token_file,
         tokenizer_path=args.tokenizer_path,
+        manifest_sha256=args.manifest_sha256,
+        tokenizer_sha256=args.tokenizer_sha256,
+        artifact_cache_dir=args.artifact_cache_dir,
+        object_store_endpoint_url=args.object_store_endpoint_url,
         device=args.device,
         steps=args.steps,
         batch_size=args.batch_size,

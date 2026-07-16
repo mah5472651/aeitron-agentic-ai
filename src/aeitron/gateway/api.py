@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import json
+import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,37 @@ class ProjectCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     repo_path: str = Field(min_length=1)
     default_branch: str = Field(default="main", min_length=1, max_length=100)
+
+
+SAFE_REPO_PATH_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,254}$")
+
+
+def resolve_registered_repo_path(value: str) -> Path:
+    """Resolve an API repository path beneath an administrator-owned root."""
+
+    if "\x00" in value or len(value) > 4096:
+        raise ValueError("repo_path contains invalid data")
+    normalized = value.replace("\\", "/").strip()
+    if normalized in {"", "."}:
+        parts: list[str] = []
+    else:
+        if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+            raise ValueError("repo_path must be relative to an allowed project root")
+        parts = normalized.split("/")
+        if any(part in {"", ".", ".."} or SAFE_REPO_PATH_PART.fullmatch(part) is None for part in parts):
+            raise ValueError("repo_path contains an unsafe path component")
+
+    configured = [item for item in os.environ.get("AEITRON_PROJECT_ROOTS", "").split(os.pathsep) if item]
+    roots = [Path(item).expanduser().resolve() for item in configured] if configured else [Path.cwd().resolve()]
+    for root in roots:
+        candidate = root.joinpath(*parts).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        if candidate.is_dir():
+            return candidate
+    raise ValueError("repo_path is not a directory beneath an allowed project root")
 
 
 class IndexProjectRequest(BaseModel):
@@ -643,9 +675,10 @@ async def model_pretraining_readiness(request: PretrainingRunSpec) -> dict[str, 
 
 @app.post("/v1/projects")
 async def create_project(request: ProjectCreateRequest) -> dict[str, Any]:
-    repo_path = Path(request.repo_path).expanduser().resolve()
-    if not repo_path.exists() or not repo_path.is_dir():
-        raise HTTPException(status_code=400, detail=f"repo_path is not a directory: {repo_path}")
+    try:
+        repo_path = resolve_registered_repo_path(request.repo_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return STORE.create_project(
         name=request.name,
         repo_path=str(repo_path),

@@ -44,13 +44,18 @@ spec:
                   key: workspace-bootstrap-token
             - name: AEITRON_ALLOW_TOKEN_ISSUE
               value: "0"
+            - name: AEITRON_PROJECT_ROOTS
+              value: /workspace/projects
             - name: AEITRON_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: aeitron-secrets
                   key: database-url
             - name: AEITRON_REDIS_URL
-              value: redis://aeitron-redis:6379/0
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-secrets
+                  key: redis-url
             - name: AEITRON_QDRANT_URL
               value: http://aeitron-qdrant:6333
             - name: AEITRON_OBJECT_STORE_URI
@@ -89,6 +94,8 @@ spec:
               mountPath: /app/artifacts
             - name: tmp
               mountPath: /tmp
+            - name: project-workspaces
+              mountPath: /workspace/projects
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -116,6 +123,9 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 128Mi
+        - name: project-workspaces
+          persistentVolumeClaim:
+            claimName: aeitron-project-workspaces
 ---
 apiVersion: v1
 kind: Service
@@ -135,4 +145,15 @@ metadata:
 data:
   git-commit: "replace-with-immutable-git-commit"
   image-digest: "replace-with-sha256-image-digest"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aeitron-project-workspaces
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: aeitron-workspaces
+  resources:
+    requests:
+      storage: 1Ti
 

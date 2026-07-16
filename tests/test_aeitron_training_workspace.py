@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import tempfile
 import unittest
@@ -12,6 +13,8 @@ from fastapi.testclient import TestClient
 from src.aeitron.identity.auth import AuthConfig
 from src.aeitron.learning.storage import LocalObjectStore
 from src.aeitron.training_client import _validate_workspace_url, format_event
+from src.aeitron.model_ops.distributed_worker import normalize_slurm_environment
+from src.aeitron.training_proofs import parse_dr_workload
 from src.aeitron.training_workspace import (
     ALLOWED_TRANSITIONS,
     InMemoryEventBus,
@@ -37,6 +40,35 @@ from src.aeitron.training_workspace import (
 
 
 class AeitronTrainingWorkspaceTest(unittest.TestCase):
+    def test_disaster_recovery_workload_parser_rejects_command_shapes(self) -> None:
+        self.assertEqual(
+            parse_dr_workload("aeitron-training:deployment:aeitron-training-controller"),
+            ("aeitron-training", "deployment", "aeitron-training-controller"),
+        )
+        for unsafe in [
+            "default:job:runner",
+            "default:deployment:controller;whoami",
+            "default/deployment/controller",
+            "default:deployment:../controller",
+        ]:
+            with self.subTest(unsafe=unsafe), self.assertRaises(ValueError):
+                parse_dr_workload(unsafe)
+
+    def test_slurm_environment_normalization_rejects_invalid_rank_topology(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "SLURM_PROCID": "8",
+                "SLURM_LOCALID": "0",
+                "SLURM_NTASKS": "8",
+                "MASTER_ADDR": "trainer-0",
+                "MASTER_PORT": "29500",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "rank topology"):
+                normalize_slurm_environment()
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
@@ -382,6 +414,27 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
         self.assertIsInstance(container["command"], list)
         self.assertNotIn("shell", json.dumps(manifest).lower())
         self.assertIn("AEITRON_WORKSPACE_TOKEN_FILE", json.dumps(manifest))
+        command = container["command"]
+        self.assertIn("src.aeitron.model_ops.distributed_worker", command)
+        volumes = manifest["spec"]["pytorchReplicaSpecs"]["Master"]["template"]["spec"]["volumes"]
+        workspace = next(item for item in volumes if item["name"] == "workspace")
+        self.assertEqual(workspace["persistentVolumeClaim"]["claimName"], "aeitron-training-checkpoints")
+
+        standard_spec = self.service.resolve_spec(
+            self.request(
+                profile_id="defensive-10k",
+                idempotency_key="workspace-kubernetes-1",
+                dataset_manifest_uri="/data/manifest.json",
+                dataset_manifest_sha256="b" * 64,
+                tokenizer_uri="/data/tokenizer.json",
+                tokenizer_sha256="c" * 64,
+            )
+        )
+        standard_job = self._job_from_spec(standard_spec, owner="admin", key="workspace-kubernetes-1")
+        standard_manifest = KubernetesSchedulerAdapter().manifest(standard_job, attempt)
+        standard_volumes = standard_manifest["spec"]["template"]["spec"]["volumes"]
+        standard_workspace = next(item for item in standard_volumes if item["name"] == "workspace")
+        self.assertEqual(standard_workspace["persistentVolumeClaim"]["claimName"], "aeitron-training-checkpoints")
 
     @staticmethod
     def _job_from_spec(spec: object, *, owner: str, key: str):
@@ -397,18 +450,34 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
         )
 
     def test_slurm_script_uses_fixed_srun_path_and_strict_shell(self) -> None:
+        data_dir = self.root / "megatron-data"
+        data_dir.mkdir()
+        prefix = data_dir / "corpus"
+        prefix.with_suffix(".bin").write_bytes(b"tokens")
+        prefix.with_suffix(".idx").write_bytes(b"index")
+        manifest = data_dir / "manifest.json"
+        manifest.write_text(json.dumps({"megatron_data_prefix": str(prefix)}), encoding="utf-8")
+        tokenizer = data_dir / "tokenizer.json"
+        tokenizer.write_text("{}", encoding="utf-8")
+        megatron_root = self.root / "Megatron-LM"
+        megatron_root.mkdir()
+        (megatron_root / "pretrain_gpt.py").write_text("# test entrypoint\n", encoding="utf-8")
         request = self.request(
             profile_id="aeitron-60b-hybrid",
             idempotency_key="workspace-slurm-1",
-            dataset_manifest_uri="/data/manifest.json",
-            dataset_manifest_sha256="b" * 64,
-            tokenizer_uri="/data/tokenizer.json",
-            tokenizer_sha256="c" * 64,
+            dataset_manifest_uri=str(manifest),
+            dataset_manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            tokenizer_uri=str(tokenizer),
+            tokenizer_sha256=hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
         )
         spec = self.service.resolve_spec(request)
         job = self._job_from_spec(spec, owner="admin", key="workspace-slurm-1")
         attempt = asyncio.run(self.service.create_attempt(asyncio.run(self.store.create_job(job))))
-        script = SlurmSchedulerAdapter(work_dir=self.root / "slurm").script(job, attempt)
+        with patch.dict(
+            "os.environ",
+            {"AEITRON_MEGATRON_ROOT": str(megatron_root), "AEITRON_SHARED_CHECKPOINT_ROOT": str(self.root)},
+        ):
+            script = SlurmSchedulerAdapter(work_dir=self.root / "slurm").script(job, attempt)
         self.assertIn("set -euo pipefail", script)
         self.assertIn("srun", script)
         self.assertIn("AEITRON_WORKSPACE_TOKEN_FILE", script)

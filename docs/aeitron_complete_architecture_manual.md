@@ -3817,6 +3817,124 @@ Kubernetes/PyTorchJob, Slurm, FSDP, ZeRO-3, Megatron, and 60B resume checks
 probe their real dependencies. A missing cluster or GPU allocation is an
 explicit blocker. Running a local mock does not promote those proof states.
 
+### Distributed Execution And Checkpoint Proof Contract
+
+`src/aeitron/model_ops/distributed_worker.py` is the fixed cluster entrypoint.
+It converts Kubernetes replica metadata or Slurm rank variables into canonical
+PyTorch rank variables without accepting an arbitrary shell command. A
+PyTorchJob replica launches one process per visible GPU. Slurm validates
+`SLURM_PROCID`, `SLURM_LOCALID`, `SLURM_NTASKS`, master address, and port before
+starting either native Aeitron pretraining or the pinned Megatron entrypoint.
+
+FSDP checkpoints no longer gather a full model on rank zero. They use PyTorch
+Distributed Checkpoint sharded model and optimizer state, per-rank RNG state,
+trainer and scheduler state, checksums, an incomplete staging directory, and
+an atomic final-directory commit on shared storage. Resume restores the
+sharded state and verifies step/token state before training continues.
+DeepSpeed uses its native sharded checkpoint client state. Megatron requires a
+real `pretrain_gpt.py`, indexed `.bin/.idx` data under the immutable manifest
+root, topology divisibility, distributed optimizer state, and `torch_dist`
+checkpoint format.
+
+Workers materialize `file://` or `s3://` dataset manifests, tokenizers, and
+shards through a bounded local artifact cache. SHA-256 mismatch, path escape,
+missing object, or tokenizer/model mismatch blocks the run before optimization.
+Native distributed checkpoints are uploaded file by file to workspace object
+storage, registered transactionally, committed only after checksum validation,
+and marked reload-verified only after an actual reload succeeds.
+
+Real Kubernetes FSDP and ZeRO-3 proof commands:
+
+```powershell
+$common = @(
+  "--skip-infrastructure", "--skip-disaster-recovery", "--skip-capability-probes",
+  "--dataset-manifest-uri", $env:AEITRON_PROOF_DATASET_URI,
+  "--dataset-manifest-sha256", $env:AEITRON_PROOF_DATASET_SHA256,
+  "--tokenizer-uri", $env:AEITRON_PROOF_TOKENIZER_URI,
+  "--tokenizer-sha256", $env:AEITRON_PROOF_TOKENIZER_SHA256,
+  "--git-commit", $env:AEITRON_TRAINING_GIT_COMMIT,
+  "--container-digest", $env:AEITRON_TRAINING_IMAGE_DIGEST,
+  "--live-timeout-seconds", "86400",
+  "--inject-worker-loss"
+)
+python -m src.aeitron.training_proofs --live-profile aeitron-7b-fsdp @common
+python -m src.aeitron.training_proofs --live-profile aeitron-32b-zero3 @common
+```
+
+The proof submits a real immutable job, watches the state machine, requires
+heartbeats and a reload-verified checkpoint, deletes one Kubernetes worker only
+after that checkpoint exists, and then requires post-injection events and a
+successful terminal state. `blocked` means the cluster, CRD, image, data, GPU,
+or service dependency was unavailable. It is never rewritten as `passed`.
+
+Real Slurm/Megatron 60B proof:
+
+```powershell
+$env:AEITRON_MEGATRON_ROOT = "/cluster/software/Megatron-LM"
+$env:AEITRON_SHARED_CHECKPOINT_ROOT = "/cluster/checkpoints/aeitron"
+python -m src.aeitron.training_proofs --live-profile aeitron-60b-hybrid @common
+```
+
+For the 60B profile, dataset and tokenizer URIs must resolve to immutable
+cluster-mounted files. The manifest binds a `megatron_data_prefix` whose
+`.bin/.idx` files remain under the manifest directory. The proof waits for a
+multi-file Megatron checkpoint, runs a real `scontrol requeue`, then requires
+new events and successful completion. Promotion remains
+`built_not_cluster_proven` until this exact run succeeds on the target Slurm
+fabric and a subsequent resume reads the same checkpoint.
+
+### Disaster Recovery And Soak Proofs
+
+The 24-hour proof performs real Postgres transactions, Redis write/read/delete,
+and MinIO write/read/checksum/delete on every cycle. It records availability,
+error-budget consumption, consecutive failures, and p50/p95/p99/max latency.
+It passes only after the full 86,400 seconds elapse:
+
+```powershell
+python -m src.aeitron.training_proofs --soak-seconds 86400 `
+  --soak-interval-seconds 30 --skip-capability-probes `
+  --output-dir artifacts\aeitron\production-proofs\24-hour-soak
+```
+
+Local DR proves Postgres dump/restore, Redis AOF recovery, MinIO volume
+recovery, and worker-loss retry using isolated Docker services. The live
+Kubernetes drill is deliberately disruptive and must be explicitly enabled:
+
+```powershell
+python -m src.aeitron.training_proofs --skip-infrastructure `
+  --skip-disaster-recovery --skip-capability-probes `
+  --inject-kubernetes-disaster-recovery `
+  --dr-workload default:statefulset:aeitron-postgres `
+  --dr-workload default:statefulset:aeitron-redis `
+  --dr-workload default:statefulset:aeitron-minio `
+  --dr-workload aeitron-training:deployment:aeitron-training-controller
+```
+
+Before disruption it persists a job in Postgres, a sequenced checkpoint event
+in Redis Streams, and a checksummed marker in S3/MinIO. Each declared rollout
+must recover before the next starts. Fresh clients then verify the exact job,
+event, and object checksum. Provider-managed regional failover still requires
+that provider's runbook and cannot be truthfully proved by repository code
+alone.
+
+### Strict CodeQL Gate
+
+The security audit resolves the installed official CodeQL bundle, builds a
+fresh Python database from `src`, runs `python-security-extended.qls`, parses
+SARIF, and blocks on every result. Scanner timeout, database creation failure,
+analysis failure, or malformed SARIF also blocks. Deployment YAML is evaluated
+separately by the Kubernetes policy audit.
+
+```powershell
+$env:AEITRON_CODEQL_BIN = "$HOME\.aeitron\tools\codeql\codeql\codeql.exe"
+python -m src.aeitron.security.audit `
+  --strict-external-tools --output-dir artifacts\aeitron\security-audit
+```
+
+Do not suppress a CodeQL result merely to make the gate green. Fix the sink or
+record an independently reviewed, narrowly scoped exception in the governed
+security process.
+
 ### Workspace Verification
 
 ```powershell

@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -120,10 +121,11 @@ class AeitronMvpFoundationTest(unittest.TestCase):
             gateway_api.STORE = replacement_store
             try:
                 client = TestClient(gateway_api.app)
-                create_response = client.post(
-                    "/v1/projects",
-                    json={"name": "gateway-demo", "repo_path": str(workspace), "default_branch": "main"},
-                )
+                with patch.dict("os.environ", {"AEITRON_PROJECT_ROOTS": str(workspace)}, clear=False):
+                    create_response = client.post(
+                        "/v1/projects",
+                        json={"name": "gateway-demo", "repo_path": ".", "default_branch": "main"},
+                    )
                 self.assertEqual(create_response.status_code, 200, create_response.text)
                 project_id = create_response.json()["id"]
 

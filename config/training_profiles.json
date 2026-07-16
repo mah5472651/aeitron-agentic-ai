@@ -84,6 +84,7 @@
       "queue": "gpu-training",
       "account": null,
       "storage_class": "aeitron-checkpoints",
+      "shared_checkpoint_claim": "aeitron-training-checkpoints",
       "priority_class": "aeitron-training-normal",
       "gang_scheduling": false,
       "topology_key": "kubernetes.io/hostname"
@@ -340,6 +341,7 @@
       "runtime_limits": {"maximum_wall_time_seconds": 1209600, "heartbeat_timeout_seconds": 90, "graceful_shutdown_seconds": 300},
       "dataloader": {"workers_per_rank": 16, "prefetch_batches": 16, "local_cache_gib": 8000},
       "scheduler_policy": {"namespace": "aeitron-training", "queue": "gpu-h100", "account": "aeitron-pretraining", "priority_class": "aeitron-training-critical", "gang_scheduling": true},
+      "immutable_inputs": {"allowed_uri_schemes": ["file"]},
       "cost_quota": {"maximum_gpu_hours": 1000000.0, "maximum_cost_usd": 100000000.0, "maximum_storage_gib": 1000000},
       "allowed_overrides": {"steps": {"minimum": 10000, "maximum": 5000000}, "sequence_length": {"minimum": 2048, "maximum": 131072}, "nodes": {"minimum": 16, "maximum": 256}},
       "requirements": ["hopper_or_newer_recommended", "nvlink_or_nvswitch", "rdma", "megatron", "gang_scheduling", "promoted_dataset_gate", "distributed_checkpoint", "checkpoint_evaluation"]

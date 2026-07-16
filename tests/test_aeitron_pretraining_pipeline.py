@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,8 +12,15 @@ from src.aeitron.learning.quality import DatasetQualityGate, QualityGateConfig
 from src.aeitron.learning.mixer import ScratchMixConfig, build_scratch_instruction_mix
 from src.aeitron.evaluation.checkpoint_eval import evaluate_checkpoint
 from src.aeitron.learning.web_ingest import allowed_url, text_from_html
-from src.aeitron.model_ops.data_loader import TokenShardStream, load_manifest
-from src.aeitron.model_ops.pretrain_loop import build_cluster_training_plan, load_deepspeed_config, run_pretraining_loop, validate_production_training_args
+from src.aeitron.model_ops.data_loader import ArtifactCache, TokenShardStream, load_manifest
+from src.aeitron.model_ops.pretrain_loop import (
+    _load_dcp_checkpoint,
+    _save_dcp_checkpoint,
+    build_cluster_training_plan,
+    load_deepspeed_config,
+    run_pretraining_loop,
+    validate_production_training_args,
+)
 from src.aeitron.model_ops.native_serving import NativeServingConfig, create_app
 from src.aeitron.model_ops.production_adapters import build_megatron_launch_plan, build_tensorrt_llm_plan, export_hf_llama_package, validate_vllm_package
 from src.aeitron.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints
@@ -37,6 +45,50 @@ from src.aeitron.model_ops.torch_decoder import model_profile
 
 
 class AeitronPretrainingPipelineTest(unittest.TestCase):
+    def test_artifact_cache_accepts_absolute_file_and_enforces_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "manifest.json"
+            source.write_text('{"dataset_id":"test"}', encoding="utf-8")
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            cache = ArtifactCache(root / "cache")
+            self.assertEqual(cache.materialize(source, expected_sha256=digest), source.resolve())
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                cache.materialize(source, expected_sha256="0" * 64)
+
+    def test_distributed_checkpoint_roundtrip_preserves_training_state(self) -> None:
+        import torch
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model = torch.nn.Linear(4, 4)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+            checkpoint = Path(temp_dir) / "checkpoint-step-00000001"
+            before = {name: value.detach().clone() for name, value in model.state_dict().items()}
+            _save_dcp_checkpoint(
+                checkpoint_dir=checkpoint,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                trainer_state={
+                    "step": 1,
+                    "trained_tokens": 64,
+                    "config": {"vocab_size": 16, "hidden_size": 4},
+                },
+            )
+            with torch.no_grad():
+                for parameter in model.parameters():
+                    parameter.zero_()
+            step, tokens = _load_dcp_checkpoint(
+                checkpoint_path=checkpoint / "dcp",
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+            )
+            self.assertEqual((step, tokens), (1, 64))
+            for name, value in model.state_dict().items():
+                self.assertTrue(torch.equal(value, before[name]))
+
     def test_learning_validation_generates_instruction_corpus_and_tokenizer_audit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -259,7 +311,25 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
             )
             loaded = load_manifest(root / "shards" / "manifest.json")
             self.assertTrue(loaded.train_shards)
-            batch = next(TokenShardStream(loaded.train_shards, sequence_length=16, batch_size=1).batches())
+            self.assertEqual(set(loaded.shard_sha256), set(loaded.train_shards + loaded.val_shards))
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                next(
+                    TokenShardStream(
+                        loaded.train_shards,
+                        sequence_length=16,
+                        batch_size=1,
+                        shuffle=False,
+                        expected_sha256={loaded.train_shards[0]: "0" * 64},
+                    ).batches()
+                )
+            batch = next(
+                TokenShardStream(
+                    loaded.train_shards,
+                    sequence_length=16,
+                    batch_size=1,
+                    expected_sha256=loaded.shard_sha256,
+                ).batches()
+            )
             self.assertEqual(len(batch[0]), 16)
             report = run_pretraining_loop(
                 output_dir=root / "train",

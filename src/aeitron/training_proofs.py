@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess  # nosec B404 - fixed proof commands, no shell execution
 import tempfile
@@ -39,6 +41,7 @@ from src.aeitron.training_workspace import (
     TrainingJob,
     TrainingEventBatch,
     TrainingEventInput,
+    TrainingJobCreateRequest,
     TrainingProfileRegistry,
     TrainingWorkspaceService,
 )
@@ -99,6 +102,14 @@ def command_evidence(argv: list[str], *, timeout: int = 30) -> dict[str, Any]:
         "stdout": completed.stdout[-8000:],
         "stderr": completed.stderr[-8000:],
     }
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int((len(ordered) - 1) * fraction)))
+    return ordered[index]
 
 
 async def infrastructure_lifecycle_proof(
@@ -323,11 +334,15 @@ async def soak_proof(
     object_store_endpoint_url: str,
     duration_seconds: int,
     interval_seconds: int,
+    minimum_availability: float = 0.999,
 ) -> ProofResult:
     started = time.perf_counter()
     started_at = now_iso()
     checks = 0
     failures: list[str] = []
+    latencies: dict[str, list[float]] = {"postgres": [], "redis": [], "object_store": [], "cycle": []}
+    consecutive_failures = 0
+    maximum_consecutive_failures = 0
     try:
         import asyncpg
         import redis.asyncio as redis
@@ -335,29 +350,93 @@ async def soak_proof(
         redis_client = redis.from_url(redis_url, decode_responses=True)
         object_store = S3ObjectStore(object_store_uri, endpoint_url=object_store_endpoint_url)
         deadline = time.monotonic() + duration_seconds
-        while time.monotonic() < deadline:
-            try:
-                connection = await asyncpg.connect(database_url)
+        with tempfile.TemporaryDirectory(prefix="aeitron-soak-") as temp_dir:
+            download_path = Path(temp_dir) / "roundtrip.json"
+            while time.monotonic() < deadline:
+                cycle_started = time.perf_counter()
+                audit_id = uuid.uuid4()
+                redis_key = f"aeitron:proof:soak:{audit_id}"
+                object_key = f"proofs/soak/{audit_id}.json"
                 try:
-                    await connection.fetchval("SELECT 1")
-                finally:
-                    await connection.close()
-                if not await redis_client.ping():
-                    raise RuntimeError("Redis ping returned false")
-                await asyncio.to_thread(object_store.list_objects, "proofs")
-                checks += 1
-            except Exception as exc:
-                failures.append(f"{type(exc).__name__}: {exc}")
-            await asyncio.sleep(min(interval_seconds, max(0.0, deadline - time.monotonic())))
+                    operation_started = time.perf_counter()
+                    connection = await asyncpg.connect(database_url)
+                    try:
+                        async with connection.transaction():
+                            await connection.execute(
+                                """
+                                INSERT INTO training_audit_events(id,actor_id,action,outcome,metadata)
+                                VALUES($1,'soak-proof','infrastructure.soak','accepted',$2::jsonb)
+                                """,
+                                audit_id,
+                                json.dumps({"started_at": started_at}),
+                            )
+                            stored = await connection.fetchval(
+                                "SELECT count(*) FROM training_audit_events WHERE id=$1", audit_id
+                            )
+                            if stored != 1:
+                                raise RuntimeError("Postgres soak transaction was not readable")
+                            await connection.execute("DELETE FROM training_audit_events WHERE id=$1", audit_id)
+                    finally:
+                        await connection.close()
+                    latencies["postgres"].append(time.perf_counter() - operation_started)
+
+                    operation_started = time.perf_counter()
+                    await redis_client.set(redis_key, str(audit_id), ex=max(60, interval_seconds * 4))
+                    if await redis_client.get(redis_key) != str(audit_id):
+                        raise RuntimeError("Redis soak round-trip mismatch")
+                    await redis_client.delete(redis_key)
+                    latencies["redis"].append(time.perf_counter() - operation_started)
+
+                    operation_started = time.perf_counter()
+                    payload = {"proof_id": str(audit_id), "timestamp": now_iso()}
+                    stored_object = await asyncio.to_thread(object_store.put_json, payload, key=object_key)
+                    await asyncio.to_thread(object_store.get_file, object_key, download_path)
+                    if sha256_file(download_path) != stored_object.sha256:
+                        raise RuntimeError("object-store soak checksum mismatch")
+                    await asyncio.to_thread(object_store.delete, object_key)
+                    download_path.unlink(missing_ok=True)
+                    latencies["object_store"].append(time.perf_counter() - operation_started)
+                    checks += 1
+                    consecutive_failures = 0
+                except Exception as exc:
+                    failures.append(f"{now_iso()} {type(exc).__name__}: {exc}")
+                    consecutive_failures += 1
+                    maximum_consecutive_failures = max(maximum_consecutive_failures, consecutive_failures)
+                    with contextlib.suppress(Exception):
+                        await redis_client.delete(redis_key)
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(object_store.delete, object_key)
+                latencies["cycle"].append(time.perf_counter() - cycle_started)
+                await asyncio.sleep(min(interval_seconds, max(0.0, deadline - time.monotonic())))
         await redis_client.aclose()
         measured = time.perf_counter() - started
         full_duration = measured >= duration_seconds * 0.99
+        total_checks = checks + len(failures)
+        availability = checks / max(1, total_checks)
+        latency_report = {
+            name: {
+                "p50_ms": round(percentile(values, 0.50) * 1000, 3),
+                "p95_ms": round(percentile(values, 0.95) * 1000, 3),
+                "p99_ms": round(percentile(values, 0.99) * 1000, 3),
+                "max_ms": round(max(values, default=0.0) * 1000, 3),
+            }
+            for name, values in latencies.items()
+        }
+        passed = full_duration and checks > 0 and availability >= minimum_availability and maximum_consecutive_failures <= 1
         return ProofResult(
             name=f"infrastructure_soak_{duration_seconds}s",
-            status="passed" if full_duration and checks > 0 and not failures else "failed",
+            status="passed" if passed else "failed",
             started_at=started_at,
             duration_seconds=measured,
-            evidence={"requested_seconds": duration_seconds, "health_checks": checks},
+            evidence={
+                "requested_seconds": duration_seconds,
+                "successful_transactions": checks,
+                "failed_transactions": len(failures),
+                "availability": availability,
+                "minimum_availability": minimum_availability,
+                "maximum_consecutive_failures": maximum_consecutive_failures,
+                "latency": latency_report,
+            },
             blockers=failures[-20:],
         )
     except Exception as exc:
@@ -427,6 +506,204 @@ def external_scheduler_proofs() -> list[ProofResult]:
             )
         )
     return results
+
+
+async def live_scheduler_execution_proof(
+    *,
+    profile_id: str,
+    database_url: str,
+    redis_url: str,
+    object_store_uri: str,
+    object_store_endpoint_url: str,
+    dataset_manifest_uri: str,
+    dataset_manifest_sha256: str,
+    tokenizer_uri: str,
+    tokenizer_sha256: str,
+    git_commit: str,
+    container_digest: str,
+    timeout_seconds: int,
+    poll_seconds: int,
+    inject_worker_loss: bool = False,
+) -> ProofResult:
+    started = time.perf_counter()
+    started_at = now_iso()
+    service: TrainingWorkspaceService | None = None
+    controller: TrainingController | None = None
+    job: TrainingJob | None = None
+    failure_injected = False
+    injection_sequence = 0
+    megatron_checkpoint_files = 0
+    try:
+        service = TrainingWorkspaceService(
+            store=PostgresTrainingStore(database_url),
+            events=RedisEventBus(redis_url, retention_events=2_000_000),
+            object_store=S3ObjectStore(object_store_uri, endpoint_url=object_store_endpoint_url),
+            profiles=TrainingProfileRegistry.from_file(),
+            campaigns=QualificationCampaignRegistry.from_file(),
+            production_mode=True,
+        )
+        profile = service.profiles.latest(profile_id)
+        if profile.scheduler not in {"kubernetes", "kubernetes_pytorch", "slurm"}:
+            raise ValueError("live scheduler proof requires a cluster scheduler profile")
+        request = TrainingJobCreateRequest(
+            profile_id=profile_id,
+            idempotency_key=f"live-proof-{profile_id}-{uuid.uuid4().hex[:16]}",
+            dataset_manifest_uri=dataset_manifest_uri,
+            dataset_manifest_sha256=dataset_manifest_sha256,
+            tokenizer_uri=tokenizer_uri,
+            tokenizer_sha256=tokenizer_sha256,
+            git_commit=git_commit,
+            container_digest=container_digest,
+            metadata={"dataset_promotion": "promoted", "proof": "live-scheduler-execution"},
+        )
+        job = await service.create_job(request, owner_id="production-proof")
+        controller = TrainingController(service)
+        deadline = time.monotonic() + timeout_seconds
+        observed: list[str] = []
+        while time.monotonic() < deadline:
+            job = await controller.reconcile_job(job)
+            if not observed or observed[-1] != job.status.value:
+                observed.append(job.status.value)
+            if job.status.value in {"succeeded", "failed", "blocked", "cancelled"}:
+                break
+            if inject_worker_loss and not failure_injected and job.status == JobStatus.RUNNING:
+                committed = await service.list_checkpoints(job.job_id)
+                checkpoint_ready = bool(committed and any(item.reload_verified for item in committed))
+                if profile.distributed_strategy == "megatron":
+                    shared_root_value = os.environ.get("AEITRON_SHARED_CHECKPOINT_ROOT", "")
+                    checkpoint_root = Path(shared_root_value).expanduser().resolve() / "jobs" / job.job_id / "training" / "checkpoints"
+                    megatron_checkpoint_files = sum(1 for item in checkpoint_root.rglob("*") if item.is_file()) if checkpoint_root.is_dir() else 0
+                    checkpoint_ready = megatron_checkpoint_files > 1
+                if checkpoint_ready:
+                    binding = SchedulerBinding.model_validate(job.scheduler_binding)
+                    if profile.scheduler in {"kubernetes", "kubernetes_pytorch"}:
+                        pods = command_evidence(
+                            [
+                                "kubectl",
+                                "get",
+                                "pods",
+                                "-n",
+                                binding.namespace or profile.scheduler_policy.namespace,
+                                "-l",
+                                f"job-id={job.job_id}",
+                                "-o",
+                                "json",
+                            ],
+                            timeout=30,
+                        )
+                        if pods["exit_code"] != 0:
+                            raise RuntimeError("Kubernetes worker inventory failed before chaos injection")
+                        pod_payload = json.loads(pods["stdout"])
+                        candidates = [
+                            item["metadata"]["name"]
+                            for item in pod_payload.get("items", [])
+                            if item.get("status", {}).get("phase") == "Running"
+                        ]
+                        if not candidates:
+                            raise RuntimeError("no running Kubernetes worker pod is available for chaos injection")
+                        deleted = command_evidence(
+                            [
+                                "kubectl",
+                                "delete",
+                                "pod",
+                                sorted(candidates)[-1],
+                                "-n",
+                                binding.namespace or profile.scheduler_policy.namespace,
+                                "--grace-period=0",
+                                "--wait=false",
+                            ],
+                            timeout=30,
+                        )
+                        if deleted["exit_code"] != 0:
+                            raise RuntimeError("Kubernetes worker deletion failed")
+                    else:
+                        requeued = command_evidence(["scontrol", "requeue", binding.external_id], timeout=30)
+                        if requeued["exit_code"] != 0:
+                            raise RuntimeError("Slurm job requeue failed during chaos injection")
+                    current = await service.get_job(job.job_id)
+                    injection_sequence = current.event_sequence
+                    failure_injected = True
+            await asyncio.sleep(poll_seconds)
+        else:
+            await service.cancel_job(
+                job.job_id,
+                scheduler=controller.schedulers.get(job.spec.scheduler),
+                actor_id="production-proof-timeout",
+            )
+            raise TimeoutError(f"live scheduler proof exceeded {timeout_seconds} seconds")
+        events = []
+        cursor = 0
+        while True:
+            page = await service.events.read(job.job_id, after_sequence=cursor, limit=1000)
+            if not page:
+                break
+            events.extend(page)
+            cursor = page[-1].sequence
+        checkpoints = await service.list_checkpoints(job.job_id)
+        attempts = await service.store.list_attempts(job.job_id)
+        if profile.distributed_strategy == "megatron":
+            shared_root_value = os.environ.get("AEITRON_SHARED_CHECKPOINT_ROOT", "")
+            checkpoint_root = Path(shared_root_value).expanduser().resolve() / "jobs" / job.job_id / "training" / "checkpoints"
+            megatron_checkpoint_files = sum(1 for item in checkpoint_root.rglob("*") if item.is_file()) if checkpoint_root.is_dir() else 0
+        checkpoint_proven = (
+            megatron_checkpoint_files > 1
+            if profile.distributed_strategy == "megatron"
+            else any(item.reload_verified for item in checkpoints)
+        )
+        passed = (
+            job.status == JobStatus.SUCCEEDED
+            and bool(attempts)
+            and any(event.kind == "heartbeat" for event in events)
+            and checkpoint_proven
+            and (not inject_worker_loss or (failure_injected and any(event.sequence > injection_sequence for event in events)))
+        )
+        return ProofResult(
+            name=f"live_{profile.scheduler}_{profile_id}",
+            status="passed" if passed else "failed",
+            started_at=started_at,
+            duration_seconds=time.perf_counter() - started,
+            evidence={
+                "job_id": job.job_id,
+                "scheduler": profile.scheduler,
+                "distributed_strategy": profile.distributed_strategy,
+                "observed_states": observed,
+                "attempts": len(attempts),
+                "events": len(events),
+                "heartbeats": sum(event.kind == "heartbeat" for event in events),
+                "checkpoints": len(checkpoints),
+                "reload_verified_checkpoints": sum(item.reload_verified for item in checkpoints),
+                "megatron_checkpoint_files": megatron_checkpoint_files,
+                "terminal_status": job.status.value,
+                "worker_loss_requested": inject_worker_loss,
+                "worker_loss_injected": failure_injected,
+                "post_injection_events": sum(event.sequence > injection_sequence for event in events),
+            },
+            blockers=[] if passed else ["job did not finish with heartbeat and reload-verified checkpoint evidence"],
+        )
+    except (FileNotFoundError, ConnectionError, TimeoutError, RuntimeError) as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        dependency_markers = ["required", "unavailable", "missing", "cluster", "topology", "connection", "timed out"]
+        blocked = any(marker in message.lower() for marker in dependency_markers)
+        return ProofResult(
+            name=f"live_scheduler_{profile_id}",
+            status="blocked" if blocked else "failed",
+            started_at=started_at,
+            duration_seconds=time.perf_counter() - started,
+            evidence={"job_id": job.job_id if job else None},
+            blockers=[message],
+        )
+    except Exception as exc:
+        return ProofResult(
+            name=f"live_scheduler_{profile_id}",
+            status="failed",
+            started_at=started_at,
+            duration_seconds=time.perf_counter() - started,
+            evidence={"job_id": job.job_id if job else None},
+            blockers=[f"{type(exc).__name__}: {exc}"],
+        )
+    finally:
+        if service is not None:
+            await service.close()
 
 
 def docker_disaster_recovery_proof(
@@ -572,6 +849,190 @@ def docker_disaster_recovery_proof(
             evidence=evidence,
             blockers=[f"{type(exc).__name__}: {exc}"],
         )
+
+
+KUBERNETES_NAME_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$")
+KUBERNETES_ROLLOUT_KINDS = {"deployment", "statefulset"}
+
+
+def parse_dr_workload(value: str) -> tuple[str, str, str]:
+    parts = value.split(":")
+    if len(parts) != 3:
+        raise ValueError("DR workload must use namespace:kind:name")
+    namespace, kind, name = parts
+    kind = kind.lower()
+    if kind not in KUBERNETES_ROLLOUT_KINDS:
+        raise ValueError(f"unsupported DR workload kind: {kind}")
+    for label, item in (("namespace", namespace), ("name", name)):
+        if len(item) > 253 or KUBERNETES_NAME_RE.fullmatch(item) is None:
+            raise ValueError(f"invalid Kubernetes {label}: {item!r}")
+    return namespace, kind, name
+
+
+async def kubernetes_disaster_recovery_proof(
+    *,
+    workloads: list[str],
+    database_url: str,
+    redis_url: str,
+    object_store_uri: str,
+    object_store_endpoint_url: str,
+    rollout_timeout_seconds: int,
+) -> ProofResult:
+    """Disrupt self-hosted control-plane services and prove durable recovery.
+
+    This is intentionally opt-in. It never accepts arbitrary commands: callers
+    provide only validated Kubernetes namespace, workload kind, and DNS name.
+    """
+
+    started = time.perf_counter()
+    started_at = now_iso()
+    service: TrainingWorkspaceService | None = None
+    marker_dir: Path | None = None
+    evidence: dict[str, Any] = {"workloads": workloads, "restarts": []}
+    try:
+        if shutil.which("kubectl") is None:
+            raise FileNotFoundError("kubectl is required for the Kubernetes disaster-recovery proof")
+        parsed = [parse_dr_workload(value) for value in workloads]
+        if not parsed:
+            raise ValueError("at least one Kubernetes DR workload is required")
+
+        for namespace, kind, name in parsed:
+            preflight = command_evidence(["kubectl", "get", kind, name, "-n", namespace, "-o", "name"], timeout=30)
+            if preflight["exit_code"] != 0:
+                raise RuntimeError(f"Kubernetes DR preflight failed for {namespace}:{kind}:{name}: {preflight['stderr'][-500:]}")
+
+        service = TrainingWorkspaceService(
+            store=PostgresTrainingStore(database_url),
+            events=RedisEventBus(redis_url, retention_events=2_000_000),
+            object_store=S3ObjectStore(object_store_uri, endpoint_url=object_store_endpoint_url),
+            profiles=TrainingProfileRegistry.from_file(),
+            campaigns=QualificationCampaignRegistry.from_file(),
+        )
+        job = await service.create_job(
+            TrainingJobCreateRequest(
+                profile_id="defensive-1k",
+                idempotency_key=f"cluster-dr-{uuid.uuid4()}",
+                git_commit="abcdef1",
+                container_digest="sha256:" + "d" * 64,
+                metadata={"proof": "kubernetes-disaster-recovery"},
+            ),
+            owner_id="cluster-dr-proof",
+        )
+        running, attempt = await service.claim_notebook_job(job.job_id)
+        await service.ingest_events(
+            running.job_id,
+            TrainingEventBatch(
+                attempt_id=attempt.attempt_id,
+                events=[
+                    TrainingEventInput(
+                        source_sequence=1,
+                        kind="checkpoint",
+                        stage="disaster_recovery",
+                        status="prepared",
+                        payload={"durable_marker": True},
+                    )
+                ],
+            ),
+        )
+        marker = json.dumps({"job_id": job.job_id, "attempt_id": attempt.attempt_id}, sort_keys=True).encode("utf-8")
+        marker_digest = hashlib.sha256(marker).hexdigest()
+        marker_dir = Path(tempfile.mkdtemp(prefix="aeitron-cluster-dr-"))
+        marker_path = marker_dir / "marker.json"
+        marker_path.write_bytes(marker)
+        marker_key = f"proofs/cluster-dr/{job.job_id}/marker.json"
+        stored_marker = await asyncio.to_thread(
+            service.object_store.put_file,
+            marker_path,
+            key=marker_key,
+        )
+        marker_uri = stored_marker.uri
+        await service.close()
+        service = None
+
+        for namespace, kind, name in parsed:
+            target = f"{kind}/{name}"
+            restarted = command_evidence(["kubectl", "rollout", "restart", target, "-n", namespace], timeout=30)
+            if restarted["exit_code"] != 0:
+                raise RuntimeError(f"failed to restart {namespace}:{target}: {restarted['stderr'][-500:]}")
+            recovered = command_evidence(
+                ["kubectl", "rollout", "status", target, "-n", namespace, f"--timeout={rollout_timeout_seconds}s"],
+                timeout=rollout_timeout_seconds + 30,
+            )
+            evidence["restarts"].append(
+                {
+                    "namespace": namespace,
+                    "target": target,
+                    "restart_exit_code": restarted["exit_code"],
+                    "recovery_exit_code": recovered["exit_code"],
+                }
+            )
+            if recovered["exit_code"] != 0:
+                raise RuntimeError(f"rollout recovery failed for {namespace}:{target}: {recovered['stderr'][-500:]}")
+
+        service = TrainingWorkspaceService(
+            store=PostgresTrainingStore(database_url),
+            events=RedisEventBus(redis_url, retention_events=2_000_000),
+            object_store=S3ObjectStore(object_store_uri, endpoint_url=object_store_endpoint_url),
+            profiles=TrainingProfileRegistry.from_file(),
+            campaigns=QualificationCampaignRegistry.from_file(),
+        )
+        recovered_job = await service.get_job(job.job_id)
+        recovered_events = await service.events.read(job.job_id, after_sequence=0, limit=10)
+        marker_download = marker_path.with_name("recovered-marker.json")
+        await asyncio.to_thread(service.object_store.get_file, marker_key, marker_download)
+        recovered_digest = sha256_file(marker_download)
+        passed = (
+            recovered_job.job_id == job.job_id
+            and recovered_job.status == JobStatus.RUNNING
+            and len(recovered_events) == 1
+            and recovered_events[0].kind == "checkpoint"
+            and recovered_digest == marker_digest
+            and all(item["recovery_exit_code"] == 0 for item in evidence["restarts"])
+        )
+        evidence.update(
+            {
+                "job_id": job.job_id,
+                "attempt_id": attempt.attempt_id,
+                "postgres_job_recovered": recovered_job.job_id == job.job_id,
+                "redis_event_recovered": len(recovered_events) == 1,
+                "object_uri": marker_uri,
+                "object_checksum_expected": marker_digest,
+                "object_checksum_recovered": recovered_digest,
+            }
+        )
+        return ProofResult(
+            name="kubernetes_control_plane_disaster_recovery",
+            status="passed" if passed else "failed",
+            started_at=started_at,
+            duration_seconds=time.perf_counter() - started,
+            evidence=evidence,
+            blockers=[] if passed else ["one or more durable records did not survive the Kubernetes recovery drill"],
+        )
+    except (FileNotFoundError, ConnectionError, TimeoutError, RuntimeError) as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        dependency_failure = any(term in message.lower() for term in ("required", "preflight", "connect", "not found", "unavailable"))
+        return ProofResult(
+            name="kubernetes_control_plane_disaster_recovery",
+            status="blocked" if dependency_failure else "failed",
+            started_at=started_at,
+            duration_seconds=time.perf_counter() - started,
+            evidence=evidence,
+            blockers=[message],
+        )
+    except Exception as exc:
+        return ProofResult(
+            name="kubernetes_control_plane_disaster_recovery",
+            status="failed",
+            started_at=started_at,
+            duration_seconds=time.perf_counter() - started,
+            evidence=evidence,
+            blockers=[f"{type(exc).__name__}: {exc}"],
+        )
+    finally:
+        if service is not None:
+            await service.close()
+        if marker_dir is not None:
+            shutil.rmtree(marker_dir, ignore_errors=True)
 
 
 async def worker_loss_recovery_proof(
@@ -755,8 +1216,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soak-seconds", type=int, default=0, help="Set to 86400 for the required 24-hour proof.")
     parser.add_argument("--soak-interval-seconds", type=int, default=30)
     parser.add_argument("--skip-infrastructure", action="store_true")
+    parser.add_argument("--skip-capability-probes", action="store_true", help="Omit unrelated scheduler/GPU probes from a targeted proof report.")
     parser.add_argument("--docker-project", default="aeitron-proof")
     parser.add_argument("--skip-disaster-recovery", action="store_true")
+    parser.add_argument(
+        "--inject-kubernetes-disaster-recovery",
+        action="store_true",
+        help="Disrupt the explicitly listed Kubernetes workloads and verify Postgres, Redis, and S3 recovery.",
+    )
+    parser.add_argument(
+        "--dr-workload",
+        action="append",
+        default=[],
+        help="Kubernetes workload as namespace:kind:name; repeat for each control-plane dependency.",
+    )
+    parser.add_argument("--dr-rollout-timeout-seconds", type=int, default=600)
+    parser.add_argument("--live-profile", action="append", default=[], help="Submit and watch this real cluster profile; repeatable.")
+    parser.add_argument("--dataset-manifest-uri")
+    parser.add_argument("--dataset-manifest-sha256")
+    parser.add_argument("--tokenizer-uri")
+    parser.add_argument("--tokenizer-sha256")
+    parser.add_argument("--git-commit", default=os.environ.get("AEITRON_TRAINING_GIT_COMMIT", ""))
+    parser.add_argument("--container-digest", default=os.environ.get("AEITRON_TRAINING_IMAGE_DIGEST", ""))
+    parser.add_argument("--live-timeout-seconds", type=int, default=86400)
+    parser.add_argument("--live-poll-seconds", type=int, default=15)
+    parser.add_argument("--inject-worker-loss", action="store_true", help="After a verified checkpoint, kill/requeue one real worker and require recovery.")
     return parser.parse_args()
 
 
@@ -817,8 +1301,57 @@ async def async_main() -> int:
                 object_store_endpoint_url=args.object_store_endpoint_url,
             )
         )
-    results.extend(external_scheduler_proofs())
-    results.extend(distributed_gpu_proofs())
+    if args.inject_kubernetes_disaster_recovery:
+        workloads = args.dr_workload or [
+            "default:statefulset:aeitron-postgres",
+            "default:statefulset:aeitron-redis",
+            "default:statefulset:aeitron-minio",
+            "aeitron-training:deployment:aeitron-training-controller",
+        ]
+        results.append(
+            await kubernetes_disaster_recovery_proof(
+                workloads=workloads,
+                database_url=args.database_url,
+                redis_url=args.redis_url,
+                object_store_uri=args.object_store_uri,
+                object_store_endpoint_url=args.object_store_endpoint_url,
+                rollout_timeout_seconds=args.dr_rollout_timeout_seconds,
+            )
+        )
+    if args.live_profile:
+        required_live = {
+            "dataset_manifest_uri": args.dataset_manifest_uri,
+            "dataset_manifest_sha256": args.dataset_manifest_sha256,
+            "tokenizer_uri": args.tokenizer_uri,
+            "tokenizer_sha256": args.tokenizer_sha256,
+            "git_commit": args.git_commit,
+            "container_digest": args.container_digest,
+        }
+        missing_live = [name for name, value in required_live.items() if not value]
+        if missing_live:
+            raise ValueError("live scheduler proofs require: " + ", ".join(missing_live))
+        for profile_id in args.live_profile:
+            results.append(
+                await live_scheduler_execution_proof(
+                    profile_id=profile_id,
+                    database_url=args.database_url,
+                    redis_url=args.redis_url,
+                    object_store_uri=args.object_store_uri,
+                    object_store_endpoint_url=args.object_store_endpoint_url,
+                    dataset_manifest_uri=args.dataset_manifest_uri,
+                    dataset_manifest_sha256=args.dataset_manifest_sha256,
+                    tokenizer_uri=args.tokenizer_uri,
+                    tokenizer_sha256=args.tokenizer_sha256,
+                    git_commit=args.git_commit,
+                    container_digest=args.container_digest,
+                    timeout_seconds=args.live_timeout_seconds,
+                    poll_seconds=args.live_poll_seconds,
+                    inject_worker_loss=args.inject_worker_loss,
+                )
+            )
+    if not args.skip_capability_probes:
+        results.extend(external_scheduler_proofs())
+        results.extend(distributed_gpu_proofs())
     report = build_report(results)
     report_path = output_dir / "production_proof_report.json"
     report_path.write_text(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True), encoding="utf-8")
