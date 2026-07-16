@@ -43,6 +43,7 @@ class AeitronProductionHardeningTest(unittest.TestCase):
     def test_migrations_load_and_expand_schema_include(self) -> None:
         migrations = load_migrations()
         self.assertTrue(migrations)
+        self.assertTrue(all(not migration.sql.startswith("\ufeff") for migration in migrations))
         expanded = expand_psql_includes(migrations[0].sql, base_dir=Path.cwd())
         self.assertIn("CREATE TABLE IF NOT EXISTS projects", expanded)
         self.assertTrue(any(migration.version == "0003_task_retry" for migration in migrations))

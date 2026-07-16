@@ -257,20 +257,43 @@ def build_megatron_launch_plan(
     megatron_root: str | Path | None = None,
     execute: bool = False,
 ) -> AdapterReport:
-    root = Path(megatron_root or os.environ.get("MEGATRON_LM_ROOT", ""))
-    output = Path(output_dir)
+    numeric_values = {
+        "tensor_parallel": tensor_parallel,
+        "pipeline_parallel": pipeline_parallel,
+        "data_parallel": data_parallel,
+        "sequence_length": sequence_length,
+        "micro_batch_size": micro_batch_size,
+        "global_batch_size": global_batch_size,
+        "train_iters": train_iters,
+    }
+    invalid = [name for name, value in numeric_values.items() if not isinstance(value, int) or value <= 0]
+    if invalid:
+        raise ValueError("Megatron integer settings must be positive: " + ", ".join(invalid))
+    world_size = tensor_parallel * pipeline_parallel * data_parallel
+    if global_batch_size % (micro_batch_size * data_parallel) != 0:
+        raise ValueError("global_batch_size must be divisible by micro_batch_size * data_parallel")
+    if tensor_parallel * pipeline_parallel > world_size:
+        raise ValueError("invalid Megatron parallel topology")
+
+    root_value = megatron_root or os.environ.get("MEGATRON_LM_ROOT", "")
+    root = Path(root_value).expanduser().resolve() if root_value else Path("__missing_megatron_root__").resolve()
+    output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     missing = []
-    if not Path(manifest).exists():
+    manifest_path = Path(manifest).expanduser().resolve()
+    tokenizer_file = Path(tokenizer_path).expanduser().resolve()
+    if not manifest_path.is_file():
         missing.append(f"manifest:{manifest}")
-    if not Path(tokenizer_path).exists():
+    if not tokenizer_file.is_file():
         missing.append(f"tokenizer:{tokenizer_path}")
-    pretrain = root / "pretrain_gpt.py"
-    if not root.exists() or not pretrain.exists():
+    pretrain = (root / "pretrain_gpt.py").resolve()
+    if not root.is_dir() or not pretrain.is_file() or root not in pretrain.parents:
         missing.append("MEGATRON_LM_ROOT/pretrain_gpt.py")
-    world_size = tensor_parallel * pipeline_parallel * data_parallel
+    torchrun = shutil.which("torchrun")
+    if not torchrun:
+        missing.append("executable:torchrun")
     command = [
-        "torchrun",
+        str(Path(torchrun).resolve()) if torchrun else "torchrun",
         "--nproc_per_node",
         str(world_size),
         str(pretrain),
@@ -293,11 +316,11 @@ def build_megatron_launch_plan(
         "--load",
         str(output / "checkpoints"),
         "--data-path",
-        str(manifest),
+        str(manifest_path),
         "--tokenizer-type",
         "HuggingFaceTokenizer",
         "--tokenizer-model",
-        str(tokenizer_path),
+        str(tokenizer_file),
     ]
     report = AdapterReport(
         status="blocked_missing_dependency" if missing else "built_not_cluster_proven",
@@ -311,7 +334,14 @@ def build_megatron_launch_plan(
     if execute:
         if missing:
             raise RuntimeError("cannot execute Megatron plan with missing dependencies: " + ", ".join(missing))
-        completed = subprocess.run(command, cwd=root, text=True, check=False)  # nosec B603
+        # Every path, integer, and executable above is canonicalized and bounded; argv is a list and shell stays disabled.
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
+        completed = subprocess.run(  # nosec B603
+            command,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
+            cwd=root,
+            text=True,
+            check=False,
+        )
         if completed.returncode != 0:
             raise RuntimeError(f"Megatron command failed with exit code {completed.returncode}")
     return report

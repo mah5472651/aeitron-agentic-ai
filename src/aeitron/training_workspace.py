@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Protocol
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
 
@@ -40,6 +41,7 @@ from src.aeitron.shared.schemas import StrictModel
 
 
 PROFILE_PATH = Path("config/training_profiles.json")
+CAMPAIGN_PATH = Path("config/training_qualification_campaigns.json")
 MAX_EVENT_BYTES = 64 * 1024
 MAX_EVENT_BATCH = 100
 SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")
@@ -98,6 +100,16 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 def new_ulid() -> str:
     """Return a sortable ULID without adding a runtime dependency."""
 
@@ -153,6 +165,171 @@ class ResourceRequest(StrictModel):
     rdma_required: bool = False
 
 
+class OptimizerPolicy(StrictModel):
+    name: Literal["adamw"] = "adamw"
+    learning_rate: float = Field(gt=0.0, le=1.0)
+    beta1: float = Field(default=0.9, gt=0.0, lt=1.0)
+    beta2: float = Field(default=0.95, gt=0.0, lt=1.0)
+    epsilon: float = Field(default=1e-8, gt=0.0, le=1e-2)
+    weight_decay: float = Field(default=0.1, ge=0.0, le=1.0)
+    gradient_clip_norm: float = Field(default=1.0, gt=0.0, le=100.0)
+
+
+class LearningRatePolicy(StrictModel):
+    schedule: Literal["constant", "linear", "cosine"] = "cosine"
+    warmup_steps: int = Field(default=0, ge=0)
+    warmup_ratio: float = Field(default=0.0, ge=0.0, lt=1.0)
+    minimum_learning_rate_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_warmup(self) -> "LearningRatePolicy":
+        if self.warmup_steps and self.warmup_ratio:
+            raise ValueError("set either warmup_steps or warmup_ratio, not both")
+        return self
+
+
+class TokenBudgetPolicy(StrictModel):
+    target_tokens: int = Field(gt=0)
+    maximum_tokens: int = Field(gt=0)
+    global_batch_sequences: int = Field(gt=0)
+    accounting: Literal["non_padding_tokens"] = "non_padding_tokens"
+
+    @model_validator(mode="after")
+    def validate_budget(self) -> "TokenBudgetPolicy":
+        if self.maximum_tokens < self.target_tokens:
+            raise ValueError("maximum_tokens must be >= target_tokens")
+        return self
+
+
+class CheckpointPolicy(StrictModel):
+    interval_steps: int = Field(gt=0)
+    keep_last: int = Field(default=3, ge=1, le=100)
+    keep_best: int = Field(default=1, ge=1, le=20)
+    save_optimizer: bool = True
+    save_scheduler: bool = True
+    save_rng_state: bool = True
+    require_checksum_manifest: bool = True
+    require_reload_verification: bool = True
+
+
+class EvaluationPolicy(StrictModel):
+    interval_steps: int = Field(gt=0)
+    validation_batches: int = Field(default=8, ge=1, le=10_000)
+    suite_path: str = Field(min_length=1, max_length=2048)
+    strict: bool = True
+    early_stopping_patience: int = Field(default=0, ge=0, le=1000)
+    early_stopping_min_delta: float = Field(default=0.0, ge=0.0)
+    maximum_validation_regression: float = Field(default=0.03, ge=0.0, le=1.0)
+
+
+class RetentionPolicy(StrictModel):
+    hot_days: int = Field(default=30, ge=1, le=3650)
+    archive_days: int = Field(default=365, ge=1, le=36500)
+    delete_after_days: int = Field(default=730, ge=1, le=36500)
+    preserve_promoted: bool = True
+
+    @model_validator(mode="after")
+    def validate_order(self) -> "RetentionPolicy":
+        if not self.hot_days <= self.archive_days <= self.delete_after_days:
+            raise ValueError("retention must satisfy hot_days <= archive_days <= delete_after_days")
+        return self
+
+
+class PromotionPolicy(StrictModel):
+    require_reload_verification: bool = True
+    require_passing_evaluation: bool = True
+    require_no_regression: bool = True
+    minimum_completed_evaluations: int = Field(default=1, ge=1, le=100)
+    minimum_step: int = Field(default=1, ge=1)
+
+
+class RetryPolicy(StrictModel):
+    maximum_attempts: int = Field(default=3, ge=1, le=20)
+    initial_backoff_seconds: int = Field(default=30, ge=1, le=86_400)
+    maximum_backoff_seconds: int = Field(default=900, ge=1, le=86_400)
+    retryable_failures: list[Literal["infrastructure", "preemption", "node_loss", "network", "object_store"]]
+    preemption_action: Literal["checkpoint_then_requeue", "fail"] = "checkpoint_then_requeue"
+
+    @model_validator(mode="after")
+    def validate_backoff(self) -> "RetryPolicy":
+        if self.maximum_backoff_seconds < self.initial_backoff_seconds:
+            raise ValueError("maximum retry backoff must be >= initial backoff")
+        return self
+
+
+class RuntimeLimitPolicy(StrictModel):
+    maximum_wall_time_seconds: int = Field(ge=300, le=90 * 86_400)
+    heartbeat_interval_seconds: int = Field(default=5, ge=1, le=300)
+    heartbeat_timeout_seconds: int = Field(default=60, ge=5, le=3600)
+    graceful_shutdown_seconds: int = Field(default=120, ge=5, le=3600)
+
+    @model_validator(mode="after")
+    def validate_heartbeat(self) -> "RuntimeLimitPolicy":
+        if self.heartbeat_timeout_seconds < self.heartbeat_interval_seconds * 2:
+            raise ValueError("heartbeat timeout must allow at least two heartbeat intervals")
+        return self
+
+
+class DataLoaderPolicy(StrictModel):
+    workers_per_rank: int = Field(default=4, ge=0, le=128)
+    prefetch_batches: int = Field(default=4, ge=1, le=128)
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    deterministic_shuffle: bool = True
+    seed: int = Field(default=1337, ge=0, le=2**31 - 1)
+    local_cache_gib: int = Field(default=100, ge=0, le=100_000)
+    cache_path: str = Field(default="/cache/aeitron", min_length=1, max_length=1024)
+    verify_shard_checksums: bool = True
+
+
+class RuntimeImagePolicy(StrictModel):
+    repository: str = Field(min_length=1, max_length=512)
+    python_version: str = Field(pattern=r"^3\.\d{1,2}(?:\.\d{1,2})?$")
+    pytorch_version: str = Field(min_length=1, max_length=64)
+    cuda_version: str = Field(min_length=1, max_length=64)
+    require_digest_pin: bool = True
+
+    @field_validator("repository")
+    @classmethod
+    def validate_repository(cls, value: str) -> str:
+        if any(character.isspace() for character in value) or value.startswith(("http://", "https://")):
+            raise ValueError("container repository must be an OCI image name")
+        return value
+
+
+class SchedulerPolicy(StrictModel):
+    namespace: str = Field(min_length=1, max_length=128)
+    queue: str = Field(min_length=1, max_length=128)
+    account: str | None = Field(default=None, max_length=128)
+    storage_class: str = Field(min_length=1, max_length=128)
+    priority_class: str = Field(min_length=1, max_length=128)
+    gang_scheduling: bool = False
+    topology_key: str = Field(default="kubernetes.io/hostname", min_length=1, max_length=253)
+
+    @field_validator("namespace", "queue", "account", "storage_class", "priority_class")
+    @classmethod
+    def validate_scheduler_identifier(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}", value):
+            raise ValueError("scheduler policy contains an unsafe identifier")
+        return value
+
+
+class CostQuotaPolicy(StrictModel):
+    maximum_gpu_hours: float = Field(gt=0.0, le=100_000_000.0)
+    maximum_cost_usd: float = Field(gt=0.0, le=1_000_000_000.0)
+    estimated_gpu_hour_cost_usd: float = Field(gt=0.0, le=100_000.0)
+    maximum_storage_gib: int = Field(gt=0, le=100_000_000)
+    maximum_egress_gib: int = Field(default=0, ge=0, le=100_000_000)
+    maximum_concurrent_jobs_per_owner: int = Field(default=1, ge=1, le=1000)
+
+
+class ImmutableInputPolicy(StrictModel):
+    require_promoted_dataset: bool = True
+    require_dataset_sha256: bool = True
+    require_tokenizer_sha256: bool = True
+    allowed_uri_schemes: list[Literal["s3", "file"]] = Field(default_factory=lambda: ["s3"])
+
+
 class TrainingProfile(StrictModel):
     profile_id: str = Field(min_length=1, max_length=128)
     version: int = Field(ge=1)
@@ -169,6 +346,20 @@ class TrainingProfile(StrictModel):
     gradient_accumulation_steps: int = Field(ge=1, le=65536)
     dtype: Literal["bf16", "fp16", "fp32"]
     resources: ResourceRequest
+    optimizer: OptimizerPolicy
+    learning_rate: LearningRatePolicy
+    token_budget: TokenBudgetPolicy
+    checkpoint: CheckpointPolicy
+    evaluation: EvaluationPolicy
+    retention: RetentionPolicy
+    promotion: PromotionPolicy
+    retry: RetryPolicy
+    runtime_limits: RuntimeLimitPolicy
+    dataloader: DataLoaderPolicy
+    runtime_image: RuntimeImagePolicy
+    scheduler_policy: SchedulerPolicy
+    cost_quota: CostQuotaPolicy
+    immutable_inputs: ImmutableInputPolicy
     allowed_overrides: dict[str, OverrideRange] = Field(default_factory=dict)
     requirements: list[str] = Field(default_factory=list)
     secret_references: list[str] = Field(default_factory=list)
@@ -196,6 +387,21 @@ class TrainingProfile(StrictModel):
             raise ValueError("notebook profiles must be dev_only validation profiles")
         if self.model_profile in {"32b", "62b"} and not self.resources.rdma_required:
             raise ValueError("32B/60B-class profiles require RDMA")
+        world_size = self.resources.nodes * max(1, self.resources.gpus_per_node)
+        calculated_global_batch = self.batch_size * self.gradient_accumulation_steps * world_size
+        if self.token_budget.global_batch_sequences != calculated_global_batch:
+            raise ValueError(
+                "global_batch_sequences must equal batch_size * gradient_accumulation_steps * world_size"
+            )
+        minimum_tokens = self.steps * self.batch_size * self.sequence_length * world_size
+        if self.token_budget.target_tokens != minimum_tokens:
+            raise ValueError("target_tokens must equal steps * batch_size * sequence_length * world_size")
+        if self.learning_rate.warmup_steps >= self.steps:
+            raise ValueError("warmup_steps must be lower than total steps")
+        if self.checkpoint.interval_steps > self.steps or self.evaluation.interval_steps > self.steps:
+            raise ValueError("checkpoint/evaluation intervals cannot exceed total steps")
+        if self.promotion.minimum_step > self.steps:
+            raise ValueError("promotion minimum_step cannot exceed total steps")
         return self
 
     @property
@@ -225,6 +431,111 @@ class TrainingProfileRegistry(StrictModel):
         source = Path(path)
         if not source.exists():
             raise FileNotFoundError(f"training profile registry not found: {source}")
+        try:
+            payload = json.loads(source.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError(f"training profile registry is invalid JSON: {source}") from exc
+        defaults = payload.pop("defaults", {})
+        if not isinstance(defaults, dict) or not isinstance(payload.get("profiles"), list):
+            raise ValueError("training profile registry defaults/profiles have invalid types")
+        payload["profiles"] = [deep_merge(defaults, item) for item in payload["profiles"]]
+        return cls.model_validate(payload)
+
+
+class QualificationRange(StrictModel):
+    start_steps: int = Field(gt=0)
+    stop_steps: int = Field(gt=0)
+    increment_steps: int = Field(gt=0)
+    profile_id: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "QualificationRange":
+        if self.stop_steps < self.start_steps:
+            raise ValueError("qualification stop_steps must be >= start_steps")
+        if (self.stop_steps - self.start_steps) % self.increment_steps:
+            raise ValueError("qualification range must end on an exact increment")
+        return self
+
+
+class QualificationGate(StrictModel):
+    require_succeeded_job: bool = True
+    require_reload_verified_checkpoint: bool = True
+    require_passing_evaluation: bool = True
+    require_same_dataset_and_tokenizer: bool = True
+    maximum_validation_regression: float = Field(default=0.03, ge=0.0, le=1.0)
+
+
+class QualificationMilestone(StrictModel):
+    milestone_id: str
+    ordinal: int = Field(ge=1)
+    profile_id: str
+    steps: int = Field(gt=0)
+    previous_milestone_id: str | None = None
+
+
+class QualificationCampaign(StrictModel):
+    campaign_id: str
+    version: int = Field(ge=1)
+    description: str = Field(min_length=1, max_length=1000)
+    ranges: list[QualificationRange] = Field(min_length=1)
+    gate: QualificationGate = Field(default_factory=QualificationGate)
+
+    @property
+    def milestones(self) -> list[QualificationMilestone]:
+        result: list[QualificationMilestone] = []
+        previous: str | None = None
+        ordinal = 1
+        seen_steps: set[int] = set()
+        for item in self.ranges:
+            for steps in range(item.start_steps, item.stop_steps + 1, item.increment_steps):
+                if steps in seen_steps:
+                    raise ValueError(f"qualification campaign repeats step milestone: {steps}")
+                seen_steps.add(steps)
+                milestone_id = f"steps-{steps:07d}"
+                result.append(
+                    QualificationMilestone(
+                        milestone_id=milestone_id,
+                        ordinal=ordinal,
+                        profile_id=item.profile_id,
+                        steps=steps,
+                        previous_milestone_id=previous,
+                    )
+                )
+                previous = milestone_id
+                ordinal += 1
+        return result
+
+    def milestone(self, milestone_id: str) -> QualificationMilestone:
+        for item in self.milestones:
+            if item.milestone_id == milestone_id:
+                return item
+        raise KeyError(f"qualification milestone not found: {milestone_id}")
+
+
+class QualificationCampaignRegistry(StrictModel):
+    schema_version: int = Field(ge=1)
+    campaigns: list[QualificationCampaign]
+
+    @model_validator(mode="after")
+    def validate_campaigns(self) -> "QualificationCampaignRegistry":
+        identities = [(item.campaign_id, item.version) for item in self.campaigns]
+        if len(identities) != len(set(identities)):
+            raise ValueError("qualification campaign identifiers and versions must be unique")
+        for campaign in self.campaigns:
+            campaign.milestones
+        return self
+
+    def latest(self, campaign_id: str) -> QualificationCampaign:
+        matches = [item for item in self.campaigns if item.campaign_id == campaign_id]
+        if not matches:
+            raise KeyError(f"qualification campaign not found: {campaign_id}")
+        return max(matches, key=lambda item: item.version)
+
+    @classmethod
+    def from_file(cls, path: str | Path = CAMPAIGN_PATH) -> "QualificationCampaignRegistry":
+        source = Path(path)
+        if not source.exists():
+            raise FileNotFoundError(f"training qualification registry not found: {source}")
         return cls.model_validate_json(source.read_text(encoding="utf-8-sig"))
 
 
@@ -240,6 +551,14 @@ class TrainingJobCreateRequest(StrictModel):
     git_commit: str = Field(default="0000000", min_length=7, max_length=64)
     container_digest: str = Field(default="sha256:" + ("0" * 64), min_length=71, max_length=256)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    qualification_campaign_id: str | None = Field(default=None, max_length=128)
+    qualification_milestone_id: str | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_qualification_binding(self) -> "TrainingJobCreateRequest":
+        if bool(self.qualification_campaign_id) != bool(self.qualification_milestone_id):
+            raise ValueError("qualification campaign and milestone must be supplied together")
+        return self
 
     @field_validator("idempotency_key")
     @classmethod
@@ -282,6 +601,20 @@ class TrainingJobSpec(StrictModel):
     gradient_accumulation_steps: int
     dtype: str
     resources: ResourceRequest
+    optimizer: OptimizerPolicy
+    learning_rate: LearningRatePolicy
+    token_budget: TokenBudgetPolicy
+    checkpoint: CheckpointPolicy
+    evaluation: EvaluationPolicy
+    retention: RetentionPolicy
+    promotion: PromotionPolicy
+    retry: RetryPolicy
+    runtime_limits: RuntimeLimitPolicy
+    dataloader: DataLoaderPolicy
+    runtime_image: RuntimeImagePolicy
+    scheduler_policy: SchedulerPolicy
+    cost_quota: CostQuotaPolicy
+    immutable_inputs: ImmutableInputPolicy
     dataset_manifest_uri: str | None = None
     dataset_manifest_sha256: str | None = None
     tokenizer_uri: str | None = None
@@ -291,6 +624,9 @@ class TrainingJobSpec(StrictModel):
     requirements: list[str] = Field(default_factory=list)
     secret_references: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    qualification_campaign_id: str | None = None
+    qualification_campaign_version: int | None = None
+    qualification_milestone_id: str | None = None
     spec_hash: str = ""
 
     @model_validator(mode="after")
@@ -308,6 +644,13 @@ class TrainingJobSpec(StrictModel):
             ]
             if missing:
                 raise ValueError("pretraining job is missing immutable inputs: " + ", ".join(missing))
+        world_size = self.resources.nodes * max(1, self.resources.gpus_per_node)
+        expected_batch = self.batch_size * self.gradient_accumulation_steps * world_size
+        expected_tokens = self.steps * self.batch_size * self.sequence_length * world_size
+        if self.token_budget.global_batch_sequences != expected_batch:
+            raise ValueError("resolved global batch does not match the job topology")
+        if self.token_budget.target_tokens != expected_tokens:
+            raise ValueError("resolved token target does not match steps and topology")
         payload = self.model_dump(mode="json", exclude={"spec_hash"})
         calculated = sha256_text(canonical_json(payload))
         if self.spec_hash and not hmac.compare_digest(self.spec_hash, calculated):
@@ -1023,32 +1366,56 @@ class PostgresTrainingStore:
             if not row:
                 raise KeyError(f"training job not found: {job_id}")
             sequence = int(row["event_sequence"])
-            allocated: list[int | None] = []
-            for rank, source_sequence in source_keys:
-                existing = await connection.fetchval(
-                    """
-                    SELECT assigned_sequence FROM training_event_ingress
-                    WHERE attempt_id=$1::uuid AND rank=$2 AND source_sequence=$3
-                    """,
-                    attempt_id,
-                    rank,
-                    source_sequence,
+            ranks = [item[0] for item in source_keys]
+            source_sequences = [item[1] for item in source_keys]
+            existing_rows = await connection.fetch(
+                """
+                WITH incoming AS (
+                  SELECT rank,source_sequence
+                  FROM unnest($2::integer[],$3::bigint[]) AS source(rank,source_sequence)
                 )
-                if existing is not None:
+                SELECT ingress.rank,ingress.source_sequence,ingress.assigned_sequence
+                FROM training_event_ingress AS ingress
+                JOIN incoming USING(rank,source_sequence)
+                WHERE ingress.attempt_id=$1::uuid
+                """,
+                attempt_id,
+                ranks,
+                source_sequences,
+            )
+            existing = {
+                (int(item["rank"]), int(item["source_sequence"])): int(item["assigned_sequence"])
+                for item in existing_rows
+            }
+            allocated: list[int | None] = []
+            insert_ranks: list[int] = []
+            insert_sources: list[int] = []
+            insert_assigned: list[int] = []
+            seen_in_batch: set[tuple[int, int]] = set()
+            for rank, source_sequence in source_keys:
+                identity = (rank, source_sequence)
+                if identity in existing or identity in seen_in_batch:
                     allocated.append(None)
-                    continue
-                sequence += 1
+                else:
+                    seen_in_batch.add(identity)
+                    sequence += 1
+                    allocated.append(sequence)
+                    insert_ranks.append(rank)
+                    insert_sources.append(source_sequence)
+                    insert_assigned.append(sequence)
+            if insert_ranks:
                 await connection.execute(
                     """
                     INSERT INTO training_event_ingress(attempt_id,rank,source_sequence,assigned_sequence)
-                    VALUES($1::uuid,$2,$3,$4)
+                    SELECT $1::uuid,rank,source_sequence,assigned_sequence
+                    FROM unnest($2::integer[],$3::bigint[],$4::bigint[])
+                      AS source(rank,source_sequence,assigned_sequence)
                     """,
                     attempt_id,
-                    rank,
-                    source_sequence,
-                    sequence,
+                    insert_ranks,
+                    insert_sources,
+                    insert_assigned,
                 )
-                allocated.append(sequence)
             await connection.execute(
                 "UPDATE training_jobs SET event_sequence=$2 WHERE id=$1::uuid",
                 job_id,
@@ -1581,6 +1948,42 @@ def build_training_command(spec: TrainingJobSpec, *, output_dir: str) -> list[st
             str(spec.gradient_accumulation_steps),
             "--dtype",
             spec.dtype,
+            "--learning-rate",
+            str(spec.optimizer.learning_rate),
+            "--optimizer-beta1",
+            str(spec.optimizer.beta1),
+            "--optimizer-beta2",
+            str(spec.optimizer.beta2),
+            "--optimizer-epsilon",
+            str(spec.optimizer.epsilon),
+            "--weight-decay",
+            str(spec.optimizer.weight_decay),
+            "--gradient-clip-norm",
+            str(spec.optimizer.gradient_clip_norm),
+            "--learning-rate-schedule",
+            spec.learning_rate.schedule,
+            "--warmup-steps",
+            str(spec.learning_rate.warmup_steps),
+            "--warmup-ratio",
+            str(spec.learning_rate.warmup_ratio),
+            "--minimum-learning-rate-ratio",
+            str(spec.learning_rate.minimum_learning_rate_ratio),
+            "--validation-interval",
+            str(spec.evaluation.interval_steps),
+            "--validation-batches",
+            str(spec.evaluation.validation_batches),
+            "--checkpoint-every",
+            str(spec.checkpoint.interval_steps),
+            "--early-stopping-patience",
+            str(spec.evaluation.early_stopping_patience),
+            "--early-stopping-min-delta",
+            str(spec.evaluation.early_stopping_min_delta),
+            "--expected-python-version",
+            spec.runtime_image.python_version,
+            "--expected-pytorch-version",
+            spec.runtime_image.pytorch_version,
+            "--expected-cuda-version",
+            spec.runtime_image.cuda_version,
             "--progress-to-stdout",
         ]
         if spec.validation_only:
@@ -1612,6 +2015,48 @@ def build_training_command(spec: TrainingJobSpec, *, output_dir: str) -> list[st
             str(spec.gradient_accumulation_steps),
             "--dtype",
             spec.dtype,
+            "--learning-rate",
+            str(spec.optimizer.learning_rate),
+            "--optimizer-beta1",
+            str(spec.optimizer.beta1),
+            "--optimizer-beta2",
+            str(spec.optimizer.beta2),
+            "--optimizer-epsilon",
+            str(spec.optimizer.epsilon),
+            "--weight-decay",
+            str(spec.optimizer.weight_decay),
+            "--gradient-clip-norm",
+            str(spec.optimizer.gradient_clip_norm),
+            "--learning-rate-schedule",
+            spec.learning_rate.schedule,
+            "--warmup-steps",
+            str(spec.learning_rate.warmup_steps),
+            "--warmup-ratio",
+            str(spec.learning_rate.warmup_ratio),
+            "--minimum-learning-rate-ratio",
+            str(spec.learning_rate.minimum_learning_rate_ratio),
+            "--target-tokens",
+            str(spec.token_budget.target_tokens),
+            "--validate-every",
+            str(spec.evaluation.interval_steps),
+            "--validation-batches",
+            str(spec.evaluation.validation_batches),
+            "--checkpoint-every",
+            str(spec.checkpoint.interval_steps),
+            "--early-stopping-patience",
+            str(spec.evaluation.early_stopping_patience),
+            "--early-stopping-min-delta",
+            str(spec.evaluation.early_stopping_min_delta),
+            "--dataloader-prefetch-batches",
+            str(spec.dataloader.prefetch_batches),
+            "--dataloader-seed",
+            str(spec.dataloader.seed),
+            "--expected-python-version",
+            spec.runtime_image.python_version,
+            "--expected-pytorch-version",
+            spec.runtime_image.pytorch_version,
+            "--expected-cuda-version",
+            spec.runtime_image.cuda_version,
             "--model-profile",
             spec.model_profile,
             "--distributed-strategy",
@@ -1899,19 +2344,23 @@ class KubernetesSchedulerAdapter(SchedulerAdapter):
         command = build_training_command(job.spec, output_dir=output_dir)
         image = job.spec.container_digest
         if "@" not in image:
-            image = os.environ.get("AEITRON_TRAINING_IMAGE", "aeitron-training") + "@" + image
+            image = job.spec.runtime_image.repository + "@" + image
+        namespace = job.spec.scheduler_policy.namespace
         return {
             "apiVersion": "batch/v1",
             "kind": "Job",
-            "metadata": {"name": name, "namespace": self.namespace, "labels": {"app": "aeitron-training", "job-id": job.job_id}},
+            "metadata": {"name": name, "namespace": namespace, "labels": {"app": "aeitron-training", "job-id": job.job_id}},
             "spec": {
                 "backoffLimit": 0,
                 "ttlSecondsAfterFinished": 86400,
+                "activeDeadlineSeconds": job.spec.runtime_limits.maximum_wall_time_seconds,
                 "template": {
                     "metadata": {"labels": {"app": "aeitron-training", "job-id": job.job_id}},
                     "spec": {
                         "restartPolicy": "Never",
                         "serviceAccountName": "aeitron-training-worker",
+                        "priorityClassName": job.spec.scheduler_policy.priority_class,
+                        "terminationGracePeriodSeconds": job.spec.runtime_limits.graceful_shutdown_seconds,
                         "nodeSelector": self.node_selector(job.spec),
                         "containers": [
                             {
@@ -1957,7 +2406,18 @@ class KubernetesSchedulerAdapter(SchedulerAdapter):
                         },
                         "volumes": [
                             {"name": "workspace-token", "secret": {"secretName": f"aeitron-job-{job.job_id[:8]}"}},
-                            {"name": "workspace", "emptyDir": {}},
+                            {
+                                "name": "workspace",
+                                "ephemeral": {
+                                    "volumeClaimTemplate": {
+                                        "spec": {
+                                            "accessModes": ["ReadWriteOnce"],
+                                            "storageClassName": job.spec.scheduler_policy.storage_class,
+                                            "resources": {"requests": {"storage": f"{job.spec.cost_quota.maximum_storage_gib}Gi"}},
+                                        }
+                                    }
+                                },
+                            },
                             {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "8Gi"}},
                         ],
                     },
@@ -1972,7 +2432,7 @@ class KubernetesSchedulerAdapter(SchedulerAdapter):
         secret_manifest = {
             "apiVersion": "v1",
             "kind": "Secret",
-            "metadata": {"name": secret_name, "namespace": self.namespace, "labels": {"app": "aeitron-training", "job-id": job.job_id}},
+            "metadata": {"name": secret_name, "namespace": job.spec.scheduler_policy.namespace, "labels": {"app": "aeitron-training", "job-id": job.job_id}},
             "type": "Opaque",
             "stringData": {"token": token},
         }
@@ -1994,7 +2454,7 @@ class KubernetesSchedulerAdapter(SchedulerAdapter):
         return SchedulerBinding(
             scheduler=self.name,
             external_id=manifest["metadata"]["name"],
-            namespace=self.namespace,
+            namespace=job.spec.scheduler_policy.namespace,
             metadata={"apply_output": apply_output, "token_secret": secret_name, "token_expires_at": expires_at},
         )
 
@@ -2153,7 +2613,7 @@ class KubernetesPyTorchAdapter(KubernetesSchedulerAdapter):
         base_command = build_training_command(job.spec, output_dir=output_dir)
         image = job.spec.container_digest
         if "@" not in image:
-            image = os.environ.get("AEITRON_TRAINING_IMAGE", "aeitron-training") + "@" + image
+            image = job.spec.runtime_image.repository + "@" + image
         container = {
             "name": "pytorch",
             "image": image,
@@ -2190,6 +2650,8 @@ class KubernetesPyTorchAdapter(KubernetesSchedulerAdapter):
             "template": {
                 "spec": {
                     "serviceAccountName": "aeitron-training-worker",
+                    "priorityClassName": job.spec.scheduler_policy.priority_class,
+                    "terminationGracePeriodSeconds": job.spec.runtime_limits.graceful_shutdown_seconds,
                     "nodeSelector": self.node_selector(job.spec),
                     "securityContext": {
                         "runAsNonRoot": True,
@@ -2201,7 +2663,18 @@ class KubernetesPyTorchAdapter(KubernetesSchedulerAdapter):
                     "containers": [container],
                     "volumes": [
                         {"name": "workspace-token", "secret": {"secretName": f"aeitron-job-{job.job_id[:8]}"}},
-                        {"name": "workspace", "emptyDir": {}},
+                        {
+                            "name": "workspace",
+                            "ephemeral": {
+                                "volumeClaimTemplate": {
+                                    "spec": {
+                                        "accessModes": ["ReadWriteOnce"],
+                                        "storageClassName": job.spec.scheduler_policy.storage_class,
+                                        "resources": {"requests": {"storage": f"{job.spec.cost_quota.maximum_storage_gib}Gi"}},
+                                    }
+                                }
+                            },
+                        },
                         {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "8Gi"}},
                     ],
                 }
@@ -2212,8 +2685,15 @@ class KubernetesPyTorchAdapter(KubernetesSchedulerAdapter):
         return {
             "apiVersion": "kubeflow.org/v1",
             "kind": "PyTorchJob",
-            "metadata": {"name": name, "namespace": self.namespace, "labels": {"app": "aeitron-training", "job-id": job.job_id}},
-            "spec": {"runPolicy": {"cleanPodPolicy": "Running"}, "pytorchReplicaSpecs": {"Master": replica, "Worker": worker}},
+            "metadata": {"name": name, "namespace": job.spec.scheduler_policy.namespace, "labels": {"app": "aeitron-training", "job-id": job.job_id}},
+            "spec": {
+                "runPolicy": {
+                    "cleanPodPolicy": "Running",
+                    "activeDeadlineSeconds": job.spec.runtime_limits.maximum_wall_time_seconds,
+                    "schedulingPolicy": {"minAvailable": job.spec.resources.nodes},
+                },
+                "pytorchReplicaSpecs": {"Master": replica, "Worker": worker},
+            },
         }
 
     async def status(self, binding: SchedulerBinding) -> str:
@@ -2291,6 +2771,17 @@ class SlurmSchedulerAdapter(SchedulerAdapter):
         command = build_training_command(job.spec, output_dir=output_dir)
         quoted = " ".join(shlex.quote(item) for item in command)
         token_path = self.work_dir / f"{job.job_id}-token"
+        wall_seconds = job.spec.runtime_limits.maximum_wall_time_seconds
+        wall_days, remainder = divmod(wall_seconds, 86_400)
+        wall_hours, remainder = divmod(remainder, 3600)
+        wall_minutes, wall_seconds_remainder = divmod(remainder, 60)
+        slurm_time = f"{wall_days}-{wall_hours:02d}:{wall_minutes:02d}:{wall_seconds_remainder:02d}"
+        scheduler_lines = [
+            f"#SBATCH --partition={job.spec.scheduler_policy.queue}",
+            f"#SBATCH --time={slurm_time}",
+        ]
+        if job.spec.scheduler_policy.account:
+            scheduler_lines.append(f"#SBATCH --account={job.spec.scheduler_policy.account}")
         return "\n".join(
             [
                 "#!/usr/bin/env bash",
@@ -2301,6 +2792,7 @@ class SlurmSchedulerAdapter(SchedulerAdapter):
                 f"#SBATCH --gpus-per-node={job.spec.resources.gpus_per_node}",
                 f"#SBATCH --cpus-per-task={max(1, job.spec.resources.cpu_cores // max(1, job.spec.resources.gpus_per_node))}",
                 f"#SBATCH --output={shlex.quote(output_dir)}/slurm-%j.out",
+                *scheduler_lines,
                 "export PYTHONUNBUFFERED=1",
                 "export NCCL_ASYNC_ERROR_HANDLING=1",
                 f"export AEITRON_TRAINING_JOB_ID={shlex.quote(job.job_id)}",
@@ -2384,12 +2876,14 @@ class TrainingWorkspaceService:
         events: EventBus,
         object_store: ObjectStore,
         profiles: TrainingProfileRegistry | None = None,
+        campaigns: QualificationCampaignRegistry | None = None,
         production_mode: bool = False,
     ) -> None:
         self.store = store
         self.events = events
         self.object_store = object_store
         self.profiles = profiles or TrainingProfileRegistry.from_file()
+        self.campaigns = campaigns or QualificationCampaignRegistry.from_file()
         self.production_mode = production_mode
 
     @classmethod
@@ -2427,6 +2921,19 @@ class TrainingWorkspaceService:
 
     def resolve_spec(self, request: TrainingJobCreateRequest) -> TrainingJobSpec:
         profile = self.profiles.latest(request.profile_id)
+        campaign: QualificationCampaign | None = None
+        milestone: QualificationMilestone | None = None
+        if request.qualification_campaign_id and request.qualification_milestone_id:
+            campaign = self.campaigns.latest(request.qualification_campaign_id)
+            milestone = campaign.milestone(request.qualification_milestone_id)
+            if milestone.profile_id != profile.profile_id:
+                raise ValueError(
+                    f"qualification milestone requires profile {milestone.profile_id}, not {profile.profile_id}"
+                )
+            if request.overrides.get("steps") != milestone.steps:
+                raise ValueError(
+                    f"qualification milestone {milestone.milestone_id} requires immutable steps={milestone.steps}"
+                )
         git_commit = request.git_commit
         container_digest = request.container_digest
         if self.production_mode:
@@ -2459,6 +2966,27 @@ class TrainingWorkspaceService:
                 raise ValueError(f"unsupported bounded override: {key}")
         if self.production_mode and profile.dev_only:
             raise ValueError("dev-only notebook profile cannot be submitted in production mode")
+        world_size = resources.nodes * max(1, resources.gpus_per_node)
+        token_budget = profile.token_budget.model_copy(
+            update={
+                "global_batch_sequences": values["batch_size"] * values["gradient_accumulation_steps"] * world_size,
+                "target_tokens": values["steps"] * values["batch_size"] * values["sequence_length"] * world_size,
+                "maximum_tokens": max(
+                    profile.token_budget.maximum_tokens,
+                    values["steps"] * values["batch_size"] * values["sequence_length"] * world_size,
+                ),
+            }
+        )
+        if self.production_mode and profile.run_type == "pretrain":
+            for name, uri in (
+                ("dataset_manifest_uri", request.dataset_manifest_uri),
+                ("tokenizer_uri", request.tokenizer_uri),
+            ):
+                scheme = urlparse(uri or "").scheme or "file"
+                if scheme not in profile.immutable_inputs.allowed_uri_schemes:
+                    raise ValueError(f"{name} scheme {scheme!r} is not allowed by the immutable input policy")
+            if profile.immutable_inputs.require_promoted_dataset and request.metadata.get("dataset_promotion") != "promoted":
+                raise ValueError("production pretraining requires metadata.dataset_promotion='promoted'")
         metadata = dict(request.metadata)
         metadata["requested_overrides"] = request.overrides
         return TrainingJobSpec(
@@ -2478,6 +3006,20 @@ class TrainingWorkspaceService:
             gradient_accumulation_steps=values["gradient_accumulation_steps"],
             dtype=profile.dtype,
             resources=resources,
+            optimizer=profile.optimizer,
+            learning_rate=profile.learning_rate,
+            token_budget=token_budget,
+            checkpoint=profile.checkpoint,
+            evaluation=profile.evaluation,
+            retention=profile.retention,
+            promotion=profile.promotion,
+            retry=profile.retry,
+            runtime_limits=profile.runtime_limits,
+            dataloader=profile.dataloader,
+            runtime_image=profile.runtime_image,
+            scheduler_policy=profile.scheduler_policy,
+            cost_quota=profile.cost_quota,
+            immutable_inputs=profile.immutable_inputs,
             dataset_manifest_uri=request.dataset_manifest_uri,
             dataset_manifest_sha256=request.dataset_manifest_sha256,
             tokenizer_uri=request.tokenizer_uri,
@@ -2487,6 +3029,9 @@ class TrainingWorkspaceService:
             requirements=profile.requirements,
             secret_references=profile.secret_references,
             metadata=metadata,
+            qualification_campaign_id=campaign.campaign_id if campaign else None,
+            qualification_campaign_version=campaign.version if campaign else None,
+            qualification_milestone_id=milestone.milestone_id if milestone else None,
         )
 
     async def record_audit(
@@ -2518,6 +3063,34 @@ class TrainingWorkspaceService:
             if not hmac.compare_digest(existing.spec.spec_hash, spec.spec_hash):
                 raise ValueError("idempotency key already exists with a different immutable job spec")
             return existing
+        await self._validate_qualification_predecessor(spec, owner_id=owner_id)
+        active_jobs = [
+            item
+            for item in await self.store.list_jobs(owner_id=owner_id, limit=500)
+            if item.status.value not in TERMINAL_STATES
+        ]
+        if len(active_jobs) >= spec.cost_quota.maximum_concurrent_jobs_per_owner:
+            raise ValueError(
+                "owner training concurrency quota exceeded: "
+                f"{len(active_jobs)} active, limit={spec.cost_quota.maximum_concurrent_jobs_per_owner}"
+            )
+        requested_gpu_hours = (
+            spec.runtime_limits.maximum_wall_time_seconds
+            * spec.resources.nodes
+            * spec.resources.gpus_per_node
+            / 3600.0
+        )
+        if requested_gpu_hours > spec.cost_quota.maximum_gpu_hours:
+            raise ValueError(
+                f"job requests up to {requested_gpu_hours:.2f} GPU-hours but profile quota allows "
+                f"{spec.cost_quota.maximum_gpu_hours:.2f}"
+            )
+        requested_cost_usd = requested_gpu_hours * spec.cost_quota.estimated_gpu_hour_cost_usd
+        if requested_cost_usd > spec.cost_quota.maximum_cost_usd:
+            raise ValueError(
+                f"job projected cost is ${requested_cost_usd:.2f} but profile quota allows "
+                f"${spec.cost_quota.maximum_cost_usd:.2f}"
+            )
         job = TrainingJob(
             job_id=str(uuid.uuid4()),
             owner_id=owner_id,
@@ -2554,6 +3127,51 @@ class TrainingWorkspaceService:
             metadata={"profile_id": queued.spec.profile_id, "spec_hash": queued.spec.spec_hash},
         )
         return queued
+
+    async def _validate_qualification_predecessor(self, spec: TrainingJobSpec, *, owner_id: str) -> None:
+        if not spec.qualification_campaign_id or not spec.qualification_milestone_id:
+            return
+        campaign = self.campaigns.latest(spec.qualification_campaign_id)
+        milestone = campaign.milestone(spec.qualification_milestone_id)
+        if milestone.previous_milestone_id is None:
+            return
+        candidates = [
+            item
+            for item in await self.store.list_jobs(owner_id=owner_id, limit=500)
+            if item.spec.qualification_campaign_id == campaign.campaign_id
+            and item.spec.qualification_campaign_version == campaign.version
+            and item.spec.qualification_milestone_id == milestone.previous_milestone_id
+        ]
+        if not candidates:
+            raise ValueError(
+                f"qualification milestone {milestone.milestone_id} is locked; "
+                f"previous milestone {milestone.previous_milestone_id} has no job"
+            )
+        previous = max(candidates, key=lambda item: item.created_at)
+        gate = campaign.gate
+        if gate.require_succeeded_job and previous.status != JobStatus.SUCCEEDED:
+            raise ValueError(
+                f"qualification milestone is locked; previous job status={previous.status.value}, expected=succeeded"
+            )
+        if gate.require_same_dataset_and_tokenizer:
+            for name in ("dataset_manifest_sha256", "tokenizer_sha256"):
+                previous_value = getattr(previous.spec, name)
+                current_value = getattr(spec, name)
+                if not previous_value or not current_value or not hmac.compare_digest(previous_value, current_value):
+                    raise ValueError(f"qualification milestone changed immutable {name}")
+        checkpoints = await self.store.list_checkpoints(previous.job_id)
+        if gate.require_reload_verified_checkpoint and not any(item.reload_verified for item in checkpoints):
+            raise ValueError("qualification milestone is locked; previous checkpoint reload was not verified")
+        evaluations = await self.store.list_evaluations(previous.job_id)
+        passing = [item for item in evaluations if item.decision in {"pass", "release"}]
+        if gate.require_passing_evaluation and not passing:
+            raise ValueError("qualification milestone is locked; previous evaluation did not pass")
+        for evaluation in passing:
+            regression = abs(float(evaluation.metrics.get("validation_regression", 0.0)))
+            if bool(evaluation.metrics.get("regression_detected")) or regression > gate.maximum_validation_regression:
+                raise ValueError(
+                    f"qualification milestone is locked by validation regression {regression:.6f}"
+                )
 
     async def get_job(self, job_id: str) -> TrainingJob:
         job = await self.store.get_job(job_id)
@@ -2932,19 +3550,24 @@ class TrainingWorkspaceService:
             raise KeyError(f"checkpoint not found for job: {checkpoint_id}")
         if job.spec.validation_only:
             raise ValueError("validation-only checkpoints cannot be promoted as release checkpoints")
-        if not checkpoint.reload_verified:
+        policy = job.spec.promotion
+        if checkpoint.step < policy.minimum_step:
+            raise ValueError(f"checkpoint step {checkpoint.step} is below promotion minimum {policy.minimum_step}")
+        if policy.require_reload_verification and not checkpoint.reload_verified:
             raise ValueError("checkpoint promotion requires a successful reload smoke verification")
         evaluations = await self.store.list_evaluations(job_id)
-        passing = next(
-            (
-                item
-                for item in evaluations
-                if item.checkpoint_id == checkpoint_id and item.decision in {"pass", "release"}
-            ),
-            None,
-        )
-        if passing is None:
+        passing_evaluations = [
+            item
+            for item in evaluations
+            if item.checkpoint_id == checkpoint_id and item.decision in {"pass", "release"}
+        ]
+        if policy.require_passing_evaluation and len(passing_evaluations) < policy.minimum_completed_evaluations:
             raise ValueError("checkpoint promotion requires a passing committed evaluation")
+        if policy.require_no_regression and any(
+            bool(item.metrics.get("regression_detected")) for item in passing_evaluations
+        ):
+            raise ValueError("checkpoint promotion blocked by evaluation regression")
+        passing = passing_evaluations[-1] if passing_evaluations else None
         promoted = await self.store.promote_checkpoint(checkpoint_id)
         latest = await asyncio.to_thread(
             self.object_store.put_json,
@@ -2955,7 +3578,7 @@ class TrainingWorkspaceService:
                 "step": checkpoint.step,
                 "manifest_uri": checkpoint.manifest_uri,
                 "manifest_sha256": checkpoint.manifest_sha256,
-                "evaluation_id": passing.evaluation_id,
+                "evaluation_id": passing.evaluation_id if passing else None,
                 "promoted_at": utc_now().isoformat(),
             },
             key=f"jobs/{job_id}/checkpoints/latest.json",
@@ -3065,6 +3688,9 @@ class TrainingController:
                 detail=f"scheduler adapter is not registered: {job.spec.scheduler}",
             )
         if job.status == JobStatus.QUEUED:
+            retry_not_before = float(job.scheduler_binding.get("retry_not_before_unix", 0.0))
+            if retry_not_before > time.time():
+                return job
             try:
                 await scheduler.validate(job.spec)
                 provisioning = await self.service.store.transition_job(job.job_id, JobStatus.PROVISIONING, expected_version=job.version)
@@ -3132,6 +3758,43 @@ class TrainingController:
                     outcome="failed" if target == JobStatus.FAILED else "succeeded",
                     metadata={"runtime_status": runtime_status, "target": target.value},
                 )
+                if target == JobStatus.FAILED:
+                    attempts = await self.service.store.list_attempts(job.job_id)
+                    failure_class = str(binding.metadata.get("failure_class") or "infrastructure")
+                    if (
+                        failure_class in transitioned.spec.retry.retryable_failures
+                        and len(attempts) < transitioned.spec.retry.maximum_attempts
+                    ):
+                        delay = min(
+                            transitioned.spec.retry.maximum_backoff_seconds,
+                            transitioned.spec.retry.initial_backoff_seconds * (2 ** max(0, len(attempts) - 1)),
+                        )
+                        retry_binding = dict(transitioned.scheduler_binding)
+                        retry_binding.update(
+                            {
+                                "retry_not_before_unix": time.time() + delay,
+                                "retry_failure_class": failure_class,
+                                "previous_external_id": binding.external_id,
+                            }
+                        )
+                        transitioned = await self.service.store.update_binding(
+                            transitioned.job_id,
+                            expected_version=transitioned.version,
+                            binding=retry_binding,
+                        )
+                        transitioned = await self.service.store.transition_job(
+                            transitioned.job_id,
+                            JobStatus.QUEUED,
+                            expected_version=transitioned.version,
+                            detail=f"automatic retry after {failure_class}; backoff={delay}s",
+                        )
+                        await self.service.record_audit(
+                            actor_id="training-controller",
+                            job_id=transitioned.job_id,
+                            action="training.scheduler.retry",
+                            outcome="accepted",
+                            metadata={"attempts": len(attempts), "failure_class": failure_class, "backoff_seconds": delay},
+                        )
                 return transitioned
         return job
 
@@ -3258,6 +3921,7 @@ def parse_workspace_args() -> argparse.Namespace:
     controller.add_argument("--poll-seconds", type=float, default=5.0)
     controller.add_argument("--once", action="store_true")
     subparsers.add_parser("profiles")
+    subparsers.add_parser("campaigns")
     subparsers.add_parser("readiness")
     return parser.parse_args()
 
@@ -3268,6 +3932,24 @@ async def workspace_main() -> None:
     try:
         if args.command == "profiles":
             print(json.dumps({"profiles": service.profile_report()}, indent=2, sort_keys=True), flush=True)
+            return
+        if args.command == "campaigns":
+            print(
+                json.dumps(
+                    {
+                        "campaigns": [
+                            {
+                                **campaign.model_dump(mode="json"),
+                                "milestones": [item.model_dump(mode="json") for item in campaign.milestones],
+                            }
+                            for campaign in service.campaigns.campaigns
+                        ]
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
             return
         if args.command == "readiness":
             print(json.dumps(workspace_readiness(service), indent=2, sort_keys=True), flush=True)

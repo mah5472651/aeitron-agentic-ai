@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: aeitron_proof
+      POSTGRES_USER: aeitron
+      POSTGRES_PASSWORD: aeitron_proof_only_change_me
+    ports: ["127.0.0.1:55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aeitron -d aeitron_proof"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    volumes: ["proof-postgres:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports: ["127.0.0.1:56379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    volumes: ["proof-redis:/data"]
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: aeitron-proof
+      MINIO_ROOT_PASSWORD: aeitron-proof-password-change-me
+    ports: ["127.0.0.1:59000:9000", "127.0.0.1:59001:9001"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    volumes: ["proof-minio:/data"]
+
+volumes:
+  proof-postgres:
+  proof-redis:
+  proof-minio:

@@ -189,6 +189,9 @@ class Workspace:
     async def profiles(self) -> list[dict[str, Any]]:
         return (await self._request("GET", "/v1/training/profiles")).json()["profiles"]
 
+    async def campaigns(self) -> list[dict[str, Any]]:
+        return (await self._request("GET", "/v1/training/campaigns")).json()["campaigns"]
+
     async def train(
         self,
         profile: str,
@@ -202,6 +205,8 @@ class Workspace:
         tokenizer_uri: str | None = None,
         tokenizer_sha256: str | None = None,
         metadata: dict[str, Any] | None = None,
+        qualification_campaign_id: str | None = None,
+        qualification_milestone_id: str | None = None,
     ) -> TrainingRun:
         request = {
             "profile_id": profile,
@@ -215,6 +220,8 @@ class Workspace:
             "git_commit": _git_commit(),
             "container_digest": _container_digest(),
             "metadata": metadata or {},
+            "qualification_campaign_id": qualification_campaign_id,
+            "qualification_milestone_id": qualification_milestone_id,
         }
         response = await self._request("POST", "/v1/training/jobs", json=request)
         run = TrainingRun(self, response.json())
@@ -386,6 +393,10 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--dataset-manifest-sha256")
     train.add_argument("--tokenizer-uri")
     train.add_argument("--tokenizer-sha256")
+    train.add_argument("--steps", type=int)
+    train.add_argument("--campaign")
+    train.add_argument("--milestone")
+    subparsers.add_parser("campaigns")
     jobs = subparsers.add_parser("jobs")
     jobs.add_argument("action", choices=["list", "inspect", "cancel", "resume"])
     jobs.add_argument("job_id", nargs="?")
@@ -403,8 +414,14 @@ async def async_main() -> None:
                 dataset_manifest_sha256=args.dataset_manifest_sha256,
                 tokenizer_uri=args.tokenizer_uri,
                 tokenizer_sha256=args.tokenizer_sha256,
+                overrides={"steps": args.steps} if args.steps is not None else None,
+                qualification_campaign_id=args.campaign,
+                qualification_milestone_id=args.milestone,
             )
             print(json.dumps(run.payload, indent=2, sort_keys=True), flush=True)
+            return
+        if args.command == "campaigns":
+            print(json.dumps(await workspace.campaigns(), indent=2, sort_keys=True), flush=True)
             return
         if args.action == "list":
             payload: Any = await workspace.jobs()

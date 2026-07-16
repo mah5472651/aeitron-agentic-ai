@@ -8,7 +8,7 @@ import json
 import re
 import shutil
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -131,7 +131,11 @@ class S3ObjectStore:
         self.max_retries = max_retries
 
     def _object_key(self, key: str) -> str:
-        return f"{self.prefix}/{key}".strip("/") if self.prefix else key
+        normalized = key.replace("\\", "/").strip("/")
+        parts = PurePosixPath(normalized).parts if normalized else ()
+        if any(part in {".", ".."} for part in parts):
+            raise ValueError(f"unsafe S3 object key: {key}")
+        return f"{self.prefix}/{normalized}".strip("/") if self.prefix else normalized
 
     def put_file(self, path: str | Path, *, key: str | None = None) -> StoredObject:
         source = Path(path)
@@ -171,10 +175,17 @@ class S3ObjectStore:
 
     def head(self, key: str) -> StoredObject:
         object_key = self._object_key(key)
-        response = retry_sync(
-            lambda: self.client.head_object(Bucket=self.bucket, Key=object_key),
-            max_retries=self.max_retries,
-        )
+        try:
+            response = retry_sync(
+                lambda: self.client.head_object(Bucket=self.bucket, Key=object_key),
+                max_retries=self.max_retries,
+            )
+        except RuntimeError as exc:
+            cause = exc.__cause__
+            response_code = getattr(cause, "response", {}).get("Error", {}).get("Code", "")
+            if str(response_code) in {"404", "NoSuchKey", "NotFound"}:
+                raise FileNotFoundError(f"object not found: {key}") from exc
+            raise
         return StoredObject(
             source_path=f"s3://{self.bucket}/{object_key}",
             uri=f"s3://{self.bucket}/{object_key}",
@@ -198,21 +209,31 @@ class S3ObjectStore:
 
     def list_objects(self, prefix: str = "") -> list[StoredObject]:
         object_prefix = self._object_key(prefix) if prefix else self.prefix
-        response = retry_sync(
-            lambda: self.client.list_objects_v2(Bucket=self.bucket, Prefix=object_prefix),
-            max_retries=self.max_retries,
-        )
         objects = []
-        for item in response.get("Contents", []):
-            key = item["Key"]
-            objects.append(
-                StoredObject(
-                    source_path=f"s3://{self.bucket}/{key}",
-                    uri=f"s3://{self.bucket}/{key}",
-                    size_bytes=int(item.get("Size", 0)),
-                    sha256="",
-                )
+        continuation: str | None = None
+        while True:
+            request: dict[str, Any] = {"Bucket": self.bucket, "Prefix": object_prefix}
+            if continuation:
+                request["ContinuationToken"] = continuation
+            response = retry_sync(
+                lambda request=request: self.client.list_objects_v2(**request),
+                max_retries=self.max_retries,
             )
+            for item in response.get("Contents", []):
+                key = item["Key"]
+                objects.append(
+                    StoredObject(
+                        source_path=f"s3://{self.bucket}/{key}",
+                        uri=f"s3://{self.bucket}/{key}",
+                        size_bytes=int(item.get("Size", 0)),
+                        sha256="",
+                    )
+                )
+            if not response.get("IsTruncated"):
+                break
+            continuation = response.get("NextContinuationToken")
+            if not continuation:
+                raise RuntimeError("S3 pagination response was truncated without a continuation token")
         return objects
 
     def presign_put(
@@ -325,7 +346,7 @@ def verify_object_store_lifecycle(
     uploaded = store.put_file(source, key=key)
     store.head(key)
     downloaded_object = store.get_file(key, downloaded)
-    listed = store.list_objects(str(Path(key).parent))
+    listed = store.list_objects(str(PurePosixPath(key).parent))
     checksum_match = file_sha256(source) == file_sha256(downloaded)
     store.delete(key)
     deleted = True
@@ -335,7 +356,7 @@ def verify_object_store_lifecycle(
     except FileNotFoundError:
         deleted = True
     report = ObjectStoreLifecycleReport(
-        status="passed" if checksum_match and deleted else "failed",
+        status="passed" if checksum_match and deleted and len(listed) >= 1 else "failed",
         uri=config.uri,
         key=key,
         uploaded=uploaded,

@@ -277,6 +277,23 @@ async def training_profiles(http_request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
+@app.get("/v1/training/campaigns")
+async def training_campaigns(http_request: Request) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "training:jobs:read")
+        return {
+            "campaigns": [
+                {
+                    **campaign.model_dump(mode="json"),
+                    "milestones": [item.model_dump(mode="json") for item in campaign.milestones],
+                }
+                for campaign in TRAINING_WORKSPACE.campaigns.campaigns
+            ]
+        }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
 @app.post("/v1/training/jobs")
 async def create_training_job(request: TrainingJobCreateRequest, http_request: Request) -> dict[str, Any]:
     try:

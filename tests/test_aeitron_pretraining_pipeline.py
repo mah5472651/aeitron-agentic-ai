@@ -713,6 +713,21 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
                 megatron_root=root / "missing-megatron",
             )
             self.assertEqual(megatron.status, "blocked_missing_dependency")
+            with self.assertRaisesRegex(ValueError, "must be positive"):
+                build_megatron_launch_plan(
+                    manifest=root / "shards" / "manifest.json",
+                    tokenizer_path=tokenizer_path,
+                    output_dir=root / "mega-invalid",
+                    model_profile="tiny",
+                    tensor_parallel=0,
+                    pipeline_parallel=1,
+                    data_parallel=1,
+                    sequence_length=16,
+                    micro_batch_size=1,
+                    global_batch_size=1,
+                    train_iters=1,
+                    megatron_root=root / "missing-megatron",
+                )
 
     def test_cluster_training_plan_validates_manifest_and_batch_math(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

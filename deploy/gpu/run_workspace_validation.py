@@ -156,7 +156,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         flush=True,
     )
     try:
-        result = await run_pipeline(pipeline_args)
+        result = await asyncio.wait_for(
+            run_pipeline(pipeline_args),
+            timeout=profile.runtime_limits.maximum_wall_time_seconds,
+        )
         if workspace and result.get("status") != "complete":
             await workspace.emit_events(
                 job_id,

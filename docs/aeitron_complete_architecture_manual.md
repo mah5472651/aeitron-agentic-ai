@@ -3699,6 +3699,124 @@ The code paths and fail-fast gates exist, but these statuses remain
 `built_not_cluster_proven` until the corresponding infrastructure test report
 is produced.
 
+### Production Training Policy Contract
+
+`config/training_profiles.json` schema version 2 is the canonical, append-only
+training policy registry. JSON `defaults` reduce duplication, but
+`TrainingProfileRegistry.from_file()` deep-resolves every profile before
+validation and hashing. The immutable hash therefore covers the complete
+resolved policy rather than a reference to mutable defaults.
+
+Every profile now binds all of the following:
+
+- AdamW learning rate, beta values, epsilon, weight decay, and gradient clip;
+- constant, linear, or cosine schedule with exactly one warmup mode;
+- global batch sequences and non-padding target/maximum token budgets;
+- checkpoint interval, retained latest/best counts, optimizer/scheduler/RNG
+  state, checksum, and reload requirements;
+- evaluation interval, suite, strictness, early stopping, and regression limit;
+- hot/archive/delete retention and promoted-checkpoint preservation;
+- promotion evidence, minimum step, and minimum evaluation count;
+- retryable failure classes, exponential backoff, preemption handling, and
+  maximum attempts;
+- wall time, heartbeat timeout, and graceful termination;
+- deterministic dataloader seed, bounded prefetch, workers, checksum policy,
+  pinning, and node-local cache budget;
+- OCI image repository plus required Python, PyTorch, and CUDA versions;
+- namespace/partition, queue, account, storage class, priority, gang
+  scheduling, and topology key;
+- maximum GPU-hours, projected USD cost, storage, egress, and owner concurrency;
+- promoted dataset and tokenizer URI/hash requirements.
+
+Resolution recalculates global batch and target tokens whenever an authorized
+step/node override changes topology. Production submissions reject unpromoted
+datasets, disallowed URI schemes, mutable image identities, excessive
+concurrency, GPU-hour requests above profile quota, and projected GPU cost
+above profile quota. Projected cost is the maximum wall time multiplied by the
+requested GPU count and the profile's audited per-GPU-hour estimate. These values are passed
+to the real pretraining process. The runtime uses configured AdamW and
+warmup/decay behavior, reports current learning rate, validates expected
+runtime versions, prefetches shard batches, and fails if consumed tokens exceed
+the immutable budget.
+
+`steps` is deliberately defined as dataloader micro-batch steps in this
+runtime. `global_batch_sequences = micro_batch * gradient_accumulation *
+world_size`; the immutable token target is calculated from consumed
+micro-batches, sequence length, and world size. Optimizer-update metrics remain
+separate so changing gradient accumulation cannot silently change token
+accounting.
+
+### Gated Qualification Staircase
+
+`config/training_qualification_campaigns.json` defines compact ranges rather
+than dozens of copied profiles. `defensive-staircase-v1` expands to 37
+milestones:
+
+1. 1k, 2k, ..., 20k;
+2. 30k, 40k, ..., 100k;
+3. 200k, 300k, ..., 1M.
+
+The first ten milestones use notebook validation. Later milestones require the
+trusted Kubernetes scheduler. A create request must bind both campaign and
+milestone and set the exact milestone step override. For every later
+milestone, the service queries durable prior jobs and requires a succeeded
+predecessor, reload-verified checkpoint, passing evaluation, <=3% validation
+regression, and identical dataset/tokenizer hashes. User-supplied metadata
+cannot bypass this gate.
+
+Example:
+
+```powershell
+aeitron train --profile defensive-staircase-notebook --steps 1000 `
+  --campaign defensive-staircase-v1 --milestone steps-0001000 `
+  --dataset-manifest-uri file:///data/manifest.json `
+  --dataset-manifest-sha256 <sha256> `
+  --tokenizer-uri file:///data/tokenizer.json --tokenizer-sha256 <sha256>
+```
+
+This validates one model/config progressively. It does not mean that 1M steps
+automatically qualifies a 1B or 60B model. Parameter-scale changes begin a new
+checkpoint lineage because their tensors are incompatible.
+
+### Measured Infrastructure Proofs
+
+`src/aeitron/training_proofs.py` writes a machine-readable report where every
+proof is `passed`, `failed`, or `blocked`. `deploy/proof/docker-compose.yml`
+provides isolated pinned Postgres, Redis, and MinIO dependencies.
+
+The local proof performs real migrations, stores a job and attempt in
+Postgres, checks event sequence deduplication through Redis Streams, executes
+MinIO upload/head/download/list/delete with SHA-256, kills a real Docker worker
+and verifies node-loss retry/backoff, dumps/restores Postgres, restarts
+Postgres/Redis/MinIO, and verifies persistence after restart.
+
+```powershell
+docker compose -p aeitron-proof -f deploy\proof\docker-compose.yml up -d
+python -m src.aeitron.training_proofs `
+  --output-dir artifacts\aeitron\production-proofs\local-docker
+```
+
+Full ordered-event and soak commands:
+
+```powershell
+python -m src.aeitron.training_proofs --event-count 1000000 `
+  --skip-disaster-recovery --output-dir artifacts\aeitron\production-proofs\million-events
+python -m src.aeitron.training_proofs --soak-seconds 86400 `
+  --output-dir artifacts\aeitron\production-proofs\24-hour-soak
+```
+
+The local full stress proof executed on 2026-07-16 accepted exactly 1,000,000
+ordered events, verified both final and tail sequence as 1,000,000, and measured
+1,285.64 events/second with no failed proof. This proves the tested local
+Postgres/Redis path; it is not a multi-region or cluster throughput claim. A
+30-second soak harness smoke also completed 15 dependency health cycles. The
+required 24-hour soak remains unproven until the exact 86,400-second command
+finishes without interruption.
+
+Kubernetes/PyTorchJob, Slurm, FSDP, ZeRO-3, Megatron, and 60B resume checks
+probe their real dependencies. A missing cluster or GPU allocation is an
+explicit blocker. Running a local mock does not promote those proof states.
+
 ### Workspace Verification
 
 ```powershell

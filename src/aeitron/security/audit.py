@@ -228,12 +228,69 @@ def _run_bandit(root: Path) -> dict[str, Any] | None:
 
 def _run_semgrep(root: Path) -> dict[str, Any]:
     base_command, missing = _resolve_python_scanner("semgrep", "semgrep")
-    if missing:
-        return {"status": "skipped", "reason": missing}
-    command = [*base_command, "scan", "--config", "auto", "--json", "src/aeitron"]
-    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
+    completed: subprocess.CompletedProcess[str] | None = None
+    backend = "local"
+    if not missing:
+        command = [*base_command, "scan", "--config", "auto", "--json", "src/aeitron"]
+        completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
+    if completed is None or completed.returncode not in {0, 1}:
+        docker = shutil.which("docker")
+        image = os.environ.get(
+            "AEITRON_SEMGREP_IMAGE",
+            "semgrep/semgrep@sha256:2b33f46ba66cf8cc2ad59ccfa7d22951fd00c632c38f1339e84ec8e6e641a942",
+        )
+        if docker and re.fullmatch(r"semgrep/semgrep@sha256:[0-9a-f]{64}", image):
+            docker_command = [
+                docker,
+                "run",
+                "--rm",
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--pids-limit=256",
+                "--memory=2g",
+                "--cpus=2",
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,size=256m",  # nosec B108 - isolated container tmpfs, not a host temp path
+                "--tmpfs",
+                "/root:rw,noexec,nosuid,size=256m",
+                "--env",
+                "SEMGREP_ENABLE_VERSION_CHECK=0",
+                "--volume",
+                f"{root}:/src:ro",
+                "--workdir",
+                "/src",
+                image,
+                "semgrep",
+                "scan",
+                "--metrics",
+                "off",
+                "--config",
+                "p/python",
+                "--json",
+                "src/aeitron",
+            ]
+            # Docker is resolved from PATH, the image is digest-pinned, root is canonical, and shell execution is disabled.
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
+            completed = subprocess.run(  # nosec B603
+                docker_command,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            backend = "docker_pinned"
+        elif completed is None:
+            return {"status": "skipped", "reason": missing or "Semgrep is unavailable"}
+    assert completed is not None
     if completed.returncode not in {0, 1}:
-        return {"status": "failed", "reason": completed.stderr[-2000:] or completed.stdout[-2000:]}
+        return {
+            "status": "failed",
+            "backend": backend,
+            "reason": completed.stderr[-2000:] or completed.stdout[-2000:],
+        }
     try:
         payload = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError:
@@ -241,7 +298,13 @@ def _run_semgrep(root: Path) -> dict[str, Any]:
     findings = payload.get("results", [])
     error_count = sum(1 for item in findings if item.get("extra", {}).get("severity") == "ERROR")
     warning_count = sum(1 for item in findings if item.get("extra", {}).get("severity") == "WARNING")
-    return {"status": "passed" if error_count == 0 else "failed", "issue_count": len(findings), "error_count": error_count, "warning_count": warning_count}
+    return {
+        "status": "passed" if error_count == 0 else "failed",
+        "backend": backend,
+        "issue_count": len(findings),
+        "error_count": error_count,
+        "warning_count": warning_count,
+    }
 
 
 def _run_codeql(root: Path) -> dict[str, Any]:

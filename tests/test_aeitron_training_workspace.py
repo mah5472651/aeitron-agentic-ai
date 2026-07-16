@@ -19,6 +19,7 @@ from src.aeitron.training_workspace import (
     JobStatus,
     KubernetesPyTorchAdapter,
     KubernetesSchedulerAdapter,
+    QualificationCampaignRegistry,
     SlurmSchedulerAdapter,
     TrainingArtifact,
     CheckpointCommitRequest,
@@ -30,6 +31,7 @@ from src.aeitron.training_workspace import (
     TrainingJobCreateRequest,
     TrainingProfileRegistry,
     TrainingWorkspaceService,
+    build_training_command,
     workspace_readiness,
 )
 
@@ -64,12 +66,36 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
 
     def test_registry_is_immutable_and_has_scale_profiles(self) -> None:
         registry = TrainingProfileRegistry.from_file()
-        self.assertEqual(registry.schema_version, 1)
+        self.assertEqual(registry.schema_version, 2)
         self.assertEqual(registry.latest("defensive-1k").scheduler, "notebook")
         target = registry.latest("aeitron-60b-hybrid")
         self.assertEqual(target.distributed_strategy, "megatron")
         self.assertTrue(target.resources.rdma_required)
         self.assertEqual(len(target.immutable_hash), 64)
+        self.assertEqual(target.optimizer.name, "adamw")
+        self.assertEqual(target.learning_rate.schedule, "cosine")
+        self.assertEqual(target.token_budget.global_batch_sequences, 2048)
+        self.assertTrue(target.checkpoint.require_reload_verification)
+        self.assertTrue(target.promotion.require_no_regression)
+        self.assertTrue(target.scheduler_policy.gang_scheduling)
+        self.assertGreater(target.cost_quota.estimated_gpu_hour_cost_usd, 0.0)
+
+    def test_qualification_campaign_has_dense_gated_milestones(self) -> None:
+        campaign = QualificationCampaignRegistry.from_file().latest("defensive-staircase-v1")
+        milestones = campaign.milestones
+        self.assertEqual(len(milestones), 37)
+        self.assertEqual([item.steps for item in milestones[:12]], list(range(1000, 13000, 1000)))
+        self.assertEqual(milestones[-1].steps, 1_000_000)
+        self.assertEqual(milestones[-1].previous_milestone_id, "steps-0900000")
+
+    def test_resolved_policy_recomputes_tokens_and_reaches_runtime_command(self) -> None:
+        request = self.request(overrides={"steps": 2000})
+        spec = self.service.resolve_spec(request)
+        self.assertEqual(spec.token_budget.target_tokens, 256_000)
+        command = build_training_command(spec, output_dir="artifacts/aeitron/test")
+        self.assertIn("--learning-rate-schedule", command)
+        self.assertIn("--checkpoint-every", command)
+        self.assertIn("--optimizer-beta2", command)
 
     def test_synced_profile_version_is_append_only(self) -> None:
         profiles = self.service.profiles.profiles
@@ -91,6 +117,22 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
                 )
             )
 
+    def test_job_admission_enforces_projected_gpu_cost(self) -> None:
+        profiles = list(self.service.profiles.profiles)
+        source = self.service.profiles.latest("defensive-1k")
+        expensive = source.model_copy(
+            update={
+                "profile_id": "defensive-cost-blocked",
+                "cost_quota": source.cost_quota.model_copy(
+                    update={"maximum_cost_usd": 1.0, "estimated_gpu_hour_cost_usd": 100.0}
+                ),
+            }
+        )
+        self.service.profiles = TrainingProfileRegistry(schema_version=2, profiles=[*profiles, expensive])
+        request = self.request(profile_id=expensive.profile_id, idempotency_key="workspace-cost-quota-1")
+        with self.assertRaisesRegex(ValueError, "projected cost"):
+            asyncio.run(self.service.create_job(request, owner_id="researcher-cost"))
+
     def test_profile_override_bounds_and_pretraining_inputs_fail_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "between"):
             self.service.resolve_spec(self.request(overrides={"steps": 999999}))
@@ -100,6 +142,32 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
             self.service.resolve_spec(
                 self.request(profile_id="aeitron-7b-fsdp", idempotency_key="workspace-pretrain-1")
             )
+
+    def test_qualification_next_milestone_is_locked_until_previous_proof(self) -> None:
+        common = {
+            "dataset_manifest_uri": "file:///data/manifest.json",
+            "dataset_manifest_sha256": "b" * 64,
+            "tokenizer_uri": "file:///data/tokenizer.json",
+            "tokenizer_sha256": "c" * 64,
+            "qualification_campaign_id": "defensive-staircase-v1",
+        }
+        first = self.request(
+            profile_id="defensive-staircase-notebook",
+            idempotency_key="qualification-first",
+            overrides={"steps": 1000},
+            qualification_milestone_id="steps-0001000",
+            **common,
+        )
+        asyncio.run(self.service.create_job(first, owner_id="qualification-owner"))
+        second = self.request(
+            profile_id="defensive-staircase-notebook",
+            idempotency_key="qualification-second",
+            overrides={"steps": 2000},
+            qualification_milestone_id="steps-0002000",
+            **common,
+        )
+        with self.assertRaisesRegex(ValueError, "previous job status=queued"):
+            asyncio.run(self.service.create_job(second, owner_id="qualification-owner"))
 
     def test_notebook_claim_events_redaction_ordering_and_terminal_state(self) -> None:
         job = asyncio.run(self.service.create_job(self.request(), owner_id="researcher-1"))

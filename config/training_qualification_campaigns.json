@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "campaigns": [
+    {
+      "campaign_id": "defensive-staircase-v1",
+      "version": 1,
+      "description": "Progressive scratch-training qualification: 1k increments through 10k, 10k increments through 100k, then 100k increments through 1M. Every stage is locked behind checkpoint reload, evaluation, regression, and immutable-input gates.",
+      "ranges": [
+        {
+          "start_steps": 1000,
+          "stop_steps": 10000,
+          "increment_steps": 1000,
+          "profile_id": "defensive-staircase-notebook"
+        },
+        {
+          "start_steps": 11000,
+          "stop_steps": 20000,
+          "increment_steps": 1000,
+          "profile_id": "defensive-staircase-cluster"
+        },
+        {
+          "start_steps": 30000,
+          "stop_steps": 100000,
+          "increment_steps": 10000,
+          "profile_id": "defensive-staircase-cluster"
+        },
+        {
+          "start_steps": 200000,
+          "stop_steps": 1000000,
+          "increment_steps": 100000,
+          "profile_id": "defensive-staircase-cluster"
+        }
+      ],
+      "gate": {
+        "require_succeeded_job": true,
+        "require_reload_verified_checkpoint": true,
+        "require_passing_evaluation": true,
+        "require_same_dataset_and_tokenizer": true,
+        "maximum_validation_regression": 0.03
+      }
+    }
+  ]
+}

@@ -78,12 +78,24 @@ class DataPipelineConfig(StrictModel):
     train_device: str = "auto"
     train_batch_size: int = Field(default=2, ge=1)
     gradient_accumulation_steps: int = Field(default=1, ge=1)
+    learning_rate: float = Field(default=1e-3, gt=0.0, le=1.0)
+    optimizer_beta1: float = Field(default=0.9, gt=0.0, lt=1.0)
+    optimizer_beta2: float = Field(default=0.95, gt=0.0, lt=1.0)
+    optimizer_epsilon: float = Field(default=1e-8, gt=0.0)
+    weight_decay: float = Field(default=0.1, ge=0.0, le=1.0)
+    gradient_clip_norm: float = Field(default=1.0, gt=0.0)
+    learning_rate_schedule: str = Field(default="cosine", pattern="^(constant|linear|cosine)$")
+    warmup_steps: int = Field(default=0, ge=0)
+    warmup_ratio: float = Field(default=0.0, ge=0.0, lt=1.0)
+    minimum_learning_rate_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
+    target_tokens: int | None = Field(default=None, gt=0)
     dtype: str = "bf16"
     model_profile_name: str = "tiny"
     attention_impl: str = "auto"
     gradient_checkpointing: bool = False
     validate_every: int = Field(default=25, ge=0)
     validation_batches: int = Field(default=4, ge=1)
+    checkpoint_every: int = Field(default=50, ge=1)
     run_checkpoint_eval: bool = True
     early_stopping_patience: int = Field(default=0, ge=0)
     early_stopping_min_delta: float = Field(default=0.0, ge=0.0)
@@ -130,6 +142,11 @@ class DataPipelineConfig(StrictModel):
     progress_to_stdout: bool = False
     progress_every_docs: int = Field(default=25, ge=1)
     progress_every_steps: int = Field(default=25, ge=1)
+    dataloader_prefetch_batches: int = Field(default=4, ge=0, le=128)
+    dataloader_seed: int = Field(default=1337, ge=0, le=2**31 - 1)
+    expected_python_version: str | None = None
+    expected_pytorch_version: str | None = None
+    expected_cuda_version: str | None = None
     production_mode: bool = False
     dev_smoke: bool = False
 
@@ -672,11 +689,22 @@ async def _run_data_pipeline_locked(
             batch_size=config.train_batch_size,
             sequence_length=config.sequence_length,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
+            learning_rate=config.learning_rate,
+            optimizer_beta1=config.optimizer_beta1,
+            optimizer_beta2=config.optimizer_beta2,
+            optimizer_epsilon=config.optimizer_epsilon,
+            weight_decay=config.weight_decay,
+            gradient_clip_norm=config.gradient_clip_norm,
+            learning_rate_schedule=config.learning_rate_schedule,
+            warmup_steps=config.warmup_steps,
+            warmup_ratio=config.warmup_ratio,
+            minimum_learning_rate_ratio=config.minimum_learning_rate_ratio,
+            target_tokens=config.target_tokens,
             dtype=config.dtype,
             model_profile_name=config.model_profile_name,
             attention_impl=config.attention_impl,
             gradient_checkpointing=config.gradient_checkpointing,
-            checkpoint_every=max(1, config.train_steps),
+            checkpoint_every=min(config.checkpoint_every, config.train_steps),
             validate_every=config.validate_every,
             validation_batches=config.validation_batches,
             early_stopping_patience=config.early_stopping_patience,
@@ -686,6 +714,11 @@ async def _run_data_pipeline_locked(
             progress_every_steps=config.progress_every_steps,
             production_mode=config.production_mode,
             dev_smoke=config.dev_smoke,
+            dataloader_prefetch_batches=config.dataloader_prefetch_batches,
+            dataloader_seed=config.dataloader_seed,
+            expected_python_version=config.expected_python_version,
+            expected_pytorch_version=config.expected_pytorch_version,
+            expected_cuda_version=config.expected_cuda_version,
         )
         if config.run_checkpoint_eval:
             progress.emit("checkpoint_eval", "started")

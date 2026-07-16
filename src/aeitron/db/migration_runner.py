@@ -25,7 +25,7 @@ class Migration:
 def load_migrations(migrations_dir: Path = MIGRATIONS_DIR) -> list[Migration]:
     migrations = []
     for path in sorted(migrations_dir.glob("*.sql")):
-        sql = path.read_text(encoding="utf-8")
+        sql = path.read_text(encoding="utf-8-sig")
         migrations.append(
             Migration(
                 version=path.stem,
@@ -46,7 +46,7 @@ def expand_psql_includes(sql: str, *, base_dir: Path | None = None) -> str:
             include_path = Path(stripped[3:].strip())
             if not include_path.is_absolute():
                 include_path = (base / include_path).resolve()
-            output.append(include_path.read_text(encoding="utf-8"))
+            output.append(include_path.read_text(encoding="utf-8-sig"))
         else:
             output.append(line)
     return "\n".join(output)

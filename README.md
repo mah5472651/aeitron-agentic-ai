@@ -759,6 +759,40 @@ Local production-service proof:
 docker compose -f deploy/prod/docker-compose.yml --profile training up --build
 ```
 
+Immutable qualification campaign and measured infrastructure proofs:
+
+```powershell
+python -m src.aeitron.training_workspace campaigns
+docker compose -p aeitron-proof -f deploy\proof\docker-compose.yml up -d
+python -m src.aeitron.training_proofs `
+  --output-dir artifacts\aeitron\production-proofs\local-docker
+```
+
+The `defensive-staircase-v1` campaign contains 37 ordered milestones: 1k
+increments through 20k, 10k increments through 100k, then 100k increments
+through 1M. A milestone cannot be submitted until the previous job succeeded,
+its checkpoint reloaded, its evaluation passed, validation did not regress by
+more than 3%, and dataset/tokenizer hashes are unchanged. The campaign is a
+qualification ladder, not a substitute for token-budget planning or parameter
+scaling.
+
+The full event and soak proofs are explicit long-running operations:
+
+```powershell
+python -m src.aeitron.training_proofs --event-count 1000000 `
+  --skip-disaster-recovery --output-dir artifacts\aeitron\production-proofs\million-events
+python -m src.aeitron.training_proofs --soak-seconds 86400 `
+  --output-dir artifacts\aeitron\production-proofs\24-hour-soak
+```
+
+The measured local run accepted and sequence-verified 1,000,000 events at
+1,285.64 events/second. Cluster schedulers, multi-node GPU recovery, the full
+24-hour soak, and 60B checkpoint resume remain blocked until those real targets
+are connected; the proof report never substitutes a local mock pass.
+
+Missing Kubernetes, Slurm, CUDA, DeepSpeed, or Megatron dependencies are
+recorded as `blocked`; they are never converted to a passing proof.
+
 The workspace UI is exposed at `http://localhost:8088`. Production ingress must
 terminate HTTPS. Profile status remains `built_not_cluster_proven` until its
 actual scheduler, topology, checkpoint reload, and scale gate pass.

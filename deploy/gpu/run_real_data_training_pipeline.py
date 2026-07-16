@@ -168,6 +168,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-steps", "--steps", dest="train_steps", type=int, default=1_000)
     parser.add_argument("--train-batch-size", "--batch-size", dest="train_batch_size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--optimizer-beta1", type=float, default=0.9)
+    parser.add_argument("--optimizer-beta2", type=float, default=0.95)
+    parser.add_argument("--optimizer-epsilon", type=float, default=1e-8)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
+    parser.add_argument("--learning-rate-schedule", choices=["constant", "linear", "cosine"], default="cosine")
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--warmup-ratio", type=float, default=0.0)
+    parser.add_argument("--minimum-learning-rate-ratio", type=float, default=0.1)
+    parser.add_argument("--target-tokens", type=int)
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="fp16")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cuda")
     parser.add_argument("--model-profile", default="tiny", choices=["tiny", "t4_validation", "1b", "7b", "32b", "62b"])
@@ -175,6 +186,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--validate-every", "--validation-interval", dest="validate_every", type=int, default=25)
     parser.add_argument("--validation-batches", type=int, default=4)
+    parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--early-stopping-patience", type=int, default=8)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--no-training-data-gate", action="store_true")
@@ -209,6 +221,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-progress-stdout", action="store_true")
     parser.add_argument("--progress-every-docs", type=int, default=10)
     parser.add_argument("--progress-every-steps", type=int, default=10)
+    parser.add_argument("--dataloader-prefetch-batches", type=int, default=4)
+    parser.add_argument("--dataloader-seed", type=int, default=1337)
+    parser.add_argument("--expected-python-version")
+    parser.add_argument("--expected-pytorch-version")
+    parser.add_argument("--expected-cuda-version")
     parser.add_argument("--production", action="store_true", help="Enable strict production data/training validation.")
     parser.add_argument("--dev-smoke", action="store_true", help="Explicitly allow tiny/dev smoke behavior under production validation.")
     parser.add_argument("--kaggle-validation", action="store_true", help="Use explicit Kaggle-safe validation thresholds; not for production.")
@@ -252,12 +269,24 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 train_device=args.device,
                 train_batch_size=args.train_batch_size,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
+                learning_rate=args.learning_rate,
+                optimizer_beta1=args.optimizer_beta1,
+                optimizer_beta2=args.optimizer_beta2,
+                optimizer_epsilon=args.optimizer_epsilon,
+                weight_decay=args.weight_decay,
+                gradient_clip_norm=args.gradient_clip_norm,
+                learning_rate_schedule=args.learning_rate_schedule,
+                warmup_steps=args.warmup_steps,
+                warmup_ratio=args.warmup_ratio,
+                minimum_learning_rate_ratio=args.minimum_learning_rate_ratio,
+                target_tokens=args.target_tokens,
                 dtype=args.dtype,
                 model_profile_name=args.model_profile,
                 attention_impl=args.attention_impl,
                 gradient_checkpointing=args.gradient_checkpointing,
                 validate_every=min(args.validate_every, args.train_steps) if args.validate_every > 0 else 0,
                 validation_batches=args.validation_batches,
+                checkpoint_every=args.checkpoint_every,
                 early_stopping_patience=args.early_stopping_patience,
                 early_stopping_min_delta=args.early_stopping_min_delta,
                 apply_training_data_gate=not args.no_training_data_gate,
@@ -288,6 +317,11 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 progress_to_stdout=args.progress_to_stdout or not args.no_progress_stdout,
                 progress_every_docs=args.progress_every_docs,
                 progress_every_steps=args.progress_every_steps,
+                dataloader_prefetch_batches=args.dataloader_prefetch_batches,
+                dataloader_seed=args.dataloader_seed,
+                expected_python_version=args.expected_python_version,
+                expected_pytorch_version=args.expected_pytorch_version,
+                expected_cuda_version=args.expected_cuda_version,
                 production_mode=args.production,
                 dev_smoke=args.dev_smoke,
             )

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from src.aeitron.evaluation.eval_runner import EvalRunReport, aggregate_scores, evaluate_checkpoint_with_schedule, regression_flags
 from src.aeitron.learning.mixer import build_mix
-from src.aeitron.model_ops.pretrain_loop import save_training_checkpoint
+from src.aeitron.model_ops.pretrain_loop import build_learning_rate_scheduler, save_training_checkpoint
 from src.aeitron.model_ops.tokenizer_pipeline import TokenizerTrainConfig, train_bpe_tokenizer
 from src.aeitron.model_ops.torch_decoder import AeitronDecoderLM, tiny_smoke_config
 
@@ -33,6 +33,25 @@ def write_jsonl(path: Path, rows: list[dict[str, object]]) -> Path:
 
 @unittest.skipIf(torch is None, "torch is required for Aeitron training-control tests")
 class AeitronTrainingControlTest(unittest.TestCase):
+    def test_warmup_cosine_scheduler_is_finite_and_decays(self) -> None:
+        parameter = torch.nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.AdamW([parameter], lr=1e-3)
+        scheduler = build_learning_rate_scheduler(
+            optimizer,
+            total_steps=100,
+            warmup_steps=10,
+            schedule="cosine",
+            minimum_learning_rate_ratio=0.1,
+        )
+        values = []
+        for _ in range(100):
+            optimizer.step()
+            scheduler.step()
+            values.append(optimizer.param_groups[0]["lr"])
+        self.assertGreater(max(values[:10]), min(values[:10]))
+        self.assertGreater(values[20], values[-1])
+        self.assertGreaterEqual(values[-1], 1e-4 - 1e-8)
+
     def make_tiny_checkpoint(self, root: Path) -> tuple[Path, Path]:
         corpus = write_jsonl(
             root / "corpus.jsonl",

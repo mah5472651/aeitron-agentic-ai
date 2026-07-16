@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess  # nosec B404
+import sys
 import time
 from functools import partial
 from pathlib import Path
@@ -33,6 +35,65 @@ except ImportError:  # pragma: no cover
 
 
 DistributedStrategy = Literal["none", "fsdp", "deepspeed_zero2", "deepspeed_zero3", "megatron"]
+LearningRateSchedule = Literal["constant", "linear", "cosine"]
+
+
+def build_learning_rate_scheduler(
+    optimizer: Any,
+    *,
+    total_steps: int,
+    warmup_steps: int,
+    schedule: LearningRateSchedule,
+    minimum_learning_rate_ratio: float,
+) -> Any:
+    if total_steps < 1:
+        raise ValueError("total_steps must be positive")
+    if not 0 <= warmup_steps < total_steps:
+        raise ValueError("warmup_steps must satisfy 0 <= warmup_steps < total_steps")
+    if not 0.0 <= minimum_learning_rate_ratio <= 1.0:
+        raise ValueError("minimum_learning_rate_ratio must be between 0 and 1")
+
+    def multiplier(step: int) -> float:
+        if warmup_steps and step < warmup_steps:
+            return max(minimum_learning_rate_ratio, float(step + 1) / float(warmup_steps))
+        if schedule == "constant":
+            return 1.0
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, float(step - warmup_steps) / float(decay_steps)))
+        if schedule == "linear":
+            factor = 1.0 - progress
+        elif schedule == "cosine":
+            factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        else:
+            raise ValueError(f"unsupported learning-rate schedule: {schedule}")
+        return minimum_learning_rate_ratio + (1.0 - minimum_learning_rate_ratio) * factor
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=multiplier)
+
+
+def validate_runtime_versions(
+    *,
+    expected_python: str | None,
+    expected_pytorch: str | None,
+    expected_cuda: str | None,
+    device: Any,
+) -> dict[str, str]:
+    actual = {
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "pytorch": str(torch.__version__).split("+", 1)[0],
+        "cuda": str(torch.version.cuda or "none"),
+    }
+    expected = {"python": expected_python, "pytorch": expected_pytorch, "cuda": expected_cuda}
+    for name, expected_value in expected.items():
+        if not expected_value:
+            continue
+        if name == "cuda" and device.type != "cuda":
+            raise RuntimeError(f"runtime contract requires CUDA {expected_value}, but selected device is {device.type}")
+        if not actual[name].startswith(expected_value):
+            raise RuntimeError(
+                f"runtime {name} mismatch: expected prefix {expected_value!r}, actual={actual[name]!r}"
+            )
+    return actual
 
 
 def is_deepspeed_strategy(strategy: DistributedStrategy) -> bool:
@@ -657,6 +718,16 @@ def run_pretraining_loop(
     batch_size: int = 2,
     sequence_length: int = 64,
     learning_rate: float = 1e-3,
+    optimizer_beta1: float = 0.9,
+    optimizer_beta2: float = 0.95,
+    optimizer_epsilon: float = 1e-8,
+    weight_decay: float = 0.1,
+    gradient_clip_norm: float = 1.0,
+    learning_rate_schedule: LearningRateSchedule = "cosine",
+    warmup_steps: int = 0,
+    warmup_ratio: float = 0.0,
+    minimum_learning_rate_ratio: float = 0.1,
+    target_tokens: int | None = None,
     gradient_accumulation_steps: int = 1,
     dtype: str = "bf16",
     validate_every: int = 25,
@@ -675,6 +746,11 @@ def run_pretraining_loop(
     production_mode: bool = False,
     dev_smoke: bool = False,
     max_training_loss: float = 10_000.0,
+    dataloader_prefetch_batches: int = 4,
+    dataloader_seed: int = 1337,
+    expected_python_version: str | None = None,
+    expected_pytorch_version: str | None = None,
+    expected_cuda_version: str | None = None,
 ) -> dict[str, Any]:
     require_torch()
     if steps < 1:
@@ -683,7 +759,24 @@ def run_pretraining_loop(
         raise ValueError("gradient_accumulation_steps must be >= 1")
     if early_stopping_patience < 0:
         raise ValueError("early_stopping_patience must be >= 0")
+    if not 0.0 < learning_rate <= 1.0:
+        raise ValueError("learning_rate must be between 0 and 1")
+    if not (0.0 < optimizer_beta1 < 1.0 and 0.0 < optimizer_beta2 < 1.0):
+        raise ValueError("optimizer beta values must be between 0 and 1")
+    if optimizer_epsilon <= 0.0 or weight_decay < 0.0 or gradient_clip_norm <= 0.0:
+        raise ValueError("optimizer epsilon/gradient clip must be positive and weight decay non-negative")
+    if warmup_steps and warmup_ratio:
+        raise ValueError("set either warmup_steps or warmup_ratio, not both")
+    resolved_warmup_steps = warmup_steps or int(steps * warmup_ratio)
+    if resolved_warmup_steps >= steps:
+        raise ValueError("warmup must be shorter than the training run")
     selected = select_device(device)
+    runtime_versions = validate_runtime_versions(
+        expected_python=expected_python_version,
+        expected_pytorch=expected_pytorch_version,
+        expected_cuda=expected_cuda_version,
+        device=selected,
+    )
     distributed_report = initialize_distributed_runtime(distributed_strategy, selected)
     if distributed_report["enabled"] and selected.type == "cuda":
         selected = torch.device(f"cuda:{distributed_report['local_rank']}")
@@ -751,11 +844,19 @@ def run_pretraining_loop(
         active_manifest.train_shards,
         sequence_length=sequence_length,
         batch_size=batch_size,
-        seed=1337,
+        seed=dataloader_seed,
         shuffle=True,
+        prefetch_batches=dataloader_prefetch_batches,
     )
     val_stream = (
-        TokenShardStream(active_manifest.val_shards, sequence_length=sequence_length, batch_size=batch_size, seed=7331, shuffle=False)
+        TokenShardStream(
+            active_manifest.val_shards,
+            sequence_length=sequence_length,
+            batch_size=batch_size,
+            seed=dataloader_seed + 5994,
+            shuffle=False,
+            prefetch_batches=dataloader_prefetch_batches,
+        )
         if active_manifest.val_shards
         else None
     )
@@ -765,8 +866,20 @@ def run_pretraining_loop(
         model.enable_gradient_checkpointing()
     if not is_deepspeed_strategy(distributed_strategy):
         model = wrap_for_distributed(model, strategy=distributed_strategy, dtype=dtype, device=selected)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.1)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _step: 1.0)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        betas=(optimizer_beta1, optimizer_beta2),
+        eps=optimizer_epsilon,
+        weight_decay=weight_decay,
+    )
+    scheduler = build_learning_rate_scheduler(
+        optimizer,
+        total_steps=steps,
+        warmup_steps=resolved_warmup_steps,
+        schedule=learning_rate_schedule,
+        minimum_learning_rate_ratio=minimum_learning_rate_ratio,
+    )
     if is_deepspeed_strategy(distributed_strategy):
         model, optimizer, scheduler = wrap_for_deepspeed(
             model,
@@ -784,6 +897,15 @@ def run_pretraining_loop(
         "batch_size": batch_size,
         "sequence_length": sequence_length,
         "learning_rate": learning_rate,
+        "optimizer_beta1": optimizer_beta1,
+        "optimizer_beta2": optimizer_beta2,
+        "optimizer_epsilon": optimizer_epsilon,
+        "weight_decay": weight_decay,
+        "gradient_clip_norm": gradient_clip_norm,
+        "learning_rate_schedule": learning_rate_schedule,
+        "warmup_steps": resolved_warmup_steps,
+        "minimum_learning_rate_ratio": minimum_learning_rate_ratio,
+        "target_tokens": target_tokens,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "dtype": dtype,
         "validate_every": validate_every,
@@ -799,6 +921,9 @@ def run_pretraining_loop(
         "production_mode": production_mode,
         "dev_smoke": dev_smoke,
         "max_training_loss": max_training_loss,
+        "dataloader_prefetch_batches": dataloader_prefetch_batches,
+        "dataloader_seed": dataloader_seed,
+        "runtime_versions": runtime_versions,
     }
     start_step = 0
     trained_tokens = 0
@@ -853,14 +978,20 @@ def run_pretraining_loop(
                 model.step()
                 grad_norm = torch.tensor(0.0)
             elif (current_step + 1) % gradient_accumulation_steps == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), gradient_clip_norm, error_if_nonfinite=True
+                )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
             else:
                 grad_norm = torch.tensor(0.0)
             current_step += 1
-            trained_tokens += batch_size * sequence_length
+            trained_tokens += batch_size * sequence_length * int(distributed_report.get("world_size", 1))
+            if target_tokens is not None and trained_tokens > target_tokens:
+                raise RuntimeError(
+                    f"training token accounting exceeded immutable target: {trained_tokens} > {target_tokens}"
+                )
             train_losses.append(float(output.loss.detach().cpu()))
             if current_step == 1 or current_step % max(1, progress_every_steps) == 0 or current_step >= steps:
                 active_progress.emit(
@@ -872,6 +1003,7 @@ def run_pretraining_loop(
                     grad_norm=round(float(grad_norm.detach().cpu()), 6),
                     trained_tokens=trained_tokens,
                     epoch=epoch,
+                    learning_rate=float(optimizer.param_groups[0]["lr"]),
                 )
 
             if val_stream is not None and validate_every > 0 and current_step % validate_every == 0:
@@ -1025,6 +1157,8 @@ def run_pretraining_loop(
         "best_validation_step": best_val_step,
         "best_checkpoint_manifest": str(best_checkpoint_manifest),
         "trained_tokens": trained_tokens,
+        "target_tokens": target_tokens,
+        "runtime_versions": runtime_versions,
         "checkpoint_manifest": str(manifest_path),
         "duration_ms": round((time.perf_counter() - started) * 1000, 3),
     }
@@ -1055,6 +1189,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--sequence-length", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--optimizer-beta1", type=float, default=0.9)
+    parser.add_argument("--optimizer-beta2", type=float, default=0.95)
+    parser.add_argument("--optimizer-epsilon", type=float, default=1e-8)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
+    parser.add_argument("--learning-rate-schedule", choices=["constant", "linear", "cosine"], default="cosine")
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--warmup-ratio", type=float, default=0.0)
+    parser.add_argument("--minimum-learning-rate-ratio", type=float, default=0.1)
+    parser.add_argument("--target-tokens", type=int)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--validate-every", type=int, default=25)
@@ -1069,6 +1213,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--production", action="store_true", help="Enable strict production training validation.")
     parser.add_argument("--dev-smoke", action="store_true", help="Explicitly allow tiny/dev smoke behavior under production validation.")
     parser.add_argument("--max-training-loss", type=float, default=10_000.0)
+    parser.add_argument("--dataloader-prefetch-batches", type=int, default=4)
+    parser.add_argument("--dataloader-seed", type=int, default=1337)
+    parser.add_argument("--expected-python-version")
+    parser.add_argument("--expected-pytorch-version")
+    parser.add_argument("--expected-cuda-version")
     parser.add_argument(
         "--distributed-strategy",
         default="none",
@@ -1125,6 +1274,16 @@ def main() -> None:
         batch_size=args.batch_size,
         sequence_length=args.sequence_length,
         learning_rate=args.learning_rate,
+        optimizer_beta1=args.optimizer_beta1,
+        optimizer_beta2=args.optimizer_beta2,
+        optimizer_epsilon=args.optimizer_epsilon,
+        weight_decay=args.weight_decay,
+        gradient_clip_norm=args.gradient_clip_norm,
+        learning_rate_schedule=args.learning_rate_schedule,
+        warmup_steps=args.warmup_steps,
+        warmup_ratio=args.warmup_ratio,
+        minimum_learning_rate_ratio=args.minimum_learning_rate_ratio,
+        target_tokens=args.target_tokens,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         dtype=args.dtype,
         validate_every=args.validate_every,
@@ -1141,6 +1300,11 @@ def main() -> None:
         production_mode=args.production,
         dev_smoke=args.dev_smoke,
         max_training_loss=args.max_training_loss,
+        dataloader_prefetch_batches=args.dataloader_prefetch_batches,
+        dataloader_seed=args.dataloader_seed,
+        expected_python_version=args.expected_python_version,
+        expected_pytorch_version=args.expected_pytorch_version,
+        expected_cuda_version=args.expected_cuda_version,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

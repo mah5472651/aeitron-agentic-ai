@@ -17,7 +17,13 @@ from src.aeitron.evaluation.benchmark_pack import BenchmarkPackConfig, run_bench
 from src.aeitron.evaluation.benchmark_suites import BenchmarkSuiteSpec, run_benchmark_suites
 from src.aeitron.learning.dataset_validation import DatasetValidationConfig, validate_dataset
 from src.aeitron.learning.source_balancing import balance_clean_jsonl
-from src.aeitron.learning.storage import LocalObjectStore, ObjectStoreConfig, upload_paths, verify_object_store_lifecycle
+from src.aeitron.learning.storage import (
+    LocalObjectStore,
+    ObjectStoreConfig,
+    S3ObjectStore,
+    upload_paths,
+    verify_object_store_lifecycle,
+)
 from src.aeitron.production_readiness import run_production_readiness
 from src.aeitron.security.audit import run_security_audit
 
@@ -49,6 +55,16 @@ class AeitronEnterpriseReadinessTest(unittest.TestCase):
             self.assertEqual(report.status, "passed")
             self.assertTrue(report.checksum_match)
             self.assertTrue(report.deleted)
+
+    def test_s3_object_keys_are_posix_normalized_and_traversal_safe(self) -> None:
+        store = object.__new__(S3ObjectStore)
+        store.prefix = "training-workspace"
+        self.assertEqual(
+            store._object_key(r"proofs\run-1\lifecycle.json"),
+            "training-workspace/proofs/run-1/lifecycle.json",
+        )
+        with self.assertRaises(ValueError):
+            store._object_key("../outside.json")
 
     def test_production_proof_validation_mode_skips_missing_external_infra(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
