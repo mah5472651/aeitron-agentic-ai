@@ -396,6 +396,72 @@ class VerifierPolicyContract(StrictModel):
         return self
 
 
+class DatasetSourceLimitsContract(StrictModel):
+    new_source_max_token_fraction: float = Field(default=0.01, gt=0.0, le=0.05)
+    source_max_token_fraction: float = Field(default=0.20, gt=0.0, le=0.50)
+    source_family_max_token_fraction: float = Field(default=0.35, gt=0.0, le=0.75)
+    minimum_reviewed_records: int = Field(default=100, ge=10)
+    minimum_reputation_lower_bound: float = Field(default=0.70, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> "DatasetSourceLimitsContract":
+        if self.new_source_max_token_fraction >= self.source_max_token_fraction:
+            raise ValueError("new source cap must be lower than mature source cap")
+        if self.source_max_token_fraction > self.source_family_max_token_fraction:
+            raise ValueError("source cap cannot exceed source-family cap")
+        return self
+
+
+class DatasetReviewPolicyContract(StrictModel):
+    high_value_requires_two_reviewers: bool = True
+    reviewer_agreement_minimum: float = Field(default=0.80, ge=0.0, le=1.0)
+    sampled_acceptance_minimum: float = Field(default=0.95, ge=0.0, le=1.0)
+    routine_sample_fraction: float = Field(default=0.03, gt=0.0, le=0.25)
+    blind_review: bool = True
+    independent_reviewer_identities: bool = True
+
+
+class DatasetPromotionThresholdsContract(StrictModel):
+    minimum_records: int = Field(default=100_000, ge=1)
+    minimum_average_quality: float = Field(default=0.80, ge=0.0, le=1.0)
+    minimum_p10_quality: float = Field(default=0.70, ge=0.0, le=1.0)
+    maximum_residual_near_duplicate_fraction: float = Field(default=0.005, ge=0.0, le=0.05)
+    maximum_benchmark_contamination: int = Field(default=0, ge=0)
+    maximum_secret_or_pii_hits: int = Field(default=0, ge=0)
+    required_license_coverage: float = Field(default=1.0, ge=0.0, le=1.0)
+    required_provenance_coverage: float = Field(default=1.0, ge=0.0, le=1.0)
+    required_high_value_review_coverage: float = Field(default=1.0, ge=0.0, le=1.0)
+    required_verified_patch_evidence_coverage: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class DatasetTrustPolicyContract(StrictModel):
+    schema_version: int = 1
+    policy_id: str = Field(min_length=3, pattern=r"^[a-z0-9][a-z0-9._-]{2,100}$")
+    scratch_only: bool = True
+    source_limits: DatasetSourceLimitsContract = Field(default_factory=DatasetSourceLimitsContract)
+    review: DatasetReviewPolicyContract = Field(default_factory=DatasetReviewPolicyContract)
+    promotion: DatasetPromotionThresholdsContract = Field(default_factory=DatasetPromotionThresholdsContract)
+    protected_holdout_names: list[str] = Field(min_length=1)
+    high_value_data_types: list[str] = Field(min_length=1)
+    split_group_keys: list[str] = Field(min_length=1)
+    forbidden_content_classes: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> "DatasetTrustPolicyContract":
+        if not self.scratch_only:
+            raise ValueError("dataset trust policy must remain scratch_only")
+        if len(self.protected_holdout_names) != len(set(self.protected_holdout_names)):
+            raise ValueError("protected holdout names must be unique")
+        if len(self.high_value_data_types) != len(set(self.high_value_data_types)):
+            raise ValueError("high-value data types must be unique")
+        if len(self.split_group_keys) != len(set(self.split_group_keys)):
+            raise ValueError("split group keys must be unique")
+        required_groups = {"repository", "source_family", "patch_lineage", "task_signature"}
+        if not required_groups.issubset(set(self.split_group_keys)):
+            raise ValueError(f"split_group_keys must include {sorted(required_groups)}")
+        return self
+
+
 def load_mix_ratios_contract(path: str | Path) -> MixRatiosContract:
     return MixRatiosContract.model_validate(_load_json(path))
 
@@ -415,3 +481,6 @@ def load_security_audit_contract(path: str | Path) -> SecurityAuditConfigContrac
 def load_verifier_policy_contract(path: str | Path) -> VerifierPolicyContract:
     return VerifierPolicyContract.model_validate(_load_json(path))
 
+
+def load_dataset_trust_policy(path: str | Path) -> DatasetTrustPolicyContract:
+    return DatasetTrustPolicyContract.model_validate(_load_json(path))

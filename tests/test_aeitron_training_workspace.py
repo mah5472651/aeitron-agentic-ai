@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from src.aeitron.identity.auth import AuthConfig
 from src.aeitron.learning.storage import LocalObjectStore
 from src.aeitron.training_client import _validate_workspace_url, format_event
-from src.aeitron.model_ops.distributed_worker import normalize_slurm_environment
+from src.aeitron.model_ops.distributed_worker import normalize_slurm_environment, parse_args
 from src.aeitron.training_proofs import parse_dr_workload
 from src.aeitron.training_workspace import (
     ALLOWED_TRANSITIONS,
@@ -68,6 +68,22 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "rank topology"):
                 normalize_slurm_environment()
+
+    def test_distributed_worker_rejects_control_characters_in_arguments(self) -> None:
+        argv = [
+            "distributed_worker",
+            "--scheduler",
+            "slurm",
+            "--nodes",
+            "1",
+            "--processes-per-node",
+            "1",
+            "--",
+            "--output-dir",
+            "safe\ninjected",
+        ]
+        with patch("sys.argv", argv), self.assertRaises(SystemExit):
+            parse_args()
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()

@@ -166,6 +166,14 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
                                 "allowed_domains": ["example.org"],
                                 "license": "mit",
                                 "category": "defensive_security",
+                                "source_id": "good-security",
+                                "source_family": "security-family",
+                                "trust_tier": "reviewed",
+                                "approved_use": "defensive",
+                                "approval_status": "approved",
+                                "immutable_revision": "commit-good",
+                                "license_evidence_sha256": "1" * 64,
+                                "legal_approval_sha256": "2" * 64,
                             },
                             {
                                 "name": "weak-docs",
@@ -173,6 +181,14 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
                                 "allowed_domains": ["docs.example.org"],
                                 "license": "mit",
                                 "category": "documentation",
+                                "source_id": "weak-docs",
+                                "source_family": "documentation-family",
+                                "trust_tier": "reviewed",
+                                "approved_use": "foundation",
+                                "approval_status": "approved",
+                                "immutable_revision": "commit-weak",
+                                "license_evidence_sha256": "3" * 64,
+                                "legal_approval_sha256": "4" * 64,
                             },
                         ]
                     }
@@ -208,7 +224,24 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 encoding="utf-8",
             )
-            reputation = build_source_reputation_report(source_quality_report_path=source_quality)
+            reviews = root / "reviews.json"
+            reviews.write_text(
+                json.dumps(
+                    {
+                        "by_source": {
+                            "good-security": {"approved": 98, "rejected": 2},
+                            "weak-docs": {"approved": 60, "rejected": 40},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            reputation = build_source_reputation_report(
+                source_quality_report_path=source_quality,
+                source_registry_path=sources,
+                review_report_path=reviews,
+                minimum_reviewed_records=100,
+            )
             self.assertGreater(reputation.sources[0].reputation_score, reputation.sources[1].reputation_score)
             reputation_path = root / "reputation.json"
             reputation_path.write_text(json.dumps(reputation.model_dump()), encoding="utf-8")
@@ -750,7 +783,8 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
                 async_workers=32,
             )
         )
-        self.assertEqual(report.status, "pass")
+        self.assertEqual(report.status, "block")
+        self.assertIn("source_registry", {item.name for item in report.checks if item.status == "fail"})
 
     def test_quality_inspector_and_run_plan_prepare_first_serious_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -789,7 +823,7 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
                     async_workers=32,
                 )
             )
-            self.assertEqual(plan.status, "ready")
+            self.assertEqual(plan.status, "blocked")
             self.assertTrue(Path(plan.merged_registry_path).exists())
             self.assertTrue(Path(plan.output_dir, "run_plan.json").exists())
             self.assertIsNotNone(plan.resource_catalog)
@@ -868,8 +902,35 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
                         "license": "mit",
                         "category": "verified_security_patch",
                         "prompt": "Fix a defensive authentication validation bug and preserve regression tests.",
-                        "chosen": "<|thought_start|>defensive fix<|thought_end|><|patch_start|>def login(u,p): return bool(u and p)<|patch_end|>",
-                        "verification": {"status": "passed"},
+                        "chosen": (
+                            "<|thought_start|>Validate both authentication inputs, preserve the existing public contract, "
+                            "and verify the regression and security tests before reporting success.<|thought_end|>"
+                            "<|patch_start|>def login(user, password):\n"
+                            "    if not isinstance(user, str) or not isinstance(password, str):\n"
+                            "        return False\n"
+                            "    return bool(user.strip() and password)<|patch_end|>"
+                        ),
+                        "provenance": {
+                            "source_id": "approved-repo",
+                            "source_family": "approved-repositories",
+                            "source_url": "https://example.org/approved-repo",
+                            "immutable_revision": "release-1",
+                            "license": "mit",
+                            "license_evidence_sha256": "a" * 64,
+                            "legal_approval_sha256": "b" * 64,
+                            "source_snapshot_sha256": "c" * 64,
+                        },
+                        "verification": {
+                            "status": "passed",
+                            "vulnerable_checkout_hash": "d" * 40,
+                            "vulnerable_test_failed": True,
+                            "patch_applied": True,
+                            "build_passed": True,
+                            "security_test_passed": True,
+                            "regression_tests_passed": True,
+                            "static_scan_passed": True,
+                            "manifest_sha256": "e" * 64,
+                        },
                     },
                     sort_keys=True,
                 )
@@ -883,7 +944,23 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
                         "license": "mit",
                         "category": "cybersecurity",
                         "text": safe_security_text * 3,
-                        "review": {"status": "approved", "reviewer": "unit-test", "decision_reason": "high value defensive data"},
+                        "provenance": {
+                            "source_id": "human-review",
+                            "source_family": "reviewed-security",
+                            "source_url": "https://example.org/reviewed-security",
+                            "immutable_revision": "release-1",
+                            "license": "mit",
+                            "license_evidence_sha256": "1" * 64,
+                            "legal_approval_sha256": "2" * 64,
+                            "source_snapshot_sha256": "3" * 64,
+                        },
+                        "review": {
+                            "status": "approved",
+                            "decisions": [
+                                {"reviewer_id": "reviewer-a", "decision": "approve"},
+                                {"reviewer_id": "reviewer-b", "decision": "approve"},
+                            ],
+                        },
                     },
                     sort_keys=True,
                 )
@@ -953,7 +1030,7 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            self.assertEqual(manifest.status, "failed")
+            self.assertEqual(manifest.status, "rejected")
             self.assertTrue(any(issue.startswith("promoted_records_below_minimum") for issue in manifest.issues))
             self.assertTrue(any(issue.startswith("verified_patch_records_below_minimum") for issue in manifest.issues))
             self.assertTrue(any(issue.startswith("human_review_approved_records_below_minimum") for issue in manifest.issues))

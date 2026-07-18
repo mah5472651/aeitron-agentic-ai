@@ -3562,6 +3562,14 @@ In strict mode, missing required scanner CLIs become release blockers. Critical
 findings, dependency warnings, failed scanner output, and failed Kubernetes
 validation block release.
 
+Every external scanner is bounded so CI cannot hang indefinitely. Defaults are
+600 seconds for Bandit and pip-audit, 900 seconds for Semgrep, and 1800 seconds
+for each CodeQL phase. Operators can set
+`AEITRON_BANDIT_TIMEOUT_SECONDS`, `AEITRON_SEMGREP_TIMEOUT_SECONDS`, and
+`AEITRON_PIP_AUDIT_TIMEOUT_SECONDS` to values from 30 through 3600 seconds.
+A timeout is a failed audit with explicit evidence, never a skipped or fake
+pass.
+
 ## Verification Commands
 
 Use these after major changes:
@@ -4433,6 +4441,245 @@ proof, multi-GPU FSDP save/reload/evaluation proof, then live Postgres, Redis,
 S3/MinIO, and Qdrant connection/lifecycle proofs. The handoff references
 `aeitron-7b-fsdp`; it does not mark FSDP or external services production-ready
 without their measured deployment evidence.
+
+## Dataset Trust Authority V2
+
+Dataset Trust Authority V2 is the only production promotion path for scratch
+pretraining data. Raw crawler output, imported patch claims, and unreviewed
+security material cannot reach tokenizer training or model training directly.
+
+```text
+governed source registry
+  -> immutable source snapshot
+  -> license and legal evidence
+  -> quality and secret/PII gate
+  -> protected benchmark fingerprint gate
+  -> exact/AST/lineage/LSH deduplication
+  -> per-source reputation and budget
+  -> independent review authority
+  -> verified patch evidence
+  -> family-aware train/validation/test split
+  -> immutable dataset manifest
+  -> promotion decision
+```
+
+### Source Governance
+
+Every crawl-ready entry in `config/data_sources.ultimate.json` now has a stable
+`source_id`, a `source_family`, a trust tier, approved use, approval status,
+immutable revision contract, content-type policy, and collection budget.
+License trust is never inferred from a source name.
+
+The checked-in ultimate registry deliberately has 17 sources in
+`pending/quarantine`. This is not a missing implementation. A source cannot be
+approved in source control without real license evidence, a legal decision, and
+an immutable source snapshot. Production validation therefore rejects the
+checked-in registry until those operational decisions are performed.
+
+An authorized data/legal operator approves one pinned source:
+
+```powershell
+python -m src.aeitron.learning.source_registry `
+  --sources config\data_sources.ultimate.json `
+  --approve-source python-core-secure-coding `
+  --immutable-revision <pinned-release-or-snapshot-id> `
+  --license-evidence artifacts\aeitron\governance\python-license-evidence.txt `
+  --legal-approval artifacts\aeitron\governance\python-legal-approval.json `
+  --trust-tier reviewed `
+  --output config\data_sources.governed.json
+```
+
+The command hashes the actual evidence files. It does not accept caller-supplied
+hashes and it refuses `rolling` as an approved revision. After every intended
+source has been reviewed, validate the resulting registry:
+
+```powershell
+python -m src.aeitron.learning.source_registry `
+  --sources config\data_sources.governed.json `
+  --production
+```
+
+Crawler rows bind `source_id`, `source_family`, immutable revision, license
+evidence hash, legal approval hash, canonical/raw content hashes, ETag or
+last-modified evidence, and one source snapshot SHA-256. Media types outside the
+source allowlist are rejected before text extraction.
+
+### Scalable Deduplication
+
+`src/aeitron/learning/near_dedup.py` is the single dedup implementation. It
+performs:
+
+- exact SHA-256 deduplication;
+- Python AST or normalized multi-language structure hashing;
+- patch/task/generated lineage deduplication;
+- 64-bit SimHash candidate search through LSH bands;
+- disk-backed SQLite indexing for local and notebook runs;
+- Postgres indexing for distributed workers;
+- transaction-scoped Postgres advisory locks to close concurrent near-duplicate
+  races.
+
+The local implementation never loads all fingerprints into RAM. Measure the
+one-million-record dry path explicitly:
+
+```powershell
+python -m src.aeitron.learning.near_dedup `
+  --scale-dry-records 1000000 `
+  --scale-output-dir artifacts\aeitron\dedup-scale
+```
+
+The report contains actual duration, peak traced Python memory, index path,
+candidate comparisons, and comparisons per record. The architecture remains
+`built_not_scale_proven` until the one-million-record command has completed and
+its report is retained.
+
+### Protected Benchmark Registry
+
+HumanEval, MBPP, SWE-Bench-style packs, CyberSecEval-style packs, and Aeitron
+repository/security qualification packs are permanently separate holdouts.
+Production promotion requires their local governed files. Missing files reject
+the dataset; they are never treated as a pass.
+
+The contamination index checks exact normalized text, task IDs, Python/code
+structure signatures, normalized five-token shingles, and 64-value MinHash
+signatures. Exact, task, structural, and near-fingerprint findings are counted
+separately. Pattern checks remain a secondary defense.
+
+### Independent Review Authority
+
+Migration `0006_dataset_trust` creates durable Postgres records for source
+snapshots, review items, reviewer assignments, decisions, adjudications,
+promotion events, and distributed dedup indexes. Local validation uses the same
+contract in SQLite.
+
+High-value security, patch, test, and debugging records require two different
+reviewer identities. Assignments are leased, content/source hashes are checked
+at decision time, and the second reviewer cannot see the first decision before
+submitting. A disagreement requires a third identity with `data:adjudicate`.
+Changing content or source snapshot creates a new review item and invalidates
+the old approval. Source evidence reports calculate Cohen's kappa and
+per-source acceptance rates.
+
+Gateway routes:
+
+```text
+POST /v1/data/source-snapshots             data:audit
+POST /v1/data/reviews                      data:review
+GET  /v1/data/reviews                      data:review
+GET  /v1/data/reviews/evidence             data:audit
+POST /v1/data/reviews/{id}/claim           data:review
+POST /v1/data/reviews/{id}/decision        data:review
+POST /v1/data/reviews/{id}/adjudicate      data:adjudicate
+GET  /v1/data/versions/{version_id}         data:audit
+POST /v1/data/versions/{version_id}/promote data:promote
+```
+
+Generic `api` scope cannot satisfy any `data:*` scope. The same exact-scope rule
+also applies to training, tool execution, and agent control namespaces.
+
+### Verified Patch Evidence
+
+`verification.status=passed` is not evidence. A promoted patch row must bind:
+
+```text
+vulnerable checkout Git hash
+vulnerability/security test failed before patch
+patch applied cleanly
+build passed
+security test passed
+regression tests passed
+static scan passed
+immutable verification manifest SHA-256
+```
+
+Every Boolean must be true and the complete provenance contract must exist.
+Missing quality metadata invokes the real quality gate; it never creates a
+default `0.95` score. A text statement such as `tests_passed=true` is ignored.
+
+### Leakage-Safe Splits and Promotion
+
+Split assignment is deterministic and SQLite-backed. Repository, project
+family, vulnerability family, patch lineage, task signature, document family,
+and source family are group keys. One group can appear in only one of train,
+validation, or test. The assignment digest and collision count are recorded.
+
+The production pack writes and hashes:
+
+```text
+dataset_version_manifest.json
+source_snapshot_manifest.json
+license_manifest.json
+dataset_trust_metrics.json
+final_near_duplicate_report.json
+benchmark_contamination_filter_report.json
+human_review_approved_report.json
+verified_patch_task_report.json
+train_val_test_split_manifest.json
+mix_manifest.json
+promotion_decision.json
+dataset_quality_dashboard.html
+```
+
+Production status is `promoted` only when all policy checks pass. Dev fixtures
+use `passed`; failed production versions use `rejected`. The active thresholds
+in `config/dataset_trust_policy.json` require:
+
+- at least 100,000 records;
+- average quality at least `0.80` and P10 quality at least `0.70`;
+- 100% license and provenance coverage;
+- zero secret/disallowed-PII findings;
+- zero protected benchmark contamination;
+- 100% high-value double-review coverage;
+- 100% verified patch evidence coverage;
+- source token fraction at most 20%;
+- source-family token fraction at most 35%;
+- a newly approved but review-sparse source at most 1%;
+- reviewer agreement kappa at least `0.80`;
+- zero cross-split group collisions.
+
+Build a real production version only after the governed registry, protected
+holdouts, review export, and patch evidence exist:
+
+```powershell
+python -m src.aeitron.learning.dataset_authority review-report `
+  --output artifacts\aeitron\review\review_evidence_report.json
+
+python -m src.aeitron.learning.production_dataset `
+  --input artifacts\aeitron\data-runs\foundation\clean\*.jsonl `
+  --output-dir data\production\aeitron-foundation-v1 `
+  --dataset-id aeitron-foundation-v1 `
+  --source-registry config\data_sources.governed.json `
+  --trust-policy config\dataset_trust_policy.json `
+  --source-review-report artifacts\aeitron\review\review_evidence_report.json `
+  --benchmark-holdout data\eval\humaneval.jsonl `
+  --benchmark-holdout data\eval\mbpp.jsonl `
+  --verified-patch artifacts\aeitron\verified-patches\verified.jsonl `
+  --human-review-approved artifacts\aeitron\review\approved.jsonl
+```
+
+Promotion re-hashes every referenced artifact, verifies that artifacts remain
+inside the configured dataset output root, verifies the active policy hash, and
+records the final manifest hash in the durable authority. A changed file or
+policy invalidates promotion.
+
+### Current Gate and Next Execution
+
+The code path is implemented and locally tested. The following are still real
+operational gates, not completed proofs:
+
+1. legal operators approve immutable source snapshots;
+2. two independent humans review high-value records and calibration samples;
+3. governed HumanEval/MBPP/SWE/security holdout files are installed;
+4. 200-record and 5,000-record calibrations pass;
+5. the one-million-fingerprint scale report passes;
+6. the first 100,000-record version reaches `promoted`;
+7. the 64,000-token tokenizer is trained only from that promoted version;
+8. T4 1k/10k qualification runs bind the promoted manifest and tokenizer;
+9. only a checkpoint that passes evaluation and reload parity becomes the
+   native active backend.
+
+No 1B, 7B, 32B, or 62B run should start before these gates. Each larger model
+starts from new Aeitron random initialization; smaller checkpoints prove the
+system and are not borrowed weight donors.
 
 ## Final Rule
 

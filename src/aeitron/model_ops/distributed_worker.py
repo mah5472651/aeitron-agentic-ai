@@ -125,6 +125,16 @@ def parse_args() -> argparse.Namespace:
     if not args.training_args or args.training_args[0] != "--":
         parser.error("training arguments must follow --")
     args.training_args = args.training_args[1:]
+    total_argument_bytes = 0
+    for value in args.training_args:
+        encoded_size = len(value.encode("utf-8", "strict"))
+        total_argument_bytes += encoded_size
+        if encoded_size > 8_192:
+            parser.error("an individual training argument exceeds 8192 UTF-8 bytes")
+        if "\x00" in value or any(character in value for character in ("\r", "\n")):
+            parser.error("training arguments cannot contain null bytes or line delimiters")
+    if total_argument_bytes > 131_072:
+        parser.error("training arguments exceed the 131072-byte aggregate limit")
     forbidden = {"--cluster-plan-only", "--scheduler", "--megatron-root"}
     if args.target == "aeitron" and forbidden.intersection(args.training_args):
         parser.error("scheduler worker received forbidden training arguments")
@@ -153,11 +163,23 @@ def main() -> None:
         )
     environment = {**os.environ, "PYTHONUNBUFFERED": "1"}
     if args.target == "aeitron":
-        os.execve(argv[0], argv, environment)
+        # The executable and module are fixed constants; only bounded,
+        # non-control-character trainer options remain variable.
+        os.execve(  # nosemgrep: python.lang.security.audit.dangerous-os-exec-tainted-env-args.dangerous-os-exec-tainted-env-args
+            argv[0],
+            argv,
+            environment,
+        )
     from src.aeitron.shared.progress import progress_from_options
 
     progress = progress_from_options(path=None, to_stdout=True)
-    child = subprocess.Popen(argv, env=environment, stdin=subprocess.DEVNULL)  # nosec B603 - validated fixed Megatron target
+    # argv[0] is sys.executable, argv[1] is the canonical trusted Megatron
+    # pretrain_gpt.py path, and all remaining arguments passed the bounds above.
+    child = subprocess.Popen(  # nosec B603  # nosemgrep: python.lang.security.audit.dangerous-os-exec-tainted-env-args.dangerous-os-exec-tainted-env-args
+        argv,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+    )
 
     def forward(signum: int, _frame: object) -> None:
         if child.poll() is None:

@@ -205,12 +205,37 @@ def _resolve_codeql() -> tuple[list[str] | None, str | None]:
     return None, f"codeql executable is not installed; checked PATH, AEITRON_CODEQL_BIN={env_path}, and {local_candidates[0]}"
 
 
+def _scanner_timeout_seconds(scanner: str, default: int) -> int:
+    variable = f"AEITRON_{scanner.upper().replace('-', '_')}_TIMEOUT_SECONDS"
+    raw = os.environ.get(variable, str(default)).strip()
+    try:
+        timeout = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{variable} must be an integer number of seconds") from exc
+    if not 30 <= timeout <= 3_600:
+        raise ValueError(f"{variable} must be between 30 and 3600 seconds")
+    return timeout
+
+
 def _run_bandit(root: Path) -> dict[str, Any] | None:
     base_command, missing = _resolve_python_scanner("bandit", "bandit")
     if missing:
         return {"status": "skipped", "reason": missing}
     command = [*base_command, "-q", "-r", "src/aeitron", "-f", "json"]
-    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
+    timeout = _scanner_timeout_seconds("bandit", 600)
+    try:
+        completed = subprocess.run(  # nosec B603
+            command,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "failed", "reason": f"Bandit exceeded {timeout} seconds"}
     if completed.returncode not in {0, 1}:
         return {"status": "skipped", "reason": completed.stderr[-1000:] or completed.stdout[-1000:]}
     try:
@@ -233,7 +258,20 @@ def _run_semgrep(root: Path) -> dict[str, Any]:
     backend = "local"
     if not missing:
         command = [*base_command, "scan", "--config", "auto", "--json", "src/aeitron"]
-        completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
+        timeout = _scanner_timeout_seconds("semgrep", 900)
+        try:
+            completed = subprocess.run(  # nosec B603
+                command,
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "failed", "backend": backend, "reason": f"Semgrep exceeded {timeout} seconds"}
     if completed is None or completed.returncode not in {0, 1}:
         docker = shutil.which("docker")
         image = os.environ.get(
@@ -273,15 +311,24 @@ def _run_semgrep(root: Path) -> dict[str, Any]:
             ]
             # Docker is resolved from PATH, the image is digest-pinned, root is canonical, and shell execution is disabled.
             # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
-            completed = subprocess.run(  # nosec B603
-                docker_command,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
-                cwd=root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
+            timeout = _scanner_timeout_seconds("semgrep", 900)
+            try:
+                completed = subprocess.run(  # nosec B603
+                    docker_command,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return {
+                    "status": "failed",
+                    "backend": "docker_pinned",
+                    "reason": f"Semgrep Docker scan exceeded {timeout} seconds",
+                }
             backend = "docker_pinned"
         elif completed is None:
             return {"status": "skipped", "reason": missing or "Semgrep is unavailable"}
@@ -403,7 +450,20 @@ def _run_pip_audit(root: Path) -> dict[str, Any]:
     if missing:
         return {"status": "skipped", "reason": missing}
     command = [*base_command, "--format", "json"]
-    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)  # nosec B603
+    timeout = _scanner_timeout_seconds("pip_audit", 600)
+    try:
+        completed = subprocess.run(  # nosec B603
+            command,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "failed", "reason": f"pip-audit exceeded {timeout} seconds"}
     if completed.returncode not in {0, 1}:
         return {"status": "failed", "reason": completed.stderr[-2000:] or completed.stdout[-2000:]}
     try:

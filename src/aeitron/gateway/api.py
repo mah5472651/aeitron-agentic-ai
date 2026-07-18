@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import time
@@ -17,6 +18,18 @@ from src.aeitron.db import LocalStore
 from src.aeitron.evaluation.benchmarks import BenchmarkHarness, built_in_security_tasks
 from src.aeitron.identity import AuthError, auth_status, create_jwt, install_auth, install_quota, validate_token_issue_request
 from src.aeitron.indexing import ContextBuilder, RepositoryIndexer, VectorBackendConfig, create_vector_index, vector_capabilities
+from src.aeitron.learning.dataset_authority import (
+    DatasetAuthorityService,
+    PromotionEvidenceCreate,
+    ReviewAdjudicationCreate,
+    ReviewDecisionCreate,
+    ReviewItemCreate,
+    SourceSnapshotCreate,
+)
+from src.aeitron.learning.production_dataset import (
+    ProductionDatasetManifest,
+    validate_dataset_manifest_for_promotion,
+)
 from src.aeitron.learning.versioning import DatasetLedger
 from src.aeitron.memory import MemoryIngestRequest, UnifiedMemoryManager
 from src.aeitron.model_ops.backends import active_model_health, list_model_profiles
@@ -50,6 +63,7 @@ AUTH_CONFIG = install_auth(app)
 install_observability(app)
 STORE = LocalStore()
 TRAINING_WORKSPACE = TrainingWorkspaceService.from_environment()
+DATASET_AUTHORITY = DatasetAuthorityService.from_environment()
 
 
 class AuthTokenRequest(BaseModel):
@@ -150,13 +164,21 @@ class TrainingArtifactRegistrationRequest(BaseModel):
     uri: str = Field(min_length=1, max_length=4096)
 
 
+class DatasetReviewClaimRequest(BaseModel):
+    lease_seconds: int = Field(default=3_600, ge=300, le=14_400)
+
+
+SAFE_DATASET_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,159}$")
+
+
 def require_scope(request: Request, scope: str) -> None:
     if not AUTH_CONFIG.enabled:
         return
     claims = getattr(request.state, "jwt_claims", {}) or {}
     scopes = set(str(item) for item in claims.get("scopes", []) if item)
-    if scope.startswith("training:"):
-        allowed = scope in scopes or "training:admin" in scopes
+    namespace = scope.split(":", 1)[0]
+    if namespace in {"training", "data", "tools", "agents"}:
+        allowed = scope in scopes or f"{namespace}:admin" in scopes
     else:
         allowed = scope in scopes or "api" in scopes
     if not allowed:
@@ -170,6 +192,25 @@ def request_scopes(request: Request) -> set[str]:
 
 def request_owner(request: Request) -> str:
     return str(getattr(request.state, "user_id", "") or "local-user")
+
+
+def _dataset_version_manifest_path(version_id: str) -> Path:
+    if SAFE_DATASET_VERSION.fullmatch(version_id) is None:
+        raise ValueError("invalid dataset version identifier")
+    root = Path(os.environ.get("AEITRON_DATASET_VERSIONS_ROOT", "data/production")).expanduser().resolve()
+    candidate = (root / version_id / "dataset_version_manifest.json").resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("dataset version path escapes configured root") from exc
+    if not candidate.is_file():
+        direct = (root / "dataset_version_manifest.json").resolve()
+        if direct.is_file():
+            payload = ProductionDatasetManifest.model_validate_json(direct.read_text(encoding="utf-8"))
+            if payload.version_id == version_id:
+                return direct
+        raise FileNotFoundError("dataset version manifest not found")
+    return candidate
 
 
 async def require_training_job_access(request: Request, job_id: str, scope: str) -> TrainingJob:
@@ -669,6 +710,156 @@ async def data_platform_status() -> dict[str, object]:
         "latest_version": latest.model_dump() if latest else None,
         "dashboard_path": str(dashboard) if dashboard.exists() else None,
     }
+
+
+@app.post("/v1/data/reviews")
+async def enqueue_dataset_review(request: ReviewItemCreate, http_request: Request) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "data:review")
+        return (await DATASET_AUTHORITY.enqueue(request)).model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/data/source-snapshots")
+async def record_dataset_source_snapshot(request: SourceSnapshotCreate, http_request: Request) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "data:audit")
+        return (await DATASET_AUTHORITY.record_source_snapshot(request)).model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/v1/data/reviews")
+async def list_dataset_reviews(
+    http_request: Request,
+    status: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "data:review")
+        items = await DATASET_AUTHORITY.list_items(
+            status=status,
+            limit=max(1, min(500, limit)),
+            reviewer_id=request_owner(http_request),
+        )
+        return {"items": [item.model_dump() for item in items]}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/data/reviews/evidence")
+async def dataset_review_evidence(http_request: Request) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "data:audit")
+        return (await DATASET_AUTHORITY.review_evidence()).model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/v1/data/reviews/{record_id}/claim")
+async def claim_dataset_review(
+    record_id: str,
+    request: DatasetReviewClaimRequest,
+    http_request: Request,
+) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "data:review")
+        assignment = await DATASET_AUTHORITY.claim(record_id, request_owner(http_request), request.lease_seconds)
+        return assignment.model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/data/reviews/{record_id}/decision")
+async def decide_dataset_review(
+    record_id: str,
+    request: ReviewDecisionCreate,
+    http_request: Request,
+) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "data:review")
+        item = await DATASET_AUTHORITY.decide(record_id, request_owner(http_request), request)
+        return item.model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/data/reviews/{record_id}/adjudicate")
+async def adjudicate_dataset_review(
+    record_id: str,
+    request: ReviewAdjudicationCreate,
+    http_request: Request,
+) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "data:adjudicate")
+        item = await DATASET_AUTHORITY.adjudicate(record_id, request_owner(http_request), request)
+        return item.model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/v1/data/versions/{version_id}")
+async def get_dataset_version(version_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "data:audit")
+        path = _dataset_version_manifest_path(version_id)
+        return ProductionDatasetManifest.model_validate_json(path.read_text(encoding="utf-8")).model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/data/versions/{version_id}/promote")
+async def promote_dataset_version(version_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        require_scope(http_request, "data:promote")
+        path = _dataset_version_manifest_path(version_id)
+        policy_path = os.environ.get("AEITRON_DATASET_TRUST_POLICY", "config/dataset_trust_policy.json")
+        manifest = validate_dataset_manifest_for_promotion(path, trust_policy_path=policy_path)
+        manifest_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        event = await DATASET_AUTHORITY.record_promotion(
+            request_owner(http_request),
+            PromotionEvidenceCreate(
+                dataset_id=manifest.dataset_id,
+                version_id=manifest.version_id,
+                manifest_sha256=manifest_sha256,
+                policy_sha256=manifest.policy_sha256,
+                decision="promoted",
+                evidence={
+                    "artifact_sha256": manifest.artifact_sha256,
+                    "promotion_decision": manifest.promotion_decision,
+                },
+            ),
+        )
+        return event.model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/v1/model/foundation/pretraining/readiness")

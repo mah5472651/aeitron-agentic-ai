@@ -32,6 +32,7 @@ from src.aeitron.learning.mixer import (
 from src.aeitron.learning.near_dedup import NearDedupReport, deduplicate_jsonl
 from src.aeitron.learning.quality_inspector import QualityInspectionReport, write_quality_report
 from src.aeitron.learning.review import ReviewReport, review_tasks
+from src.aeitron.learning.production_dataset import validate_dataset_manifest_for_promotion
 from src.aeitron.learning.source_balancing import SourceBalanceReport, balance_clean_jsonl
 from src.aeitron.learning.source_budget import SourceBudgetPlan, write_source_budget_plan
 from src.aeitron.learning.source_registry import SourceRegistry, SourceRegistryReport
@@ -149,6 +150,8 @@ class DataPipelineConfig(StrictModel):
     expected_cuda_version: str | None = None
     production_mode: bool = False
     dev_smoke: bool = False
+    promoted_dataset_manifest_path: str | None = None
+    dataset_trust_policy_path: str = "config/dataset_trust_policy.json"
 
 
 class DataPipelineReport(StrictModel):
@@ -276,18 +279,14 @@ def validate_data_pipeline_production_config(config: DataPipelineConfig) -> None
         failures.append("production mode cannot skip training")
     if config.model_profile_name == "tiny" and not config.dev_smoke:
         failures.append("production mode cannot use model_profile_name='tiny' without dev_smoke")
-    if not config.apply_training_data_gate:
-        failures.append("production mode requires training_data_gate")
     if not config.filter_licenses or not config.strict_unknown_licenses:
         failures.append("production mode requires strict license filtering")
     if not config.filter_benchmark_contamination:
         failures.append("production mode requires benchmark contamination filtering")
     if not config.near_dedup:
         failures.append("production mode requires near-duplicate removal")
-    if not config.balance_sources:
-        failures.append("production mode requires source balancing")
-    if not config.instruction_mix:
-        failures.append("production mode requires scratch instruction data mixing")
+    if not config.promoted_dataset_manifest_path:
+        failures.append("production mode requires a V2 promoted_dataset_manifest_path")
     if not config.run_checkpoint_eval:
         failures.append("production mode requires checkpoint evaluation")
     if not config.checkpoint_compare_prompt_suite:
@@ -300,6 +299,14 @@ def validate_data_pipeline_production_config(config: DataPipelineConfig) -> None
         failures.append("production mode requires min_training_rows >= 10000")
     if config.min_train_tokens < 1_000_000 and not config.dev_smoke:
         failures.append("production mode requires min_train_tokens >= 1000000")
+    if config.promoted_dataset_manifest_path:
+        try:
+            validate_dataset_manifest_for_promotion(
+                config.promoted_dataset_manifest_path,
+                trust_policy_path=config.dataset_trust_policy_path,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            failures.append(f"promoted dataset manifest failed trust validation: {exc}")
     if failures:
         raise ValueError("production data pipeline validation failed: " + "; ".join(failures))
 
@@ -515,7 +522,7 @@ async def _run_data_pipeline_locked(
     gated_holdout_path = root / "gated" / "eval-holdout.jsonl"
     gated_review_path = root / "gated" / "human-review-queue.jsonl"
     gated_decisions_path = reports_dir / "training_data_gate_decisions.jsonl"
-    if config.apply_training_data_gate:
+    if config.apply_training_data_gate and not config.production_mode:
         progress.emit(
             "training_data_gate",
             "started",
@@ -553,8 +560,14 @@ async def _run_data_pipeline_locked(
         clean_files = [str(gated_train_path)]
     source_balance_report: SourceBalanceReport | None = None
     training_files = clean_files
+    if config.production_mode:
+        governed_manifest = validate_dataset_manifest_for_promotion(
+            config.promoted_dataset_manifest_path or "",
+            trust_policy_path=config.dataset_trust_policy_path,
+        )
+        training_files = [governed_manifest.artifacts["train"]]
     balanced_clean_path = root / "balanced" / "balanced-clean-000000.jsonl"
-    if config.balance_sources:
+    if config.balance_sources and not config.production_mode:
         progress.emit("source_balancing", "started", max_source_fraction=config.max_source_fraction)
         source_balance_report = balance_clean_jsonl(
             input_paths=clean_files,
@@ -578,7 +591,7 @@ async def _run_data_pipeline_locked(
     instruction_mix_report: ScratchInstructionMixReport | None = None
     instruction_mix_path = root / "mixed" / "scratch-instruction-mix.jsonl"
     instruction_mix_report_path = reports_dir / "instruction_mix_report.json"
-    if config.instruction_mix:
+    if config.instruction_mix and not config.production_mode:
         progress.emit(
             "instruction_mix",
             "started",
@@ -1048,6 +1061,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-to-stdout", action="store_true")
     parser.add_argument("--progress-every-docs", type=int, default=25)
     parser.add_argument("--progress-every-steps", type=int, default=25)
+    parser.add_argument("--production-mode", action="store_true")
+    parser.add_argument("--dev-smoke", action="store_true")
+    parser.add_argument("--promoted-dataset-manifest")
+    parser.add_argument("--dataset-trust-policy", default="config/dataset_trust_policy.json")
     return parser.parse_args()
 
 
@@ -1124,6 +1141,10 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         progress_to_stdout=args.progress_to_stdout,
         progress_every_docs=args.progress_every_docs,
         progress_every_steps=args.progress_every_steps,
+        production_mode=args.production_mode,
+        dev_smoke=args.dev_smoke,
+        promoted_dataset_manifest_path=args.promoted_dataset_manifest,
+        dataset_trust_policy_path=args.dataset_trust_policy,
     )
 
 

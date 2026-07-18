@@ -19,6 +19,7 @@ def main() -> None:
             "tests.test_aeitron_mvp_foundation",
             "tests.test_aeitron_model_foundation",
             "tests.test_aeitron_data_engine",
+            "tests.test_aeitron_dataset_trust",
             "tests.test_aeitron_pretraining_pipeline",
             "tests.test_aeitron_production_hardening",
             "tests.test_aeitron_scratch_decoder",

@@ -597,6 +597,14 @@ python -m src.aeitron.learning.run_plan \
   --async-workers 64
 ```
 
+Export the blind-review evidence from the configured Dataset Authority before
+building a production dataset:
+
+```bash
+python -m src.aeitron.learning.dataset_authority review-report \
+  --output artifacts/aeitron/review/review_evidence_report.json
+```
+
 Promote a governed 100k-1M production dataset pack into `data/production`:
 
 ```bash
@@ -604,7 +612,9 @@ python -m src.aeitron.learning.production_dataset \
   --input artifacts/aeitron/data-runs/first-serious-run/clean/*.jsonl \
   --output-dir data/production/aeitron-corpus-v1 \
   --dataset-id aeitron-corpus-v1 \
-  --source-registry config/data_sources.ultimate.json \
+  --source-registry config/data_sources.governed.json \
+  --trust-policy config/dataset_trust_policy.json \
+  --source-review-report artifacts/aeitron/review/review_evidence_report.json \
   --benchmark-holdout data/eval/humaneval.jsonl \
   --benchmark-holdout data/eval/mbpp.jsonl \
   --verified-patch artifacts/aeitron/verified-patches/verified_patch_tasks.jsonl \
@@ -615,12 +625,24 @@ python -m src.aeitron.learning.production_dataset \
   --min-train-records 90000
 ```
 
-This command writes `final/train.jsonl`, `final/val.jsonl`,
+The checked-in ultimate registry is intentionally quarantine-only. Production
+promotion requires a legally reviewed `data_sources.governed.json` with
+immutable revisions and real evidence hashes. This command writes
+`final/train.jsonl`, `final/val.jsonl`,
 `final/test.jsonl`, `final/holdout.jsonl`, `dataset_version_manifest.json`,
 license/quality/contamination/dedup/source/gate/split/validation reports, and
 `review/human_review_queue.jsonl`. Production mode fails if required row counts,
-verified patch rows, or human-approved high-value rows are missing. Use
+verified patch evidence, two-reviewer coverage, protected holdouts, source caps,
+or quality thresholds are missing. Production success is `promoted`; use
 `--dev-smoke` only for local plumbing checks.
+
+One-million-record bounded-memory dedup proof:
+
+```bash
+python -m src.aeitron.learning.near_dedup \
+  --scale-dry-records 1000000 \
+  --scale-output-dir artifacts/aeitron/dedup-scale
+```
 
 Training resource priority catalog:
 

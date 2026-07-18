@@ -1,0 +1,454 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from starlette.requests import Request
+
+from src.aeitron.gateway import api as gateway_api
+from src.aeitron.identity import AuthConfig
+from src.aeitron.learning.benchmark_contamination_filter import (
+    build_protected_fingerprint_index,
+    filter_benchmark_contamination_jsonl,
+)
+from src.aeitron.learning.dataset_authority import (
+    ReviewAdjudicationCreate,
+    ReviewDecisionCreate,
+    ReviewItemCreate,
+    SQLiteDatasetAuthorityStore,
+    SourceSnapshotCreate,
+)
+from src.aeitron.learning.data_pipeline import (
+    DataPipelineConfig,
+    validate_data_pipeline_production_config,
+)
+from src.aeitron.learning.near_dedup import (
+    PostgresLSHDedupIndex,
+    deduplicate_jsonl,
+    run_dedup_scale_validation,
+)
+from src.aeitron.learning.production_dataset import (
+    ProductionDatasetConfig,
+    ProductionDatasetManifest,
+    SplitManifest,
+    _sha256_file,
+    split_train_val_test,
+    validate_dataset_manifest_for_promotion,
+)
+from src.aeitron.learning.source_registry import SourceRegistry
+from src.aeitron.learning.source_reputation import build_source_reputation_report
+from src.aeitron.learning.training_data_gate import TrainingDataGateConfig, score_row
+from src.aeitron.learning.web_ingest import SourceSpec
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+class DatasetAuthorityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_blind_two_reviewer_conflict_requires_independent_adjudication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteDatasetAuthorityStore(Path(temp_dir) / "authority.sqlite3")
+            request = ReviewItemCreate(
+                content_hash="a" * 64,
+                source_snapshot_sha256="b" * 64,
+                source_id="trusted-source",
+                data_type="verified_security_patch",
+                high_value=True,
+                payload={"text": "reviewed defensive patch"},
+            )
+            item = await store.enqueue(request)
+            await store.claim(item.review_item_id, "reviewer-one", 600)
+            first = await store.decide(
+                item.review_item_id,
+                "reviewer-one",
+                ReviewDecisionCreate(
+                    decision="approve",
+                    rationale="The patch evidence and regression coverage are complete.",
+                    content_hash=request.content_hash,
+                    source_snapshot_sha256=request.source_snapshot_sha256,
+                    evidence={"manifest": "verified"},
+                ),
+            )
+            self.assertEqual(first.status, "in_review")
+            await store.claim(item.review_item_id, "reviewer-two", 600)
+            blinded = await store.get_item(item.review_item_id, reviewer_id="reviewer-two")
+            self.assertEqual(blinded.decisions, [])
+            with self.assertRaises(PermissionError):
+                await store.claim(item.review_item_id, "reviewer-one", 600)
+            conflict = await store.decide(
+                item.review_item_id,
+                "reviewer-two",
+                ReviewDecisionCreate(
+                    decision="reject",
+                    rationale="The static-analysis evidence does not cover the modified sink.",
+                    content_hash=request.content_hash,
+                    source_snapshot_sha256=request.source_snapshot_sha256,
+                    evidence={"missing_check": "static-sink"},
+                ),
+            )
+            self.assertEqual(conflict.status, "adjudication_required")
+            with self.assertRaises(PermissionError):
+                await store.adjudicate(
+                    item.review_item_id,
+                    "reviewer-one",
+                    ReviewAdjudicationCreate(
+                        decision="approve",
+                        rationale="A reviewer cannot adjudicate their own disputed record.",
+                    ),
+                )
+            resolved = await store.adjudicate(
+                item.review_item_id,
+                "adjudicator-three",
+                ReviewAdjudicationCreate(
+                    decision="reject",
+                    rationale="The missing static-analysis evidence is material and blocks promotion.",
+                    evidence={"decision": "return_to_verification"},
+                ),
+            )
+            self.assertEqual(resolved.status, "rejected")
+            report = await store.review_evidence()
+            self.assertEqual(report.by_source["trusted-source"].rejected, 1)
+            self.assertEqual(report.by_source["trusted-source"].paired_reviews, 1)
+
+    async def test_source_drift_creates_new_review_and_immutable_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteDatasetAuthorityStore(Path(temp_dir) / "authority.sqlite3")
+            snapshot = await store.record_source_snapshot(
+                SourceSnapshotCreate(
+                    source_id="source-a",
+                    source_family="family-a",
+                    immutable_revision="commit-123",
+                    registry_sha256="1" * 64,
+                    license_evidence_sha256="2" * 64,
+                    legal_approval_sha256="3" * 64,
+                    snapshot_sha256="4" * 64,
+                    status="approved",
+                )
+            )
+            repeated = await store.record_source_snapshot(
+                SourceSnapshotCreate(
+                    source_id="source-a",
+                    source_family="family-a",
+                    immutable_revision="commit-123",
+                    registry_sha256="1" * 64,
+                    license_evidence_sha256="2" * 64,
+                    legal_approval_sha256="3" * 64,
+                    snapshot_sha256="4" * 64,
+                    status="approved",
+                )
+            )
+            self.assertEqual(snapshot.snapshot_id, repeated.snapshot_id)
+            first = await store.enqueue(
+                ReviewItemCreate(
+                    content_hash="5" * 64,
+                    source_snapshot_sha256="4" * 64,
+                    source_id="source-a",
+                    data_type="code",
+                    high_value=False,
+                )
+            )
+            changed = await store.enqueue(
+                ReviewItemCreate(
+                    content_hash="5" * 64,
+                    source_snapshot_sha256="6" * 64,
+                    source_id="source-a",
+                    data_type="code",
+                    high_value=False,
+                )
+            )
+            self.assertNotEqual(first.review_item_id, changed.review_item_id)
+            with self.assertRaises(ValueError):
+                SourceSnapshotCreate(
+                    source_id="source-a",
+                    source_family="family-a",
+                    immutable_revision="rolling",
+                    registry_sha256="1" * 64,
+                    license_evidence_sha256="2" * 64,
+                    legal_approval_sha256="3" * 64,
+                    snapshot_sha256="4" * 64,
+                    status="approved",
+                )
+
+
+class DatasetFingerprintAndManifestTest(unittest.TestCase):
+    def test_data_governance_scopes_are_not_satisfied_by_generic_api_scope(self) -> None:
+        original = gateway_api.AUTH_CONFIG
+        gateway_api.AUTH_CONFIG = AuthConfig(enabled=True, jwt_secret="x" * 32)
+        try:
+            request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
+            request.state.jwt_claims = {"scopes": ["api"]}
+            with self.assertRaises(PermissionError):
+                gateway_api.require_scope(request, "data:promote")
+            request.state.jwt_claims = {"scopes": ["data:promote"]}
+            gateway_api.require_scope(request, "data:promote")
+        finally:
+            gateway_api.AUTH_CONFIG = original
+
+    def test_high_value_rows_enter_review_queue_without_durable_approval(self) -> None:
+        row = {
+            "source": "approved-source",
+            "text": "Defensive patch and regression test evidence " * 20,
+            "content_hash": "a" * 64,
+            "quality": {
+                "quality_score": 0.90,
+                "data_type": "patch",
+                "labels": ["patch", "tests", "defensive_security"],
+                "risk_flags": [],
+            },
+        }
+        decision = score_row(
+            row,
+            reputation_by_source={
+                "approved-source": {
+                    "reputation_score": 0.90,
+                    "reputation_lower_bound": 0.80,
+                    "action": "promote",
+                    "approval_status": "approved",
+                    "license_trust": 1.0,
+                }
+            },
+            config=TrainingDataGateConfig(require_governed_sources=True),
+        )
+        self.assertEqual(decision.status, "review_queue")
+        self.assertIn("independent_high_value_review_required", decision.reasons)
+
+    def test_source_reputation_never_inherits_other_source_task_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            quality = root / "quality.json"
+            tasks = root / "tasks.json"
+            feedback = root / "feedback.json"
+            registry = root / "registry.json"
+            quality.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {"source": "source-a", "rows": 100, "avg_quality_score": 0.8, "defensive_security_rows": 50, "code_rows": 20},
+                            {"source": "source-b", "rows": 100, "avg_quality_score": 0.8, "defensive_security_rows": 50, "code_rows": 20},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tasks.write_text(json.dumps({"by_source": {"source-a": {"extracted": 40}}}), encoding="utf-8")
+            feedback.write_text(json.dumps({"by_source": {"source-a": {"score": 0.9}}}), encoding="utf-8")
+            registry.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": source,
+                                "source_id": source,
+                                "trust_tier": "reviewed",
+                                "approval_status": "approved",
+                                "approved_use": "foundation",
+                                "license_evidence_sha256": "1" * 64,
+                                "legal_approval_sha256": "2" * 64,
+                            }
+                            for source in ("source-a", "source-b")
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = build_source_reputation_report(
+                source_quality_report_path=quality,
+                task_report_path=tasks,
+                feedback_report_path=feedback,
+                source_registry_path=registry,
+            )
+            scores = {item.source: item for item in report.sources}
+            self.assertGreater(scores["source-a"].task_coverage, 0.0)
+            self.assertEqual(scores["source-b"].task_coverage, 0.0)
+            self.assertEqual(scores["source-b"].benchmark_feedback_score, 0.0)
+
+    def test_postgres_lsh_contract_rejects_non_postgres_dsn(self) -> None:
+        with self.assertRaises(ValueError):
+            PostgresLSHDedupIndex("sqlite:///unsafe.db", dataset_version="version-1")
+
+    def test_source_approval_is_bound_to_real_evidence_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            license_evidence = root / "license.txt"
+            legal_approval = root / "approval.json"
+            license_evidence.write_text("Reviewed MIT license evidence", encoding="utf-8")
+            legal_approval.write_text('{"approved_by":"legal-test"}', encoding="utf-8")
+            registry = SourceRegistry(
+                [
+                    SourceSpec(
+                        name="approved-test-source",
+                        urls=["https://example.com/docs"],
+                        allowed_domains=["example.com"],
+                        license="mit",
+                        source_id="approved-test-source",
+                        source_family="approved-family",
+                    )
+                ]
+            )
+            approved = registry.approve_source(
+                source_id="approved-test-source",
+                immutable_revision="commit-abc123",
+                license_evidence_path=license_evidence,
+                legal_approval_path=legal_approval,
+            )
+            self.assertEqual(approved.approval_status, "approved")
+            self.assertEqual(approved.license_evidence_sha256, _sha256_file(license_evidence))
+            self.assertEqual(approved.legal_approval_sha256, _sha256_file(legal_approval))
+            self.assertEqual(registry.validate(production=True).approved_sources, 1)
+
+    def test_scale_validation_uses_bounded_index_and_subquadratic_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = run_dedup_scale_validation(record_count=2_000, output_dir=temp_dir)
+            self.assertEqual(report.status, "passed")
+            self.assertTrue(report.memory_bounded)
+            self.assertLess(report.comparisons_per_record, 128.0)
+            self.assertTrue(Path(report.index_path).exists())
+
+    def test_streaming_lsh_removes_exact_structural_lineage_and_near_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "rows.jsonl"
+            rows = [
+                {
+                    "source": "one",
+                    "language": "python",
+                    "text": "def validate(value):\n    return value.strip() if isinstance(value, str) else ''\n",
+                    "patch_lineage": "patch-a",
+                },
+                {
+                    "source": "one",
+                    "language": "python",
+                    "text": "def validate(value):\n    return value.strip() if isinstance(value, str) else ''\n",
+                    "patch_lineage": "patch-b",
+                },
+                {
+                    "source": "two",
+                    "language": "python",
+                    "text": "def validate(value):\n    return value.strip() if isinstance(value, str) else None\n",
+                    "patch_lineage": "patch-a",
+                },
+                {
+                    "source": "three",
+                    "language": "python",
+                    "text": "def authorize(subject, action):\n    return bool(subject and action)\n",
+                    "patch_lineage": "patch-c",
+                },
+            ]
+            _write_jsonl(source, rows)
+            report = deduplicate_jsonl([source], root / "clean.jsonl", index_path=root / "dedup.sqlite3")
+            self.assertEqual(report.accepted, 2)
+            self.assertGreaterEqual(report.exact_duplicates + report.structural_duplicates + report.lineage_duplicates, 2)
+            self.assertLess(report.candidate_comparisons, len(rows) * len(rows))
+            self.assertTrue(report.memory_bounded)
+
+    def test_protected_fingerprints_block_exact_task_and_near_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            holdout = root / "protected.jsonl"
+            candidate = root / "candidate.jsonl"
+            protected_text = (
+                "Implement a function that validates an authorization token, checks expiry, "
+                "and returns a structured defensive error without exposing credentials."
+            )
+            _write_jsonl(holdout, [{"task_id": "secure-001", "text": protected_text}])
+            _write_jsonl(
+                candidate,
+                [
+                    {"source": "exact", "text": protected_text},
+                    {"source": "task", "task_id": "secure-001", "text": "different task body with enough detail"},
+                    {
+                        "source": "clean",
+                        "task_id": "independent-002",
+                        "text": "Document deterministic build caching for a Rust workspace and its tests.",
+                    },
+                ],
+            )
+            index = build_protected_fingerprint_index([holdout], root / "protected.sqlite3")
+            report = filter_benchmark_contamination_jsonl(
+                [candidate],
+                root / "clean.jsonl",
+                protected_index_path=index,
+            )
+            self.assertEqual(report.accepted, 1)
+            self.assertEqual(report.rejected, 2)
+            self.assertEqual(report.exact_hits, 1)
+            self.assertEqual(report.task_id_hits, 1)
+
+    def test_group_split_never_crosses_repository_family(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "rows.jsonl"
+            rows = [
+                {"text": f"repository example {index}", "repository": "org/repo-a", "license": "mit"}
+                for index in range(20)
+            ]
+            rows.extend(
+                {"text": f"other family {index}", "repository": "org/repo-b", "license": "mit"}
+                for index in range(20)
+            )
+            _write_jsonl(source, rows)
+            manifest = split_train_val_test(
+                source,
+                root / "split",
+                ProductionDatasetConfig(input_paths=[str(source)], output_dir=str(root / "out")),
+            )
+            observed: dict[str, set[str]] = {}
+            for split_name, path in (("train", manifest.train_path), ("val", manifest.val_path), ("test", manifest.test_path)):
+                for line in Path(path).read_text(encoding="utf-8").splitlines():
+                    row = json.loads(line)
+                    observed.setdefault(row["repository"], set()).add(split_name)
+            self.assertTrue(all(len(splits) == 1 for splits in observed.values()))
+            self.assertEqual(manifest.cross_split_group_collisions, 0)
+
+    def test_manifest_tampering_invalidates_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact = root / "train.jsonl"
+            artifact.write_text('{"text":"trusted"}\n', encoding="utf-8")
+            policy = root / "policy.json"
+            policy.write_text(Path("config/dataset_trust_policy.json").read_text(encoding="utf-8"), encoding="utf-8")
+            manifest = ProductionDatasetManifest(
+                dataset_id="aeitron-test",
+                version_id="version-1",
+                status="promoted",
+                output_dir=str(root),
+                dev_smoke=False,
+                artifacts={"train": str(artifact)},
+                metrics={},
+                reports={},
+                artifact_sha256={"train": _sha256_file(artifact)},
+                policy_sha256=_sha256_file(policy),
+                promotion_decision={"status": "promoted"},
+            )
+            manifest_path = manifest.write(root)
+            validated = validate_dataset_manifest_for_promotion(manifest_path, trust_policy_path=policy)
+            self.assertEqual(validated.version_id, "version-1")
+            artifact.write_text('{"text":"tampered"}\n', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                validate_dataset_manifest_for_promotion(manifest_path, trust_policy_path=policy)
+
+    def test_production_training_requires_promoted_dataset_manifest(self) -> None:
+        config = DataPipelineConfig(
+            sources_path="config/data_sources.ultimate.json",
+            frontier_backend="postgres",
+            postgres_dsn="postgresql://aeitron:secret@postgres/aeitron",
+            object_store_uri="s3://aeitron-training",
+            model_profile_name="aeitron-1b",
+            checkpoint_compare_prompt_suite="data/eval/qualification.jsonl",
+            min_training_average_quality_score=0.80,
+            min_training_rows=100_000,
+            min_train_tokens=10_000_000,
+            production_mode=True,
+        )
+        with self.assertRaisesRegex(ValueError, "promoted_dataset_manifest_path"):
+            validate_data_pipeline_production_config(config)
+
+
+if __name__ == "__main__":
+    unittest.main()

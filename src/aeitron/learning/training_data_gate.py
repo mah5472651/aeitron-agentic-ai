@@ -24,12 +24,16 @@ from src.aeitron.shared.schemas import StrictModel
 PATCH_DATA_TYPES = {"patch", "debug_trace"}
 SECURITY_DATA_TYPES = {"security_advisory", "security_reference"}
 HIGH_VALUE_LABELS = {"defensive_security", "code", "patch", "tests", "runtime_trace", "agentic_coding"}
+MANDATORY_REVIEW_LABELS = {"defensive_security", "patch", "tests", "runtime_trace"}
 NOISE_FLAGS = {"navigation_or_boilerplate_noise", "repeated_lines", "heavy_boilerplate_noise"}
 
 
 class TrainingDataGateConfig(StrictModel):
     min_quality_score: float = Field(default=0.58, ge=0.0, le=1.0)
     min_source_reputation_score: float = Field(default=0.45, ge=0.0, le=1.0)
+    min_reputation_lower_bound: float = Field(default=0.70, ge=0.0, le=1.0)
+    require_governed_sources: bool = False
+    allow_governed_quarantine: bool = False
     reject_noise_flags: bool = True
     eval_holdout_fraction: float = Field(default=0.02, ge=0.0, le=0.5)
     seed: int = 1337
@@ -37,6 +41,8 @@ class TrainingDataGateConfig(StrictModel):
     security_priority_bonus: float = Field(default=0.08, ge=0.0, le=0.5)
     high_value_review_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
     min_review_queue_score: float = Field(default=0.62, ge=0.0, le=1.0)
+    routine_review_fraction: float = Field(default=0.03, ge=0.0, le=0.25)
+    require_high_value_review: bool = False
 
 
 class GateDecision(StrictModel):
@@ -69,17 +75,14 @@ class TrainingDataGateReport(StrictModel):
     created_at_unix: float = Field(default_factory=time.time)
 
 
-def _load_reputation(path: str | Path | None) -> dict[str, float]:
+def _load_reputation(path: str | Path | None) -> dict[str, dict[str, Any]]:
     if not path:
         return {}
     source = Path(path)
     if not source.exists():
         return {}
     payload = json.loads(source.read_text(encoding="utf-8"))
-    return {
-        str(item.get("source") or "unknown"): float(item.get("reputation_score", 0.5))
-        for item in payload.get("sources", [])
-    }
+    return {str(item.get("source") or "unknown"): dict(item) for item in payload.get("sources", [])}
 
 
 def _quality(row: dict[str, Any]) -> dict[str, Any]:
@@ -110,23 +113,72 @@ def _bounded(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def score_row(row: dict[str, Any], *, reputation_by_source: dict[str, float], config: TrainingDataGateConfig) -> GateDecision:
+def _has_independent_review(row: dict[str, Any]) -> bool:
+    review = row.get("human_review") if isinstance(row.get("human_review"), dict) else {}
+    decisions = review.get("decisions") if isinstance(review.get("decisions"), list) else []
+    reviewer_ids = {
+        str(item.get("reviewer_id"))
+        for item in decisions
+        if isinstance(item, dict) and item.get("reviewer_id")
+    }
+    values = [
+        str(item.get("decision"))
+        for item in decisions
+        if isinstance(item, dict) and item.get("decision") in {"approve", "reject"}
+    ]
+    if len(reviewer_ids) < 2 or len(values) < 2:
+        return False
+    if set(values) == {"approve"}:
+        return True
+    adjudication = review.get("adjudication") if isinstance(review.get("adjudication"), dict) else {}
+    return (
+        len(set(values)) > 1
+        and adjudication.get("decision") == "approve"
+        and adjudication.get("adjudicator_id") not in reviewer_ids
+    )
+
+
+def _deterministic_sample(content_hash: str, fraction: float, seed: int, stratum: str) -> bool:
+    if fraction <= 0:
+        return False
+    value = int(stable_hash(f"{seed}:{stratum}:{content_hash}")[:16], 16) / float(1 << 64)
+    return value < fraction
+
+
+def score_row(row: dict[str, Any], *, reputation_by_source: dict[str, dict[str, Any]], config: TrainingDataGateConfig) -> GateDecision:
     quality = _quality(row)
     source = str(row.get("source") or "unknown")
     text = _text(row)
     digest = str(row.get("content_hash") or quality.get("content_hash") or stable_hash(text))
     quality_score = _bounded(float(quality.get("quality_score", 0.0)))
-    reputation = _bounded(reputation_by_source.get(source, 0.5))
+    source_evidence = reputation_by_source.get(source, {})
+    reputation = _bounded(float(source_evidence.get("reputation_score", 0.5)))
+    reputation_lower_bound = _bounded(float(source_evidence.get("reputation_lower_bound", 0.0)))
+    source_action = str(source_evidence.get("action") or "unknown")
+    source_approval = str(source_evidence.get("approval_status") or "pending")
+    source_license_trust = _bounded(float(source_evidence.get("license_trust", 0.0)))
     data_type = str(quality.get("data_type") or "unknown")
     labels = {str(item) for item in quality.get("labels", [])}
     risk_flags = {str(item) for item in quality.get("risk_flags", [])}
     priorities = _priority_labels(quality)
+    mandatory_review = data_type in PATCH_DATA_TYPES | SECURITY_DATA_TYPES or bool(labels & MANDATORY_REVIEW_LABELS)
     reasons: list[str] = []
 
     if quality_score < config.min_quality_score:
         reasons.append("quality_below_training_threshold")
     if reputation < config.min_source_reputation_score:
         reasons.append("source_reputation_below_threshold")
+    if config.require_governed_sources:
+        quarantine_allowed = (
+            config.allow_governed_quarantine
+            and source_action == "quarantine"
+            and source_approval == "approved"
+            and source_license_trust >= 1.0
+        )
+        if source_action not in {"promote", "watch"} and not quarantine_allowed:
+            reasons.append(f"source_governance_action:{source_action}")
+        if reputation_lower_bound < config.min_reputation_lower_bound and not quarantine_allowed:
+            reasons.append("source_reputation_lower_bound_below_threshold")
     if config.reject_noise_flags and risk_flags.intersection(NOISE_FLAGS) and quality_score < config.high_value_review_threshold:
         reasons.append("boilerplate_or_low_signal_noise")
     if not text.strip():
@@ -144,6 +196,21 @@ def score_row(row: dict[str, Any], *, reputation_by_source: dict[str, float], co
     if reasons:
         high_value_uncertain = score >= config.min_review_queue_score and bool(priorities)
         status = "review_queue" if high_value_uncertain else "rejected"
+    elif (
+        (config.require_high_value_review or config.require_governed_sources)
+        and mandatory_review
+        and not _has_independent_review(row)
+    ):
+        status = "review_queue"
+        reasons.append("independent_high_value_review_required")
+    elif _deterministic_sample(
+        digest,
+        config.routine_review_fraction,
+        config.seed,
+        f"{source}:{data_type}",
+    ) and not _has_independent_review(row):
+        status = "review_queue"
+        reasons.append("routine_stratified_review_sample")
     else:
         status = "promoted"
 
