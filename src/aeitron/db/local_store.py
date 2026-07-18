@@ -105,6 +105,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   output_json TEXT NOT NULL DEFAULT '{}',
   attempt INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 2,
+  lease_owner TEXT,
+  lease_expires_at REAL,
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
   error TEXT,
   started_at REAL,
   finished_at REAL,
@@ -168,12 +171,66 @@ CREATE TABLE IF NOT EXISTS learning_candidates (
   created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_messages (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  task_graph_id TEXT NOT NULL REFERENCES task_graphs(id) ON DELETE CASCADE,
+  task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+  correlation_id TEXT NOT NULL,
+  sender_role TEXT NOT NULL CHECK (sender_role IN ('architect', 'coder', 'tester', 'security_reviewer', 'critic', 'verifier', 'orchestrator')),
+  recipient_role TEXT NOT NULL CHECK (recipient_role IN ('architect', 'coder', 'tester', 'security_reviewer', 'critic', 'verifier', 'orchestrator', 'broadcast')),
+  kind TEXT NOT NULL CHECK (kind IN ('proposal', 'evidence', 'challenge', 'review', 'decision')),
+  payload_json TEXT NOT NULL,
+  evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS blackboard_entries (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  task_graph_id TEXT NOT NULL REFERENCES task_graphs(id) ON DELETE CASCADE,
+  entry_key TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('fact', 'artifact', 'decision', 'question', 'evidence')),
+  value_json TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  immutable INTEGER NOT NULL DEFAULT 0,
+  verified INTEGER NOT NULL DEFAULT 0,
+  source_message_id TEXT REFERENCES agent_messages(id) ON DELETE SET NULL,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(run_id, entry_key),
+  CHECK (kind <> 'evidence' OR immutable = 1)
+);
+
+CREATE TABLE IF NOT EXISTS failure_records (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+  signature TEXT NOT NULL,
+  cluster_key TEXT NOT NULL,
+  raw_error TEXT NOT NULL,
+  root_cause TEXT,
+  patch_id TEXT REFERENCES patches(id) ON DELETE SET NULL,
+  verification_ref TEXT,
+  status TEXT NOT NULL DEFAULT 'observed',
+  occurrence_count INTEGER NOT NULL DEFAULT 1,
+  dataset_candidate_id TEXT REFERENCES learning_candidates(id) ON DELETE SET NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  first_seen_at REAL NOT NULL,
+  last_seen_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_workspace_files_project_path ON workspace_files(project_id, path);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_project_path ON code_chunks(project_id, path);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_project_symbol ON code_chunks(project_id, symbol_name);
 CREATE INDEX IF NOT EXISTS idx_runs_project_status ON runs(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_graph_status ON tasks(task_graph_id, status);
 CREATE INDEX IF NOT EXISTS idx_memory_project_kind ON memory_entries(project_id, kind);
+CREATE INDEX IF NOT EXISTS idx_messages_run_created ON agent_messages(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_correlation ON agent_messages(correlation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_blackboard_run_kind ON blackboard_entries(run_id, kind);
+CREATE INDEX IF NOT EXISTS idx_failures_cluster ON failure_records(project_id, cluster_key);
 """
 
 
@@ -220,6 +277,12 @@ class LocalStore:
             connection.execute("ALTER TABLE tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0")
         if "max_attempts" not in task_columns:
             connection.execute("ALTER TABLE tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 2")
+        if "lease_owner" not in task_columns:
+            connection.execute("ALTER TABLE tasks ADD COLUMN lease_owner TEXT")
+        if "lease_expires_at" not in task_columns:
+            connection.execute("ALTER TABLE tasks ADD COLUMN lease_expires_at REAL")
+        if "cancel_requested" not in task_columns:
+            connection.execute("ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         with self._lock:
@@ -387,6 +450,8 @@ class LocalStore:
         if graph is None:
             return None
         graph_payload = json.loads(graph["graph_json"])
+        graph_payload["status"] = graph["status"]
+        graph_payload["updated_at_unix"] = graph["updated_at"]
         task_rows = self.connection.execute(
             "SELECT * FROM tasks WHERE task_graph_id = ? ORDER BY created_at, rowid",
             (task_graph_id,),
@@ -467,7 +532,9 @@ class LocalStore:
                 output_json = CASE WHEN ? IS NULL THEN output_json ELSE ? END,
                 error = ?,
                 started_at = CASE WHEN ? THEN COALESCE(started_at, ?) ELSE started_at END,
-                finished_at = CASE WHEN ? THEN ? ELSE finished_at END
+                finished_at = CASE WHEN ? THEN ? ELSE finished_at END,
+                lease_owner = CASE WHEN ? IN ('completed', 'failed', 'cancelled', 'queued') THEN NULL ELSE lease_owner END,
+                lease_expires_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled', 'queued') THEN NULL ELSE lease_expires_at END
             WHERE id = ?
             """,
             (
@@ -479,6 +546,8 @@ class LocalStore:
                 timestamp,
                 finished,
                 timestamp,
+                status,
+                status,
                 task_id,
             ),
         )
@@ -500,6 +569,473 @@ class LocalStore:
                 error,
                 task_id,
             ),
+        )
+        self.connection.commit()
+
+    def claim_tasks(
+        self,
+        task_graph_id: str,
+        task_ids: list[str],
+        *,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> list[dict[str, Any]]:
+        """Atomically claim queued tasks using a bounded worker lease."""
+
+        if not task_ids:
+            return []
+        if not worker_id or len(worker_id) > 200:
+            raise ValueError("worker_id must contain 1-200 characters")
+        if not 1.0 <= lease_seconds <= 86_400.0:
+            raise ValueError("lease_seconds must be between 1 and 86400")
+        now = now_unix()
+        claimed: list[str] = []
+        with self._lock:
+            connection = self.connection
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET attempt = attempt + 1,
+                        status = CASE WHEN attempt + 1 >= max_attempts THEN 'failed' ELSE 'queued' END,
+                        error = 'worker lease expired',
+                        finished_at = CASE WHEN attempt + 1 >= max_attempts THEN ? ELSE finished_at END,
+                        lease_owner = NULL, lease_expires_at = NULL
+                    WHERE task_graph_id = ? AND status = 'running'
+                      AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+                      AND cancel_requested = 0
+                    """,
+                    (now, task_graph_id, now),
+                )
+                for task_id in task_ids:
+                    cursor = connection.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'running', lease_owner = ?, lease_expires_at = ?,
+                            started_at = COALESCE(started_at, ?)
+                        WHERE id = ? AND task_graph_id = ? AND status = 'queued'
+                          AND cancel_requested = 0
+                        """,
+                        (worker_id, now + lease_seconds, now, task_id, task_graph_id),
+                    )
+                    if cursor.rowcount == 1:
+                        claimed.append(task_id)
+                if claimed:
+                    connection.execute(
+                        "UPDATE task_graphs SET status = 'running', updated_at = ? WHERE id = ?",
+                        (now, task_graph_id),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return [task for task_id in claimed if (task := self.get_task(task_id)) is not None]
+
+    def recover_expired_task_leases(self, task_graph_id: str) -> int:
+        timestamp = now_unix()
+        cursor = self.connection.execute(
+            """
+            UPDATE tasks
+            SET attempt = attempt + 1,
+                status = CASE WHEN attempt + 1 >= max_attempts THEN 'failed' ELSE 'queued' END,
+                lease_owner = NULL, lease_expires_at = NULL,
+                error = 'worker lease expired',
+                finished_at = CASE WHEN attempt + 1 >= max_attempts THEN ? ELSE finished_at END
+            WHERE task_graph_id = ? AND status = 'running'
+              AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+              AND cancel_requested = 0
+            """,
+            (timestamp, task_graph_id, timestamp),
+        )
+        self.connection.commit()
+        return cursor.rowcount
+
+    def renew_task_lease(self, task_id: str, *, worker_id: str, lease_seconds: float) -> bool:
+        if not 1.0 <= lease_seconds <= 86_400.0:
+            raise ValueError("lease_seconds must be between 1 and 86400")
+        cursor = self.connection.execute(
+            """
+            UPDATE tasks SET lease_expires_at = ?
+            WHERE id = ? AND status = 'running' AND lease_owner = ? AND cancel_requested = 0
+            """,
+            (now_unix() + lease_seconds, task_id, worker_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount == 1
+
+    def cancel_task_graph(self, task_graph_id: str) -> int:
+        timestamp = now_unix()
+        with self._lock:
+            connection = self.connection
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET cancel_requested = 1,
+                        status = CASE WHEN status IN ('queued', 'running') THEN 'cancelled' ELSE status END,
+                        finished_at = CASE WHEN status IN ('queued', 'running') THEN ? ELSE finished_at END,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL
+                    WHERE task_graph_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')
+                    """,
+                    (timestamp, task_graph_id),
+                )
+                connection.execute(
+                    "UPDATE task_graphs SET status = 'cancelled', updated_at = ? WHERE id = ?",
+                    (timestamp, task_graph_id),
+                )
+                connection.commit()
+                return cursor.rowcount
+            except Exception:
+                connection.rollback()
+                raise
+
+    def insert_agent_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        timestamp = float(message.get("created_at_unix") or now_unix())
+        self.connection.execute(
+            """
+            INSERT INTO agent_messages(
+              id, run_id, task_graph_id, task_id, correlation_id, sender_role,
+              recipient_role, kind, payload_json, evidence_refs_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message["message_id"],
+                message["run_id"],
+                message["task_graph_id"],
+                message.get("task_id"),
+                message["correlation_id"],
+                message["sender_role"],
+                message["recipient_role"],
+                message["kind"],
+                json.dumps(message.get("payload", {}), sort_keys=True),
+                json.dumps(message.get("evidence_refs", []), sort_keys=True),
+                timestamp,
+            ),
+        )
+        self.connection.commit()
+        result = self.get_agent_message(str(message["message_id"]))
+        if result is None:
+            raise RuntimeError("agent message insert did not round-trip")
+        return result
+
+    def get_agent_message(self, message_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM agent_messages WHERE id = ?", (message_id,)).fetchone()
+        return self._agent_message_row(row)
+
+    def list_agent_messages(
+        self,
+        run_id: str,
+        *,
+        correlation_id: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 10_000:
+            raise ValueError("message limit must be between 1 and 10000")
+        if correlation_id:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM agent_messages
+                WHERE run_id = ? AND correlation_id = ?
+                ORDER BY created_at, rowid LIMIT ?
+                """,
+                (run_id, correlation_id, limit),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM agent_messages WHERE run_id = ? ORDER BY created_at, rowid LIMIT ?",
+                (run_id, limit),
+            ).fetchall()
+        return [item for row in rows if (item := self._agent_message_row(row)) is not None]
+
+    def _agent_message_row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        data = row_to_dict(row)
+        if data is None:
+            return None
+        data["message_id"] = data.pop("id")
+        data["payload"] = json.loads(data.pop("payload_json") or "{}")
+        data["evidence_refs"] = json.loads(data.pop("evidence_refs_json") or "[]")
+        data["created_at_unix"] = data.pop("created_at")
+        return data
+
+    def put_blackboard_entry(
+        self,
+        *,
+        entry_id: str,
+        run_id: str,
+        task_graph_id: str,
+        entry_key: str,
+        kind: str,
+        value: dict[str, Any],
+        immutable: bool,
+        verified: bool,
+        source_message_id: str | None,
+        expected_version: int | None,
+    ) -> dict[str, Any]:
+        timestamp = now_unix()
+        with self._lock:
+            connection = self.connection
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = connection.execute(
+                    "SELECT * FROM blackboard_entries WHERE run_id = ? AND entry_key = ?",
+                    (run_id, entry_key),
+                ).fetchone()
+                if current is None:
+                    if expected_version not in {None, 0}:
+                        raise RuntimeError("blackboard version conflict: entry does not exist")
+                    connection.execute(
+                        """
+                        INSERT INTO blackboard_entries(
+                          id, run_id, task_graph_id, entry_key, kind, value_json, version,
+                          immutable, verified, source_message_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            entry_id,
+                            run_id,
+                            task_graph_id,
+                            entry_key,
+                            kind,
+                            json.dumps(value, sort_keys=True),
+                            int(immutable),
+                            int(verified),
+                            source_message_id,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                else:
+                    current_version = int(current["version"])
+                    if bool(current["immutable"]):
+                        raise RuntimeError("immutable blackboard evidence cannot be changed")
+                    if expected_version is None or expected_version != current_version:
+                        raise RuntimeError(
+                            f"blackboard version conflict: expected {expected_version}, current {current_version}"
+                        )
+                    connection.execute(
+                        """
+                        UPDATE blackboard_entries
+                        SET kind = ?, value_json = ?, version = version + 1,
+                            verified = ?, source_message_id = ?, updated_at = ?
+                        WHERE run_id = ? AND entry_key = ? AND version = ?
+                        """,
+                        (
+                            kind,
+                            json.dumps(value, sort_keys=True),
+                            int(verified),
+                            source_message_id,
+                            timestamp,
+                            run_id,
+                            entry_key,
+                            current_version,
+                        ),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        result = self.get_blackboard_entry(run_id, entry_key)
+        if result is None:
+            raise RuntimeError("blackboard write did not round-trip")
+        return result
+
+    def get_blackboard_entry(self, run_id: str, entry_key: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM blackboard_entries WHERE run_id = ? AND entry_key = ?",
+            (run_id, entry_key),
+        ).fetchone()
+        return self._blackboard_row(row)
+
+    def list_blackboard_entries(self, run_id: str, *, kind: str | None = None) -> list[dict[str, Any]]:
+        if kind:
+            rows = self.connection.execute(
+                "SELECT * FROM blackboard_entries WHERE run_id = ? AND kind = ? ORDER BY created_at, rowid",
+                (run_id, kind),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM blackboard_entries WHERE run_id = ? ORDER BY created_at, rowid",
+                (run_id,),
+            ).fetchall()
+        return [item for row in rows if (item := self._blackboard_row(row)) is not None]
+
+    def _blackboard_row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        data = row_to_dict(row)
+        if data is None:
+            return None
+        data["entry_id"] = data.pop("id")
+        data["value"] = json.loads(data.pop("value_json") or "{}")
+        data["immutable"] = bool(data["immutable"])
+        data["verified"] = bool(data["verified"])
+        data["created_at_unix"] = data.pop("created_at")
+        data["updated_at_unix"] = data.pop("updated_at")
+        return data
+
+    def record_failure(
+        self,
+        *,
+        project_id: str | None,
+        run_id: str | None,
+        task_id: str | None,
+        signature: str,
+        cluster_key: str,
+        raw_error: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        timestamp = now_unix()
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT * FROM failure_records
+                WHERE project_id IS ? AND cluster_key = ? AND status IN ('observed', 'linked', 'verified')
+                ORDER BY last_seen_at DESC LIMIT 1
+                """,
+                (project_id, cluster_key),
+            ).fetchone()
+            if row is None:
+                failure_id = new_id()
+                self.connection.execute(
+                    """
+                    INSERT INTO failure_records(
+                      id, project_id, run_id, task_id, signature, cluster_key, raw_error,
+                      metadata_json, first_seen_at, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        failure_id,
+                        project_id,
+                        run_id,
+                        task_id,
+                        signature,
+                        cluster_key,
+                        raw_error,
+                        json.dumps(metadata or {}, sort_keys=True),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            else:
+                failure_id = str(row["id"])
+                merged_metadata = json.loads(row["metadata_json"] or "{}")
+                merged_metadata.update(metadata or {})
+                self.connection.execute(
+                    """
+                    UPDATE failure_records
+                    SET occurrence_count = occurrence_count + 1, last_seen_at = ?,
+                        raw_error = ?, run_id = COALESCE(?, run_id),
+                        task_id = COALESCE(?, task_id), metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        timestamp,
+                        raw_error,
+                        run_id,
+                        task_id,
+                        json.dumps(merged_metadata, sort_keys=True),
+                        failure_id,
+                    ),
+                )
+            self.connection.commit()
+        result = self.get_failure(failure_id)
+        if result is None:
+            raise RuntimeError("failure record did not round-trip")
+        return result
+
+    def link_failure_resolution(
+        self,
+        failure_id: str,
+        *,
+        root_cause: str,
+        patch_id: str,
+        verification_ref: str,
+        verified: bool,
+    ) -> dict[str, Any]:
+        status = "verified" if verified else "linked"
+        self.connection.execute(
+            """
+            UPDATE failure_records
+            SET root_cause = ?, patch_id = ?, verification_ref = ?, status = ?, last_seen_at = ?
+            WHERE id = ?
+            """,
+            (root_cause, patch_id, verification_ref, status, now_unix(), failure_id),
+        )
+        self.connection.commit()
+        result = self.get_failure(failure_id)
+        if result is None:
+            raise KeyError(f"unknown failure record: {failure_id}")
+        return result
+
+    def get_failure(self, failure_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM failure_records WHERE id = ?", (failure_id,)).fetchone()
+        data = row_to_dict(row)
+        if data is None:
+            return None
+        data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
+        return data
+
+    def list_failure_clusters(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT cluster_key, signature, SUM(occurrence_count) AS occurrence_count,
+                   MAX(last_seen_at) AS last_seen_at,
+                   SUM(CASE WHEN status = 'verified' THEN occurrence_count ELSE 0 END) AS verified_count
+            FROM failure_records
+            WHERE project_id IS ?
+            GROUP BY cluster_key, signature
+            ORDER BY occurrence_count DESC, last_seen_at DESC
+            """,
+            (project_id,),
+        ).fetchall()
+        return [row_to_dict(row) or {} for row in rows]
+
+    def insert_learning_candidate(
+        self,
+        *,
+        project_id: str | None,
+        run_id: str | None,
+        patch_id: str | None,
+        kind: str,
+        prompt: str,
+        chosen: str,
+        verification: dict[str, Any],
+        score: float,
+    ) -> dict[str, Any]:
+        candidate_id = new_id()
+        self.connection.execute(
+            """
+            INSERT INTO learning_candidates(
+              id, project_id, run_id, patch_id, kind, status, prompt, chosen,
+              verification_json, score, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending_review', ?, ?, ?, ?, ?)
+            """,
+            (
+                candidate_id,
+                project_id,
+                run_id,
+                patch_id,
+                kind,
+                prompt,
+                chosen,
+                json.dumps(verification, sort_keys=True),
+                score,
+                now_unix(),
+            ),
+        )
+        self.connection.commit()
+        row = self.connection.execute("SELECT * FROM learning_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        result = row_to_dict(row)
+        if result is None:
+            raise RuntimeError("learning candidate insert did not round-trip")
+        result["verification"] = json.loads(result.pop("verification_json") or "{}")
+        return result
+
+    def attach_failure_candidate(self, failure_id: str, candidate_id: str) -> None:
+        self.connection.execute(
+            "UPDATE failure_records SET dataset_candidate_id = ? WHERE id = ? AND status = 'verified'",
+            (candidate_id, failure_id),
         )
         self.connection.commit()
 

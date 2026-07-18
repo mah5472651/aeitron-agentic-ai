@@ -36,7 +36,10 @@ Aeitron follows this roadmap for every future change:
 - local vector search for repository chunks
 - Context building
 - Durable TaskGraph runtime
-- TaskGraph state machine: advance, complete, fail
+- concurrent dependency-ready TaskGraph workers with leases, timeout, retry, and cancellation
+- typed agent packets, durable message history, versioned shared blackboard
+- peer challenge, critic, verifier, and bounded three-revision reflection protocol
+- normalized failure clustering and verified repair dataset candidates
 - Tool command execution
 - Defensive Semgrep/CodeQL verifier hooks
 - hardened Docker sandbox contract
@@ -109,7 +112,35 @@ Invoke-RestMethod http://127.0.0.1:8090/v1/projects/<project_id>/symbols
 Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/taskgraphs/<task_graph_id>/advance
 Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/tasks/<task_id>/complete -Body '{"outputs":{}}' -ContentType 'application/json'
 Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/tasks/<task_id>/fail -Body '{"error":"reason"}' -ContentType 'application/json'
+Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/taskgraphs/<task_graph_id>/cancel
 ```
+
+The native worker pool runs every dependency-ready node up to its configured
+concurrency limit. It writes `proposal`, `evidence`, `challenge`, `review`, and
+`decision` packets to durable history. Run-scoped facts and artifacts use an
+optimistically locked blackboard; evidence is immutable. Only a verifier-backed
+accepted negotiation can be promoted into Unified Memory.
+
+Collaboration inspection endpoints:
+
+```text
+POST /v1/agent/messages
+GET  /v1/agent/runs/{run_id}/messages
+PUT  /v1/agent/blackboard
+GET  /v1/agent/runs/{run_id}/blackboard
+GET  /v1/projects/{project_id}/failure-clusters
+```
+
+After applying Postgres migrations, prove durable contention and CAS behavior:
+
+```powershell
+python -m src.aeitron.runtime.collaboration --postgres-proof `
+  --database-url "$env:AEITRON_DATABASE_URL" `
+  --output-dir artifacts\aeitron\agent-collaboration-proof
+```
+
+Production readiness consumes the generated proof report. Configuration alone
+does not mark collaboration persistence production-ready.
 
 ## Aeitron Scratch Model Serving
 

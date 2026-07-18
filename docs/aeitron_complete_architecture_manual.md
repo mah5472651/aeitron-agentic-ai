@@ -53,6 +53,9 @@ architecture. It has:
 - JWT auth and quota middleware
 - repository indexing and context packing
 - durable TaskGraph execution
+- concurrent role-separated workers and durable typed agent communication
+- run-scoped immutable-evidence blackboard and bounded reflection
+- failure signature clustering and verified repair linkage
 - tool execution and Docker sandbox contracts
 - patch preview/apply/rollback/verify flows
 - defensive verification and benchmark harnesses
@@ -80,6 +83,11 @@ Gateway Layer
   +--> Context Builder
   +--> Agent Runtime
   +--> TaskGraph Runtime
+  |      +--> Concurrent Worker Pool
+  |      +--> Typed Agent Message History
+  |      +--> Shared Blackboard
+  |      +--> Negotiation / Reflection
+  |      +--> Failure Intelligence
   +--> Tool / Sandbox Runtime
   +--> Patch Manager
   +--> Verifier
@@ -378,23 +386,133 @@ Files:
 - `src/aeitron/planning/engine.py`
 - `src/aeitron/runtime/taskgraph.py`
 - `src/aeitron/runtime/engine.py`
+- `src/aeitron/runtime/collaboration.py`
 
 Purpose:
 
-Create and execute durable task graphs for agentic work. Current default graph:
+Create and execute durable task graphs for agentic work. The graph is a DAG,
+not a decorative linear checklist:
 
 ```text
-understand
-  -> planner
-  -> retrieve_context
-  -> edit
-  -> test
-  -> critic_review
-  -> security_review
-  -> performance_review
-  -> verify
-  -> summarize
+understand -> planner -> retrieve_context -> edit
+                                           |-> test -> critic_review --|
+                                           |-> security_review --------|-> verify -> summarize
+                                           `-> performance_review -----|
 ```
+
+`AgentWorkerPool` atomically claims every dependency-ready node up to the
+configured concurrency limit. A task claim has a worker ID and expiring lease.
+Long-running handlers renew the lease in the background. A crashed worker's
+expired lease consumes one retry attempt; the task is requeued only while its
+bounded retry budget remains. Each handler has an absolute timeout. Cancellation
+marks all queued/running nodes cancelled and stops in-flight asyncio handlers.
+
+Role ownership is fixed:
+
+| Task | Role | Responsibility boundary |
+|---|---|---|
+| understand, planner, retrieve_context | architect | requirements, plan, context; no executable patch |
+| edit | coder | code or patch proposal |
+| test | tester | measured execution evidence |
+| security_review | security reviewer | defensive risk challenge and review |
+| critic_review, performance_review | critic | flaws and confidence; no final solution |
+| verify | verifier | success-criteria decision only |
+| summarize | orchestrator | evidence-backed response assembly |
+
+Registering a handler under the wrong role fails before execution.
+
+### Typed Agent Communication
+
+All packets are Pydantic-validated and persisted in `agent_messages`. The only
+message kinds are:
+
+- `proposal`
+- `evidence`
+- `challenge`
+- `review`
+- `decision`
+
+Packets carry run, graph, task, correlation, sender/recipient role, bounded JSON
+payload, evidence references, and timestamp. Payloads are capped at 64 KiB,
+common secret keys/values are redacted, duplicate evidence references are
+rejected, and sender role capabilities are validated. Architects cannot publish
+patch artifacts, critics cannot issue decisions, and only verifiers can publish
+verification decisions.
+
+### Shared Blackboard
+
+`blackboard_entries` is temporary run-scoped coordination state. It does not
+duplicate Unified Memory.
+
+- kinds: fact, artifact, decision, question, evidence
+- evidence is immutable after insertion
+- mutable updates require `expected_version`
+- conflicting writes fail with a version conflict
+- every entry can reference its source message
+- only accepted verifier decisions may be promoted to Unified Memory
+
+Working drafts, raw thoughts, failed guesses, and unverified output remain in
+run history and are never promoted as long-term memory.
+
+### Negotiation And Reflection
+
+The strict flow is:
+
+```text
+worker proposal
+  -> peer challenge/review
+  -> evidence response
+  -> critic confidence and flaw report
+  -> verifier decision
+  -> revise when rejected or confidence < 0.85
+```
+
+Revision always checks:
+
+1. What assumptions are wrong?
+2. What can fail?
+3. What security risks exist?
+4. What was not verified?
+
+There are at most three revision cycles. Acceptance requires peer acceptance,
+critic confidence at or above the configured threshold, verifier acceptance,
+and at least one verification evidence reference. This prevents infinite
+reasoning loops and evidence-free confidence claims.
+
+### Failure Intelligence
+
+Runtime exceptions and timeouts are secret-redacted and normalized by replacing
+volatile paths, addresses, UUIDs, locations, and large numbers. A SHA-256
+cluster key groups equivalent failures. Each cluster tracks occurrence count,
+last seen time, task kind, root cause, patch, and verification reference.
+
+A failure becomes a `pending_review` scratch-training dataset candidate only
+when:
+
+- it repeated at least the configured threshold;
+- a real patch record is linked;
+- root cause is recorded;
+- verification passed.
+
+Unresolved failures and unverified patches cannot enter the learning candidate
+path.
+
+### Postgres Production Proof
+
+Migration `0005_agent_collaboration.sql` owns task leases, messages, blackboard
+entries, and failure records. The live proof command creates a namespaced
+project/run, races two Postgres claimers with `FOR UPDATE SKIP LOCKED`, verifies
+there is exactly one winner, verifies stale blackboard CAS rejection, reads a
+durable message back, and removes all proof rows through project cascade.
+
+```powershell
+python -m src.aeitron.runtime.collaboration --postgres-proof `
+  --database-url "$env:AEITRON_DATABASE_URL" `
+  --output-dir artifacts\aeitron\agent-collaboration-proof
+```
+
+The production readiness gate requires the measured report. Merely setting a
+Postgres URL is insufficient.
 
 When it runs:
 
@@ -407,8 +525,14 @@ APIs:
 - `POST /v1/agent/runs`
 - `GET /v1/taskgraphs/{task_graph_id}`
 - `POST /v1/taskgraphs/{task_graph_id}/advance`
+- `POST /v1/taskgraphs/{task_graph_id}/cancel`
 - `POST /v1/tasks/{task_id}/complete`
 - `POST /v1/tasks/{task_id}/fail`
+- `POST /v1/agent/messages`
+- `GET /v1/agent/runs/{run_id}/messages`
+- `PUT /v1/agent/blackboard`
+- `GET /v1/agent/runs/{run_id}/blackboard`
+- `GET /v1/projects/{project_id}/failure-clusters`
 
 Why it exists:
 

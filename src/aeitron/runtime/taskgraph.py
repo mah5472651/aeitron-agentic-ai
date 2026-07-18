@@ -76,6 +76,7 @@ class TaskAdvanceResponse(StrictModel):
     task_graph_id: str
     status: str
     active_task: dict[str, Any] | None = None
+    active_tasks: list[dict[str, Any]] = Field(default_factory=list)
     ready_task_count: int
     completed_task_count: int
     failed_task_count: int
@@ -137,20 +138,34 @@ class TaskGraphRuntime:
         apply_patch: bool,
     ) -> TaskGraph:
         nodes: list[TaskNode] = []
-        previous_id: str | None = None
+        node_ids: dict[str, str] = {}
+        dependency_kinds: dict[str, list[str]] = {
+            "understand": [],
+            "planner": ["understand"],
+            "retrieve_context": ["planner"],
+            "edit": ["retrieve_context"],
+            "test": ["edit"],
+            "critic_review": ["test"],
+            "security_review": ["edit"],
+            "performance_review": ["edit"],
+            "verify": ["test", "critic_review", "security_review", "performance_review"],
+            "summarize": ["verify"],
+        }
         for kind, title in TASK_NODE_ORDER:
+            dependencies = [node_ids[item] for item in dependency_kinds[kind]]
             node = TaskNode(
                 kind=kind,
                 title=title,
                 instructions=self.instructions_for(kind, prompt=prompt, mode=mode, apply_patch=apply_patch),
-                depends_on=[previous_id] if previous_id else [],
+                depends_on=dependencies,
                 inputs={"prompt": prompt, "mode": mode, "max_steps": max_steps} if kind == "understand" else {},
             )
             nodes.append(node)
-            previous_id = node.node_id
+            node_ids[kind] = node.node_id
         edges = [
-            {"from": nodes[index].node_id, "to": nodes[index + 1].node_id, "condition": "success"}
-            for index in range(len(nodes) - 1)
+            {"from": dependency_id, "to": node.node_id, "condition": "success"}
+            for node in nodes
+            for dependency_id in node.depends_on
         ]
         return TaskGraph(
             project_id=project_id,
@@ -191,22 +206,40 @@ class TaskGraphRuntime:
         if failed:
             self.store.update_task_graph_status(task_graph_id, "failed")
             return self.advance_report(task_graph_id, "failed", None, tasks)
+        self.store.recover_expired_task_leases(task_graph_id)
+        tasks = self.store.list_tasks(task_graph_id)
+        failed = [task for task in tasks if task["status"] == "failed"]
+        if failed:
+            self.store.update_task_graph_status(task_graph_id, "failed")
+            return self.advance_report(task_graph_id, "failed", None, tasks)
+        cancelled = [task for task in tasks if task["status"] == "cancelled"]
+        if cancelled:
+            self.store.update_task_graph_status(task_graph_id, "cancelled")
+            return self.advance_report(task_graph_id, "cancelled", None, tasks)
         running = [task for task in tasks if task["status"] == "running"]
         if running:
             return self.advance_report(task_graph_id, "running", running[0], tasks)
-        ready = self.ready_tasks(tasks)
-        if ready:
-            task = ready[0]
-            self.store.update_task_state(task["id"], status="running", started=True)
-            self.store.update_task_graph_status(task_graph_id, "running")
-            started = self.store.get_task(task["id"])
+        claimed = self.claim_ready_tasks(
+            task_graph_id,
+            limit=1,
+            worker_id=f"api-{uuid.uuid4()}",
+            lease_seconds=300.0,
+        )
+        if claimed:
+            started = claimed[0]
             return self.advance_report(task_graph_id, "running", started, self.store.list_tasks(task_graph_id))
         if tasks and all(task["status"] == "completed" for task in tasks):
             self.store.update_task_graph_status(task_graph_id, "completed")
             return self.advance_report(task_graph_id, "completed", None, tasks)
         return self.advance_report(task_graph_id, str(graph.get("status") or "queued"), None, tasks)
 
-    def complete_task(self, task_id: str, request: TaskCompleteRequest | None = None) -> TaskAdvanceResponse:
+    def complete_task(
+        self,
+        task_id: str,
+        request: TaskCompleteRequest | None = None,
+        *,
+        claim_next: bool = True,
+    ) -> TaskAdvanceResponse:
         task = self.store.get_task(task_id)
         if task is None:
             raise KeyError(f"unknown task: {task_id}")
@@ -217,9 +250,11 @@ class TaskGraphRuntime:
             error=None,
             finished=True,
         )
-        return self.advance(task["task_graph_id"])
+        if claim_next:
+            return self.advance(task["task_graph_id"])
+        return self.report(task["task_graph_id"])
 
-    def fail_task(self, task_id: str, request: TaskFailRequest) -> TaskAdvanceResponse:
+    def fail_task(self, task_id: str, request: TaskFailRequest, *, claim_next: bool = True) -> TaskAdvanceResponse:
         task = self.store.get_task(task_id)
         if task is None:
             raise KeyError(f"unknown task: {task_id}")
@@ -242,7 +277,9 @@ class TaskGraphRuntime:
             )
             self.store.update_task_attempt(task_id, attempt=next_attempt, outputs=retry_outputs, error=request.error)
             self.store.update_task_graph_status(task["task_graph_id"], "running")
-            return self.advance(task["task_graph_id"])
+            if claim_next:
+                return self.advance(task["task_graph_id"])
+            return self.report(task["task_graph_id"])
         self.store.update_task_state(
             task_id,
             status="failed",
@@ -252,7 +289,66 @@ class TaskGraphRuntime:
         )
         self.store.update_task_attempt(task_id, attempt=next_attempt, outputs=retry_outputs, error=request.error)
         self.store.update_task_graph_status(task["task_graph_id"], "failed")
-        return self.advance(task["task_graph_id"])
+        return self.report(task["task_graph_id"])
+
+    def claim_ready_tasks(
+        self,
+        task_graph_id: str,
+        *,
+        limit: int,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 64:
+            raise ValueError("claim limit must be between 1 and 64")
+        graph = self.store.get_task_graph(task_graph_id)
+        if graph is None:
+            raise KeyError(f"unknown task graph: {task_graph_id}")
+        if str(graph.get("status")) in {"completed", "failed", "cancelled"}:
+            return []
+        self.store.recover_expired_task_leases(task_graph_id)
+        tasks = self.store.list_tasks(task_graph_id)
+        if any(task["status"] == "failed" for task in tasks):
+            self.store.update_task_graph_status(task_graph_id, "failed")
+            return []
+        ready = self.ready_tasks(tasks)[:limit]
+        return self.store.claim_tasks(
+            task_graph_id,
+            [str(task["id"]) for task in ready],
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+        )
+
+    def cancel(self, task_graph_id: str) -> TaskAdvanceResponse:
+        if self.store.get_task_graph(task_graph_id) is None:
+            raise KeyError(f"unknown task graph: {task_graph_id}")
+        self.store.cancel_task_graph(task_graph_id)
+        return self.report(task_graph_id)
+
+    def report(self, task_graph_id: str) -> TaskAdvanceResponse:
+        graph = self.store.get_task_graph(task_graph_id)
+        if graph is None:
+            raise KeyError(f"unknown task graph: {task_graph_id}")
+        self.store.recover_expired_task_leases(task_graph_id)
+        tasks = self.store.list_tasks(task_graph_id)
+        failed = any(task["status"] == "failed" for task in tasks)
+        cancelled = any(task["status"] == "cancelled" for task in tasks)
+        complete = bool(tasks) and all(task["status"] == "completed" for task in tasks)
+        running = [task for task in tasks if task["status"] == "running"]
+        status = (
+            "failed"
+            if failed
+            else "cancelled"
+            if cancelled
+            else "completed"
+            if complete
+            else "running"
+            if running or self.ready_tasks(tasks)
+            else str(graph.get("status") or "queued")
+        )
+        if status != graph.get("status"):
+            self.store.update_task_graph_status(task_graph_id, status)
+        return self.advance_report(task_graph_id, status, running[0] if running else None, tasks)
 
     def ready_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         completed = {task["id"] for task in tasks if task["status"] == "completed"}
@@ -274,6 +370,7 @@ class TaskGraphRuntime:
             task_graph_id=task_graph_id,
             status=status,
             active_task=active_task,
+            active_tasks=[task for task in tasks if task["status"] == "running"],
             ready_task_count=len(ready),
             completed_task_count=sum(1 for task in tasks if task["status"] == "completed"),
             failed_task_count=sum(1 for task in tasks if task["status"] == "failed"),

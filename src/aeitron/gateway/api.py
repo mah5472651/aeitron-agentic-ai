@@ -22,6 +22,7 @@ from src.aeitron.model_ops.backends import active_model_health, list_model_profi
 from src.aeitron.model_ops.foundation import PretrainingRunSpec, foundation_status
 from src.aeitron.observability import METRICS, install_observability
 from src.aeitron.patches import PatchPreviewRequest, PatchService, PatchVerifyRequest
+from src.aeitron.runtime.collaboration import AgentMessage, BlackboardKind, BlackboardWrite, CollaborationRuntime, FailureIntelligence
 from src.aeitron.runtime.engine import AeitronRuntime
 from src.aeitron.runtime.taskgraph import AgentRunCreateRequest, TaskCompleteRequest, TaskFailRequest, TaskGraphRuntime
 from src.aeitron.shared.schemas import AeitronRunRequest, AeitronRunReport
@@ -754,6 +755,17 @@ async def advance_task_graph(task_graph_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="task graph not found") from exc
 
 
+@app.post("/v1/taskgraphs/{task_graph_id}/cancel")
+async def cancel_task_graph(task_graph_id: str, request: Request) -> dict[str, Any]:
+    try:
+        require_scope(request, "agents:control")
+        return TaskGraphRuntime(STORE).cancel(task_graph_id).model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="task graph not found") from exc
+
+
 @app.post("/v1/tasks/{task_id}/complete")
 async def complete_task(task_id: str, request: TaskCompleteRequest) -> dict[str, Any]:
     try:
@@ -768,6 +780,81 @@ async def fail_task(task_id: str, request: TaskFailRequest) -> dict[str, Any]:
         return TaskGraphRuntime(STORE).fail_task(task_id, request).model_dump()
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="task not found") from exc
+
+
+@app.post("/v1/agent/messages")
+async def publish_agent_message(message: AgentMessage, request: Request) -> dict[str, Any]:
+    try:
+        require_scope(request, "agents:messages:write")
+        return CollaborationRuntime(STORE).publish(message).model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/v1/agent/runs/{run_id}/messages")
+async def list_agent_messages(
+    run_id: str,
+    request: Request,
+    correlation_id: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    try:
+        require_scope(request, "agents:messages:read")
+        return [
+            item.model_dump(mode="json")
+            for item in CollaborationRuntime(STORE).history(run_id, correlation_id=correlation_id, limit=limit)
+        ]
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.put("/v1/agent/blackboard")
+async def write_agent_blackboard(entry: BlackboardWrite, request: Request) -> dict[str, Any]:
+    try:
+        require_scope(request, "agents:blackboard:write")
+        return CollaborationRuntime(STORE).write_blackboard(entry).model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/v1/agent/runs/{run_id}/blackboard")
+async def read_agent_blackboard(
+    run_id: str,
+    request: Request,
+    kind: BlackboardKind | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        require_scope(request, "agents:blackboard:read")
+        return [item.model_dump(mode="json") for item in CollaborationRuntime(STORE).blackboard(run_id, kind=kind)]
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/v1/projects/{project_id}/failure-clusters")
+async def list_failure_clusters(project_id: str, request: Request) -> list[dict[str, Any]]:
+    try:
+        require_scope(request, "agents:failures:read")
+        if STORE.get_project(project_id) is None:
+            raise KeyError(project_id)
+        return FailureIntelligence(STORE).clusters(project_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
 
 
 @app.get("/v1/projects/{project_id}/index/status")

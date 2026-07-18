@@ -352,6 +352,69 @@ def _check_training_workspace(mode: str) -> ReadinessCheck:
     )
 
 
+def _check_agent_collaboration(mode: str) -> ReadinessCheck:
+    migration = Path("src/aeitron/db/migrations/0005_agent_collaboration.sql")
+    database_url = os.environ.get("AEITRON_DATABASE_URL", "")
+    postgres_configured = database_url.startswith(("postgres://", "postgresql://"))
+    proof_path = Path(
+        os.environ.get(
+            "AEITRON_AGENT_COLLABORATION_PROOF_REPORT",
+            "artifacts/aeitron/agent-collaboration-proof/agent_collaboration_postgres_proof.json",
+        )
+    )
+    live_proven = False
+    if proof_path.is_file():
+        try:
+            proof = json.loads(proof_path.read_text(encoding="utf-8"))
+            live_proven = (
+                proof.get("status") == "passed"
+                and proof.get("migration") == "0005_agent_collaboration"
+                and proof.get("atomic_claim_winner_count") == 1
+                and proof.get("blackboard_stale_update_rejected") is True
+                and proof.get("durable_message_round_trip") is True
+            )
+        except (OSError, json.JSONDecodeError):
+            live_proven = False
+    missing = []
+    if not migration.exists():
+        missing.append(str(migration))
+    if mode == "production" and not postgres_configured:
+        missing.append("AEITRON_DATABASE_URL=postgresql://...")
+    if mode == "production" and not live_proven:
+        missing.append(f"valid live Postgres lifecycle proof: {proof_path}")
+    status: ReadinessStatus
+    if missing:
+        status = "blocked_missing_dependency"
+    elif mode == "production":
+        status = "production_ready_requires_external_service"
+    else:
+        status = "production_ready"
+    return ReadinessCheck(
+        subsystem="agent_collaboration",
+        status=status,
+        summary=(
+            "Concurrent TaskGraph leases, typed messages, blackboard CAS, bounded reflection, and failure intelligence are wired."
+            if not missing
+            else "Agent collaboration persistence is missing a production dependency."
+        ),
+        required_dependencies=[
+            "migration 0005_agent_collaboration",
+            "Postgres in production",
+            "live concurrent lifecycle proof",
+        ],
+        missing_dependencies=missing,
+        evidence={
+            "migration_present": migration.exists(),
+            "postgres_configured": postgres_configured,
+            "live_postgres_lifecycle_proven": live_proven,
+            "proof_report": str(proof_path),
+            "max_reflection_revisions": 3,
+            "typed_message_kinds": ["proposal", "evidence", "challenge", "review", "decision"],
+        },
+        production_blocker=mode == "production" and bool(missing),
+    )
+
+
 def _check_benchmark_files(mode: str, benchmark_dir: str | Path) -> ReadinessCheck:
     root = Path(benchmark_dir)
     required = [
@@ -387,6 +450,7 @@ def run_production_readiness(
         *_check_cli_tools(mode),
         *_check_training_stack(mode),
         _check_training_workspace(mode),
+        _check_agent_collaboration(mode),
         _check_benchmark_files(mode, benchmark_dir),
     ]
     failed = any(check.production_blocker for check in checks)
