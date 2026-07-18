@@ -23,7 +23,7 @@ class BenchmarkFeedbackReport(StrictModel):
     benchmark_score: float
     benchmark_total: int
     benchmark_passed: int
-    task_approval_rate: float
+    task_automated_pass_rate: float
     avg_quality_score: float
     recommendations: list[FeedbackRecommendation] = Field(default_factory=list)
 
@@ -46,10 +46,10 @@ def build_feedback_report(
     benchmark_passed = int(benchmark.get("passed", 0))
     avg_quality_score = float(quality.get("avg_quality_score", 0.0))
     review_total = int(review.get("total", 0))
-    review_approved = int(review.get("approved", 0))
-    task_approval_rate = review_approved / max(1, review_total)
-    approved_by_type = dict(review.get("approved_by_type") or {})
-    task_type_count = len([value for value in approved_by_type.values() if int(value) > 0])
+    automated_pass = int(review.get("automated_pass", 0))
+    task_automated_pass_rate = automated_pass / max(1, review_total)
+    automated_pass_by_type = dict(review.get("automated_pass_by_type") or {})
+    task_type_count = len([value for value in automated_pass_by_type.values() if int(value) > 0])
     components = dict(quality.get("avg_component_scores") or {})
 
     recommendations: list[FeedbackRecommendation] = []
@@ -62,22 +62,22 @@ def build_feedback_report(
                 metadata={"avg_quality_score": avg_quality_score},
             )
         )
-    if review_total and task_approval_rate < 0.5:
+    if review_total and task_automated_pass_rate < 0.5:
         recommendations.append(
             FeedbackRecommendation(
                 kind="task_extraction",
                 severity="high",
-                message="Task approval rate is low; improve task extraction prompts and reject noisy sources.",
-                metadata={"task_approval_rate": task_approval_rate},
+                message="Automated task pass rate is low; improve extraction rules and reject noisy sources.",
+                metadata={"task_automated_pass_rate": task_automated_pass_rate},
             )
         )
-    if review_approved >= 20 and task_type_count < 3:
+    if automated_pass >= 20 and task_type_count < 3:
         recommendations.append(
             FeedbackRecommendation(
                 kind="task_diversity",
                 severity="medium",
-                message="Approved task mix is narrow; add sources that produce security, patch, debug, test, and implementation tasks.",
-                metadata={"approved_by_type": approved_by_type},
+                message="Automated-pass task mix is narrow; add sources that produce security, patch, debug, test, and implementation tasks.",
+                metadata={"automated_pass_by_type": automated_pass_by_type},
             )
         )
     if components and max(float(components.get("security_signal", 0.0)), float(components.get("agentic_signal", 0.0))) < 0.2:
@@ -98,19 +98,39 @@ def build_feedback_report(
                 metadata={"benchmark_score": benchmark_score, "benchmark_total": benchmark_total},
             )
         )
+    if benchmark_total == 0:
+        recommendations.append(
+            FeedbackRecommendation(
+                kind="benchmark_missing",
+                severity="high",
+                message="No governed benchmark result is bound to this dataset; training promotion is prohibited.",
+            )
+        )
+    if automated_pass:
+        recommendations.append(
+            FeedbackRecommendation(
+                kind="human_review_required",
+                severity="high",
+                message=(
+                    "Automated policy checks are not human approval. Candidate tasks require the configured "
+                    "independent review and Dataset Trust Authority promotion gates."
+                ),
+                metadata={"automated_pass_candidates": automated_pass},
+            )
+        )
     if not recommendations:
         recommendations.append(
             FeedbackRecommendation(
-                kind="promotion",
+                kind="governance",
                 severity="info",
-                message="Dataset version passes current feedback gates and can be queued for training/evaluation promotion.",
+                message="Automated feedback found no additional issue; only the Dataset Trust Authority can promote this version.",
             )
         )
     return BenchmarkFeedbackReport(
         benchmark_score=benchmark_score,
         benchmark_total=benchmark_total,
         benchmark_passed=benchmark_passed,
-        task_approval_rate=round(task_approval_rate, 6),
+        task_automated_pass_rate=round(task_automated_pass_rate, 6),
         avg_quality_score=avg_quality_score,
         recommendations=recommendations,
     )

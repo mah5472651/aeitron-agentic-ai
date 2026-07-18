@@ -130,6 +130,7 @@ class DataPipelineConfig(StrictModel):
     extract_tasks: bool = True
     review_tasks: bool = True
     max_extracted_tasks: int = Field(default=50_000, ge=1)
+    max_tasks_per_source_row: int = Field(default=3, ge=1, le=20)
     object_store_uri: str = "local://artifacts/aeitron/object-store"
     object_store_endpoint_url: str | None = None
     upload_artifacts: bool = True
@@ -472,18 +473,45 @@ async def _run_data_pipeline_locked(
 
     task_report: TaskExtractionReport | None = None
     review_report: ReviewReport | None = None
-    approved_tasks_path = root / "tasks" / "approved_tasks.jsonl"
+    automated_pass_tasks_path = root / "tasks" / "automated_pass_tasks.jsonl"
     task_report_path = reports_dir / "task_extraction_report.json"
     if config.extract_tasks:
-        progress.emit("task_extraction", "started", max_tasks=config.max_extracted_tasks)
-        task_report = extract_tasks(clean_files, tasks_path, max_tasks=config.max_extracted_tasks)
+        progress.emit(
+            "task_extraction",
+            "started",
+            max_tasks=config.max_extracted_tasks,
+            max_tasks_per_source_row=config.max_tasks_per_source_row,
+        )
+        task_report = extract_tasks(
+            clean_files,
+            tasks_path,
+            max_tasks=config.max_extracted_tasks,
+            max_tasks_per_row=config.max_tasks_per_source_row,
+        )
         task_report_path.write_text(json.dumps(task_report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
-        progress.emit("task_extraction", "complete", extracted=task_report.extracted)
+        progress.emit(
+            "task_extraction",
+            "complete",
+            extracted=task_report.extracted,
+            scanned_rows=task_report.scanned_rows,
+            capped_rows=task_report.capped_rows,
+            average_tasks_per_row=task_report.average_tasks_per_row,
+        )
         if config.review_tasks:
             progress.emit("task_review", "started")
-            review_report = review_tasks(tasks_path, reports_dir / "task_review_decisions.jsonl", approved_tasks_path)
+            review_report = review_tasks(
+                tasks_path,
+                reports_dir / "task_review_decisions.jsonl",
+                automated_pass_tasks_path,
+            )
             (reports_dir / "task_review_report.json").write_text(json.dumps(review_report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
-            progress.emit("task_review", "complete", approved=review_report.approved, rejected=review_report.rejected)
+            progress.emit(
+                "task_review",
+                "complete",
+                automated_pass=review_report.automated_pass,
+                human_approved=review_report.human_approved,
+                rejected=review_report.rejected,
+            )
     feedback_path = reports_dir / "feedback_report.json"
     review_report_path = reports_dir / "task_review_report.json" if review_report is not None else None
     feedback_report: BenchmarkFeedbackReport = write_feedback_report(
@@ -830,7 +858,7 @@ async def _run_data_pipeline_locked(
         artifacts.append(artifact_from_path(task_report_path, role="task_extraction_report"))
     if review_report is not None:
         artifacts.append(artifact_from_path(reports_dir / "task_review_report.json", role="task_review_report"))
-        artifacts.append(artifact_from_path(approved_tasks_path, role="approved_tasks"))
+        artifacts.append(artifact_from_path(automated_pass_tasks_path, role="automated_task_candidates"))
     for shard_path in manifest.train_shards + manifest.val_shards:
         artifacts.append(artifact_from_path(shard_path, role="token_shard"))
     version_id = build_version_id(config.dataset_id, [artifact.sha256 for artifact in artifacts])
@@ -872,7 +900,7 @@ async def _run_data_pipeline_locked(
         if task_report is not None:
             upload_candidates.extend([str(tasks_path), str(task_report_path)])
         if review_report is not None:
-            upload_candidates.extend([str(reports_dir / "task_review_report.json"), str(approved_tasks_path)])
+            upload_candidates.extend([str(reports_dir / "task_review_report.json"), str(automated_pass_tasks_path)])
         if checkpoint_eval_report is not None:
             upload_candidates.append(str(checkpoint_eval_path))
         if source_balance_report is not None:
@@ -1048,6 +1076,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-task-extraction", action="store_true")
     parser.add_argument("--no-task-review", action="store_true")
     parser.add_argument("--max-extracted-tasks", type=int, default=50_000)
+    parser.add_argument("--max-tasks-per-source-row", type=int, default=3)
     parser.add_argument("--object-store-uri", default="local://artifacts/aeitron/object-store")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--no-upload", action="store_true")
@@ -1128,6 +1157,7 @@ def config_from_args(args: argparse.Namespace) -> DataPipelineConfig:
         extract_tasks=not args.no_task_extraction,
         review_tasks=not args.no_task_review,
         max_extracted_tasks=args.max_extracted_tasks,
+        max_tasks_per_source_row=args.max_tasks_per_source_row,
         object_store_uri=args.object_store_uri,
         object_store_endpoint_url=args.object_store_endpoint_url,
         upload_artifacts=not args.no_upload,

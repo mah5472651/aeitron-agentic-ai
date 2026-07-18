@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import time
@@ -55,23 +56,38 @@ class ExtractedTask(StrictModel):
 class TaskExtractionReport(StrictModel):
     output_path: str
     scanned_rows: int
+    rows_with_tasks: int
+    capped_rows: int
     extracted: int
+    average_tasks_per_row: float = Field(ge=0.0)
     by_type: dict[str, int]
     by_language: dict[str, int] = Field(default_factory=dict)
     by_security_category: dict[str, int] = Field(default_factory=dict)
     created_at_unix: float = Field(default_factory=time.time)
 
 
-def _security_categories(text: str) -> list[str]:
+def _security_categories(text: str, source_url: str | None = None) -> list[str]:
     lowered = text.lower()
-    categories = [
-        category
-        for category, terms in SECURITY_CATEGORIES.items()
-        if any(term in lowered for term in terms)
-    ]
-    if (CVE_RE.search(text) or CWE_RE.search(text)) and "vulnerability_taxonomy" not in categories:
-        categories.append("vulnerability_taxonomy")
-    return categories
+    primary_context = lowered[:300]
+    normalized_url = (source_url or "").lower().replace("-", "_")
+    scores: list[tuple[int, str]] = []
+    for category, terms in SECURITY_CATEGORIES.items():
+        score = 0
+        if category in normalized_url:
+            score += 10
+        for term in terms:
+            count = lowered.count(term)
+            if term in primary_context:
+                score += 5
+            if count >= 2:
+                score += min(count, 4)
+            elif count == 1 and any(marker in term for marker in (".", "=", "_", "/", "-")):
+                score += 2
+        if score >= 4:
+            scores.append((score, category))
+    if CVE_RE.search(text) or CWE_RE.search(text):
+        scores.append((10, "vulnerability_taxonomy"))
+    return [category for _score, category in sorted(scores, key=lambda item: (-item[0], item[1]))[:3]]
 
 
 def _row_text(row: dict[str, Any]) -> str:
@@ -134,7 +150,7 @@ def _task(
 
 
 def _security_finding_task(row: dict[str, Any], text: str, language: str | None) -> ExtractedTask:
-    categories = _security_categories(text)
+    categories = _security_categories(text, row.get("url"))
     excerpt = text[:9000]
     prompt = (
         f"Analyze the approved defensive source context from {_source(row)}.\n\n"
@@ -176,7 +192,7 @@ def _patch_generation_task(row: dict[str, Any], text: str, language: str | None,
             "Mentions validation or regression checks.",
             "Does not execute or weaponize the issue.",
         ],
-        metadata={"security_categories": _security_categories(text + "\n" + (code or ""))},
+        metadata={"security_categories": _security_categories(text + "\n" + (code or ""), row.get("url"))},
     )
 
 
@@ -196,7 +212,7 @@ def _code_review_task(row: dict[str, Any], text: str, language: str | None, code
             "Separates confirmed issues from assumptions.",
             "Suggests safe minimal changes.",
         ],
-        metadata={"security_categories": _security_categories(text + "\n" + code)},
+        metadata={"security_categories": _security_categories(text + "\n" + code, row.get("url"))},
     )
 
 
@@ -283,7 +299,7 @@ def _tasks_from_row(row: dict[str, Any]) -> list[ExtractedTask]:
     lowered = text.lower()
     tasks: list[ExtractedTask] = []
     code_candidates = _code_candidates(text, language)
-    security_signal = bool(_security_categories(text)) or "defensive_security" in labels
+    security_signal = bool(_security_categories(text, row.get("url"))) or "defensive_security" in labels
     patch_signal = any(term in lowered for term in PATCH_TERMS) or "patch" in labels
     test_signal = any(term in lowered for term in TEST_TERMS) or "tests" in labels
     implementation_signal = any(term in lowered for term in IMPLEMENTATION_TERMS)
@@ -303,10 +319,30 @@ def _tasks_from_row(row: dict[str, Any]) -> list[ExtractedTask]:
     return tasks
 
 
-def extract_tasks(input_paths: list[str | Path], output_path: str | Path, *, max_tasks: int = 10_000) -> TaskExtractionReport:
+TASK_TYPE_PRIORITY = {
+    "security_patch_generation": 0,
+    "security_vulnerability_identification": 1,
+    "debugging_from_error_trace": 2,
+    "regression_test_generation": 3,
+    "secure_code_review": 4,
+    "implementation_planning": 5,
+}
+
+
+def extract_tasks(
+    input_paths: list[str | Path],
+    output_path: str | Path,
+    *,
+    max_tasks: int = 10_000,
+    max_tasks_per_row: int = 3,
+) -> TaskExtractionReport:
+    if max_tasks < 1:
+        raise ValueError("max_tasks must be positive")
+    if not 1 <= max_tasks_per_row <= 20:
+        raise ValueError("max_tasks_per_row must be between 1 and 20")
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    scanned = extracted = 0
+    scanned = rows_with_tasks = capped_rows = extracted = 0
     by_type: dict[str, int] = {}
     by_language: dict[str, int] = {}
     by_security_category: dict[str, int] = {}
@@ -315,12 +351,21 @@ def extract_tasks(input_paths: list[str | Path], output_path: str | Path, *, max
         for path in input_paths:
             for row in iter_jsonl(path):
                 scanned += 1
-                for task in _tasks_from_row(row):
+                candidates = sorted(
+                    _tasks_from_row(row),
+                    key=lambda task: (TASK_TYPE_PRIORITY.get(task.task_type, 99), task.task_id),
+                )
+                if len(candidates) > max_tasks_per_row:
+                    capped_rows += 1
+                selected = candidates[:max_tasks_per_row]
+                emitted_for_row = 0
+                for task in selected:
                     if task.task_id in seen:
                         continue
                     seen.add(task.task_id)
                     handle.write(json.dumps(task.model_dump(), ensure_ascii=False, sort_keys=True) + "\n")
                     extracted += 1
+                    emitted_for_row += 1
                     by_type[task.task_type] = by_type.get(task.task_type, 0) + 1
                     by_language[task.language or "unknown"] = by_language.get(task.language or "unknown", 0) + 1
                     for category in task.metadata.get("security_categories") or []:
@@ -329,17 +374,50 @@ def extract_tasks(input_paths: list[str | Path], output_path: str | Path, *, max
                         return TaskExtractionReport(
                             output_path=str(target),
                             scanned_rows=scanned,
+                            rows_with_tasks=rows_with_tasks + (1 if emitted_for_row else 0),
+                            capped_rows=capped_rows,
                             extracted=extracted,
+                            average_tasks_per_row=round(extracted / max(1, scanned), 6),
                             by_type=dict(sorted(by_type.items())),
                             by_language=dict(sorted(by_language.items())),
                             by_security_category=dict(sorted(by_security_category.items())),
                         )
+                if emitted_for_row:
+                    rows_with_tasks += 1
     return TaskExtractionReport(
         output_path=str(target),
         scanned_rows=scanned,
+        rows_with_tasks=rows_with_tasks,
+        capped_rows=capped_rows,
         extracted=extracted,
+        average_tasks_per_row=round(extracted / max(1, scanned), 6),
         by_type=dict(sorted(by_type.items())),
         by_language=dict(sorted(by_language.items())),
         by_security_category=dict(sorted(by_security_category.items())),
     )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Extract bounded task candidates from governed Aeitron JSONL.")
+    parser.add_argument("--input", action="append", required=True, help="Input JSONL path; repeat for multiple shards.")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--max-tasks", type=int, default=10_000)
+    parser.add_argument("--max-tasks-per-row", type=int, default=3)
+    parser.add_argument("--report-out")
+    args = parser.parse_args()
+    report = extract_tasks(
+        args.input,
+        args.output,
+        max_tasks=args.max_tasks,
+        max_tasks_per_row=args.max_tasks_per_row,
+    )
+    if args.report_out:
+        report_target = Path(args.report_out)
+        report_target.parent.mkdir(parents=True, exist_ok=True)
+        report_target.write_text(json.dumps(report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
+    print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
 

@@ -968,8 +968,10 @@ Approved source registry
   -> quality inspection
   -> source quality scoring
   -> task extraction
-  -> automated/human review queue
-  -> approved task JSONL
+  -> automated policy screen
+  -> independent human review and adjudication
+  -> Dataset Trust Authority promotion
+  -> promoted task JSONL
   -> benchmark/data feedback
   -> tokenizer training
   -> token shard creation
@@ -1389,7 +1391,7 @@ Why it exists:
 Raw documents are not enough for agentic learning. The model needs tasks,
 prompts, context, and verifiable work patterns.
 
-## Automated And Human Review Queue
+## Automated Task Policy Screen
 
 Files:
 
@@ -1397,16 +1399,18 @@ Files:
 
 Purpose:
 
-Review extracted tasks before promotion.
+Screen extracted task candidates before independent human review. This module
+does not approve training data and cannot promote a dataset version.
 
 Outputs:
 
 - review decisions JSONL
-- approved task JSONL
+- automated-pass candidate JSONL
+- persisted review report JSON
 
 Decision statuses:
 
-- `approved`
+- `automated_pass`
 - `needs_human_review`
 - `rejected`
 
@@ -1422,13 +1426,16 @@ Automated policy checks:
 Command:
 
 ```bash
-python -m src.aeitron.learning.review --input artifacts/aeitron/data-pipeline/tasks/tasks.jsonl --decisions-out artifacts/aeitron/data-pipeline/reports/task_review_decisions.jsonl --approved-out artifacts/aeitron/data-pipeline/tasks/approved_tasks.jsonl
+python -m src.aeitron.learning.review --input artifacts/aeitron/data-pipeline/tasks/tasks.jsonl --decisions-out artifacts/aeitron/data-pipeline/reports/task_review_decisions.jsonl --automated-pass-out artifacts/aeitron/data-pipeline/tasks/automated_pass_tasks.jsonl --report-out artifacts/aeitron/data-pipeline/reports/task_review_report.json
 ```
 
 Why it exists:
 
-Task extraction can create noisy prompts. Training should use approved tasks,
-not every generated candidate.
+Task extraction can create noisy prompts. At most three ranked tasks are emitted
+per source row by default. Security categories are evidence-weighted, capped at
+three, and do not treat one navigation-menu mention as category proof.
+Automated-pass tasks must still pass independent review, benchmark, evidence,
+and Dataset Trust Authority promotion gates.
 
 ## Benchmark And Data Feedback
 
@@ -1871,8 +1878,10 @@ first:
    - `reports/contamination_report.json`
    - `reports/task_review_report.json`
    - `reports/feedback_report.json`
-   - `tasks/approved_tasks.jsonl`
-7. If clean, scale to 5k, then 100k, then 1M.
+   - `tasks/automated_pass_tasks.jsonl`
+7. Confirm that `human_approved` is zero unless durable independent review
+   evidence is supplied through the Dataset Trust Authority.
+8. If every hard gate passes, scale to 5k, then 100k, then 1M.
 
 ## Real Approved-Source GPU Training Run
 
@@ -4669,7 +4678,7 @@ operational gates, not completed proofs:
 1. legal operators approve immutable source snapshots;
 2. two independent humans review high-value records and calibration samples;
 3. governed HumanEval/MBPP/SWE/security holdout files are installed;
-4. 200-record and 5,000-record calibrations pass;
+4. a corrected 200-record calibration and then a 5,000-record calibration pass;
 5. the one-million-fingerprint scale report passes;
 6. the first 100,000-record version reaches `promoted`;
 7. the 64,000-token tokenizer is trained only from that promoted version;
@@ -4680,6 +4689,43 @@ operational gates, not completed proofs:
 No 1B, 7B, 32B, or 62B run should start before these gates. Each larger model
 starts from new Aeitron random initialization; smaller checkpoints prove the
 system and are not borrowed weight donors.
+
+### 200-Record Quarantine Calibration Evidence
+
+The first real-source quarantine calibration ran against the ultimate source
+registry with a 200-document target. It was a diagnostic run, not a promoted
+dataset:
+
+- 203 documents were fetched, 192 passed the first quality gate, and 184
+  remained after exact/near deduplication;
+- protected benchmark contamination was zero;
+- average heuristic quality was `0.653601`, below the production target;
+- one OWASP source supplied roughly 69% of rows, proving that source balancing
+  and source-family caps are mandatory;
+- the old task extractor reached its 500-task cap from a small corpus and
+  navigation text produced excessive vulnerability-category matches;
+- the calibration tokenizer had only 8,282 training tokens and no validation
+  tokens, so it is explicitly non-promotable.
+
+The calibration exposed and triggered these code fixes:
+
+1. Source budgets now fail closed. Missing reputation evidence or a blocked
+   governance action allocates zero documents; the plan records unallocated
+   capacity. Re-evaluation correctly produced `0/200` allocated documents and
+   17 blocked sources.
+2. Task extraction now emits at most three ranked tasks per row, reports capped
+   rows and average tasks per row, and bounds security categories using weighted
+   evidence.
+3. Automated screening now reports `automated_pass` and `human_approved=0`.
+   It never calls candidates approved.
+4. Missing governed benchmark evidence and missing human review explicitly
+   prohibit training promotion.
+
+The immediate next action is not GPU training or a 5,000-document crawl.
+Operators must first bind real legal/source approvals, install governed holdout
+files, and complete an independent review sample. Then rerun the 200-record
+calibration with a fresh output directory. Only a passing corrected run may
+advance to 5,000 records.
 
 ## Final Rule
 

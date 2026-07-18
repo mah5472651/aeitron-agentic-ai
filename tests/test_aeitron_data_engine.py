@@ -254,6 +254,46 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
             budgets = {item.source: item.target_docs for item in plan.budgets}
             self.assertGreater(budgets["good-security"], budgets["weak-docs"])
 
+    def test_source_budget_blocks_sources_without_reputation_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sources = root / "sources.json"
+            sources.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": "unmeasured-source",
+                                "urls": ["https://example.org/security"],
+                                "allowed_domains": ["example.org"],
+                                "license": "mit",
+                                "category": "defensive_security",
+                                "source_id": "unmeasured-source",
+                                "source_family": "security-family",
+                                "trust_tier": "quarantine",
+                                "approved_use": "defensive",
+                                "approval_status": "pending",
+                                "immutable_revision": "snapshot-1",
+                                "license_evidence_sha256": "1" * 64,
+                                "legal_approval_sha256": "2" * 64,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan = build_source_budget_plan(
+                sources_path=sources,
+                reputation_report_path=None,
+                target_total_docs=200,
+                min_docs_per_source=1,
+            )
+            self.assertEqual(plan.allocated_total_docs, 0)
+            self.assertEqual(plan.unallocated_docs, 200)
+            self.assertEqual(plan.eligible_sources, 0)
+            self.assertEqual(plan.blocked_sources, 1)
+            self.assertEqual(plan.budgets[0].reason, "missing_reputation_evidence")
+
     async def test_vulnerability_adapters_normalize_official_api_payloads(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             if "known_exploited_vulnerabilities" in str(request.url):
@@ -454,13 +494,17 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
             }
             clean.write_text(json.dumps(row) + "\n", encoding="utf-8")
             report = extract_tasks([clean], root / "tasks.jsonl", max_tasks=20)
-            self.assertGreaterEqual(report.extracted, 3)
+            self.assertEqual(report.extracted, 3)
+            self.assertEqual(report.rows_with_tasks, 1)
+            self.assertEqual(report.capped_rows, 1)
+            self.assertEqual(report.average_tasks_per_row, 3.0)
             self.assertIn("security_vulnerability_identification", report.by_type)
             self.assertIn("security_patch_generation", report.by_type)
             self.assertIn("regression_test_generation", report.by_type)
             tasks = list(iter_jsonl(root / "tasks.jsonl"))
             self.assertTrue(all(task["success_criteria"] for task in tasks))
             self.assertTrue(all(task["negative_constraints"] for task in tasks))
+            self.assertTrue(all(len(task["metadata"].get("security_categories", [])) <= 3 for task in tasks))
             self.assertTrue(any(task["metadata"]["training_priority"] == "critical" for task in tasks))
 
     def test_training_data_gate_promotes_high_signal_rows_and_separates_review_holdout(self) -> None:
@@ -724,7 +768,8 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(report.training_quality_report["rows"], report.source_balance_report["output_rows"])
             self.assertIsNotNone(report.source_quality_report)
             self.assertIsNotNone(report.review_report)
-            self.assertGreaterEqual(report.review_report["approved"], 1)
+            self.assertGreaterEqual(report.review_report["automated_pass"], 1)
+            self.assertEqual(report.review_report["human_approved"], 0)
             self.assertIsNotNone(report.feedback_report)
             self.assertIsNotNone(report.source_reputation_report)
             self.assertTrue(report.source_reputation_report["sources"])
@@ -1053,14 +1098,18 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            review = review_tasks(tasks, root / "decisions.jsonl", root / "approved.jsonl")
-            self.assertEqual(review.approved, 1)
+            review = review_tasks(tasks, root / "decisions.jsonl", root / "automated-pass.jsonl")
+            self.assertEqual(review.automated_pass, 1)
+            self.assertEqual(review.human_approved, 0)
             quality = root / "quality.json"
             quality.write_text(json.dumps({"avg_quality_score": 0.8}), encoding="utf-8")
             review_json = root / "review.json"
             review_json.write_text(json.dumps(review.model_dump()), encoding="utf-8")
             feedback = build_feedback_report(quality_report_path=quality, review_report_path=review_json)
-            self.assertEqual(feedback.recommendations[0].kind, "promotion")
+            kinds = {recommendation.kind for recommendation in feedback.recommendations}
+            self.assertIn("benchmark_missing", kinds)
+            self.assertIn("human_review_required", kinds)
+            self.assertNotIn("promotion", kinds)
 
 
 if __name__ == "__main__":

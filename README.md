@@ -686,8 +686,8 @@ Pipeline outputs include:
 - quality inspection report
 - source quality report
 - extracted task JSONL
-- automated review decisions
-- approved task JSONL
+- automated policy decisions
+- automated-pass task candidates (not human-approved training data)
 - benchmark/data feedback report
 - tokenizer and token-shard manifest
 - dataset version manifest
@@ -712,13 +712,19 @@ python -m src.aeitron.learning.governance --store artifacts/aeitron/governance s
 python -m src.aeitron.learning.review \
   --input artifacts/aeitron/data-pipeline/tasks/tasks.jsonl \
   --decisions-out artifacts/aeitron/data-pipeline/reports/task_review_decisions.jsonl \
-  --approved-out artifacts/aeitron/data-pipeline/tasks/approved_tasks.jsonl
+  --automated-pass-out artifacts/aeitron/data-pipeline/tasks/automated_pass_tasks.jsonl \
+  --report-out artifacts/aeitron/data-pipeline/reports/task_review_report.json
 
 python -m src.aeitron.learning.feedback \
   --output artifacts/aeitron/data-pipeline/reports/feedback_report.json \
   --quality-report artifacts/aeitron/data-pipeline/reports/quality_report.json \
   --review-report artifacts/aeitron/data-pipeline/reports/task_review_report.json
 ```
+
+Automated task screening is not human approval and cannot promote data. A
+missing benchmark report now blocks promotion feedback. Source-budget planning
+also fails closed: a source without measured reputation evidence receives zero
+documents, and the plan reports the unallocated budget explicitly.
 
 The data engine is defensive and allowlist-first. It is for public documentation,
 licensed code, security guidance, benchmark corpora, and approved repository

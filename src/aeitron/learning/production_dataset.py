@@ -1135,7 +1135,14 @@ def build_production_dataset(config: ProductionDatasetConfig) -> ProductionDatas
             target_total_docs=config.source_budget_target_docs,
         )
     else:
-        source_budget_plan = SourceBudgetPlan(target_total_docs=config.source_budget_target_docs, allocated_total_docs=0, budgets=[])
+        source_budget_plan = SourceBudgetPlan(
+            target_total_docs=config.source_budget_target_docs,
+            allocated_total_docs=0,
+            unallocated_docs=config.source_budget_target_docs,
+            eligible_sources=0,
+            blocked_sources=0,
+            budgets=[],
+        )
         _write_json(reports_dir / "source_budget_plan.json", source_budget_plan)
 
     promoted = work_dir / "05_promoted.jsonl"

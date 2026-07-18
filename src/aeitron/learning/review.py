@@ -1,4 +1,9 @@
-﻿"""Automated and human-review queue for extracted Aeitron data tasks."""
+"""Automated policy screening for extracted Aeitron task candidates.
+
+This module does not perform human review and cannot promote training data.
+Passing rows remain candidates until the Dataset Trust Authority completes the
+configured independent human-review and evidence gates.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +32,7 @@ HIGH_RISK_ACTION_TERMS = {
 
 class ReviewDecision(StrictModel):
     task_id: str
-    status: Literal["approved", "needs_human_review", "rejected"]
+    status: Literal["automated_pass", "needs_human_review", "rejected"]
     reviewer: str = "automated-policy"
     score: float = Field(ge=0.0, le=1.0)
     reasons: list[str] = Field(default_factory=list)
@@ -39,13 +44,15 @@ class ReviewDecision(StrictModel):
 class ReviewReport(StrictModel):
     input_path: str
     decisions_path: str
-    approved_path: str
+    automated_pass_path: str
+    review_mode: Literal["automated_policy"] = "automated_policy"
     total: int
-    approved: int
+    automated_pass: int
+    human_approved: int = 0
     needs_human_review: int
     rejected: int
     by_type: dict[str, int] = Field(default_factory=dict)
-    approved_by_type: dict[str, int] = Field(default_factory=dict)
+    automated_pass_by_type: dict[str, int] = Field(default_factory=dict)
     avg_score: float = 0.0
     created_at_unix: float = Field(default_factory=time.time)
 
@@ -81,9 +88,9 @@ def review_task(task: dict[str, Any]) -> ReviewDecision:
         score += 0.1
     score = max(0.0, min(1.0, score))
     if "high_risk_action_request" in reasons:
-        status: Literal["approved", "needs_human_review", "rejected"] = "rejected"
+        status: Literal["automated_pass", "needs_human_review", "rejected"] = "rejected"
     elif score >= 0.75 and not reasons:
-        status = "approved"
+        status = "automated_pass"
     elif training_priority == "critical" and score >= 0.50:
         status = "needs_human_review"
     elif score >= 0.55:
@@ -100,16 +107,23 @@ def review_task(task: dict[str, Any]) -> ReviewDecision:
     )
 
 
-def review_tasks(input_path: str | Path, decisions_path: str | Path, approved_path: str | Path) -> ReviewReport:
+def review_tasks(
+    input_path: str | Path,
+    decisions_path: str | Path,
+    automated_pass_path: str | Path,
+) -> ReviewReport:
     decisions_target = Path(decisions_path)
-    approved_target = Path(approved_path)
+    automated_pass_target = Path(automated_pass_path)
     decisions_target.parent.mkdir(parents=True, exist_ok=True)
-    approved_target.parent.mkdir(parents=True, exist_ok=True)
-    total = approved = human = rejected = 0
+    automated_pass_target.parent.mkdir(parents=True, exist_ok=True)
+    total = automated_pass = human = rejected = 0
     by_type: dict[str, int] = {}
-    approved_by_type: dict[str, int] = {}
+    automated_pass_by_type: dict[str, int] = {}
     scores: list[float] = []
-    with decisions_target.open("w", encoding="utf-8") as decisions_handle, approved_target.open("w", encoding="utf-8") as approved_handle:
+    with (
+        decisions_target.open("w", encoding="utf-8") as decisions_handle,
+        automated_pass_target.open("w", encoding="utf-8") as automated_pass_handle,
+    ):
         for task in iter_jsonl(input_path):
             total += 1
             task_type = str(task.get("task_type") or "unknown")
@@ -117,11 +131,11 @@ def review_tasks(input_path: str | Path, decisions_path: str | Path, approved_pa
             decision = review_task(task)
             scores.append(decision.score)
             decisions_handle.write(json.dumps(decision.model_dump(), ensure_ascii=False, sort_keys=True) + "\n")
-            if decision.status == "approved":
-                approved += 1
-                approved_by_type[task_type] = approved_by_type.get(task_type, 0) + 1
-                task["review"] = decision.model_dump()
-                approved_handle.write(json.dumps(task, ensure_ascii=False, sort_keys=True) + "\n")
+            if decision.status == "automated_pass":
+                automated_pass += 1
+                automated_pass_by_type[task_type] = automated_pass_by_type.get(task_type, 0) + 1
+                task["automated_policy_review"] = decision.model_dump()
+                automated_pass_handle.write(json.dumps(task, ensure_ascii=False, sort_keys=True) + "\n")
             elif decision.status == "needs_human_review":
                 human += 1
             else:
@@ -129,24 +143,29 @@ def review_tasks(input_path: str | Path, decisions_path: str | Path, approved_pa
     return ReviewReport(
         input_path=str(input_path),
         decisions_path=str(decisions_target),
-        approved_path=str(approved_target),
+        automated_pass_path=str(automated_pass_target),
         total=total,
-        approved=approved,
+        automated_pass=automated_pass,
         needs_human_review=human,
         rejected=rejected,
         by_type=dict(sorted(by_type.items())),
-        approved_by_type=dict(sorted(approved_by_type.items())),
+        automated_pass_by_type=dict(sorted(automated_pass_by_type.items())),
         avg_score=round(sum(scores) / max(1, len(scores)), 6),
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Review extracted Aeitron task candidates.")
+    parser = argparse.ArgumentParser(description="Apply automated policy screening to extracted Aeitron task candidates.")
     parser.add_argument("--input", required=True)
     parser.add_argument("--decisions-out", required=True)
-    parser.add_argument("--approved-out", required=True)
+    parser.add_argument("--automated-pass-out", required=True)
+    parser.add_argument("--report-out")
     args = parser.parse_args()
-    report = review_tasks(args.input, args.decisions_out, args.approved_out)
+    report = review_tasks(args.input, args.decisions_out, args.automated_pass_out)
+    if args.report_out:
+        report_target = Path(args.report_out)
+        report_target.parent.mkdir(parents=True, exist_ok=True)
+        report_target.write_text(json.dumps(report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
 
 
