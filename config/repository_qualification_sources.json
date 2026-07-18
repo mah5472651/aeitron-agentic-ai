@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "source_id": "secrepobench-318",
+      "adapter": "secrepobench",
+      "repository_url": "https://github.com/ai-sec-lab/SecRepoBench.git",
+      "pinned_commit": "029e753dc25ef4751e03ba0031434cd953c82d80",
+      "evaluation_only": true,
+      "approval_required": true,
+      "license_review_status": "required_before_use",
+      "required_files": [
+        "sample_metadata.json.gz",
+        "report.json.gz",
+        "github_repos.json"
+      ],
+      "allowed_repository_hosts": [
+        "github.com"
+      ],
+      "notes": "318 historical repository-level secure completion tasks. Aeitron does not redistribute or train on this benchmark. A local legal/license approval record is mandatory before pack generation."
+    }
+  ]
+}

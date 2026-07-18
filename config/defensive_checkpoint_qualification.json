@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "campaign_id": "aeitron-defensive-checkpoint-qualification-v1",
+  "curriculum_mode": "defensive_security_only",
+  "scratch_only": true,
+  "model_profile": "t4_validation",
+  "sequence_length": 256,
+  "batch_size": 1,
+  "gradient_accumulation_steps": 8,
+  "dtype": "fp16",
+  "learning_rate": 0.0003,
+  "warmup_ratio": 0.05,
+  "validate_every": 250,
+  "validation_batches": 8,
+  "checkpoint_every": 500,
+  "early_stopping_patience": 8,
+  "early_stopping_min_delta": 0.0001,
+  "progress_every_steps": 10,
+  "gate": {
+    "stage_steps": [
+      1000,
+      10000,
+      20000,
+      50000,
+      100000
+    ],
+    "minimum_score_improvement": 0.01,
+    "maximum_score_regression": 0.0,
+    "maximum_task_regressions": 0,
+    "maximum_hallucination_rate": 0.0,
+    "maximum_collapse_rate": 0.0,
+    "require_tokenizer_audit_pass": true,
+    "require_checkpoint_eval_pass": true,
+    "require_best_validation_checkpoint": true,
+    "require_improvement_from_stage": 10000
+  }
+}

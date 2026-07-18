@@ -163,6 +163,7 @@ class ScratchInstructionMixReport(StrictModel):
     buckets: list[ScratchMixBucketReport]
     rejected_rows: int
     offensive_rejected_rows: int = 0
+    strict_offensive_filter: bool = True
     transformed_instruction_rows: int
     raw_preserved_rows: int
     target_ratios: dict[str, float]
@@ -644,6 +645,7 @@ def build_scratch_instruction_mix(
         buckets=bucket_reports,
         rejected_rows=rejected,
         offensive_rejected_rows=offensive_rejected,
+        strict_offensive_filter=active.strict_offensive_filter,
         transformed_instruction_rows=transformed,
         raw_preserved_rows=raw_preserved,
         target_ratios={key: round(value, 6) for key, value in sorted(normalized.items())},

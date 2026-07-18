@@ -27,6 +27,7 @@ def main() -> None:
             "tests.test_aeitron_training_workspace",
             "tests.test_aeitron_agent_collaboration",
             "tests.test_aeitron_agent_execution",
+            "tests.test_aeitron_qualification_campaign",
         ],
         capture_output=True,
         text=True,

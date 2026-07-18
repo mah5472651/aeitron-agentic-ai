@@ -486,6 +486,29 @@ def latest_checkpoint(output_dir: str | Path) -> Path | None:
     return max(candidates, default=(0, None), key=lambda item: item[0])[1]
 
 
+def checkpoint_payload_from_manifest(manifest_path: str | Path) -> Path:
+    """Resolve and verify a single-process checkpoint from its signed-by-hash manifest."""
+
+    source = Path(manifest_path).resolve(strict=True)
+    manifest = CheckpointManifest.model_validate_json(source.read_text(encoding="utf-8-sig"))
+    root = Path(manifest.checkpoint_dir).resolve(strict=True)
+    if not manifest.files:
+        raise ValueError("initial checkpoint manifest contains no files")
+    for entry in manifest.files:
+        relative = str(entry.get("path") or "")
+        candidate = (root / relative).resolve(strict=True)
+        if candidate != root and root not in candidate.parents:
+            raise ValueError("initial checkpoint manifest contains a path outside checkpoint_dir")
+        expected_size = int(entry.get("size_bytes", -1))
+        expected_hash = str(entry.get("sha256") or "")
+        if candidate.stat().st_size != expected_size or sha256_file(candidate) != expected_hash:
+            raise ValueError(f"initial checkpoint integrity check failed: {relative}")
+    payload = root / "model.pt"
+    if not payload.is_file():
+        raise ValueError("external checkpoint initialization currently requires a single-process model.pt checkpoint")
+    return payload
+
+
 def _json_state(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _json_state(item) for key, item in value.items()}
@@ -546,6 +569,8 @@ def _load_dcp_checkpoint(
     optimizer: "torch.optim.Optimizer",
     scheduler: "torch.optim.lr_scheduler.LRScheduler | None",
     expected_config: ScratchDecoderConfig | None = None,
+    expected_dataset_manifest_sha256: str | None = None,
+    expected_tokenizer_sha256: str | None = None,
 ) -> tuple[int, int]:
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
@@ -562,11 +587,23 @@ def _load_dcp_checkpoint(
     root = checkpoint_path.parent
     trainer_state = json.loads((root / "trainer_state.json").read_text(encoding="utf-8"))
     if expected_config is not None:
-        saved = trainer_state.get("config") or {}
-        if int(saved.get("vocab_size", -1)) != expected_config.vocab_size:
-            raise ValueError("distributed checkpoint vocab_size does not match current training config")
-        if int(saved.get("hidden_size", -1)) != expected_config.hidden_size:
-            raise ValueError("distributed checkpoint hidden_size does not match current training config")
+        try:
+            saved_config = ScratchDecoderConfig.model_validate(trainer_state.get("config") or {})
+        except Exception as exc:
+            raise ValueError(f"distributed checkpoint model config is invalid: {exc}") from exc
+        if saved_config.model_dump() != expected_config.model_dump():
+            mismatched = sorted(
+                key
+                for key, value in expected_config.model_dump().items()
+                if saved_config.model_dump().get(key) != value
+            )
+            raise ValueError(f"distributed checkpoint architecture config is incompatible: {', '.join(mismatched)}")
+    if expected_dataset_manifest_sha256 is not None:
+        if str(trainer_state.get("dataset_manifest_sha256") or "") != expected_dataset_manifest_sha256:
+            raise ValueError("distributed checkpoint dataset manifest hash does not match immutable training input")
+    if expected_tokenizer_sha256 is not None:
+        if str(trainer_state.get("tokenizer_sha256") or "") != expected_tokenizer_sha256:
+            raise ValueError("distributed checkpoint tokenizer hash does not match immutable training input")
     if scheduler is not None and trainer_state.get("scheduler"):
         scheduler.load_state_dict(trainer_state["scheduler"])
     rank_path = root / f"rank-{distributed_rank():05d}.json"
@@ -809,6 +846,8 @@ def load_checkpoint(
     scheduler: "torch.optim.lr_scheduler.LRScheduler | None" = None,
     device: "torch.device",
     expected_config: ScratchDecoderConfig | None = None,
+    expected_dataset_manifest_sha256: str | None = None,
+    expected_tokenizer_sha256: str | None = None,
 ) -> tuple[int, int]:
     if checkpoint_path.is_dir() and (checkpoint_path / ".metadata").is_file():
         return _load_dcp_checkpoint(
@@ -817,19 +856,48 @@ def load_checkpoint(
             optimizer=optimizer,
             scheduler=scheduler,
             expected_config=expected_config,
+            expected_dataset_manifest_sha256=expected_dataset_manifest_sha256,
+            expected_tokenizer_sha256=expected_tokenizer_sha256,
         )
     if checkpoint_path.is_dir() and (checkpoint_path / "latest").exists() and hasattr(model, "load_checkpoint"):
         loaded_path, client_state = model.load_checkpoint(str(checkpoint_path))
         if not loaded_path:
             raise RuntimeError("DeepSpeed checkpoint reload failed")
+        if expected_config is not None:
+            saved_config = ScratchDecoderConfig.model_validate(client_state.get("config") or {})
+            if saved_config.model_dump() != expected_config.model_dump():
+                raise ValueError("DeepSpeed checkpoint architecture config is incompatible")
+        if expected_dataset_manifest_sha256 is not None:
+            if str(client_state.get("dataset_manifest_sha256") or "") != expected_dataset_manifest_sha256:
+                raise ValueError("DeepSpeed checkpoint dataset manifest hash does not match immutable training input")
+        if expected_tokenizer_sha256 is not None:
+            if str(client_state.get("tokenizer_sha256") or "") != expected_tokenizer_sha256:
+                raise ValueError("DeepSpeed checkpoint tokenizer hash does not match immutable training input")
         return int(client_state.get("step", 0)), int(client_state.get("trained_tokens", 0))
     payload = load_trusted_checkpoint(checkpoint_path, map_location=device)
     if expected_config is not None:
-        saved_config = payload.get("config") or {}
-        if int(saved_config.get("vocab_size", expected_config.vocab_size)) != expected_config.vocab_size:
-            raise ValueError("checkpoint vocab_size does not match current training config")
-        if int(saved_config.get("hidden_size", expected_config.hidden_size)) != expected_config.hidden_size:
-            raise ValueError("checkpoint hidden_size does not match current training config")
+        try:
+            saved_config = ScratchDecoderConfig.model_validate(payload.get("config") or {})
+        except Exception as exc:
+            raise ValueError(f"checkpoint model config is missing or invalid: {exc}") from exc
+        expected_payload = expected_config.model_dump()
+        saved_payload = saved_config.model_dump()
+        mismatched = {
+            key: {"checkpoint": saved_payload.get(key), "expected": value}
+            for key, value in expected_payload.items()
+            if saved_payload.get(key) != value
+        }
+        if mismatched:
+            names = ", ".join(sorted(mismatched))
+            raise ValueError(f"checkpoint architecture config is incompatible: {names}")
+    if expected_dataset_manifest_sha256 is not None:
+        actual_dataset_hash = str(payload.get("dataset_manifest_sha256") or "")
+        if actual_dataset_hash != expected_dataset_manifest_sha256:
+            raise ValueError("checkpoint dataset manifest hash does not match immutable training input")
+    if expected_tokenizer_sha256 is not None:
+        actual_tokenizer_hash = str(payload.get("tokenizer_sha256") or "")
+        if actual_tokenizer_hash != expected_tokenizer_sha256:
+            raise ValueError("checkpoint tokenizer hash does not match immutable training input")
     model.load_state_dict(payload["model"])
     optimizer.load_state_dict(payload["optimizer"])
     if scheduler is not None and isinstance(payload.get("scheduler"), dict):
@@ -1007,6 +1075,8 @@ def run_pretraining_loop(
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 0.0,
     resume: bool = True,
+    initial_checkpoint_manifest: str | Path | None = None,
+    allow_initial_dataset_rebind: bool = False,
     progress: ProgressReporter | None = None,
     progress_every_steps: int = 25,
     model_profile_name: str = "tiny",
@@ -1214,6 +1284,7 @@ def run_pretraining_loop(
     }
     start_step = 0
     trained_tokens = 0
+    resume_source = ""
     if resume:
         checkpoint = latest_checkpoint(root)
         if checkpoint is not None:
@@ -1224,7 +1295,33 @@ def run_pretraining_loop(
                 scheduler=scheduler,
                 device=selected,
                 expected_config=config,
+                expected_dataset_manifest_sha256=sha256_file(active_manifest_path) if active_manifest_path else None,
+                expected_tokenizer_sha256=sha256_file(local_tokenizer),
             )
+            resume_source = str(checkpoint)
+        elif initial_checkpoint_manifest:
+            initial_checkpoint = checkpoint_payload_from_manifest(initial_checkpoint_manifest)
+            start_step, trained_tokens = load_checkpoint(
+                initial_checkpoint,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device=selected,
+                expected_config=config,
+                expected_dataset_manifest_sha256=(
+                    None
+                    if allow_initial_dataset_rebind
+                    else sha256_file(active_manifest_path) if active_manifest_path else None
+                ),
+                expected_tokenizer_sha256=sha256_file(local_tokenizer),
+            )
+            resume_source = str(initial_checkpoint)
+    elif initial_checkpoint_manifest:
+        raise ValueError("initial_checkpoint_manifest requires resume=True")
+    if start_step >= steps:
+        raise ValueError(
+            f"requested final step {steps} must be greater than resumed checkpoint step {start_step}"
+        )
 
     model.train()
     started = time.perf_counter()
@@ -1423,6 +1520,8 @@ def run_pretraining_loop(
         scheduler=scheduler,
         device=selected,
         expected_config=config,
+        expected_dataset_manifest_sha256=sha256_file(active_manifest_path) if active_manifest_path else None,
+        expected_tokenizer_sha256=sha256_file(local_tokenizer),
     )
     if reloaded_step != current_step or reloaded_tokens != trained_tokens:
         raise RuntimeError(
@@ -1447,6 +1546,9 @@ def run_pretraining_loop(
         "steps": current_step,
         "requested_steps": steps,
         "start_step": start_step,
+        "resume_source": resume_source,
+        "initial_checkpoint_manifest": str(initial_checkpoint_manifest or ""),
+        "initial_dataset_rebound": bool(initial_checkpoint_manifest and allow_initial_dataset_rebind),
         "device": str(selected),
         "dtype": dtype,
         "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -1528,6 +1630,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--initial-checkpoint-manifest")
+    parser.add_argument("--allow-initial-dataset-rebind", action="store_true")
     parser.add_argument("--model-profile", default="tiny", choices=["tiny", "t4_validation", "1b", "7b", "32b", "62b"])
     parser.add_argument("--attention-impl", default="auto", choices=["auto", "sdpa", "eager"])
     parser.add_argument("--gradient-checkpointing", action="store_true")
@@ -1617,6 +1721,8 @@ def main() -> None:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         resume=not args.no_resume,
+        initial_checkpoint_manifest=args.initial_checkpoint_manifest,
+        allow_initial_dataset_rebind=args.allow_initial_dataset_rebind,
         model_profile_name=args.model_profile,
         attention_impl=args.attention_impl,
         gradient_checkpointing=args.gradient_checkpointing,

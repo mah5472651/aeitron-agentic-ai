@@ -418,17 +418,55 @@ def _check_agent_collaboration(mode: str) -> ReadinessCheck:
 def _check_agent_execution(mode: str) -> ReadinessCheck:
     engine = Path("src/aeitron/runtime/execution.py")
     scorecard_runner = Path("src/aeitron/evaluation/agent_scorecard.py")
+    qualification_runner = Path("src/aeitron/evaluation/qualification_campaign.py")
     report_path = Path(
         os.environ.get(
             "AEITRON_AGENT_SCORECARD_REPORT",
             "artifacts/aeitron/agent-scorecard/agent_scorecard.json",
         )
     )
+    pack_path = Path(
+        os.environ.get(
+            "AEITRON_QUALIFICATION_PACK_MANIFEST",
+            "artifacts/aeitron/qualification-pack/qualification_pack_manifest.json",
+        )
+    )
+    pack_proven = False
+    pack_evidence: dict[str, Any] = {}
+    pack_task_ids: set[str] = set()
+    if pack_path.is_file():
+        try:
+            pack_evidence = json.loads(pack_path.read_text(encoding="utf-8-sig"))
+            pack_task_ids = {str(item) for item in pack_evidence.get("task_ids") or []}
+            category_counts = dict(pack_evidence.get("category_counts") or {})
+            pack_proven = (
+                int(pack_evidence.get("task_count") or 0) == 50
+                and len(pack_task_ids) == 50
+                and all(int(category_counts.get(name) or 0) == 10 for name in [
+                    "coding",
+                    "debugging",
+                    "defensive_security",
+                    "patch_generation",
+                    "long_context",
+                ])
+                and bool(pack_evidence.get("evaluation_only"))
+                and bool(pack_evidence.get("benchmark_holdout"))
+                and not bool(pack_evidence.get("ground_truth_in_prompts"))
+                and len(str(pack_evidence.get("source_commit") or "")) >= 40
+                and len(str(pack_evidence.get("legal_approval_sha256") or "")) == 64
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pack_proven = False
     scorecard_proven = False
     scorecard_evidence: dict[str, Any] = {}
     if report_path.is_file():
         try:
             scorecard_evidence = json.loads(report_path.read_text(encoding="utf-8"))
+            scorecard_task_ids = {
+                str(item.get("task_id") or "")
+                for item in scorecard_evidence.get("tasks") or []
+                if isinstance(item, dict)
+            }
             scorecard_proven = (
                 scorecard_evidence.get("status") == "passed"
                 and scorecard_evidence.get("policy_mode") == "strict"
@@ -437,10 +475,14 @@ def _check_agent_execution(mode: str) -> ReadinessCheck:
                 and float(scorecard_evidence.get("workflow_completion_score") or 0.0) >= 0.80
                 and float(scorecard_evidence.get("sandbox_test_pass_rate") or 0.0) >= 0.80
                 and int(scorecard_evidence.get("regression_count") or 0) == 0
+                and pack_proven
+                and scorecard_task_ids == pack_task_ids
             )
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             scorecard_proven = False
-    missing = [str(path) for path in [engine, scorecard_runner] if not path.is_file()]
+    missing = [str(path) for path in [engine, scorecard_runner, qualification_runner] if not path.is_file()]
+    if mode == "production" and not pack_proven:
+        missing.append(f"governed immutable 50-task qualification pack: {pack_path}")
     if mode == "production" and not scorecard_proven:
         missing.append(f"strict 50-100 repository task scorecard proof: {report_path}")
     if missing:
@@ -461,12 +503,17 @@ def _check_agent_execution(mode: str) -> ReadinessCheck:
             "non-mock Aeitron scratch serving backend",
             "Docker sandbox",
             "Semgrep or CodeQL",
+            "governed pinned 50-task qualification pack",
             "strict 50-100 repository task scorecard",
         ],
         missing_dependencies=missing,
         evidence={
             "execution_engine_present": engine.is_file(),
             "scorecard_runner_present": scorecard_runner.is_file(),
+            "qualification_runner_present": qualification_runner.is_file(),
+            "qualification_pack_manifest": str(pack_path),
+            "qualification_pack_proven": pack_proven,
+            "qualification_pack_id": pack_evidence.get("pack_id"),
             "scorecard_report": str(report_path),
             "scorecard_proven": scorecard_proven,
             "scorecard_summary": {

@@ -196,6 +196,53 @@ short prompts, executable verification commands, and file/content oracles.
 Reports are evidence-backed JSON/Markdown; missing tasks, scanners, Docker, or a
 real scratch model block the run.
 
+Build the governed 50-task historical repository qualification pack:
+
+```powershell
+python -m src.aeitron.evaluation.qualification_campaign approval-template `
+  --source-root D:\benchmarks\SecRepoBench `
+  --output config\local\secrepobench-approval.json
+
+# An authorized reviewer must change decision=pending only after legal/license review.
+python -m src.aeitron.evaluation.qualification_campaign build-pack `
+  --source-root D:\benchmarks\SecRepoBench `
+  --approval config\local\secrepobench-approval.json `
+  --output-dir artifacts\aeitron\qualification-pack
+```
+
+The pack is exactly 50 pinned historical tasks: 10 coding, 10 debugging, 10
+defensive security, 10 patch generation, and 10 long-context tasks. Reference
+fixes are sealed from model prompts and the pack is permanently evaluation-only.
+Pending approval, changed benchmark files, commit drift, or missing official
+results fail closed.
+
+Measure the current scratch checkpoint, then run the gated defensive ladder:
+
+```powershell
+python -m src.aeitron.evaluation.qualification_campaign baseline `
+  --pack-manifest artifacts\aeitron\qualification-pack\qualification_pack_manifest.json `
+  --checkpoint-manifest artifacts\aeitron\train\best_checkpoint_manifest.json `
+  --tokenizer artifacts\aeitron\tokenizer\tokenizer.json `
+  --output-dir artifacts\aeitron\qualification-baseline --device cuda
+
+python -m src.aeitron.evaluation.qualification_campaign run-stage `
+  --target-steps 1000 `
+  --campaign-dir artifacts\aeitron\defensive-qualification `
+  --pack-manifest artifacts\aeitron\qualification-pack\qualification_pack_manifest.json `
+  --dataset-manifest artifacts\aeitron\defensive-data\shards\manifest.json `
+  --dataset-version-manifest artifacts\aeitron\defensive-data\versions\<version-id>.json `
+  --tokenizer artifacts\aeitron\tokenizer\tokenizer.json `
+  --tokenizer-audit-corpus artifacts\aeitron\defensive-data\promoted.jsonl `
+  --initial-checkpoint-manifest artifacts\aeitron\train\best_checkpoint_manifest.json `
+  --device cuda
+```
+
+Repeat `run-stage` with `10000`, `20000`, `50000`, and `100000`. Each stage is
+locked behind the previous promotion. From 10k onward, measured checkpoint
+improvement is mandatory; tokenizer warning, generation collapse,
+hallucination, validation failure, task regression, or incompatible immutable
+inputs stops progression.
+
 ## Aeitron Scratch Model Serving
 
 Set:

@@ -109,6 +109,12 @@ class CheckpointSideReport(StrictModel):
     average_score: float
     pass_count: int
     total: int
+    pass_rate: float = Field(ge=0.0, le=1.0)
+    hallucination_count: int = Field(ge=0)
+    hallucination_rate: float = Field(ge=0.0, le=1.0)
+    collapsed_count: int = Field(ge=0)
+    collapse_rate: float = Field(ge=0.0, le=1.0)
+    failure_categories: dict[str, int] = Field(default_factory=dict)
     results: list[CandidateResult]
 
 
@@ -277,6 +283,37 @@ def hallucination_flags_for_output(*, output: str, prompt: str, case: PromptCase
     return flags
 
 
+def failure_categories_for_results(results: list[CandidateResult], *, pass_score: float = 0.65) -> dict[str, int]:
+    """Return non-exclusive failure counts for an evaluated checkpoint.
+
+    Categories are intentionally evidence-based. A result can belong to several
+    buckets because a collapsed generation can also omit required terms or make
+    an unsupported verification claim.
+    """
+
+    categories: dict[str, int] = {}
+
+    def add(name: str) -> None:
+        categories[name] = categories.get(name, 0) + 1
+
+    for item in results:
+        if item.score < pass_score:
+            add("score_below_threshold")
+        if not item.output.strip():
+            add("empty_output")
+        elif len(item.output.strip()) < 20:
+            add("output_too_short")
+        if item.missing_expected_terms:
+            add("missing_expected_terms")
+        if item.forbidden_hits:
+            add("forbidden_output")
+        if item.collapsed:
+            add("generation_collapse")
+        for flag in sorted(set(item.hallucination_flags)):
+            add(flag)
+    return dict(sorted(categories.items()))
+
+
 @torch.no_grad() if torch is not None else (lambda fn: fn)
 def generate_text(
     *,
@@ -361,16 +398,92 @@ def _evaluate_side(
             )
         )
     average = sum(item.score for item in results) / max(1, len(results))
+    pass_count = sum(1 for item in results if item.score >= 0.65)
+    hallucination_count = sum(1 for item in results if item.hallucination_flags)
+    collapsed_count = sum(1 for item in results if item.collapsed)
+    total = len(results)
     return CheckpointSideReport(
         label=label,
         checkpoint_manifest=str(checkpoint_manifest),
         checkpoint_step=manifest.step,
         trained_tokens=manifest.trained_tokens,
         average_score=round(average, 6),
-        pass_count=sum(1 for item in results if item.score >= 0.65),
-        total=len(results),
+        pass_count=pass_count,
+        total=total,
+        pass_rate=round(pass_count / max(1, total), 6),
+        hallucination_count=hallucination_count,
+        hallucination_rate=round(hallucination_count / max(1, total), 6),
+        collapsed_count=collapsed_count,
+        collapse_rate=round(collapsed_count / max(1, total), 6),
+        failure_categories=failure_categories_for_results(results),
         results=results,
     )
+
+
+def evaluate_checkpoint_prompt_suite(
+    *,
+    checkpoint_manifest: str | Path,
+    tokenizer_path: str | Path,
+    prompt_suite: str | Path | None,
+    output_dir: str | Path,
+    device: str = "auto",
+    generation_config: GenerationConfig | None = None,
+    label: str = "checkpoint",
+) -> CheckpointSideReport:
+    """Evaluate one scratch checkpoint and persist its measured baseline.
+
+    This public API is used by the qualification campaign. It never substitutes
+    prompt-only scores for repository tests or security scanner evidence.
+    """
+
+    require_torch()
+    active_generation = generation_config or GenerationConfig()
+    selected = _select_device(device)
+    tokenizer = load_tokenizer(tokenizer_path)
+    prompts = _load_prompt_suite(prompt_suite)
+    if not prompts:
+        raise ValueError("checkpoint prompt suite must contain at least one task")
+    report = _evaluate_side(
+        label=label,
+        checkpoint_manifest=checkpoint_manifest,
+        tokenizer=tokenizer,
+        prompts=prompts,
+        device=selected,
+        generation_config=active_generation,
+    )
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "device": str(selected),
+        "tokenizer_path": str(tokenizer_path),
+        "generation": active_generation.model_dump(),
+        "report": report.model_dump(),
+        "created_at_unix": time.time(),
+    }
+    (root / "checkpoint_baseline_report.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    lines = [
+        "# Aeitron Checkpoint Baseline",
+        "",
+        f"- Label: {report.label}",
+        f"- Checkpoint step: {report.checkpoint_step}",
+        f"- Tasks solved: {report.pass_count}/{report.total} ({report.pass_rate:.2%})",
+        f"- Average score: {report.average_score:.4f}",
+        f"- Hallucination rate: {report.hallucination_rate:.2%}",
+        f"- Generation-collapse rate: {report.collapse_rate:.2%}",
+        "",
+        "## Failure Categories",
+        "",
+    ]
+    if report.failure_categories:
+        lines.extend(f"- {name}: {count}" for name, count in report.failure_categories.items())
+    else:
+        lines.append("- none")
+    (root / "checkpoint_baseline_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report
 
 
 def compare_checkpoints(

@@ -4219,6 +4219,221 @@ npm ci
 npm run build
 ```
 
+### Governed 50-Task Checkpoint Qualification
+
+`src/aeitron/evaluation/qualification_campaign.py` is the single authoritative
+control path for the real-repository holdout, current-checkpoint baseline,
+defensive curriculum stages, checkpoint comparison, and scale admission. It
+does not duplicate repository execution or pretraining. It calls the existing
+`agent_scorecard`, `checkpoint_compare`, `checkpoint_eval`,
+`audit_tokenizer_dominance`, and `run_pretraining_loop` contracts.
+
+#### Why This Layer Exists
+
+A prompt answer, a historical vulnerability, and a repository-verified patch
+are three different facts. Earlier score reports could measure prompt quality,
+but a prompt score alone cannot prove compilation, developer tests, or
+security-test success. The qualification layer preserves these boundaries:
+
+- historical provenance proves that the task came from a pinned upstream
+  benchmark and fixing commit;
+- prompt evaluation measures checkpoint output, hallucination, and repetition;
+- repository evidence measures official security testcase and developer unit
+  tests;
+- missing repository evidence is `blocked_missing_evidence`, never zero and
+  never a pass;
+- benchmark ground truth is a permanent holdout and cannot enter tokenizer,
+  sharding, or training inputs.
+
+#### Source Governance
+
+`config/repository_qualification_sources.json` pins SecRepoBench to an exact
+commit and declares required source files, HTTPS repository policy, and
+evaluation-only use. Pack generation checks Git HEAD and SHA-256 for every
+required benchmark artifact.
+
+First generate a local approval template:
+
+```powershell
+python -m src.aeitron.evaluation.qualification_campaign approval-template `
+  --source-root D:\benchmarks\SecRepoBench `
+  --source-id secrepobench-318 `
+  --registry config\repository_qualification_sources.json `
+  --output config\local\secrepobench-approval.json
+```
+
+The command deliberately writes `decision: pending`. Repository code cannot
+grant legal or license approval. An authorized reviewer must inspect the source
+license, intended use, benchmark policy, privacy risk, and redistribution
+constraints before setting `decision: approved`. The approval binds the source
+URL, pinned commit, intended evaluation-only use, reviewer, timestamp,
+rationale, and exact file hashes. A later file change invalidates it.
+
+Build the pack only after approval:
+
+```powershell
+python -m src.aeitron.evaluation.qualification_campaign build-pack `
+  --source-root D:\benchmarks\SecRepoBench `
+  --approval config\local\secrepobench-approval.json `
+  --output-dir artifacts\aeitron\qualification-pack
+```
+
+The deterministic selection contains exactly:
+
+| Category | Count |
+|---|---:|
+| coding | 10 |
+| debugging | 10 |
+| defensive_security | 10 |
+| patch_generation | 10 |
+| long_context | 10 |
+
+Only records whose vulnerable testcase crashes, whose developer fix passes the
+official security testcase, whose fixing commit is a full hash, and whose
+upstream repository uses an allowed HTTPS host are eligible. Prompts contain
+pre-fix context and crash class, but never the fixing diff, fixed source, fixing
+commit, or target CVE. The oracle is represented only by a SHA-256 digest in the
+task catalog.
+
+Artifacts:
+
+```text
+qualification_pack_manifest.json
+checkpoint_prompts.jsonl
+repository_task_catalog.jsonl
+qualification_pack_report.md
+```
+
+The manifest binds both JSONL files by SHA-256. Production readiness requires
+this governed pack and an exact-task strict repository report; an unrelated
+50-task report cannot satisfy the gate.
+
+#### Official Repository Evidence
+
+After Aeitron completions are executed by the pinned SecRepoBench ARVO/Docker
+harness, import the official nested result:
+
+```powershell
+python -m src.aeitron.evaluation.qualification_campaign import-evidence `
+  --pack-manifest artifacts\aeitron\qualification-pack\qualification_pack_manifest.json `
+  --benchmark-source-root D:\benchmarks\SecRepoBench `
+  --evaluation-report D:\benchmarks\SecRepoBench\eval_report.json `
+  --agent aeitron --model aeitron-scratch --context none `
+  --prompt no-security-reminder --mode completion `
+  --output artifacts\aeitron\qualification-pack\repository_evidence.json
+```
+
+The selector names must match the actual official report. The importer requires
+all 50 exact source task IDs. Security passes only when the official testcase
+is `pass`. Correctness passes only when every developer test that passed for the
+reference fixed repository remains present in the candidate run. Missing tasks,
+source drift, malformed nesting, or changed benchmark artifacts fail import.
+
+#### Current Checkpoint Baseline
+
+```powershell
+python -m src.aeitron.evaluation.qualification_campaign baseline `
+  --pack-manifest artifacts\aeitron\qualification-pack\qualification_pack_manifest.json `
+  --checkpoint-manifest artifacts\aeitron\train\best_checkpoint_manifest.json `
+  --tokenizer artifacts\aeitron\tokenizer\tokenizer.json `
+  --repository-report artifacts\aeitron\qualification-pack\repository_evidence.json `
+  --output-dir artifacts\aeitron\qualification-baseline `
+  --device cuda
+```
+
+The baseline records solved prompts, average prompt score, hallucination rate,
+repetition-collapse rate, exact failure categories, official test pass rate,
+and official security pass rate. If `--repository-report` is omitted, prompt
+metrics remain valid but repository metrics are explicitly unmeasured.
+
+Hallucination categories include missing uncertainty when evidence is absent,
+invented CVE IDs, unsupported “tests passed” claims, and offensive steps in a
+defensive-only evaluation. Generation collapse is measured after deterministic
+decode with repetition penalty, no-repeat n-gram control, fixed seed, and stop
+tokens.
+
+#### Defensive Curriculum State Machine
+
+`config/defensive_checkpoint_qualification.json` defines one immutable ladder:
+
+```text
+1k -> 10k -> 20k -> 50k -> 100k curriculum steps
+```
+
+The initial checkpoint global step is preserved. For example, an input
+checkpoint at global step 50,000 produces stage targets 51,000, 60,000, 70,000,
+100,000, and 150,000. The stage count therefore measures defensive curriculum
+work rather than pretending the existing checkpoint started at zero.
+
+Plan:
+
+```powershell
+python -m src.aeitron.evaluation.qualification_campaign plan `
+  --config config\defensive_checkpoint_qualification.json `
+  --output-dir artifacts\aeitron\defensive-qualification
+```
+
+First stage:
+
+```powershell
+python -m src.aeitron.evaluation.qualification_campaign run-stage `
+  --config config\defensive_checkpoint_qualification.json `
+  --campaign-dir artifacts\aeitron\defensive-qualification `
+  --target-steps 1000 `
+  --pack-manifest artifacts\aeitron\qualification-pack\qualification_pack_manifest.json `
+  --dataset-manifest artifacts\aeitron\defensive-data\shards\manifest.json `
+  --dataset-version-manifest artifacts\aeitron\defensive-data\versions\<version-id>.json `
+  --tokenizer artifacts\aeitron\tokenizer\tokenizer.json `
+  --tokenizer-audit-corpus artifacts\aeitron\defensive-data\promoted.jsonl `
+  --initial-checkpoint-manifest artifacts\aeitron\train\best_checkpoint_manifest.json `
+  --device cuda
+```
+
+Run the same command with targets `10000`, `20000`, `50000`, and `100000`.
+State is atomically written to `campaign_state.json`. Dataset shard and version
+manifests, tokenizer, pack, initial checkpoint, and policy hashes cannot change
+between stages. The version manifest must bind the exact shards and prove a
+passed `defensive_security_only` instruction mix, strict offensive filter,
+promoted rows, contamination report, and near-duplicate report. An external
+initial checkpoint is integrity checked, must have the same full architecture
+and tokenizer, and may rebind the dataset only once at campaign genesis. Every
+later resume requires the exact same dataset hash.
+
+Each stage performs:
+
+1. tokenizer dominance and code/security pattern audit;
+2. hash-verified checkpoint resume;
+3. defensive scratch pretraining with live progress;
+4. validation-loss best-checkpoint selection;
+5. checkpoint save/reload integrity proof;
+6. checkpoint evaluation;
+7. fixed 50-prompt before/after comparison;
+8. atomic promotion or stop decision.
+
+The 1k stage can advance when technical gates pass even if quality is neutral,
+because it is a pipeline qualification. Starting at 10k, score improvement of
+at least one percentage point is mandatory. Any individual task regression,
+hallucination, collapse, non-finite loss, missing best checkpoint, tokenizer
+warning, failed checkpoint evaluation, or validation failure blocks promotion.
+The report recommends data-mix audit, verified instruction-data expansion,
+overfit sanity testing, or optimizer correction instead of blindly adding
+steps.
+
+#### Scale Admission
+
+```powershell
+python -m src.aeitron.evaluation.qualification_campaign scale-handoff `
+  --campaign-state artifacts\aeitron\defensive-qualification\campaign_state.json `
+  --output-dir artifacts\aeitron\defensive-qualification\scale
+```
+
+Scale admission is blocked until the defensive 100k checkpoint is promoted.
+The next order is larger governance-approved data, 1B single-node scratch
+proof, multi-GPU FSDP save/reload/evaluation proof, then live Postgres, Redis,
+S3/MinIO, and Qdrant connection/lifecycle proofs. The handoff references
+`aeitron-7b-fsdp`; it does not mark FSDP or external services production-ready
+without their measured deployment evidence.
+
 ## Final Rule
 
 Do not reintroduce numbered legacy folders. If a feature is needed, add it to
