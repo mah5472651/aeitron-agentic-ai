@@ -15,12 +15,16 @@ from src.aeitron.runtime.collaboration import (
     VerifierDecision,
 )
 from src.aeitron.runtime.engine import AgentRouter, AgentWorkerPool, AgentWorkerPoolReport, AeitronRuntime
+from src.aeitron.runtime.execution import AgentExecutionReport, AgentExecutionRequest, AgentExecutionService
 from src.aeitron.runtime.taskgraph import TaskGraphRuntime
 
 __all__ = [
     "AgentMessage",
     "AgentRole",
     "AgentRouter",
+    "AgentExecutionReport",
+    "AgentExecutionRequest",
+    "AgentExecutionService",
     "AgentWorkerPool",
     "AgentWorkerPoolReport",
     "AeitronRuntime",

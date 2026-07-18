@@ -385,10 +385,10 @@ def _check_agent_collaboration(mode: str) -> ReadinessCheck:
     status: ReadinessStatus
     if missing:
         status = "blocked_missing_dependency"
-    elif mode == "production":
+    elif live_proven:
         status = "production_ready_requires_external_service"
     else:
-        status = "production_ready"
+        status = "built_not_cluster_proven"
     return ReadinessCheck(
         subsystem="agent_collaboration",
         status=status,
@@ -410,6 +410,79 @@ def _check_agent_collaboration(mode: str) -> ReadinessCheck:
             "proof_report": str(proof_path),
             "max_reflection_revisions": 3,
             "typed_message_kinds": ["proposal", "evidence", "challenge", "review", "decision"],
+        },
+        production_blocker=mode == "production" and bool(missing),
+    )
+
+
+def _check_agent_execution(mode: str) -> ReadinessCheck:
+    engine = Path("src/aeitron/runtime/execution.py")
+    scorecard_runner = Path("src/aeitron/evaluation/agent_scorecard.py")
+    report_path = Path(
+        os.environ.get(
+            "AEITRON_AGENT_SCORECARD_REPORT",
+            "artifacts/aeitron/agent-scorecard/agent_scorecard.json",
+        )
+    )
+    scorecard_proven = False
+    scorecard_evidence: dict[str, Any] = {}
+    if report_path.is_file():
+        try:
+            scorecard_evidence = json.loads(report_path.read_text(encoding="utf-8"))
+            scorecard_proven = (
+                scorecard_evidence.get("status") == "passed"
+                and scorecard_evidence.get("policy_mode") == "strict"
+                and 50 <= int(scorecard_evidence.get("task_count") or 0) <= 100
+                and float(scorecard_evidence.get("architecture_reliability_score") or 0.0) >= 0.95
+                and float(scorecard_evidence.get("workflow_completion_score") or 0.0) >= 0.80
+                and float(scorecard_evidence.get("sandbox_test_pass_rate") or 0.0) >= 0.80
+                and int(scorecard_evidence.get("regression_count") or 0) == 0
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            scorecard_proven = False
+    missing = [str(path) for path in [engine, scorecard_runner] if not path.is_file()]
+    if mode == "production" and not scorecard_proven:
+        missing.append(f"strict 50-100 repository task scorecard proof: {report_path}")
+    if missing:
+        status: ReadinessStatus = "blocked_missing_dependency"
+    elif scorecard_proven:
+        status = "production_ready"
+    else:
+        status = "built_not_cluster_proven"
+    return ReadinessCheck(
+        subsystem="verified_agent_execution",
+        status=status,
+        summary=(
+            "Architect, coder, sandbox tester, defensive reviewers, critic, verifier, bounded revision, and patch transaction are wired."
+            if not missing
+            else "Verified agent execution is missing code or a required real-repository proof."
+        ),
+        required_dependencies=[
+            "non-mock Aeitron scratch serving backend",
+            "Docker sandbox",
+            "Semgrep or CodeQL",
+            "strict 50-100 repository task scorecard",
+        ],
+        missing_dependencies=missing,
+        evidence={
+            "execution_engine_present": engine.is_file(),
+            "scorecard_runner_present": scorecard_runner.is_file(),
+            "scorecard_report": str(report_path),
+            "scorecard_proven": scorecard_proven,
+            "scorecard_summary": {
+                key: scorecard_evidence.get(key)
+                for key in [
+                    "status",
+                    "policy_mode",
+                    "task_count",
+                    "architecture_reliability_score",
+                    "workflow_completion_score",
+                    "sandbox_test_pass_rate",
+                    "regression_count",
+                ]
+            },
+            "max_patch_revisions": 3,
+            "original_mutation_before_accept": False,
         },
         production_blocker=mode == "production" and bool(missing),
     )
@@ -451,6 +524,7 @@ def run_production_readiness(
         *_check_training_stack(mode),
         _check_training_workspace(mode),
         _check_agent_collaboration(mode),
+        _check_agent_execution(mode),
         _check_benchmark_files(mode, benchmark_dir),
     ]
     failed = any(check.production_blocker for check in checks)

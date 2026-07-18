@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from src.aeitron.observability import METRICS, install_observability
 from src.aeitron.patches import PatchPreviewRequest, PatchService, PatchVerifyRequest
 from src.aeitron.runtime.collaboration import AgentMessage, BlackboardKind, BlackboardWrite, CollaborationRuntime, FailureIntelligence
 from src.aeitron.runtime.engine import AeitronRuntime
+from src.aeitron.runtime.execution import AgentExecutionReport, AgentExecutionRequest, AgentExecutionService
 from src.aeitron.runtime.taskgraph import AgentRunCreateRequest, TaskCompleteRequest, TaskFailRequest, TaskGraphRuntime
 from src.aeitron.shared.schemas import AeitronRunRequest, AeitronRunReport
 from src.aeitron.tools import DockerSandboxRunner, HardenedToolExecutor, SandboxRunRequest, ToolExecuteRequest
@@ -729,6 +731,48 @@ async def create_agent_run(request: AgentRunCreateRequest) -> dict[str, Any]:
         return TaskGraphRuntime(STORE).create_agent_run(request).model_dump()
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project or session not found") from exc
+
+
+@app.post("/v1/agent/execute", response_model=AgentExecutionReport)
+async def execute_agent_workflow(
+    payload: AgentExecutionRequest,
+    http_request: Request,
+) -> AgentExecutionReport:
+    """Run architect-to-verifier workflow and mutate only an accepted patch."""
+
+    started = time.perf_counter()
+    try:
+        require_scope(http_request, "agents:execute")
+        report = await AgentExecutionService(STORE).execute(payload)
+        METRICS.inc(
+            "aeitron_agent_executions_total",
+            status=report.status,
+            applied=str(report.applied).lower(),
+        )
+        METRICS.observe(
+            "aeitron_agent_execution_duration_ms",
+            report.total_duration_ms,
+            status=report.status,
+        )
+        METRICS.observe(
+            "aeitron_agent_revision_attempts",
+            float(len(report.attempts)),
+            status=report.status,
+        )
+        return report
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        METRICS.observe(
+            "aeitron_agent_gateway_duration_ms",
+            (time.perf_counter() - started) * 1000,
+        )
 
 
 @app.get("/v1/agent/runs/{run_id}")

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import difflib
+import os
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -16,14 +19,21 @@ from src.aeitron.verifier import VerificationRequest, VerifierRuntime
 
 
 class FileEdit(StrictModel):
-    path: str
+    path: str = Field(min_length=1, max_length=1024)
     new_content: str
 
     @field_validator("path")
     @classmethod
     def validate_relative_path(cls, value: str) -> str:
         normalized = value.replace("\\", "/")
-        if normalized.startswith("/") or normalized.startswith("../") or "/../" in f"/{normalized}/":
+        parts = normalized.split("/")
+        if (
+            normalized.startswith("/")
+            or Path(normalized).drive
+            or (len(parts[0]) >= 2 and parts[0][1] == ":")
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(ord(character) < 32 for character in normalized)
+        ):
             raise ValueError(f"unsafe edit path: {value}")
         if normalized == ".git" or normalized.startswith(".git/"):
             raise ValueError("patches cannot write inside .git")
@@ -80,7 +90,10 @@ class PatchService:
         for edit in request.edits:
             target = resolve_inside(root, edit.path)
             before = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
-            backup["files"][edit.path] = before
+            backup["files"][edit.path] = {
+                "existed": target.exists(),
+                "content": before,
+            }
             diff_parts.append(self.make_diff(edit.path, before, edit.new_content))
         record = self.store.create_patch_record(
             project_id=request.project_id,
@@ -96,11 +109,20 @@ class PatchService:
         record = self.store.get_patch(patch_id)
         if record is None:
             raise KeyError(f"unknown patch: {patch_id}")
+        if record["status"] == "applied":
+            return self.response_from_record(record)
+        if record["status"] != "preview":
+            raise ValueError(f"patch {patch_id} cannot be applied from status {record['status']}")
         root = project_root(self.store, record["project_id"])
-        for edit in record["backup"].get("edits", []):
-            target = resolve_inside(root, edit["path"])
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(str(edit["new_content"]), encoding="utf-8")
+        written: list[Path] = []
+        try:
+            for edit in record["backup"].get("edits", []):
+                target = resolve_inside(root, edit["path"])
+                self._atomic_write(target, str(edit["new_content"]))
+                written.append(target)
+        except Exception:
+            self._restore_files(root, record["backup"].get("files", {}), only=written)
+            raise
         self.store.update_patch_status(patch_id, "applied", applied=True)
         return self.response_from_record(self.store.get_patch(patch_id) or record)
 
@@ -108,13 +130,77 @@ class PatchService:
         record = self.store.get_patch(patch_id)
         if record is None:
             raise KeyError(f"unknown patch: {patch_id}")
-        root = project_root(self.store, record["project_id"])
-        for relative, before in record["backup"].get("files", {}).items():
-            target = resolve_inside(root, relative)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(str(before), encoding="utf-8")
+        if record["status"] == "rolled_back":
+            return self.response_from_record(record)
+        if record["status"] not in {"preview", "applied"}:
+            raise ValueError(f"patch {patch_id} cannot be rolled back from status {record['status']}")
+        # A preview has never mutated the workspace. Rejecting one must not
+        # replace files or change their timestamps and permissions.
+        if record["status"] == "applied":
+            root = project_root(self.store, record["project_id"])
+            self._restore_files(root, record["backup"].get("files", {}))
         self.store.update_patch_status(patch_id, "rolled_back", rolled_back=True)
         return self.response_from_record(self.store.get_patch(patch_id) or record)
+
+    def _restore_files(
+        self,
+        root: Path,
+        backups: dict[str, Any],
+        *,
+        only: list[Path] | None = None,
+    ) -> None:
+        selected = {path.resolve() for path in only} if only is not None else None
+        for relative, backup in backups.items():
+            target = resolve_inside(root, relative)
+            if selected is not None and target.resolve() not in selected:
+                continue
+            # Older patch records stored the original content directly.
+            if isinstance(backup, dict):
+                existed = bool(backup.get("existed"))
+                content = str(backup.get("content") or "")
+            else:
+                existed = True
+                content = str(backup)
+            if not existed:
+                target.unlink(missing_ok=True)
+                self._remove_empty_parents(target.parent, root)
+                continue
+            self._atomic_write(target, content)
+
+    @staticmethod
+    def _atomic_write(target: Path, content: str) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o600
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".aeitron-tmp",
+            dir=str(target.parent),
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, target)
+            if os.name != "nt":
+                directory_descriptor = os.open(target.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _remove_empty_parents(path: Path, root: Path) -> None:
+        while path != root:
+            try:
+                path.rmdir()
+            except OSError:
+                return
+            path = path.parent
 
     def preview_apply_verify(self, request: PatchVerifyRequest) -> PatchVerifyResponse:
         patch = self.preview(request)

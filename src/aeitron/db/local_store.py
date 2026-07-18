@@ -316,6 +316,11 @@ class LocalStore:
         row = self.connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         return row_to_dict(row)
 
+    def delete_project(self, project_id: str) -> bool:
+        cursor = self.connection.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        self.connection.commit()
+        return cursor.rowcount == 1
+
     def update_project_index_status(self, project_id: str, status: str, *, indexed_at: float | None = None) -> None:
         self.connection.execute(
             """

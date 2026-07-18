@@ -479,6 +479,146 @@ critic confidence at or above the configured threshold, verifier acceptance,
 and at least one verification evidence reference. This prevents infinite
 reasoning loops and evidence-free confidence claims.
 
+### Verified Repository Execution
+
+`src/aeitron/runtime/execution.py` is the single orchestration boundary that
+turns the collaboration primitives into a real coding-agent run. It does not
+replace TaskGraph, patch, tool, scanner, indexing, or verifier ownership.
+
+The worker sequence is:
+
+```text
+Architect
+  validates a structured plan; executable code is forbidden
+Coder
+  returns validated complete-file edits and candidate test argv
+Stage transaction
+  copies the bounded repository without links/generated directories
+  previews the same patch for the original and applies it only to the stage
+Tester || Security Reviewer || Performance Reviewer
+  run concurrently after the patch exists
+Critic
+  receives all three evidence sets and returns confidence plus concrete flaws
+Verifier
+  checks objective criteria without generating a solution
+Orchestrator
+  returns a typed evidence-backed summary
+```
+
+Every model-produced control artifact is JSON parsed into a strict Pydantic
+schema. Markdown-wrapped JSON, missing fields, contradictory final status,
+duplicate patch paths, path escapes, oversized patches, and role mixing fail
+the task. Raw private chain-of-thought is not requested or persisted.
+
+The original repository mutation invariant is:
+
+```text
+copy original -> apply candidate to stage -> execute evidence gates
+  -> accepted: atomic apply to original
+  -> rejected: original preview record becomes rolled_back
+```
+
+Atomic patch writes use a same-directory temporary file, `fsync`, and
+`os.replace`. If a multi-file apply raises, already-written files are restored.
+Rollback restores existing files and removes files created by the rejected
+patch, including empty parent directories. Apply and rollback are idempotent
+for their terminal states.
+
+Strict execution performs dependency preflight before calling the model:
+
+- private non-mock Aeitron scratch serving backend;
+- reachable Docker engine;
+- Semgrep and/or CodeQL when configured as required;
+- allowlisted sandbox image;
+- no host execution fallback.
+
+Tests run in a network-disabled, read-only-root container with one CPU, 512 MiB
+RAM, dropped capabilities, unprivileged UID/GID, and bounded tmpfs workspace.
+The security reviewer compares finding fingerprints from the original baseline
+with the staged patch and rejects newly introduced findings. A missing required
+scanner is evidence of failure, not a pass.
+
+On rejection, critic flaws, incorrect assumptions, failure modes, security
+risks, missing evidence, scanner issues, and verifier failures become the next
+revision context. The initial attempt plus at most three revisions are allowed.
+Each revision is a distinct durable run and TaskGraph. Repeated normalized
+failures enter Failure Intelligence; only a later verified patch can link and
+promote the resolved experience.
+
+Gateway API:
+
+```text
+POST /v1/agent/execute
+scope: agents:execute
+```
+
+The synchronous response contains every attempt, test evidence, scanner
+evidence, critic review, verifier decision, final patch status, confidence, and
+whether the original workspace was changed. Metrics include execution count,
+duration, and revision attempts.
+
+### Repository Agent Scorecard
+
+`src/aeitron/evaluation/agent_scorecard.py` runs the same Gateway execution
+service against isolated copies of approved real repositories. It never runs a
+weaker scoring-only implementation.
+
+Each JSONL task supplies:
+
+```json
+{
+  "task_id": "auth-debug-001",
+  "repository": "auth-debug-001",
+  "prompt": "fix login",
+  "category": "debugging",
+  "verification_commands": [["python", "-m", "pytest", "-q"]],
+  "expected_changed_files": ["src/auth.py"],
+  "required_substrings": {"src/auth.py": ["compare_digest"]},
+  "forbidden_substrings": {"src/auth.py": ["== supplied_token"]},
+  "short_prompt": true,
+  "run_semgrep": true,
+  "run_codeql": false
+}
+```
+
+Strict suite rules:
+
+- 50-100 unique tasks;
+- at least 10 each for coding, debugging, security, patch, and long-context;
+- at least 10 short-prompt tasks;
+- every task has test commands, expected files, and content assertions;
+- every task enables Semgrep or CodeQL;
+- repository paths stay under `AEITRON_SCORECARD_REPO_ROOTS`;
+- a non-mock Aeitron scratch backend is mandatory.
+
+Tasks run with bounded concurrency. The runner hashes every source repository
+before and after execution, stages a separate worktree, and writes each complete
+execution report under `tasks/<task_id>/execution_report.json`. Aggregate JSON
+and Markdown expose:
+
+- architecture reliability;
+- workflow completion;
+- security detection/fix score;
+- short-prompt understanding;
+- sandbox/test pass rate;
+- regression count;
+- confidence and objective score per task.
+
+Production pass requires at least 95% source/reliability integrity, at least 80%
+workflow, security, short-prompt and sandbox/test rates, and zero accepted
+regressions. `AEITRON_AGENT_SCORECARD_REPORT` is consumed by production
+readiness. Without a measured strict 50-100 task report the subsystem remains
+`built_not_cluster_proven` in development and blocks production.
+
+```powershell
+$env:AEITRON_SCORECARD_REPO_ROOTS = "D:\approved-agent-eval-repos"
+python -m src.aeitron.evaluation.agent_scorecard `
+  --tasks D:\approved-agent-eval-repos\tasks.jsonl `
+  --repository-root D:\approved-agent-eval-repos `
+  --output-dir artifacts\aeitron\agent-scorecard `
+  --policy-mode strict --concurrency 4
+```
+
 ### Failure Intelligence
 
 Runtime exceptions and timeouts are secret-redacted and normalized by replacing

@@ -142,6 +142,60 @@ python -m src.aeitron.runtime.collaboration --postgres-proof `
 Production readiness consumes the generated proof report. Configuration alone
 does not mark collaboration persistence production-ready.
 
+## Verified Coding-Agent Workflow
+
+One command now runs the complete architect-to-verifier workflow:
+
+```text
+architect plan -> context -> coder patch
+  -> sandbox test || Semgrep/CodeQL review || performance review
+  -> critic -> verifier -> bounded revision (maximum 3)
+  -> accepted patch apply | rejected patch rollback
+```
+
+Candidate edits are applied only to an ephemeral repository copy. The registered
+workspace remains unchanged until the verifier has test and defensive-security
+evidence and confidence is at least the configured threshold.
+
+```powershell
+$body = @{
+  project_id = "<project-id>"
+  prompt = "Fix the authentication regression and verify it"
+  verification_commands = @(, @("python", "-m", "pytest", "-q"))
+  policy_mode = "strict"
+  max_revisions = 3
+  apply_on_accept = $true
+  require_sandbox = $true
+  run_semgrep = $true
+  fail_on_scanner_unavailable = $true
+} | ConvertTo-Json -Depth 8
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/agent/execute `
+  -Headers @{Authorization = "Bearer <token>"} `
+  -ContentType "application/json" -Body $body
+```
+
+Strict mode fails before model work if the private Aeitron serving backend,
+Docker engine, or required scanner is unavailable. It never falls back to host
+execution.
+
+Run a production repository scorecard:
+
+```powershell
+$env:AEITRON_SCORECARD_REPO_ROOTS = "D:\approved-agent-eval-repos"
+python -m src.aeitron.evaluation.agent_scorecard `
+  --tasks D:\approved-agent-eval-repos\tasks.jsonl `
+  --repository-root D:\approved-agent-eval-repos `
+  --output-dir artifacts\aeitron\agent-scorecard `
+  --policy-mode strict --concurrency 4
+```
+
+Strict scorecards require 50-100 repository tasks, at least 10 tasks in each of
+coding, debugging, security, patch, and long-context categories, at least 10
+short prompts, executable verification commands, and file/content oracles.
+Reports are evidence-backed JSON/Markdown; missing tasks, scanners, Docker, or a
+real scratch model block the run.
+
 ## Aeitron Scratch Model Serving
 
 Set:
