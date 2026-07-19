@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import time
 import uuid
+import zipfile
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -412,7 +413,7 @@ class ReviewerRosterReadinessReport(StrictModel):
 
 class ReviewerGovernanceBundleReport(StrictModel):
     schema_version: Literal[1] = 1
-    status: Literal["awaiting_human_identities"] = "awaiting_human_identities"
+    status: Literal["awaiting_human_identities", "ready_for_qualification"] = "awaiting_human_identities"
     roster_id: str
     rubric_id: str
     output_dir: str
@@ -427,6 +428,44 @@ class ReviewerGovernanceBundleReport(StrictModel):
     def validate_hashes(self) -> "ReviewerGovernanceBundleReport":
         object.__setattr__(self, "roster_sha256", _validate_hash(self.roster_sha256, "roster_sha256"))
         object.__setattr__(self, "rubric_sha256", _validate_hash(self.rubric_sha256, "rubric_sha256"))
+        return self
+
+
+class ReviewerDeliveryArtifact(StrictModel):
+    reviewer_id: str
+    package_path: str
+    package_sha256: str
+    item_count: Literal[20] = 20
+    answer_key_included: Literal[False] = False
+
+    @field_validator("package_sha256")
+    @classmethod
+    def validate_package_hash(cls, value: str) -> str:
+        return _validate_hash(value, "package_sha256")
+
+
+class ReviewerDeliveryReport(StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["ready_for_secure_delivery"] = "ready_for_secure_delivery"
+    roster_id: str
+    rubric_id: Literal["aeitron-review-rubric-v1"] = REVIEW_RUBRIC_ID
+    rubric_sha256: str
+    qualification_pack_sha256: str
+    packages: list[ReviewerDeliveryArtifact]
+    warning: str
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> "ReviewerDeliveryReport":
+        object.__setattr__(self, "rubric_sha256", _validate_hash(self.rubric_sha256, "rubric_sha256"))
+        object.__setattr__(
+            self,
+            "qualification_pack_sha256",
+            _validate_hash(self.qualification_pack_sha256, "qualification_pack_sha256"),
+        )
+        if len(self.packages) != 2:
+            raise ValueError("reviewer delivery requires exactly two reviewer packages")
+        if len({package.reviewer_id for package in self.packages}) != 2:
+            raise ValueError("reviewer delivery packages must target distinct reviewers")
         return self
 
 
@@ -921,6 +960,190 @@ def initialize_reviewer_qualification_pack(output_dir: str | Path) -> ReviewerQu
     )
     _write_model_atomically(report, manifest_path)
     os.chmod(manifest_path, 0o600)
+    return report
+
+
+def finalize_reviewer_governance_bundle(output_dir: str | Path) -> ReviewerGovernanceBundleReport:
+    root = Path(output_dir).expanduser().resolve(strict=True)
+    roster_path = root / "data_reviewers.json"
+    rubric_path = root / "reviewer-rubric-v1.md"
+    onboarding_path = root / "reviewer-onboarding.json"
+    manifest_path = root / "reviewer-governance-manifest.json"
+    for required_path in (roster_path, rubric_path, onboarding_path, manifest_path):
+        if not required_path.is_file():
+            raise FileNotFoundError(f"reviewer governance artifact is missing: {required_path}")
+
+    roster = load_reviewer_roster(roster_path)
+    readiness = reviewer_roster_readiness(roster)
+    if readiness.status != "ready":
+        raise ValueError("reviewer roster is not ready: " + "; ".join(readiness.blockers))
+    expected_rubric = build_reviewer_rubric_markdown()
+    if rubric_path.read_text(encoding="utf-8") != expected_rubric:
+        raise ValueError("reviewer rubric does not match the code-governed v1 rubric")
+
+    report = ReviewerGovernanceBundleReport(
+        status="ready_for_qualification",
+        roster_id=roster.roster_id,
+        rubric_id=REVIEW_RUBRIC_ID,
+        output_dir=str(root),
+        roster_path=str(roster_path),
+        rubric_path=str(rubric_path),
+        onboarding_path=str(onboarding_path),
+        roster_sha256=_hash_file(roster_path),
+        rubric_sha256=_hash_file(rubric_path),
+        warning=(
+            "The identity roster is ready. Phase 0 remains incomplete until both reviewers finish "
+            "the blind qualification pack and the qualification result is evaluated."
+        ),
+    )
+    _write_model_atomically(report, manifest_path)
+    os.chmod(manifest_path, 0o600)
+    return report
+
+
+def prepare_reviewer_delivery_packages(
+    governance_dir: str | Path,
+    output_dir: str | Path,
+) -> ReviewerDeliveryReport:
+    governance_root = Path(governance_dir).expanduser().resolve(strict=True)
+    output_root = Path(output_dir).expanduser().resolve()
+    governance_manifest_path = governance_root / "reviewer-governance-manifest.json"
+    qualification_manifest_path = governance_root / "reviewer-qualification-manifest.json"
+    governance = ReviewerGovernanceBundleReport.model_validate_json(
+        governance_manifest_path.read_text(encoding="utf-8")
+    )
+    qualification = ReviewerQualificationPackReport.model_validate_json(
+        qualification_manifest_path.read_text(encoding="utf-8")
+    )
+    if governance.status != "ready_for_qualification":
+        raise ValueError("reviewer governance manifest must be finalized before delivery")
+
+    roster_path = governance_root / "data_reviewers.json"
+    rubric_path = governance_root / "reviewer-rubric-v1.md"
+    pack_path = governance_root / "reviewer-qualification-v1.jsonl"
+    if _hash_file(roster_path) != governance.roster_sha256:
+        raise ValueError("reviewer roster changed after governance finalization")
+    if _hash_file(rubric_path) != governance.rubric_sha256:
+        raise ValueError("reviewer rubric changed after governance finalization")
+    if _hash_file(pack_path) != qualification.pack_sha256:
+        raise ValueError("reviewer qualification pack changed after initialization")
+
+    roster = load_reviewer_roster(roster_path)
+    readiness = reviewer_roster_readiness(roster)
+    if readiness.status != "ready":
+        raise ValueError("reviewer roster is no longer ready: " + "; ".join(readiness.blockers))
+    reviewers = sorted(
+        (
+            identity
+            for identity in roster.identities
+            if identity.active and "reviewer" in identity.roles
+        ),
+        key=lambda identity: identity.reviewer_id,
+    )
+    if len(reviewers) != 2:
+        raise ValueError("delivery requires exactly two active reviewer identities")
+
+    output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    report_path = output_root / "reviewer-delivery-report.json"
+    targets = [output_root / f"{reviewer.reviewer_id}-qualification.zip" for reviewer in reviewers]
+    existing = [str(path) for path in [*targets, report_path] if path.exists()]
+    if existing:
+        raise FileExistsError("refusing to overwrite reviewer delivery artifacts: " + ", ".join(existing))
+
+    pack_rows = [
+        json.loads(line)
+        for line in pack_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(pack_rows) != 20:
+        raise ValueError("reviewer qualification pack must contain exactly twenty rows")
+    packages: list[ReviewerDeliveryArtifact] = []
+    for reviewer, target in zip(reviewers, targets, strict=True):
+        responses = "".join(
+            json.dumps(
+                {
+                    "item_id": row["item_id"],
+                    "reviewer_id": reviewer.reviewer_id,
+                    "decision": None,
+                    "rationale": None,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+            for row in pack_rows
+        )
+        package_manifest = {
+            "schema_version": 1,
+            "reviewer_id": reviewer.reviewer_id,
+            "rubric_id": REVIEW_RUBRIC_ID,
+            "rubric_sha256": governance.rubric_sha256,
+            "qualification_pack_sha256": qualification.pack_sha256,
+            "item_count": 20,
+            "answer_key_included": False,
+            "instructions": [
+                "Read reviewer-rubric-v1.md before reviewing.",
+                "Complete every decision and write a concrete one-sentence rationale.",
+                "Do not discuss decisions with the other reviewer before both submissions are complete.",
+                "Return only reviewer-responses.jsonl through the approved secure channel.",
+            ],
+        }
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with zipfile.ZipFile(
+                temporary,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+            ) as archive:
+                _write_deterministic_zip_entry(
+                    archive,
+                    "reviewer-rubric-v1.md",
+                    rubric_path.read_bytes(),
+                )
+                _write_deterministic_zip_entry(
+                    archive,
+                    "reviewer-qualification-v1.jsonl",
+                    pack_path.read_bytes(),
+                )
+                _write_deterministic_zip_entry(
+                    archive,
+                    "reviewer-responses.jsonl",
+                    responses.encode("utf-8"),
+                )
+                _write_deterministic_zip_entry(
+                    archive,
+                    "delivery-manifest.json",
+                    (json.dumps(package_manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+                )
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        os.chmod(target, 0o600)
+        with zipfile.ZipFile(target, mode="r") as archive:
+            names = set(archive.namelist())
+        if "reviewer-qualification-answer-key-v1.json" in names or len(names) != 4:
+            raise RuntimeError("reviewer delivery package content contract was violated")
+        packages.append(
+            ReviewerDeliveryArtifact(
+                reviewer_id=reviewer.reviewer_id,
+                package_path=str(target),
+                package_sha256=_hash_file(target),
+            )
+        )
+
+    report = ReviewerDeliveryReport(
+        roster_id=roster.roster_id,
+        rubric_sha256=governance.rubric_sha256,
+        qualification_pack_sha256=qualification.pack_sha256,
+        packages=packages,
+        warning=(
+            "Packages contain no answer key or OIDC subject. Deliver each package only to its named "
+            "reviewer through an authenticated secure channel."
+        ),
+    )
+    _write_model_atomically(report, report_path)
+    os.chmod(report_path, 0o600)
+    os.chmod(output_root, 0o700)
     return report
 
 
@@ -1859,9 +2082,11 @@ def _cli_service(database: str | None) -> DatasetAuthorityService:
 def _validate_cli_identity(args: argparse.Namespace) -> None:
     roster_path = getattr(args, "reviewer_roster", None)
     if not roster_path or args.command in {
+        "finalize-reviewer-governance",
         "initialize-reviewer-governance",
         "initialize-reviewer-qualification",
         "list",
+        "prepare-reviewer-deliveries",
         "review-report",
         "reviewer-roster-template",
         "validate-reviewer-roster",
@@ -1892,6 +2117,13 @@ async def _run_cli_command(args: argparse.Namespace) -> StrictModel | list[Stric
         )
     if args.command == "initialize-reviewer-qualification":
         return initialize_reviewer_qualification_pack(args.output_dir)
+    if args.command == "finalize-reviewer-governance":
+        return finalize_reviewer_governance_bundle(args.output_dir)
+    if args.command == "prepare-reviewer-deliveries":
+        return prepare_reviewer_delivery_packages(
+            args.governance_dir,
+            args.output_dir,
+        )
     if args.command == "reviewer-roster-template":
         template = build_reviewer_roster_onboarding_template(
             roster_id=args.roster_id,
@@ -1973,6 +2205,19 @@ def _hash_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _write_deterministic_zip_entry(
+    archive: zipfile.ZipFile,
+    name: str,
+    payload: bytes,
+) -> None:
+    if Path(name).is_absolute() or ".." in Path(name).parts:
+        raise ValueError("reviewer package entry must be a safe relative path")
+    info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o600 << 16
+    archive.writestr(info, payload, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export immutable review evidence from the configured Aeitron Dataset Authority.",
@@ -1989,6 +2234,17 @@ def main() -> None:
         help="Create a deterministic 20-item blind qualification pack and restricted answer key.",
     )
     qualification_parser.add_argument("--output-dir", required=True)
+    finalize_parser = subparsers.add_parser(
+        "finalize-reviewer-governance",
+        help="Rebind the manifest to a ready real-identity roster and code-governed rubric.",
+    )
+    finalize_parser.add_argument("--output-dir", required=True)
+    delivery_parser = subparsers.add_parser(
+        "prepare-reviewer-deliveries",
+        help="Build two answer-key-free reviewer delivery packages.",
+    )
+    delivery_parser.add_argument("--governance-dir", required=True)
+    delivery_parser.add_argument("--output-dir", required=True)
     report_parser = subparsers.add_parser(
         "review-report",
         help="Export aggregate independent-review evidence for dataset promotion.",

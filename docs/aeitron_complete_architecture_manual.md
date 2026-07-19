@@ -4982,6 +4982,26 @@ approvals and ten expected rejections spanning security documentation, code,
 patch, and debugging evidence. It is operational reviewer training material and
 is permanently excluded from model training.
 
+After the governance operator writes three real, distinct OIDC subjects into
+the external roster, rebind the manifest and create reviewer-specific delivery
+packages:
+
+```powershell
+python -m src.aeitron.learning.dataset_authority finalize-reviewer-governance `
+  --output-dir C:\AeitronGovernance
+
+python -m src.aeitron.learning.dataset_authority prepare-reviewer-deliveries `
+  --governance-dir C:\AeitronGovernance `
+  --output-dir C:\AeitronGovernance\reviewer-deliveries
+```
+
+Finalization rejects a non-ready roster or changed rubric. Delivery rejects a
+stale roster, rubric, or qualification pack and refuses to overwrite previous
+packages. Each ZIP contains the rubric, blind twenty-item pack, assigned response
+template, and a delivery manifest. It contains neither the answer key nor OIDC
+subjects. Deliver each ZIP only through an authenticated channel to its named
+reviewer.
+
 The repository ships with an empty roster so no fictional human approval can
 unlock data. Gateway use also requires exact `data:review`,
 `data:adjudicate`, or `data:promote` scopes. Offline commands validate the same

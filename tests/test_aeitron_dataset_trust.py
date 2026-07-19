@@ -4,6 +4,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from starlette.requests import Request
@@ -23,8 +24,10 @@ from src.aeitron.learning.dataset_authority import (
     SQLiteDatasetAuthorityStore,
     SourceSnapshotCreate,
     build_reviewer_roster_onboarding_template,
+    finalize_reviewer_governance_bundle,
     initialize_reviewer_governance_bundle,
     initialize_reviewer_qualification_pack,
+    prepare_reviewer_delivery_packages,
     reviewer_roster_readiness,
 )
 from src.aeitron.learning.data_pipeline import (
@@ -110,6 +113,76 @@ class DatasetAuthorityTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("never enter training", report.handling_warning)
             with self.assertRaises(FileExistsError):
                 initialize_reviewer_qualification_pack(Path(temp_dir) / "governance")
+
+    async def test_ready_roster_is_rebound_and_delivery_packages_exclude_identity_and_answer_key(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            governance_dir = Path(temp_dir) / "governance"
+            initialize_reviewer_governance_bundle(governance_dir)
+            initialize_reviewer_qualification_pack(governance_dir)
+            roster = ReviewerRoster(
+                roster_id="aeitron-data-reviewers-v1",
+                identities=[
+                    ReviewerIdentity(
+                        reviewer_id="reviewer-one",
+                        identity_provider_subject="oidc:subject-one",
+                        roles={"reviewer"},
+                        approved_by="governance-owner",
+                        approved_at="2026-07-20T01:00:00+06:00",
+                    ),
+                    ReviewerIdentity(
+                        reviewer_id="reviewer-two",
+                        identity_provider_subject="oidc:subject-two",
+                        roles={"reviewer"},
+                        approved_by="governance-owner",
+                        approved_at="2026-07-20T01:00:00+06:00",
+                    ),
+                    ReviewerIdentity(
+                        reviewer_id="adjudicator-one",
+                        identity_provider_subject="oidc:subject-three",
+                        roles={"adjudicator"},
+                        approved_by="governance-owner",
+                        approved_at="2026-07-20T01:00:00+06:00",
+                    ),
+                ],
+            )
+            roster_path = governance_dir / "data_reviewers.json"
+            roster_path.write_text(roster.model_dump_json(indent=2) + "\n", encoding="utf-8")
+            finalized = finalize_reviewer_governance_bundle(governance_dir)
+            self.assertEqual(finalized.status, "ready_for_qualification")
+            self.assertEqual(
+                finalized.roster_sha256,
+                hashlib.sha256(roster_path.read_bytes()).hexdigest(),
+            )
+
+            delivery = prepare_reviewer_delivery_packages(
+                governance_dir,
+                Path(temp_dir) / "deliveries",
+            )
+            self.assertEqual(delivery.status, "ready_for_secure_delivery")
+            self.assertEqual(len(delivery.packages), 2)
+            for package in delivery.packages:
+                with zipfile.ZipFile(package.package_path, mode="r") as archive:
+                    names = set(archive.namelist())
+                    self.assertEqual(
+                        names,
+                        {
+                            "delivery-manifest.json",
+                            "reviewer-qualification-v1.jsonl",
+                            "reviewer-responses.jsonl",
+                            "reviewer-rubric-v1.md",
+                        },
+                    )
+                    combined = b"\n".join(archive.read(name) for name in sorted(names))
+                self.assertNotIn(b"answer-key", combined)
+                self.assertNotIn(b"oidc:subject", combined)
+                self.assertFalse(package.answer_key_included)
+            with self.assertRaises(FileExistsError):
+                prepare_reviewer_delivery_packages(
+                    governance_dir,
+                    Path(temp_dir) / "deliveries",
+                )
 
     async def test_reviewer_onboarding_never_fabricates_identity_and_reports_readiness(self) -> None:
         template = build_reviewer_roster_onboarding_template()
