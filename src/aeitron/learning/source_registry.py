@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -93,9 +95,53 @@ class SourceApprovalRequestArtifact(StrictModel):
     required_legal_fields: list[str]
 
 
+class SourceSelectionEntry(StrictModel):
+    source_id: str
+    registry_entry_sha256: str
+
+
+class SourceSelectionManifest(StrictModel):
+    schema_version: Literal[1] = 1
+    source_count: int = Field(ge=1)
+    source_ids: list[str] = Field(min_length=1)
+    input_registry_sha256: str
+    selected_registry_sha256: str
+    entries: list[SourceSelectionEntry] = Field(min_length=1)
+
+    @field_validator("input_registry_sha256", "selected_registry_sha256")
+    @classmethod
+    def validate_manifest_sha256(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
+            raise ValueError("selection manifest hashes must be SHA-256 hex")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "SourceSelectionManifest":
+        if self.source_count != len(self.source_ids) or self.source_count != len(self.entries):
+            raise ValueError("selection manifest count does not match selected sources")
+        if self.source_ids != sorted(self.source_ids):
+            raise ValueError("selection manifest source_ids must be sorted")
+        if len(set(self.source_ids)) != len(self.source_ids):
+            raise ValueError("selection manifest contains duplicate source IDs")
+        if [entry.source_id for entry in self.entries] != self.source_ids:
+            raise ValueError("selection manifest entries do not match source_ids")
+        return self
+
+
 def source_registry_entry_sha256(source: SourceSpec) -> str:
     payload = json.dumps(
         source.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def source_registry_snapshot_sha256(sources: list[SourceSpec]) -> str:
+    payload = json.dumps(
+        [source.model_dump(mode="json") for source in sorted(sources, key=lambda item: item.source_id or "")],
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -124,6 +170,52 @@ class SourceRegistry:
         for path in paths:
             sources.extend(load_sources(path))
         return cls(sources)
+
+    def select_sources(
+        self,
+        source_ids: list[str],
+        *,
+        expected_count: int | None = None,
+    ) -> tuple["SourceRegistry", SourceSelectionManifest]:
+        requested = [source_id.strip().lower() for source_id in source_ids]
+        if not requested or any(not source_id for source_id in requested):
+            raise ValueError("source selection requires at least one non-empty source ID")
+        duplicates = sorted({source_id for source_id in requested if requested.count(source_id) > 1})
+        if duplicates:
+            raise ValueError("duplicate selected source IDs: " + ", ".join(duplicates))
+        if expected_count is not None and expected_count != len(requested):
+            raise ValueError(
+                f"selected source count mismatch: expected {expected_count}, received {len(requested)}"
+            )
+
+        available: dict[str, SourceSpec] = {}
+        for source in self.sources:
+            assert source.source_id is not None
+            if source.source_id in available:
+                raise ValueError(f"duplicate source_id in input registry: {source.source_id}")
+            available[source.source_id] = source
+        unknown = sorted(set(requested) - set(available))
+        if unknown:
+            raise ValueError("unknown selected source IDs: " + ", ".join(unknown))
+
+        selected_ids = sorted(requested)
+        selected_sources = [available[source_id] for source_id in selected_ids]
+        selected_registry = SourceRegistry(selected_sources)
+        selected_registry.validate()
+        manifest = SourceSelectionManifest(
+            source_count=len(selected_sources),
+            source_ids=selected_ids,
+            input_registry_sha256=source_registry_snapshot_sha256(self.sources),
+            selected_registry_sha256=source_registry_snapshot_sha256(selected_sources),
+            entries=[
+                SourceSelectionEntry(
+                    source_id=source_id,
+                    registry_entry_sha256=source_registry_entry_sha256(available[source_id]),
+                )
+                for source_id in selected_ids
+            ],
+        )
+        return selected_registry, manifest
 
     def validate(self, *, production: bool = False) -> SourceRegistryReport:
         warnings: list[str] = []
@@ -163,14 +255,6 @@ class SourceRegistry:
                     warnings.append(f"{source.name}: duplicate seed URL ignored by frontier: {url}")
                 seen_urls.add(url)
 
-        snapshot_payload = json.dumps(
-            [source.model_dump(mode="json") for source in sorted(self.sources, key=lambda item: item.source_id or "")],
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        import hashlib
-
         report = SourceRegistryReport(
             source_count=len(self.sources),
             url_count=url_count,
@@ -178,7 +262,7 @@ class SourceRegistry:
             categories=sorted(categories),
             approved_sources=approved_sources,
             quarantine_sources=quarantine_sources,
-            source_snapshot_sha256=hashlib.sha256(snapshot_payload.encode("utf-8")).hexdigest(),
+            source_snapshot_sha256=source_registry_snapshot_sha256(self.sources),
             warnings=warnings,
         )
         if production:
@@ -368,7 +452,7 @@ class SourceRegistry:
             "request_count": len(written),
             "requests": [
                 {
-                    "path": str(path),
+                    "path": path.name,
                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                 }
                 for path in written
@@ -380,11 +464,53 @@ class SourceRegistry:
         )
         return written
 
-    def write(self, path: str | Path) -> Path:
-        target = Path(path)
+    @staticmethod
+    def write_selection_manifest(manifest: SourceSelectionManifest, path: str | Path) -> Path:
+        target = Path(path).resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
+        SourceRegistry._atomic_write_json(target, manifest.model_dump(mode="json"))
+        return target
+
+    @staticmethod
+    def _atomic_write_json(target: Path, payload: dict[str, object]) -> None:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, target)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    def write(self, path: str | Path, *, protect_existing_approvals: bool = True) -> Path:
+        target = Path(path).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if protect_existing_approvals and target.is_file():
+            existing = SourceRegistry.from_file(target)
+            incoming_by_id = {source.source_id: source for source in self.sources}
+            for approved in existing.sources:
+                if approved.approval_status != "approved":
+                    continue
+                incoming = incoming_by_id.get(approved.source_id)
+                if incoming is None:
+                    raise ValueError(f"refusing to remove previously approved source: {approved.source_id}")
+                if incoming.model_dump(mode="json") != approved.model_dump(mode="json"):
+                    raise ValueError(f"refusing to alter previously approved source: {approved.source_id}")
         payload = {"sources": [source.model_dump() for source in self.sources]}
-        target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        self._atomic_write_json(target, payload)
         return target
 
 
@@ -401,8 +527,29 @@ def main() -> None:
     parser.add_argument("--legal-approval")
     parser.add_argument("--trust-tier", choices=["reviewed", "trusted"], default="reviewed")
     parser.add_argument("--prepare-approval-dir")
+    parser.add_argument(
+        "--select-source",
+        action="append",
+        default=[],
+        help="Select an exact source ID into an isolated governed batch; repeat for each source.",
+    )
+    parser.add_argument("--expect-source-count", type=int)
+    parser.add_argument("--selection-manifest")
     args = parser.parse_args()
     registry = SourceRegistry.from_files(args.sources)
+    if args.select_source:
+        registry, selection_manifest = registry.select_sources(
+            args.select_source,
+            expected_count=args.expect_source_count,
+        )
+        if args.selection_manifest:
+            registry.write_selection_manifest(selection_manifest, args.selection_manifest)
+    elif args.selection_manifest:
+        parser.error("--selection-manifest requires at least one --select-source")
+    elif args.expect_source_count is not None and len(registry.sources) != args.expect_source_count:
+        parser.error(
+            f"source count mismatch: expected {args.expect_source_count}, loaded {len(registry.sources)}"
+        )
     if args.prepare_approval_dir:
         registry.prepare_approval_requests(args.prepare_approval_dir)
     if args.approve_source:

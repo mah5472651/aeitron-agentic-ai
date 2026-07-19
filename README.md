@@ -1015,6 +1015,33 @@ python -m src.aeitron.learning.calibration_gate prepare `
   --output-dir artifacts\aeitron\calibration-preflight
 ```
 
+For the first balanced foundation calibration, select the exact eight-source
+batch before requesting approvals. Selection is deterministic, hash-bound, and
+does not modify the ultimate catalog:
+
+```powershell
+python -m src.aeitron.learning.source_registry `
+  --sources config\data_sources.ultimate.json `
+  --select-source owasp-cheat-sheet-series `
+  --select-source nist-secure-engineering `
+  --select-source python-core-secure-coding `
+  --select-source rust-core-secure-systems `
+  --select-source go-core-secure-coding `
+  --select-source postgresql-secure-data-layer `
+  --select-source docker-production-builds `
+  --select-source kubernetes-production-security `
+  --expect-source-count 8 `
+  --selection-manifest artifacts\aeitron\governance\day-1-3-balanced-foundation-8\source_selection_manifest.json `
+  --prepare-approval-dir artifacts\aeitron\governance\day-1-3-balanced-foundation-8\approval-requests `
+  --output artifacts\aeitron\governance\day-1-3-balanced-foundation-8\sources.pending.json
+```
+
+The pending artifact is not a governed registry and cannot start production
+collection. The first real approval reads this eight-source file and writes
+`config/data_sources.governed.json`; every subsequent approval must read and
+rewrite that governed file. Atomic writes reject removal or alteration of an
+already approved source.
+
 `config/data_reviewers.json` intentionally contains no invented identities.
 Governance operators must configure two independent reviewers and a separate
 adjudicator. Legal operators must approve every immutable source contract using

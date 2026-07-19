@@ -4780,16 +4780,31 @@ change invalidates the pack.
 
 #### Legal source approval binding
 
-Generate approval requests:
+The first governed calibration uses an exact eight-source balanced foundation
+batch. Create it deterministically from the ultimate registry:
 
 ```powershell
-python -m src.aeitron.learning.calibration_gate prepare `
+python -m src.aeitron.learning.source_registry `
   --sources config\data_sources.ultimate.json `
-  --protected-config config\protected_benchmarks.json `
-  --protected-manifest data\eval\protected\protected_benchmark_manifest.json `
-  --reviewer-roster config\data_reviewers.json `
-  --output-dir artifacts\aeitron\calibration-preflight
+  --select-source owasp-cheat-sheet-series `
+  --select-source nist-secure-engineering `
+  --select-source python-core-secure-coding `
+  --select-source rust-core-secure-systems `
+  --select-source go-core-secure-coding `
+  --select-source postgresql-secure-data-layer `
+  --select-source docker-production-builds `
+  --select-source kubernetes-production-security `
+  --expect-source-count 8 `
+  --selection-manifest artifacts\aeitron\governance\day-1-3-balanced-foundation-8\source_selection_manifest.json `
+  --prepare-approval-dir artifacts\aeitron\governance\day-1-3-balanced-foundation-8\approval-requests `
+  --output artifacts\aeitron\governance\day-1-3-balanced-foundation-8\sources.pending.json
 ```
+
+The selection fails on an unknown ID, duplicate ID, count mismatch, or duplicate
+input registry entry. Its manifest binds the complete input registry snapshot,
+selected snapshot, selected IDs, and each selected entry hash. The ultimate
+catalog remains unchanged. `sources.pending.json` is local staging evidence,
+not a production registry.
 
 Each request binds the source ID, complete registry entry SHA-256, source
 family, allowed domains, seed URLs, declared license, and intended use. An
@@ -4817,7 +4832,7 @@ entry, mismatched license, mismatched use, or mismatched evidence hash:
 
 ```powershell
 python -m src.aeitron.learning.source_registry `
-  --sources config\data_sources.ultimate.json `
+  --sources artifacts\aeitron\governance\day-1-3-balanced-foundation-8\sources.pending.json `
   --approve-source SOURCE_ID `
   --immutable-revision IMMUTABLE_REVISION `
   --license-evidence governance\source-approvals\SOURCE_ID\license.txt `
@@ -4826,9 +4841,25 @@ python -m src.aeitron.learning.source_registry `
   --output config\data_sources.governed.json
 ```
 
-Subsequent approvals must read and rewrite the governed registry so previous
-approvals remain present. Legal decisions are real organizational evidence;
-Aeitron does not create them automatically.
+Only the first approval reads the pending staging registry. Every subsequent
+approval must use `--sources config\data_sources.governed.json` and rewrite the
+same governed output so previous approvals remain present. Registry writes are
+atomic and reject removal, downgrade, or mutation of an existing approved
+entry. Legal evidence remains local and ignored by Git. Another environment
+must provision the same hash-bound evidence or production preflight fails.
+Legal decisions are real organizational evidence; Aeitron does not create them
+automatically.
+
+After all eight approvals, production validation must report exactly eight
+approved sources, zero quarantine sources, zero missing hashes, and no rolling
+revision:
+
+```powershell
+python -m src.aeitron.learning.source_registry `
+  --sources config\data_sources.governed.json `
+  --expect-source-count 8 `
+  --production
+```
 
 #### Reviewer identity and blindness
 

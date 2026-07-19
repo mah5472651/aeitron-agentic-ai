@@ -272,6 +272,100 @@ class DatasetFingerprintAndManifestTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             PostgresLSHDedupIndex("sqlite:///unsafe.db", dataset_version="version-1")
 
+    def test_source_selection_is_exact_deterministic_and_hash_bound(self) -> None:
+        sources = [
+            SourceSpec(
+                name=f"source-{index}",
+                source_id=f"source-{index}",
+                source_family=f"family-{index}",
+                urls=[f"https://example.com/{index}"],
+                allowed_domains=["example.com"],
+                license="mit",
+            )
+            for index in range(3)
+        ]
+        registry = SourceRegistry(sources)
+        selected, manifest = registry.select_sources(
+            ["source-2", "source-0"],
+            expected_count=2,
+        )
+        self.assertEqual([source.source_id for source in selected.sources], ["source-0", "source-2"])
+        self.assertEqual(manifest.source_ids, ["source-0", "source-2"])
+        self.assertEqual(manifest.source_count, 2)
+        self.assertEqual(
+            [entry.registry_entry_sha256 for entry in manifest.entries],
+            [
+                source_registry_entry_sha256(sources[0]),
+                source_registry_entry_sha256(sources[2]),
+            ],
+        )
+        self.assertEqual(len(registry.sources), 3)
+        with self.assertRaisesRegex(ValueError, "duplicate selected"):
+            registry.select_sources(["source-0", "source-0"], expected_count=2)
+        with self.assertRaisesRegex(ValueError, "unknown selected"):
+            registry.select_sources(["source-missing"], expected_count=1)
+        with self.assertRaisesRegex(ValueError, "count mismatch"):
+            registry.select_sources(["source-0"], expected_count=2)
+
+    def test_registry_write_refuses_approved_source_removal_or_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "governed.json"
+            approved = SourceSpec(
+                name="approved-source",
+                source_id="approved-source",
+                source_family="approved-family",
+                urls=["https://example.com/docs"],
+                allowed_domains=["example.com"],
+                license="mit",
+                trust_tier="reviewed",
+                approval_status="approved",
+                immutable_revision="commit-abc123",
+                license_evidence_sha256="1" * 64,
+                legal_approval_sha256="2" * 64,
+                approval_request_sha256="3" * 64,
+            )
+            SourceRegistry([approved]).write(target)
+            with self.assertRaisesRegex(ValueError, "remove previously approved"):
+                SourceRegistry(
+                    [
+                        SourceSpec(
+                            name="different-source",
+                            source_id="different-source",
+                            source_family="different-family",
+                            urls=["https://example.com/other"],
+                            allowed_domains=["example.com"],
+                            license="mit",
+                        )
+                    ]
+                ).write(target)
+            changed = approved.model_copy(update={"immutable_revision": "commit-def456"})
+            with self.assertRaisesRegex(ValueError, "alter previously approved"):
+                SourceRegistry([changed]).write(target)
+            self.assertEqual(
+                SourceRegistry.from_file(target).sources[0].immutable_revision,
+                "commit-abc123",
+            )
+
+    def test_approval_request_manifest_uses_portable_relative_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = SourceRegistry(
+                [
+                    SourceSpec(
+                        name="approval-source",
+                        source_id="approval-source",
+                        source_family="approval-family",
+                        urls=["https://example.com/docs"],
+                        allowed_domains=["example.com"],
+                        license="mit",
+                    )
+                ]
+            )
+            output = Path(temp_dir) / "requests"
+            registry.prepare_approval_requests(output)
+            manifest = json.loads((output / "approval-request-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["requests"][0]["path"], "approval-source.approval-request.json")
+            self.assertFalse(Path(manifest["requests"][0]["path"]).is_absolute())
+
     def test_source_approval_is_bound_to_real_evidence_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
