@@ -50,7 +50,30 @@ class BenchmarkMaterializationReport(StrictModel):
     files: dict[str, str]
     rows: dict[str, int]
     sources: dict[str, str]
+    revisions: dict[str, str]
+    licenses: dict[str, str]
+    sha256: dict[str, str]
+    train_policy: dict[str, Literal["eval_holdout"]]
     created_at_unix: float = Field(default_factory=time.time)
+
+    @model_validator(mode="after")
+    def validate_artifact_bindings(self) -> "BenchmarkMaterializationReport":
+        expected_keys = set(self.files)
+        for name, values in {
+            "rows": self.rows,
+            "sources": self.sources,
+            "revisions": self.revisions,
+            "licenses": self.licenses,
+            "sha256": self.sha256,
+            "train_policy": self.train_policy,
+        }.items():
+            if set(values) != expected_keys:
+                raise ValueError(f"materialization report {name} keys do not match files")
+        for digest in self.sha256.values():
+            normalized = digest.lower()
+            if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
+                raise ValueError("materialized benchmark hash must be SHA-256 hex")
+        return self
 
 
 class ProtectedBenchmarkSource(StrictModel):
@@ -134,8 +157,24 @@ class ProtectedBenchmarkManifest(StrictModel):
 
 
 PUBLIC_BENCHMARK_SOURCES = {
-    "humaneval": "https://raw.githubusercontent.com/openai/human-eval/master/data/HumanEval.jsonl.gz",
-    "mbpp": "https://raw.githubusercontent.com/google-research/google-research/master/mbpp/mbpp.jsonl",
+    "humaneval": {
+        "url": (
+            "https://raw.githubusercontent.com/openai/human-eval/"
+            "6d43fb980f9fee3c892a914eda09951f772ad10d/data/HumanEval.jsonl.gz"
+        ),
+        "revision": "6d43fb980f9fee3c892a914eda09951f772ad10d",
+        "license": "MIT",
+        "minimum_rows": 164,
+    },
+    "mbpp": {
+        "url": (
+            "https://raw.githubusercontent.com/google-research/google-research/"
+            "95e3a1da2d27cb9c8289f6fd3076cfed608c3c94/mbpp/mbpp.jsonl"
+        ),
+        "revision": "95e3a1da2d27cb9c8289f6fd3076cfed608c3c94",
+        "license": "Apache-2.0",
+        "minimum_rows": 374,
+    },
 }
 
 
@@ -211,9 +250,11 @@ def materialize_public_benchmark_pack(output_dir: str | Path) -> BenchmarkMateri
     """Fetch public coding benchmarks into Aeitron' local eval JSONL format."""
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
-    human_payload = gzip.decompress(_download_bytes(PUBLIC_BENCHMARK_SOURCES["humaneval"]))
+    human_contract = PUBLIC_BENCHMARK_SOURCES["humaneval"]
+    mbpp_contract = PUBLIC_BENCHMARK_SOURCES["mbpp"]
+    human_payload = gzip.decompress(_download_bytes(str(human_contract["url"])))
     human_rows = [json.loads(line) for line in human_payload.decode("utf-8").splitlines() if line.strip()]
-    mbpp_payload = _download_bytes(PUBLIC_BENCHMARK_SOURCES["mbpp"])
+    mbpp_payload = _download_bytes(str(mbpp_contract["url"]))
     mbpp_rows = [json.loads(line) for line in mbpp_payload.decode("utf-8").splitlines() if line.strip()]
     files = {
         "humaneval": str(root / "humaneval.jsonl"),
@@ -223,12 +264,29 @@ def materialize_public_benchmark_pack(output_dir: str | Path) -> BenchmarkMateri
         "humaneval": _write_jsonl_rows(Path(files["humaneval"]), human_rows),
         "mbpp": _write_jsonl_rows(Path(files["mbpp"]), mbpp_rows),
     }
+    minimums = {
+        "humaneval": int(human_contract["minimum_rows"]),
+        "mbpp": int(mbpp_contract["minimum_rows"]),
+    }
     report = BenchmarkMaterializationReport(
-        status="passed" if rows["humaneval"] >= 164 and rows["mbpp"] >= 374 else "failed",
+        status="passed" if all(rows[name] >= minimums[name] for name in minimums) else "failed",
         output_dir=str(root),
         files=files,
         rows=rows,
-        sources=PUBLIC_BENCHMARK_SOURCES,
+        sources={
+            "humaneval": str(human_contract["url"]),
+            "mbpp": str(mbpp_contract["url"]),
+        },
+        revisions={
+            "humaneval": str(human_contract["revision"]),
+            "mbpp": str(mbpp_contract["revision"]),
+        },
+        licenses={
+            "humaneval": str(human_contract["license"]),
+            "mbpp": str(mbpp_contract["license"]),
+        },
+        sha256={name: _sha256_file(Path(path)) for name, path in files.items()},
+        train_policy={"humaneval": "eval_holdout", "mbpp": "eval_holdout"},
     )
     (root / "benchmark_materialization_report.json").write_text(json.dumps(report.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
     return report

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import sqlite3
 import tempfile
@@ -8,8 +9,10 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
+from unittest.mock import patch
 
 from src.aeitron.evaluation.benchmark_pack import (
+    materialize_public_benchmark_pack,
     materialize_protected_benchmark_pack,
     validate_protected_benchmark_manifest,
 )
@@ -152,6 +155,33 @@ def _reviewer_roster(path: Path) -> Path:
 
 
 class ProtectedBenchmarkGovernanceTest(unittest.TestCase):
+    def test_public_pack_is_revision_hash_and_holdout_bound(self) -> None:
+        human_rows = [{"task_id": f"HumanEval/{index}", "prompt": "pass"} for index in range(164)]
+        mbpp_rows = [{"task_id": index, "text": "write code"} for index in range(374)]
+
+        def download(url: str, *, max_bytes: int = 20_000_000) -> bytes:
+            self.assertGreater(max_bytes, 0)
+            if "human-eval" in url:
+                self.assertIn("6d43fb980f9fee3c892a914eda09951f772ad10d", url)
+                payload = "\n".join(json.dumps(row) for row in human_rows).encode("utf-8")
+                return gzip.compress(payload)
+            self.assertIn("95e3a1da2d27cb9c8289f6fd3076cfed608c3c94", url)
+            return "\n".join(json.dumps(row) for row in mbpp_rows).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "src.aeitron.evaluation.benchmark_pack._download_bytes",
+            side_effect=download,
+        ):
+            report = materialize_public_benchmark_pack(temp_dir)
+            self.assertEqual(report.status, "passed")
+            self.assertEqual(report.rows, {"humaneval": 164, "mbpp": 374})
+            self.assertEqual(set(report.sha256), {"humaneval", "mbpp"})
+            self.assertTrue(all(len(digest) == 64 for digest in report.sha256.values()))
+            self.assertEqual(
+                report.train_policy,
+                {"humaneval": "eval_holdout", "mbpp": "eval_holdout"},
+            )
+
     def test_materialized_pack_is_hash_bound_and_detects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

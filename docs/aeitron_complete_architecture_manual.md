@@ -3330,6 +3330,80 @@ Default production minimums:
 - SWE-style suite: at least 1 local governed task file
 - CyberSecEval-style suite: at least 1 local governed task file
 
+### Governed Sprint Day 4-6 Execution
+
+Day 4 materializes the public coding holdouts and verifies their local
+contracts without treating adapter validation as model performance:
+
+```powershell
+python -m src.aeitron.evaluation.benchmark_pack `
+  --materialize-public `
+  --target-dir data\eval
+
+python -m src.aeitron.evaluation.benchmark_pack `
+  --human-eval data\eval\humaneval.jsonl `
+  --mbpp data\eval\mbpp.jsonl `
+  --min-human-eval-tasks 164 `
+  --min-mbpp-tasks 374 `
+  --non-strict `
+  --output-dir artifacts\aeitron\benchmark-pack
+```
+
+The verified July 2026 local materialization contains 164 HumanEval rows and
+974 MBPP rows. `--non-strict` means only these two supplied suites are checked;
+it does not waive their minimum counts. The resulting suite status proves
+files, schemas, and adapter execution. It is not a checkpoint pass rate.
+The materialization report binds each artifact to its immutable upstream
+revision, declared license, SHA-256, and `eval_holdout` policy. Protected
+benchmark fingerprints remain separately pinned under `data/eval/protected`.
+
+Day 5 exports the current durable Dataset Authority review state:
+
+```powershell
+python -m src.aeitron.learning.dataset_authority review-report `
+  --database artifacts\aeitron\dataset-authority.sqlite3 `
+  --output artifacts\aeitron\review\review_evidence_report.json
+```
+
+The report includes a schema version, `empty`, `in_progress`, or `complete`
+status, total items, decisions, sources, approved/rejected/pending records, and
+paired-review count. An empty authority is valid at this scaffold stage and
+must report explicit zero totals. It does not satisfy later human-review
+promotion requirements.
+
+Day 6 must use the immutable calibration authority, not the older direct GPU
+pipeline command. Training and tokenizer flags do not belong in a governed
+crawl-only calibration:
+
+```powershell
+python -m src.aeitron.learning.calibration_gate run `
+  --stage calibration_200 `
+  --sources config\data_sources.governed.json `
+  --protected-config config\protected_benchmarks.json `
+  --protected-manifest data\eval\protected\protected_benchmark_manifest.json `
+  --reviewer-roster config\data_reviewers.json `
+  --legal-evidence-dir governance\source-approvals `
+  --trust-policy config\dataset_trust_policy.json `
+  --work-dir artifacts\aeitron\calibration-200-v2 `
+  --authority-db artifacts\aeitron\dataset-authority.sqlite3 `
+  --crawl-multiplier 2 `
+  --workers 4 `
+  --max-depth 1 `
+  --delay-seconds 0.5
+```
+
+The active trust policy caps each source at 20%, which is stricter than the
+old 25% command-line cap. The command creates no crawl output unless all
+source approvals, evidence files, reviewer identities, and protected holdouts
+validate first.
+
+Current Day 6 status is intentionally `blocked`: the protected pack passes,
+but the selected eight-source registry still has zero approved sources and the
+reviewer roster has zero identities. A real legal operator must bind all eight
+immutable source approvals, and governance must configure two independent
+reviewers plus one independent adjudicator. No calibration work directory or
+quality result may be interpreted as passed before those dependencies exist.
+
 ## Scratch Learning Validation Layer
 
 Purpose:

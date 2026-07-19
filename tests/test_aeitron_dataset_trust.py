@@ -51,6 +51,21 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class DatasetAuthorityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_review_evidence_is_explicit_and_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteDatasetAuthorityStore(Path(temp_dir) / "authority.sqlite3")
+            report = await store.review_evidence()
+            self.assertEqual(report.schema_version, 1)
+            self.assertEqual(report.status, "empty")
+            self.assertEqual(report.total_items, 0)
+            self.assertEqual(report.decision_count, 0)
+            self.assertEqual(report.source_count, 0)
+            self.assertEqual(report.approved, 0)
+            self.assertEqual(report.rejected, 0)
+            self.assertEqual(report.pending, 0)
+            self.assertEqual(report.paired_reviews, 0)
+            self.assertEqual(report.by_source, {})
+
     async def test_blind_two_reviewer_conflict_requires_independent_adjudication(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteDatasetAuthorityStore(Path(temp_dir) / "authority.sqlite3")
@@ -115,6 +130,10 @@ class DatasetAuthorityTest(unittest.IsolatedAsyncioTestCase):
             report = await store.review_evidence()
             self.assertEqual(report.by_source["trusted-source"].rejected, 1)
             self.assertEqual(report.by_source["trusted-source"].paired_reviews, 1)
+            self.assertEqual(report.status, "complete")
+            self.assertEqual(report.total_items, 1)
+            self.assertEqual(report.decision_count, 2)
+            self.assertEqual(report.rejected, 1)
 
     async def test_source_drift_creates_new_review_and_immutable_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

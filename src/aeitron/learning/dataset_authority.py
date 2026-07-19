@@ -265,8 +265,36 @@ class SourceReviewEvidence(StrictModel):
 
 
 class ReviewEvidenceReport(StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["empty", "in_progress", "complete"]
+    total_items: int = Field(ge=0)
+    decision_count: int = Field(ge=0)
+    source_count: int = Field(ge=0)
+    approved: int = Field(ge=0)
+    rejected: int = Field(ge=0)
+    pending: int = Field(ge=0)
+    paired_reviews: int = Field(ge=0)
     by_source: dict[str, SourceReviewEvidence]
     created_at_unix: float = Field(default_factory=time.time)
+
+    @model_validator(mode="after")
+    def validate_aggregates(self) -> "ReviewEvidenceReport":
+        if self.total_items != self.approved + self.rejected + self.pending:
+            raise ValueError("review evidence item totals are inconsistent")
+        if self.source_count != len(self.by_source):
+            raise ValueError("review evidence source_count is inconsistent")
+        if self.approved != sum(item.approved for item in self.by_source.values()):
+            raise ValueError("review evidence approved total is inconsistent")
+        if self.rejected != sum(item.rejected for item in self.by_source.values()):
+            raise ValueError("review evidence rejected total is inconsistent")
+        if self.pending != sum(item.pending for item in self.by_source.values()):
+            raise ValueError("review evidence pending total is inconsistent")
+        if self.paired_reviews != sum(item.paired_reviews for item in self.by_source.values()):
+            raise ValueError("review evidence paired_reviews total is inconsistent")
+        expected_status = "empty" if self.total_items == 0 else ("complete" if self.pending == 0 else "in_progress")
+        if self.status != expected_status:
+            raise ValueError(f"review evidence status must be {expected_status!r}")
+        return self
 
 
 class ReviewerIdentity(StrictModel):
@@ -418,7 +446,21 @@ def _review_evidence_from_rows(items: list[dict[str, Any]], decisions: list[dict
             reviewer_agreement_kappa=round(_cohen_kappa(pairs), 6),
             acceptance_rate=round(int(bucket["approved"]) / max(1, total_terminal), 6),
         )
-    return ReviewEvidenceReport(by_source=by_source)
+    approved = sum(item.approved for item in by_source.values())
+    rejected = sum(item.rejected for item in by_source.values())
+    pending = sum(item.pending for item in by_source.values())
+    total_items = approved + rejected + pending
+    return ReviewEvidenceReport(
+        status="empty" if total_items == 0 else ("complete" if pending == 0 else "in_progress"),
+        total_items=total_items,
+        decision_count=len(decisions),
+        source_count=len(by_source),
+        approved=approved,
+        rejected=rejected,
+        pending=pending,
+        paired_reviews=sum(item.paired_reviews for item in by_source.values()),
+        by_source=by_source,
+    )
 
 
 class SQLiteDatasetAuthorityStore:
