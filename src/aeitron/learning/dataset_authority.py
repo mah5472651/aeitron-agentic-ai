@@ -368,6 +368,100 @@ class ReviewerRoster(StrictModel):
         return blockers
 
 
+class ReviewerRosterSlot(StrictModel):
+    slot: Literal["reviewer_1", "reviewer_2", "adjudicator"]
+    required_role: Literal["reviewer", "adjudicator"]
+    required_fields: list[str]
+
+
+class ReviewerRosterOnboardingTemplate(StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["awaiting_human_identities"] = "awaiting_human_identities"
+    roster_id: str
+    required_slots: list[ReviewerRosterSlot]
+    final_roster_path: str
+    warning: str
+
+
+class ReviewerRosterReadinessReport(StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["ready", "blocked"]
+    roster_id: str
+    active_reviewer_count: int = Field(ge=0)
+    active_adjudicator_count: int = Field(ge=0)
+    independent_subject_count: int = Field(ge=0)
+    blockers: list[str]
+
+    @model_validator(mode="after")
+    def validate_status(self) -> "ReviewerRosterReadinessReport":
+        expected = "blocked" if self.blockers else "ready"
+        if self.status != expected:
+            raise ValueError(f"reviewer roster readiness status must be {expected!r}")
+        return self
+
+
+def build_reviewer_roster_onboarding_template(
+    *,
+    roster_id: str = "aeitron-data-reviewers-v1",
+    final_roster_path: str = "config/data_reviewers.json",
+) -> ReviewerRosterOnboardingTemplate:
+    required_fields = [
+        "reviewer_id",
+        "identity_provider_subject",
+        "roles",
+        "active",
+        "approved_by",
+        "approved_at",
+    ]
+    return ReviewerRosterOnboardingTemplate(
+        roster_id=roster_id,
+        required_slots=[
+            ReviewerRosterSlot(
+                slot="reviewer_1",
+                required_role="reviewer",
+                required_fields=required_fields,
+            ),
+            ReviewerRosterSlot(
+                slot="reviewer_2",
+                required_role="reviewer",
+                required_fields=required_fields,
+            ),
+            ReviewerRosterSlot(
+                slot="adjudicator",
+                required_role="adjudicator",
+                required_fields=required_fields,
+            ),
+        ],
+        final_roster_path=final_roster_path,
+        warning=(
+            "This template contains no identities and cannot unlock calibration. "
+            "A governance operator must register two independent reviewers and one independent adjudicator."
+        ),
+    )
+
+
+def reviewer_roster_readiness(roster: ReviewerRoster) -> ReviewerRosterReadinessReport:
+    active_reviewers = {
+        identity.identity_provider_subject
+        for identity in roster.identities
+        if identity.active and "reviewer" in identity.roles
+    }
+    active_adjudicators = {
+        identity.identity_provider_subject
+        for identity in roster.identities
+        if identity.active and "adjudicator" in identity.roles
+    }
+    blockers = roster.readiness_blockers()
+    return ReviewerRosterReadinessReport(
+        status="blocked" if blockers else "ready",
+        roster_id=roster.roster_id,
+        active_reviewer_count=len(active_reviewers),
+        active_adjudicator_count=len(active_adjudicators),
+        independent_subject_count=len(active_reviewers | active_adjudicators),
+        blockers=blockers,
+    )
+
+
 def load_reviewer_roster(path: str | Path) -> ReviewerRoster:
     return ReviewerRoster.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
@@ -1302,7 +1396,12 @@ def _cli_service(database: str | None) -> DatasetAuthorityService:
 
 def _validate_cli_identity(args: argparse.Namespace) -> None:
     roster_path = getattr(args, "reviewer_roster", None)
-    if not roster_path or args.command in {"list", "review-report"}:
+    if not roster_path or args.command in {
+        "list",
+        "review-report",
+        "reviewer-roster-template",
+        "validate-reviewer-roster",
+    }:
         return
     roster = load_reviewer_roster(roster_path)
     if args.command in {"claim", "decide"}:
@@ -1322,18 +1421,19 @@ def _parse_cli_evidence(value: str | None) -> dict[str, Any]:
 
 async def _run_cli_command(args: argparse.Namespace) -> StrictModel | list[StrictModel]:
     _validate_cli_identity(args)
+    if args.command == "reviewer-roster-template":
+        template = build_reviewer_roster_onboarding_template(
+            roster_id=args.roster_id,
+            final_roster_path=args.final_roster_path,
+        )
+        _write_model_atomically(template, args.output)
+        return template
+    if args.command == "validate-reviewer-roster":
+        return reviewer_roster_readiness(load_reviewer_roster(args.reviewer_roster))
     service = _cli_service(getattr(args, "database", None))
     if args.command == "review-report":
         report = await service.review_evidence()
-        target = Path(args.output).expanduser().resolve()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_payload = json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
-        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            temporary.write_text(_atomic_payload, encoding="utf-8")
-            temporary.replace(target)
-        finally:
-            temporary.unlink(missing_ok=True)
+        _write_model_atomically(report, args.output)
         return report
     if args.command == "list":
         return await service.list_items(
@@ -1369,6 +1469,19 @@ async def _run_cli_command(args: argparse.Namespace) -> StrictModel | list[Stric
     raise ValueError(f"unsupported command: {args.command}")
 
 
+def _write_model_atomically(model: StrictModel, output_path: str | Path) -> Path:
+    target = Path(output_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(model.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export immutable review evidence from the configured Aeitron Dataset Authority.",
@@ -1380,6 +1493,18 @@ def main() -> None:
     )
     report_parser.add_argument("--output", required=True)
     report_parser.add_argument("--database")
+    roster_template_parser = subparsers.add_parser(
+        "reviewer-roster-template",
+        help="Create a non-authorizing onboarding template for real reviewer identities.",
+    )
+    roster_template_parser.add_argument("--output", required=True)
+    roster_template_parser.add_argument("--roster-id", default="aeitron-data-reviewers-v1")
+    roster_template_parser.add_argument("--final-roster-path", default="config/data_reviewers.json")
+    roster_validate_parser = subparsers.add_parser(
+        "validate-reviewer-roster",
+        help="Validate reviewer independence and report calibration readiness.",
+    )
+    roster_validate_parser.add_argument("--reviewer-roster", default="config/data_reviewers.json")
     list_parser = subparsers.add_parser("list", help="List blinded review records.")
     list_parser.add_argument("--database")
     list_parser.add_argument("--reviewer-id")
@@ -1414,6 +1539,8 @@ def main() -> None:
     else:
         payload = result.model_dump(mode="json")
     print(json.dumps(payload, indent=2, sort_keys=True))
+    if isinstance(result, ReviewerRosterReadinessReport) and result.status != "ready":
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

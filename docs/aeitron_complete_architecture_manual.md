@@ -4579,8 +4579,13 @@ source has been reviewed, validate the resulting registry:
 ```powershell
 python -m src.aeitron.learning.source_registry `
   --sources config\data_sources.governed.json `
+  --verify-evidence-dir governance\source-approvals `
   --production
 ```
+
+Production CLI validation requires durable evidence replay. It re-hashes every
+`license.txt` and `approval.json` beneath the governance root and rejects
+missing, changed, or mismatched files.
 
 Crawler rows bind `source_id`, `source_family`, immutable revision, license
 evidence hash, legal approval hash, canonical/raw content hashes, ETag or
@@ -4882,7 +4887,11 @@ not a production registry.
 
 Each request binds the source ID, complete registry entry SHA-256, source
 family, allowed domains, seed URLs, declared license, and intended use. An
-authorized legal operator must produce a JSON decision containing:
+approval request also contains canonical evidence paths and a deliberately
+non-authorizing `pending_human_review` decision template. Empty reviewer,
+revision, hash, and rationale fields cannot be accepted by the approval
+validator. An authorized legal operator must independently inspect the source
+and produce a JSON decision containing:
 
 ```text
 schema_version
@@ -4932,6 +4941,7 @@ revision:
 python -m src.aeitron.learning.source_registry `
   --sources config\data_sources.governed.json `
   --expect-source-count 8 `
+  --verify-evidence-dir governance\source-approvals `
   --production
 ```
 
@@ -4950,6 +4960,12 @@ unlock data. Gateway use also requires exact `data:review`,
 roster:
 
 ```powershell
+python -m src.aeitron.learning.dataset_authority reviewer-roster-template `
+  --output artifacts\aeitron\governance\reviewer-roster-onboarding.json
+
+python -m src.aeitron.learning.dataset_authority validate-reviewer-roster `
+  --reviewer-roster config\data_reviewers.json
+
 python -m src.aeitron.learning.dataset_authority list `
   --database artifacts\aeitron\dataset-authority.sqlite3 `
   --reviewer-id REVIEWER_ID --status pending
@@ -4965,6 +4981,12 @@ python -m src.aeitron.learning.dataset_authority decide `
   --review-item-id REVIEW_ITEM_ID --reviewer-id REVIEWER_ID `
   --decision approve --rationale "REAL REVIEW RATIONALE"
 ```
+
+The onboarding template has three required slots but contains no identity
+values and cannot unlock calibration. The roster validator exits nonzero until
+there are two active reviewer subjects and one independent active adjudicator
+subject. `reviewer_id`, identity-provider subject, governance approver, and
+timezone-aware approval timestamp must come from the real organization.
 
 Reviewer two cannot read reviewer one's decision before submitting their own.
 The same identity cannot occupy both reviewer slots. Conflict requires a third

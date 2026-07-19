@@ -17,8 +17,12 @@ from src.aeitron.learning.dataset_authority import (
     ReviewAdjudicationCreate,
     ReviewDecisionCreate,
     ReviewItemCreate,
+    ReviewerIdentity,
+    ReviewerRoster,
     SQLiteDatasetAuthorityStore,
     SourceSnapshotCreate,
+    build_reviewer_roster_onboarding_template,
+    reviewer_roster_readiness,
 )
 from src.aeitron.learning.data_pipeline import (
     DataPipelineConfig,
@@ -51,6 +55,50 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class DatasetAuthorityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_reviewer_onboarding_never_fabricates_identity_and_reports_readiness(self) -> None:
+        template = build_reviewer_roster_onboarding_template()
+        self.assertEqual(template.status, "awaiting_human_identities")
+        self.assertEqual(
+            [slot.required_role for slot in template.required_slots],
+            ["reviewer", "reviewer", "adjudicator"],
+        )
+        empty = ReviewerRoster(roster_id=template.roster_id, identities=[])
+        blocked = reviewer_roster_readiness(empty)
+        self.assertEqual(blocked.status, "blocked")
+        self.assertEqual(blocked.active_reviewer_count, 0)
+        self.assertEqual(blocked.active_adjudicator_count, 0)
+
+        ready = ReviewerRoster(
+            roster_id=template.roster_id,
+            identities=[
+                ReviewerIdentity(
+                    reviewer_id="reviewer-one",
+                    identity_provider_subject="idp:reviewer-one",
+                    roles={"reviewer"},
+                    approved_by="governance-owner",
+                    approved_at="2026-07-19T12:00:00+06:00",
+                ),
+                ReviewerIdentity(
+                    reviewer_id="reviewer-two",
+                    identity_provider_subject="idp:reviewer-two",
+                    roles={"reviewer"},
+                    approved_by="governance-owner",
+                    approved_at="2026-07-19T12:00:00+06:00",
+                ),
+                ReviewerIdentity(
+                    reviewer_id="adjudicator-one",
+                    identity_provider_subject="idp:adjudicator-one",
+                    roles={"adjudicator"},
+                    approved_by="governance-owner",
+                    approved_at="2026-07-19T12:00:00+06:00",
+                ),
+            ],
+        )
+        readiness = reviewer_roster_readiness(ready)
+        self.assertEqual(readiness.status, "ready")
+        self.assertEqual(readiness.independent_subject_count, 3)
+        self.assertEqual(readiness.blockers, [])
+
     async def test_empty_review_evidence_is_explicit_and_consistent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteDatasetAuthorityStore(Path(temp_dir) / "authority.sqlite3")
@@ -382,8 +430,15 @@ class DatasetFingerprintAndManifestTest(unittest.TestCase):
             output = Path(temp_dir) / "requests"
             registry.prepare_approval_requests(output)
             manifest = json.loads((output / "approval-request-manifest.json").read_text(encoding="utf-8"))
+            request = json.loads(
+                (output / "approval-source.approval-request.json").read_text(encoding="utf-8")
+            )
             self.assertEqual(manifest["requests"][0]["path"], "approval-source.approval-request.json")
             self.assertFalse(Path(manifest["requests"][0]["path"]).is_absolute())
+            self.assertEqual(request["status"], "awaiting_legal_decision")
+            self.assertEqual(request["approval_template"]["decision"], "pending_human_review")
+            self.assertIsNone(request["approval_template"]["approved_by"])
+            self.assertIsNone(request["approval_template"]["immutable_revision"])
 
     def test_source_approval_is_bound_to_real_evidence_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

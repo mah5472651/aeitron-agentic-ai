@@ -93,6 +93,10 @@ class SourceApprovalRequestArtifact(StrictModel):
     seed_urls: list[str]
     allowed_domains: list[str]
     required_legal_fields: list[str]
+    evidence_paths: dict[str, str]
+    approval_template: dict[str, object]
+    immutable_revision_requirements: list[str]
+    warning: str
 
 
 class SourceSelectionEntry(StrictModel):
@@ -443,6 +447,38 @@ class SourceRegistry:
                 seed_urls=source.urls,
                 allowed_domains=source.allowed_domains,
                 required_legal_fields=list(LegalApprovalEvidence.model_fields),
+                evidence_paths={
+                    "license": f"governance/source-approvals/{source.source_id}/license.txt",
+                    "approval": f"governance/source-approvals/{source.source_id}/approval.json",
+                },
+                approval_template={
+                    "schema_version": 1,
+                    "approval_id": None,
+                    "decision": "pending_human_review",
+                    "source_id": source.source_id,
+                    "registry_entry_sha256": source_registry_entry_sha256(source),
+                    "immutable_revision": None,
+                    "license": source.license,
+                    "license_evidence_sha256": None,
+                    "approved_use": source.approved_use,
+                    "approved_by": None,
+                    "approved_at": None,
+                    "scope": (
+                        "evaluation_only"
+                        if source.approved_use == "evaluation_only"
+                        else "training_collection"
+                    ),
+                    "rationale": None,
+                },
+                immutable_revision_requirements=[
+                    "Use an upstream commit, release, publication revision, or immutable content snapshot.",
+                    "Do not copy the literal value 'rolling' into the legal decision.",
+                    "Verify that the reviewed content and license evidence correspond to that revision.",
+                ],
+                warning=(
+                    "This request is not an approval. An authorized human must independently review "
+                    "the license, immutable revision, intended use, and evidence before creating approval.json."
+                ),
             )
             target = root / f"{source.source_id}.approval-request.json"
             target.write_text(json.dumps(artifact.model_dump(mode="json"), indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -535,6 +571,7 @@ def main() -> None:
     )
     parser.add_argument("--expect-source-count", type=int)
     parser.add_argument("--selection-manifest")
+    parser.add_argument("--verify-evidence-dir")
     args = parser.parse_args()
     registry = SourceRegistry.from_files(args.sources)
     if args.select_source:
@@ -570,6 +607,12 @@ def main() -> None:
             trust_tier=args.trust_tier,
         )
     report = registry.validate(production=args.production)
+    if args.production and not args.verify_evidence_dir:
+        parser.error("--production requires --verify-evidence-dir for durable evidence replay")
+    if args.verify_evidence_dir:
+        evidence_blockers = registry.verify_approval_evidence_directory(args.verify_evidence_dir)
+        if evidence_blockers:
+            parser.error("approval evidence verification failed: " + "; ".join(evidence_blockers))
     if args.output:
         registry.write(args.output)
     print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
