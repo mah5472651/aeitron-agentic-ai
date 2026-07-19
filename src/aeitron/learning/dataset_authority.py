@@ -28,6 +28,16 @@ from src.aeitron.shared.schemas import StrictModel
 
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+REVIEW_RUBRIC_ID = "aeitron-review-rubric-v1"
+PLACEHOLDER_MARKERS = (
+    "placeholder",
+    "real_reviewer",
+    "real_adjudicator",
+    "real_oidc",
+    "example",
+    "replace_me",
+    "todo",
+)
 REVIEW_STATUSES = {
     "pending",
     "in_review",
@@ -400,6 +410,135 @@ class ReviewerRosterReadinessReport(StrictModel):
         return self
 
 
+class ReviewerGovernanceBundleReport(StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["awaiting_human_identities"] = "awaiting_human_identities"
+    roster_id: str
+    rubric_id: str
+    output_dir: str
+    roster_path: str
+    rubric_path: str
+    onboarding_path: str
+    roster_sha256: str
+    rubric_sha256: str
+    warning: str
+
+    @model_validator(mode="after")
+    def validate_hashes(self) -> "ReviewerGovernanceBundleReport":
+        object.__setattr__(self, "roster_sha256", _validate_hash(self.roster_sha256, "roster_sha256"))
+        object.__setattr__(self, "rubric_sha256", _validate_hash(self.rubric_sha256, "rubric_sha256"))
+        return self
+
+
+class ReviewerQualificationItem(StrictModel):
+    schema_version: Literal[1] = 1
+    item_id: str
+    rubric_id: Literal["aeitron-review-rubric-v1"] = REVIEW_RUBRIC_ID
+    data_type: Literal["security_document", "code_example", "patch", "debug_trace"]
+    title: str
+    candidate_summary: str
+    evidence_summary: str
+
+
+class ReviewerQualificationAnswer(StrictModel):
+    item_id: str
+    expected_decision: Literal["approve", "reject"]
+    reason_code: str | None = None
+    rationale: str = Field(min_length=20, max_length=1_000)
+
+
+class ReviewerQualificationPackReport(StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["ready_for_blind_qualification"] = "ready_for_blind_qualification"
+    rubric_id: Literal["aeitron-review-rubric-v1"] = REVIEW_RUBRIC_ID
+    item_count: Literal[20] = 20
+    expected_approve_count: Literal[10] = 10
+    expected_reject_count: Literal[10] = 10
+    pack_path: str
+    answer_key_path: str
+    pack_sha256: str
+    answer_key_sha256: str
+    handling_warning: str
+
+    @model_validator(mode="after")
+    def validate_hashes(self) -> "ReviewerQualificationPackReport":
+        object.__setattr__(self, "pack_sha256", _validate_hash(self.pack_sha256, "pack_sha256"))
+        object.__setattr__(
+            self,
+            "answer_key_sha256",
+            _validate_hash(self.answer_key_sha256, "answer_key_sha256"),
+        )
+        return self
+
+
+def build_reviewer_rubric_markdown() -> str:
+    return """# Aeitron Reviewer Rubric v1
+
+Rubric ID: `aeitron-review-rubric-v1`
+
+This rubric governs the independent review of coding, debugging, and defensive-security training rows.
+It does not replace source-license approval, automated contamination checks, or verification evidence.
+
+## Approve only when every condition is satisfied
+
+- Content matches its bound source snapshot and provenance.
+- Content is relevant to coding, debugging, or defensive-security learning.
+- Content is technically coherent and sufficiently complete to teach from without hidden context.
+- Content is not boilerplate, navigation, advertising, or duplicated filler.
+- Content contains no credential, secret, private key, or disallowed personal information.
+- Content is not a protected benchmark prompt, answer, patch, or solution.
+- Content does not provide live-target attack, persistence, credential theft, or unbounded malware workflow.
+- Code examples have a clear intent and do not recommend an obvious insecure pattern.
+- Patch examples bind vulnerable-before, changed-after, and verification evidence.
+- CVE, CWE, compiler, test, and security-scan claims are supported by bound evidence.
+
+## Reject when any condition applies
+
+- `incorrect_or_misleading`
+- `low_signal_or_boilerplate`
+- `incomplete_context`
+- `duplicate_or_near_duplicate`
+- `missing_provenance`
+- `secret_or_pii`
+- `protected_benchmark`
+- `unsafe_live_target_content`
+- `fabricated_verification`
+- `unverified_patch`
+- `license_scope_mismatch`
+
+## Decision rationale
+
+Every decision must contain at least one concrete sentence tied to the reviewed row.
+
+Approve example:
+
+> Contains a complete parameterized-query example with clear defensive rationale and no unsupported verification claim.
+
+Reject example:
+
+> Claims regression tests passed but provides no bound test execution or verification manifest.
+
+Do not submit only a reason code, a generic phrase such as "looks good", or another reviewer's rationale.
+
+## Independence and adjudication
+
+- Two reviewers use this same rubric and submit decisions independently.
+- Neither reviewer sees the other decision before both decisions are submitted.
+- A disagreement becomes a conflict; reviewers do not rewrite decisions to manufacture agreement.
+- An independent adjudicator reviews the row and evidence under this rubric.
+- Rubric wording may be clarified before production review starts. Once a calibration round starts, its rubric hash is fixed.
+
+## Qualification targets
+
+- Policy-floor Cohen's kappa: `>= 0.80`
+- Stretch-target Cohen's kappa: `>= 0.85`
+- Policy-floor sampled acceptance rate: `>= 0.95`
+- Stretch-target sampled acceptance rate: `>= 0.97`
+
+The stretch target never replaces the policy floor, and thresholds are never lowered after observing results.
+"""
+
+
 def build_reviewer_roster_onboarding_template(
     *,
     roster_id: str = "aeitron-data-reviewers-v1",
@@ -452,6 +591,18 @@ def reviewer_roster_readiness(roster: ReviewerRoster) -> ReviewerRosterReadiness
         if identity.active and "adjudicator" in identity.roles
     }
     blockers = roster.readiness_blockers()
+    for identity in roster.identities:
+        identity_values = {
+            "reviewer_id": identity.reviewer_id,
+            "identity_provider_subject": identity.identity_provider_subject,
+            "approved_by": identity.approved_by,
+        }
+        for field_name, value in identity_values.items():
+            normalized = value.strip().lower()
+            if any(marker in normalized for marker in PLACEHOLDER_MARKERS):
+                blockers.append(
+                    f"{identity.reviewer_id}: {field_name} contains a placeholder marker and is not a real identity"
+                )
     return ReviewerRosterReadinessReport(
         status="blocked" if blockers else "ready",
         roster_id=roster.roster_id,
@@ -460,6 +611,317 @@ def reviewer_roster_readiness(roster: ReviewerRoster) -> ReviewerRosterReadiness
         independent_subject_count=len(active_reviewers | active_adjudicators),
         blockers=blockers,
     )
+
+
+def initialize_reviewer_governance_bundle(
+    output_dir: str | Path,
+    *,
+    roster_id: str = "aeitron-data-reviewers-v1",
+) -> ReviewerGovernanceBundleReport:
+    root = Path(output_dir).expanduser().resolve()
+    roster_path = root / "data_reviewers.json"
+    rubric_path = root / "reviewer-rubric-v1.md"
+    onboarding_path = root / "reviewer-onboarding.json"
+    manifest_path = root / "reviewer-governance-manifest.json"
+    protected_paths = (roster_path, rubric_path, onboarding_path, manifest_path)
+    existing = [str(path) for path in protected_paths if path.exists()]
+    if existing:
+        raise FileExistsError(
+            "refusing to overwrite reviewer governance artifacts: " + ", ".join(existing)
+        )
+
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    rubric = build_reviewer_rubric_markdown()
+    empty_roster = ReviewerRoster(roster_id=roster_id, identities=[])
+    onboarding = build_reviewer_roster_onboarding_template(
+        roster_id=roster_id,
+        final_roster_path=str(roster_path),
+    )
+    _write_text_atomically(rubric_path, rubric)
+    _write_model_atomically(empty_roster, roster_path)
+    _write_model_atomically(onboarding, onboarding_path)
+    for path in (roster_path, rubric_path, onboarding_path):
+        os.chmod(path, 0o600)
+    os.chmod(root, 0o700)
+
+    report = ReviewerGovernanceBundleReport(
+        roster_id=roster_id,
+        rubric_id=REVIEW_RUBRIC_ID,
+        output_dir=str(root),
+        roster_path=str(roster_path),
+        rubric_path=str(rubric_path),
+        onboarding_path=str(onboarding_path),
+        roster_sha256=_hash_file(roster_path),
+        rubric_sha256=_hash_file(rubric_path),
+        warning=(
+            "The roster is intentionally empty and cannot unlock calibration. "
+            "A governance operator must add two real independent OIDC reviewer subjects "
+            "and one real independent adjudicator subject, then run roster validation."
+        ),
+    )
+    _write_model_atomically(report, manifest_path)
+    os.chmod(manifest_path, 0o600)
+    return report
+
+
+def _reviewer_qualification_cases() -> list[tuple[ReviewerQualificationItem, ReviewerQualificationAnswer]]:
+    cases = [
+        (
+            "security_document",
+            "Parameterized SQL guidance",
+            "Explains placeholders and parameter binding with a complete defensive example.",
+            "Official source snapshot and license evidence are bound.",
+            "approve",
+            None,
+            "The guidance is complete, defensive, technically coherent, and supported by provenance.",
+        ),
+        (
+            "code_example",
+            "Canonical path containment",
+            "Resolves a requested path and verifies containment beneath a fixed project root.",
+            "Unit tests cover traversal and valid nested paths.",
+            "approve",
+            None,
+            "The example has a clear secure intent and includes relevant positive and negative tests.",
+        ),
+        (
+            "security_document",
+            "Password storage guidance",
+            "Documents memory-hard password hashing, salts, and parameter migration.",
+            "Official defensive documentation snapshot is bound.",
+            "approve",
+            None,
+            "The row is focused, technically useful, and contains no unsupported security claim.",
+        ),
+        (
+            "code_example",
+            "Safe process invocation",
+            "Uses an argument vector, fixed executable allowlist, bounded timeout, and a reduced environment.",
+            "Tests cover rejected shell metacharacters and timeout behavior.",
+            "approve",
+            None,
+            "The process example is complete and demonstrates bounded defensive execution.",
+        ),
+        (
+            "code_example",
+            "Checked integer arithmetic",
+            "Uses checked arithmetic and handles overflow explicitly in a systems-language example.",
+            "Compiler and unit-test evidence are bound.",
+            "approve",
+            None,
+            "The code and evidence form a coherent secure-coding example with explicit failure handling.",
+        ),
+        (
+            "code_example",
+            "HTTP client resource bounds",
+            "Configures connect and response timeouts, response-size limits, and cancellation.",
+            "Tests use an isolated local server and contain no live target.",
+            "approve",
+            None,
+            "The example teaches bounded network behavior with isolated verification evidence.",
+        ),
+        (
+            "security_document",
+            "Container least privilege",
+            "Explains non-root execution, dropped capabilities, read-only filesystems, and temporary storage.",
+            "Official container documentation snapshot is bound.",
+            "approve",
+            None,
+            "The content is structured, defensive, and sufficiently complete for training.",
+        ),
+        (
+            "security_document",
+            "Restricted workload policy",
+            "Explains restricted pod security controls and provides a valid declarative example.",
+            "Schema validation and official documentation provenance are bound.",
+            "approve",
+            None,
+            "The row combines authoritative provenance, valid configuration, and defensive rationale.",
+        ),
+        (
+            "patch",
+            "Verified input-validation patch",
+            "Changes validation logic and includes the vulnerable-before and corrected-after diff.",
+            "The original security test fails, then build, security, and regression tests pass after the patch.",
+            "approve",
+            None,
+            "The patch has complete before-and-after evidence and makes no unsupported verification claim.",
+        ),
+        (
+            "debug_trace",
+            "Reproducible authentication regression",
+            "Links a traceback to a minimal failing test and a bounded corrective change.",
+            "The failing and passing test runs are bound to the same repository snapshot.",
+            "approve",
+            None,
+            "The debugging record is reproducible, evidence-grounded, and useful without hidden context.",
+        ),
+        (
+            "security_document",
+            "Incorrect cryptographic claim",
+            "Claims that an obsolete fast hash is appropriate for password storage.",
+            "No authoritative evidence supports the claim.",
+            "reject",
+            "incorrect_or_misleading",
+            "The central security recommendation is technically incorrect and would train unsafe behavior.",
+        ),
+        (
+            "security_document",
+            "Navigation-only page",
+            "Contains menus, footer text, cookie controls, and no substantive technical content.",
+            "A source URL exists but no meaningful body content remains.",
+            "reject",
+            "low_signal_or_boilerplate",
+            "The candidate is boilerplate-heavy and contains no useful standalone training signal.",
+        ),
+        (
+            "code_example",
+            "Truncated validation helper",
+            "Shows a partial function ending before error handling or return behavior is defined.",
+            "No tests or surrounding call context are present.",
+            "reject",
+            "incomplete_context",
+            "The incomplete function cannot be interpreted or verified as a standalone example.",
+        ),
+        (
+            "security_document",
+            "Near-identical duplicate",
+            "Repeats a previously accepted paragraph with only heading and whitespace changes.",
+            "Normalized-content and MinHash evidence identify the earlier record.",
+            "reject",
+            "duplicate_or_near_duplicate",
+            "The row adds no new signal and is a verified near duplicate of an accepted record.",
+        ),
+        (
+            "code_example",
+            "Unknown repository origin",
+            "Presents a substantial code sample with no source repository, revision, or license binding.",
+            "Provenance fields and source snapshot are absent.",
+            "reject",
+            "missing_provenance",
+            "The code may be useful but cannot enter governed training without complete provenance.",
+        ),
+        (
+            "debug_trace",
+            "Credential-bearing log",
+            "Contains a captured production log with an unredacted authentication credential.",
+            "Secret scanning flags the credential class.",
+            "reject",
+            "secret_or_pii",
+            "The record contains disallowed sensitive material and must be rejected rather than normalized.",
+        ),
+        (
+            "code_example",
+            "Protected evaluation solution",
+            "Contains a solution associated with a protected benchmark task identifier.",
+            "The holdout fingerprint index reports an exact protected match.",
+            "reject",
+            "protected_benchmark",
+            "Protected benchmark material is absolutely excluded from training regardless of apparent quality.",
+        ),
+        (
+            "security_document",
+            "Live-target intrusion workflow",
+            "Describes operational steps against a third-party system without authorization or isolation.",
+            "No lab authorization, synthetic environment, or defensive framing is bound.",
+            "reject",
+            "unsafe_live_target_content",
+            "The content is an unbounded live-target workflow outside the governed defensive scope.",
+        ),
+        (
+            "patch",
+            "Claimed successful patch",
+            "States that compilation, security tests, and regression tests passed.",
+            "No command output, test manifest, repository hash, or scanner result is attached.",
+            "reject",
+            "fabricated_verification",
+            "A text claim cannot substitute for immutable verification evidence.",
+        ),
+        (
+            "patch",
+            "Unverified patch with scope mismatch",
+            "Provides a plausible security diff sourced under an unapproved training scope.",
+            "Before-and-after tests are absent and legal scope is evaluation-only.",
+            "reject",
+            "unverified_patch",
+            "The patch lacks verification and its source is not approved for training collection.",
+        ),
+    ]
+    return [
+        (
+            ReviewerQualificationItem(
+                item_id=f"reviewer-qualification-{index:02d}",
+                data_type=data_type,
+                title=title,
+                candidate_summary=candidate,
+                evidence_summary=evidence,
+            ),
+            ReviewerQualificationAnswer(
+                item_id=f"reviewer-qualification-{index:02d}",
+                expected_decision=decision,
+                reason_code=reason_code,
+                rationale=rationale,
+            ),
+        )
+        for index, (data_type, title, candidate, evidence, decision, reason_code, rationale) in enumerate(
+            cases,
+            start=1,
+        )
+    ]
+
+
+def initialize_reviewer_qualification_pack(output_dir: str | Path) -> ReviewerQualificationPackReport:
+    root = Path(output_dir).expanduser().resolve()
+    pack_path = root / "reviewer-qualification-v1.jsonl"
+    answer_key_path = root / "reviewer-qualification-answer-key-v1.json"
+    manifest_path = root / "reviewer-qualification-manifest.json"
+    existing = [str(path) for path in (pack_path, answer_key_path, manifest_path) if path.exists()]
+    if existing:
+        raise FileExistsError(
+            "refusing to overwrite reviewer qualification artifacts: " + ", ".join(existing)
+        )
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cases = _reviewer_qualification_cases()
+    items = [item for item, _ in cases]
+    answers = [answer for _, answer in cases]
+    if len(items) != 20:
+        raise RuntimeError("reviewer qualification pack must contain exactly 20 items")
+    approve_count = sum(answer.expected_decision == "approve" for answer in answers)
+    reject_count = sum(answer.expected_decision == "reject" for answer in answers)
+    if (approve_count, reject_count) != (10, 10):
+        raise RuntimeError("reviewer qualification answer key must contain ten approvals and ten rejections")
+    _write_text_atomically(
+        pack_path,
+        "".join(json.dumps(item.model_dump(mode="json"), sort_keys=True) + "\n" for item in items),
+    )
+    _write_text_atomically(
+        answer_key_path,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "rubric_id": REVIEW_RUBRIC_ID,
+                "answers": [answer.model_dump(mode="json") for answer in answers],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    for path in (pack_path, answer_key_path):
+        os.chmod(path, 0o600)
+    report = ReviewerQualificationPackReport(
+        pack_path=str(pack_path),
+        answer_key_path=str(answer_key_path),
+        pack_sha256=_hash_file(pack_path),
+        answer_key_sha256=_hash_file(answer_key_path),
+        handling_warning=(
+            "Give reviewers only the qualification pack. Keep the answer key restricted until both "
+            "independent decisions are submitted; qualification records never enter training."
+        ),
+    )
+    _write_model_atomically(report, manifest_path)
+    os.chmod(manifest_path, 0o600)
+    return report
 
 
 def load_reviewer_roster(path: str | Path) -> ReviewerRoster:
@@ -1397,6 +1859,8 @@ def _cli_service(database: str | None) -> DatasetAuthorityService:
 def _validate_cli_identity(args: argparse.Namespace) -> None:
     roster_path = getattr(args, "reviewer_roster", None)
     if not roster_path or args.command in {
+        "initialize-reviewer-governance",
+        "initialize-reviewer-qualification",
         "list",
         "review-report",
         "reviewer-roster-template",
@@ -1421,6 +1885,13 @@ def _parse_cli_evidence(value: str | None) -> dict[str, Any]:
 
 async def _run_cli_command(args: argparse.Namespace) -> StrictModel | list[StrictModel]:
     _validate_cli_identity(args)
+    if args.command == "initialize-reviewer-governance":
+        return initialize_reviewer_governance_bundle(
+            args.output_dir,
+            roster_id=args.roster_id,
+        )
+    if args.command == "initialize-reviewer-qualification":
+        return initialize_reviewer_qualification_pack(args.output_dir)
     if args.command == "reviewer-roster-template":
         template = build_reviewer_roster_onboarding_template(
             roster_id=args.roster_id,
@@ -1482,11 +1953,42 @@ def _write_model_atomically(model: StrictModel, output_path: str | Path) -> Path
     return target
 
 
+def _write_text_atomically(output_path: str | Path, payload: str) -> Path:
+    target = Path(output_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def _hash_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export immutable review evidence from the configured Aeitron Dataset Authority.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    initialize_parser = subparsers.add_parser(
+        "initialize-reviewer-governance",
+        help="Create a fail-closed external reviewer roster, rubric, and hash manifest.",
+    )
+    initialize_parser.add_argument("--output-dir", required=True)
+    initialize_parser.add_argument("--roster-id", default="aeitron-data-reviewers-v1")
+    qualification_parser = subparsers.add_parser(
+        "initialize-reviewer-qualification",
+        help="Create a deterministic 20-item blind qualification pack and restricted answer key.",
+    )
+    qualification_parser.add_argument("--output-dir", required=True)
     report_parser = subparsers.add_parser(
         "review-report",
         help="Export aggregate independent-review evidence for dataset promotion.",

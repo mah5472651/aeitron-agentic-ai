@@ -4954,6 +4954,34 @@ requires:
 - one active adjudicator whose subject is distinct from both reviewers;
 - governance approver and timestamp metadata for each identity.
 
+For a real deployment, keep identity metadata outside a public repository.
+Initialize a non-authorizing external governance bundle:
+
+```powershell
+python -m src.aeitron.learning.dataset_authority initialize-reviewer-governance `
+  --output-dir C:\AeitronGovernance
+```
+
+This creates an empty fail-closed roster, `reviewer-rubric-v1.md`, a roster
+onboarding description, and a SHA-256 manifest. It refuses to overwrite any
+existing governance artifact. The rubric defines concrete approval conditions,
+rejection reason codes, evidence requirements, independent review, adjudication,
+and the policy-floor and stretch metrics. On Windows, restrict the directory ACL
+to the project owner and authorized runtime identity before adding OIDC subjects.
+
+Create the deterministic twenty-item blind qualification pack:
+
+```powershell
+python -m src.aeitron.learning.dataset_authority initialize-reviewer-qualification `
+  --output-dir C:\AeitronGovernance
+```
+
+Give reviewers only `reviewer-qualification-v1.jsonl`. Keep the separate answer
+key restricted until both reviewers finish. The pack contains ten expected
+approvals and ten expected rejections spanning security documentation, code,
+patch, and debugging evidence. It is operational reviewer training material and
+is permanently excluded from model training.
+
 The repository ships with an empty roster so no fictional human approval can
 unlock data. Gateway use also requires exact `data:review`,
 `data:adjudicate`, or `data:promote` scopes. Offline commands validate the same
@@ -4964,7 +4992,7 @@ python -m src.aeitron.learning.dataset_authority reviewer-roster-template `
   --output artifacts\aeitron\governance\reviewer-roster-onboarding.json
 
 python -m src.aeitron.learning.dataset_authority validate-reviewer-roster `
-  --reviewer-roster config\data_reviewers.json
+  --reviewer-roster C:\AeitronGovernance\data_reviewers.json
 
 python -m src.aeitron.learning.dataset_authority list `
   --database artifacts\aeitron\dataset-authority.sqlite3 `

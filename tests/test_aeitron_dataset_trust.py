@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -22,6 +23,8 @@ from src.aeitron.learning.dataset_authority import (
     SQLiteDatasetAuthorityStore,
     SourceSnapshotCreate,
     build_reviewer_roster_onboarding_template,
+    initialize_reviewer_governance_bundle,
+    initialize_reviewer_qualification_pack,
     reviewer_roster_readiness,
 )
 from src.aeitron.learning.data_pipeline import (
@@ -55,6 +58,59 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class DatasetAuthorityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_governance_bundle_is_versioned_hash_bound_and_non_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bundle = initialize_reviewer_governance_bundle(Path(temp_dir) / "governance")
+            roster_path = Path(bundle.roster_path)
+            rubric_path = Path(bundle.rubric_path)
+            onboarding_path = Path(bundle.onboarding_path)
+            self.assertEqual(bundle.status, "awaiting_human_identities")
+            self.assertEqual(bundle.rubric_id, "aeitron-review-rubric-v1")
+            self.assertTrue(roster_path.is_file())
+            self.assertTrue(rubric_path.is_file())
+            self.assertTrue(onboarding_path.is_file())
+            self.assertEqual(
+                hashlib.sha256(roster_path.read_bytes()).hexdigest(),
+                bundle.roster_sha256,
+            )
+            self.assertEqual(
+                hashlib.sha256(rubric_path.read_bytes()).hexdigest(),
+                bundle.rubric_sha256,
+            )
+            roster = ReviewerRoster.model_validate_json(roster_path.read_text(encoding="utf-8"))
+            self.assertEqual(roster.identities, [])
+            rubric = rubric_path.read_text(encoding="utf-8")
+            self.assertIn("incorrect_or_misleading", rubric)
+            self.assertIn("Policy-floor Cohen's kappa: `>= 0.80`", rubric)
+            with self.assertRaises(FileExistsError):
+                initialize_reviewer_governance_bundle(Path(temp_dir) / "governance")
+
+    async def test_reviewer_qualification_pack_is_balanced_sealed_and_non_production(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = initialize_reviewer_qualification_pack(Path(temp_dir) / "governance")
+            pack_path = Path(report.pack_path)
+            answer_key_path = Path(report.answer_key_path)
+            rows = [
+                json.loads(line)
+                for line in pack_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            answer_key = json.loads(answer_key_path.read_text(encoding="utf-8"))
+            self.assertEqual(report.item_count, 20)
+            self.assertEqual(len(rows), 20)
+            self.assertTrue(all("expected_decision" not in row for row in rows))
+            self.assertEqual(
+                sum(item["expected_decision"] == "approve" for item in answer_key["answers"]),
+                10,
+            )
+            self.assertEqual(
+                sum(item["expected_decision"] == "reject" for item in answer_key["answers"]),
+                10,
+            )
+            self.assertIn("never enter training", report.handling_warning)
+            with self.assertRaises(FileExistsError):
+                initialize_reviewer_qualification_pack(Path(temp_dir) / "governance")
+
     async def test_reviewer_onboarding_never_fabricates_identity_and_reports_readiness(self) -> None:
         template = build_reviewer_roster_onboarding_template()
         self.assertEqual(template.status, "awaiting_human_identities")
@@ -98,6 +154,36 @@ class DatasetAuthorityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(readiness.status, "ready")
         self.assertEqual(readiness.independent_subject_count, 3)
         self.assertEqual(readiness.blockers, [])
+
+        placeholder = ReviewerRoster(
+            roster_id=template.roster_id,
+            identities=[
+                ReviewerIdentity(
+                    reviewer_id="placeholder-reviewer-one",
+                    identity_provider_subject="oidc:placeholder-one",
+                    roles={"reviewer"},
+                    approved_by="governance-owner",
+                    approved_at="2026-07-19T12:00:00+06:00",
+                ),
+                ReviewerIdentity(
+                    reviewer_id="reviewer-two",
+                    identity_provider_subject="oidc:reviewer-two",
+                    roles={"reviewer"},
+                    approved_by="governance-owner",
+                    approved_at="2026-07-19T12:00:00+06:00",
+                ),
+                ReviewerIdentity(
+                    reviewer_id="adjudicator-one",
+                    identity_provider_subject="oidc:adjudicator-one",
+                    roles={"adjudicator"},
+                    approved_by="governance-owner",
+                    approved_at="2026-07-19T12:00:00+06:00",
+                ),
+            ],
+        )
+        placeholder_report = reviewer_roster_readiness(placeholder)
+        self.assertEqual(placeholder_report.status, "blocked")
+        self.assertTrue(any("placeholder marker" in blocker for blocker in placeholder_report.blockers))
 
     async def test_empty_review_evidence_is_explicit_and_consistent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
