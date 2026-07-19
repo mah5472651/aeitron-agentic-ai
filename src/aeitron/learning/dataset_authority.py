@@ -22,7 +22,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from src.aeitron.shared.schemas import StrictModel
 
@@ -267,6 +267,81 @@ class SourceReviewEvidence(StrictModel):
 class ReviewEvidenceReport(StrictModel):
     by_source: dict[str, SourceReviewEvidence]
     created_at_unix: float = Field(default_factory=time.time)
+
+
+class ReviewerIdentity(StrictModel):
+    reviewer_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{2,127}$")
+    identity_provider_subject: str = Field(min_length=3, max_length=256)
+    roles: set[Literal["reviewer", "adjudicator"]] = Field(min_length=1)
+    active: bool = True
+    approved_by: str = Field(min_length=3, max_length=256)
+    approved_at: str
+
+    @field_validator("approved_at")
+    @classmethod
+    def validate_approval_timestamp(cls, value: str) -> str:
+        from datetime import datetime
+
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("reviewer approved_at must be RFC3339") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("reviewer approved_at must include timezone")
+        return value
+
+
+class ReviewerRoster(StrictModel):
+    schema_version: Literal[1] = 1
+    roster_id: str = Field(min_length=3, max_length=120)
+    identities: list[ReviewerIdentity]
+
+    @model_validator(mode="after")
+    def validate_unique_identities(self) -> "ReviewerRoster":
+        reviewer_ids = [identity.reviewer_id for identity in self.identities]
+        subjects = [identity.identity_provider_subject for identity in self.identities]
+        if len(reviewer_ids) != len(set(reviewer_ids)):
+            raise ValueError("reviewer roster contains duplicate reviewer_id")
+        if len(subjects) != len(set(subjects)):
+            raise ValueError("reviewer roster contains duplicate identity-provider subject")
+        return self
+
+    def active_identity(self, reviewer_id: str, role: Literal["reviewer", "adjudicator"]) -> ReviewerIdentity:
+        identity = next(
+            (
+                item
+                for item in self.identities
+                if item.reviewer_id == reviewer_id and item.active and role in item.roles
+            ),
+            None,
+        )
+        if identity is None:
+            raise PermissionError(f"{reviewer_id!r} is not an active {role} in the governed roster")
+        return identity
+
+    def readiness_blockers(self) -> list[str]:
+        reviewers = {
+            identity.identity_provider_subject
+            for identity in self.identities
+            if identity.active and "reviewer" in identity.roles
+        }
+        adjudicators = {
+            identity.identity_provider_subject
+            for identity in self.identities
+            if identity.active and "adjudicator" in identity.roles
+        }
+        blockers: list[str] = []
+        if len(reviewers) < 2:
+            blockers.append("at least two active reviewers with distinct identity-provider subjects are required")
+        if not adjudicators:
+            blockers.append("at least one active adjudicator is required")
+        if adjudicators and not any(subject not in reviewers for subject in adjudicators):
+            blockers.append("an adjudicator identity independent of both reviewer identities is required")
+        return blockers
+
+
+def load_reviewer_roster(path: str | Path) -> ReviewerRoster:
+    return ReviewerRoster.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
 
 class DatasetAuthorityStore(Protocol):
@@ -1177,6 +1252,81 @@ async def _write_review_evidence_report(output_path: str | Path) -> ReviewEviden
     return report
 
 
+def _cli_service(database: str | None) -> DatasetAuthorityService:
+    if database:
+        return DatasetAuthorityService(SQLiteDatasetAuthorityStore(Path(database).resolve()))
+    return DatasetAuthorityService.from_environment()
+
+
+def _validate_cli_identity(args: argparse.Namespace) -> None:
+    roster_path = getattr(args, "reviewer_roster", None)
+    if not roster_path or args.command in {"list", "review-report"}:
+        return
+    roster = load_reviewer_roster(roster_path)
+    if args.command in {"claim", "decide"}:
+        roster.active_identity(args.reviewer_id, "reviewer")
+    elif args.command == "adjudicate":
+        roster.active_identity(args.adjudicator_id, "adjudicator")
+
+
+def _parse_cli_evidence(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    payload = json.loads(value)
+    if not isinstance(payload, dict):
+        raise ValueError("--evidence-json must contain a JSON object")
+    return payload
+
+
+async def _run_cli_command(args: argparse.Namespace) -> StrictModel | list[StrictModel]:
+    _validate_cli_identity(args)
+    service = _cli_service(getattr(args, "database", None))
+    if args.command == "review-report":
+        report = await service.review_evidence()
+        target = Path(args.output).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_payload = json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(_atomic_payload, encoding="utf-8")
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return report
+    if args.command == "list":
+        return await service.list_items(
+            status=args.status,
+            limit=args.limit,
+            reviewer_id=args.reviewer_id,
+        )
+    if args.command == "claim":
+        return await service.claim(args.review_item_id, args.reviewer_id, args.lease_seconds)
+    if args.command == "decide":
+        item = await service.get_item(args.review_item_id, reviewer_id=args.reviewer_id)
+        return await service.decide(
+            args.review_item_id,
+            args.reviewer_id,
+            ReviewDecisionCreate(
+                decision=args.decision,
+                rationale=args.rationale,
+                content_hash=item.content_hash,
+                source_snapshot_sha256=item.source_snapshot_sha256,
+                evidence=_parse_cli_evidence(args.evidence_json),
+            ),
+        )
+    if args.command == "adjudicate":
+        return await service.adjudicate(
+            args.review_item_id,
+            args.adjudicator_id,
+            ReviewAdjudicationCreate(
+                decision=args.decision,
+                rationale=args.rationale,
+                evidence=_parse_cli_evidence(args.evidence_json),
+            ),
+        )
+    raise ValueError(f"unsupported command: {args.command}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export immutable review evidence from the configured Aeitron Dataset Authority.",
@@ -1187,11 +1337,41 @@ def main() -> None:
         help="Export aggregate independent-review evidence for dataset promotion.",
     )
     report_parser.add_argument("--output", required=True)
+    report_parser.add_argument("--database")
+    list_parser = subparsers.add_parser("list", help="List blinded review records.")
+    list_parser.add_argument("--database")
+    list_parser.add_argument("--reviewer-id")
+    list_parser.add_argument("--status", choices=sorted(REVIEW_STATUSES))
+    list_parser.add_argument("--limit", type=int, default=100)
+    claim_parser = subparsers.add_parser("claim", help="Claim one reviewer slot.")
+    claim_parser.add_argument("--database")
+    claim_parser.add_argument("--reviewer-roster", default="config/data_reviewers.json")
+    claim_parser.add_argument("--review-item-id", required=True)
+    claim_parser.add_argument("--reviewer-id", required=True)
+    claim_parser.add_argument("--lease-seconds", type=int, default=3_600)
+    decide_parser = subparsers.add_parser("decide", help="Submit a blinded reviewer decision.")
+    decide_parser.add_argument("--database")
+    decide_parser.add_argument("--reviewer-roster", default="config/data_reviewers.json")
+    decide_parser.add_argument("--review-item-id", required=True)
+    decide_parser.add_argument("--reviewer-id", required=True)
+    decide_parser.add_argument("--decision", choices=["approve", "reject"], required=True)
+    decide_parser.add_argument("--rationale", required=True)
+    decide_parser.add_argument("--evidence-json")
+    adjudicate_parser = subparsers.add_parser("adjudicate", help="Resolve a conflicting review with a third identity.")
+    adjudicate_parser.add_argument("--database")
+    adjudicate_parser.add_argument("--reviewer-roster", default="config/data_reviewers.json")
+    adjudicate_parser.add_argument("--review-item-id", required=True)
+    adjudicate_parser.add_argument("--adjudicator-id", required=True)
+    adjudicate_parser.add_argument("--decision", choices=["approve", "reject"], required=True)
+    adjudicate_parser.add_argument("--rationale", required=True)
+    adjudicate_parser.add_argument("--evidence-json")
     args = parser.parse_args()
-
-    if args.command == "review-report":
-        report = asyncio.run(_write_review_evidence_report(args.output))
-        print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
+    result = asyncio.run(_run_cli_command(args))
+    if isinstance(result, list):
+        payload = [item.model_dump(mode="json") for item in result]
+    else:
+        payload = result.model_dump(mode="json")
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

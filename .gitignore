@@ -19,6 +19,7 @@ artifacts/
 *.pid
 data/eval/*.jsonl
 data/eval/*_report.json
+data/eval/protected*/
 
 # Downloaded tools and model/checkpoint payloads
 tools/
@@ -37,6 +38,7 @@ checkpoints/
 !.env.example
 config/local/
 config/*secret*
+governance/source-approvals/
 
 # IDE and OS noise
 .vscode/

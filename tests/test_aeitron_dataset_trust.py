@@ -37,7 +37,7 @@ from src.aeitron.learning.production_dataset import (
     split_train_val_test,
     validate_dataset_manifest_for_promotion,
 )
-from src.aeitron.learning.source_registry import SourceRegistry
+from src.aeitron.learning.source_registry import SourceRegistry, source_registry_entry_sha256
 from src.aeitron.learning.source_reputation import build_source_reputation_report
 from src.aeitron.learning.training_data_gate import TrainingDataGateConfig, score_row
 from src.aeitron.learning.web_ingest import SourceSpec
@@ -278,7 +278,6 @@ class DatasetFingerprintAndManifestTest(unittest.TestCase):
             license_evidence = root / "license.txt"
             legal_approval = root / "approval.json"
             license_evidence.write_text("Reviewed MIT license evidence", encoding="utf-8")
-            legal_approval.write_text('{"approved_by":"legal-test"}', encoding="utf-8")
             registry = SourceRegistry(
                 [
                     SourceSpec(
@@ -291,6 +290,27 @@ class DatasetFingerprintAndManifestTest(unittest.TestCase):
                     )
                 ]
             )
+            source = registry.to_sources()[0]
+            legal_approval.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "approval_id": "approval-test-001",
+                        "decision": "approved",
+                        "source_id": "approved-test-source",
+                        "registry_entry_sha256": source_registry_entry_sha256(source),
+                        "immutable_revision": "commit-abc123",
+                        "license": "mit",
+                        "license_evidence_sha256": _sha256_file(license_evidence),
+                        "approved_use": "defensive",
+                        "approved_by": "legal-test-reviewer",
+                        "approved_at": "2026-07-19T12:00:00+06:00",
+                        "scope": "training_collection",
+                        "rationale": "The source license and intended defensive training use were reviewed and approved.",
+                    }
+                ),
+                encoding="utf-8",
+            )
             approved = registry.approve_source(
                 source_id="approved-test-source",
                 immutable_revision="commit-abc123",
@@ -301,6 +321,52 @@ class DatasetFingerprintAndManifestTest(unittest.TestCase):
             self.assertEqual(approved.license_evidence_sha256, _sha256_file(license_evidence))
             self.assertEqual(approved.legal_approval_sha256, _sha256_file(legal_approval))
             self.assertEqual(registry.validate(production=True).approved_sources, 1)
+
+    def test_source_approval_rejects_evidence_bound_to_another_registry_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            license_evidence = root / "license.txt"
+            legal_approval = root / "approval.json"
+            license_evidence.write_text("Reviewed MIT license evidence", encoding="utf-8")
+            legal_approval.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "approval_id": "approval-test-002",
+                        "decision": "approved",
+                        "source_id": "approved-test-source",
+                        "registry_entry_sha256": "0" * 64,
+                        "immutable_revision": "commit-abc123",
+                        "license": "mit",
+                        "license_evidence_sha256": _sha256_file(license_evidence),
+                        "approved_use": "defensive",
+                        "approved_by": "legal-test-reviewer",
+                        "approved_at": "2026-07-19T12:00:00+06:00",
+                        "scope": "training_collection",
+                        "rationale": "The source license and intended defensive training use were reviewed and approved.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = SourceRegistry(
+                [
+                    SourceSpec(
+                        name="approved-test-source",
+                        urls=["https://example.com/docs"],
+                        allowed_domains=["example.com"],
+                        license="mit",
+                        source_id="approved-test-source",
+                        source_family="approved-family",
+                    )
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "registry_entry_sha256"):
+                registry.approve_source(
+                    source_id="approved-test-source",
+                    immutable_revision="commit-abc123",
+                    license_evidence_path=license_evidence,
+                    legal_approval_path=legal_approval,
+                )
 
     def test_scale_validation_uses_bounded_index_and_subquadratic_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -418,7 +484,7 @@ class DatasetFingerprintAndManifestTest(unittest.TestCase):
                 version_id="version-1",
                 status="promoted",
                 output_dir=str(root),
-                dev_smoke=False,
+                dev_smoke=True,
                 artifacts={"train": str(artifact)},
                 metrics={},
                 reports={},

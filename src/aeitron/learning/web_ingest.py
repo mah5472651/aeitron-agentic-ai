@@ -37,6 +37,7 @@ class SourceSpec(StrictModel):
     immutable_revision: str = "rolling"
     license_evidence_sha256: str | None = None
     legal_approval_sha256: str | None = None
+    approval_request_sha256: str | None = None
     allowed_content_types: list[str] = Field(
         default_factory=lambda: [
             "application/json",
@@ -59,7 +60,7 @@ class SourceSpec(StrictModel):
             raise ValueError("source identifiers must be lowercase slugs")
         return normalized
 
-    @field_validator("license_evidence_sha256", "legal_approval_sha256")
+    @field_validator("license_evidence_sha256", "legal_approval_sha256", "approval_request_sha256")
     @classmethod
     def validate_optional_sha256(cls, value: str | None) -> str | None:
         if value is None:

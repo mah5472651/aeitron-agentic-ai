@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "pack_id": "aeitron-protected-evaluation-v1",
+  "sources": [
+    {
+      "name": "humaneval",
+      "kind": "jsonl_gzip",
+      "revision": "6d43fb980f9fee3c892a914eda09951f772ad10d",
+      "license": "MIT",
+      "output_file": "humaneval.jsonl",
+      "minimum_rows": 164,
+      "maximum_bytes": 20000000,
+      "url": "https://raw.githubusercontent.com/openai/human-eval/6d43fb980f9fee3c892a914eda09951f772ad10d/data/HumanEval.jsonl.gz",
+      "train_policy": "eval_holdout"
+    },
+    {
+      "name": "mbpp",
+      "kind": "jsonl",
+      "revision": "95e3a1da2d27cb9c8289f6fd3076cfed608c3c94",
+      "license": "Apache-2.0",
+      "output_file": "mbpp.jsonl",
+      "minimum_rows": 374,
+      "maximum_bytes": 50000000,
+      "url": "https://raw.githubusercontent.com/google-research/google-research/95e3a1da2d27cb9c8289f6fd3076cfed608c3c94/mbpp/mbpp.jsonl",
+      "train_policy": "eval_holdout"
+    },
+    {
+      "name": "swe_bench_verified",
+      "kind": "parquet",
+      "revision": "c104f840cc67f8b6eec6f759ebc8b2693d585d4a",
+      "license": "MIT",
+      "output_file": "swe_bench_verified.jsonl",
+      "minimum_rows": 500,
+      "maximum_bytes": 100000000,
+      "url": "https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified/resolve/c104f840cc67f8b6eec6f759ebc8b2693d585d4a/data/test-00000-of-00001.parquet",
+      "train_policy": "eval_holdout"
+    },
+    {
+      "name": "cyberseceval_instruct_v2",
+      "kind": "json",
+      "revision": "b71c6350a2acf2fb62c2328a734cbf440ecac386",
+      "license": "Llama-3.2-Community",
+      "output_file": "cyberseceval_instruct_v2.jsonl",
+      "minimum_rows": 1,
+      "maximum_bytes": 500000000,
+      "url": "https://raw.githubusercontent.com/meta-llama/PurpleLlama/b71c6350a2acf2fb62c2328a734cbf440ecac386/CybersecurityBenchmarks/datasets/instruct/instruct-v2.json",
+      "train_policy": "eval_holdout"
+    },
+    {
+      "name": "cyberseceval_mitre_frr",
+      "kind": "json",
+      "revision": "b71c6350a2acf2fb62c2328a734cbf440ecac386",
+      "license": "Llama-3.2-Community",
+      "output_file": "cyberseceval_mitre_frr.jsonl",
+      "minimum_rows": 1,
+      "maximum_bytes": 500000000,
+      "url": "https://raw.githubusercontent.com/meta-llama/PurpleLlama/b71c6350a2acf2fb62c2328a734cbf440ecac386/CybersecurityBenchmarks/datasets/mitre_frr/mitre_frr.json",
+      "train_policy": "eval_holdout"
+    },
+    {
+      "name": "aeitron_security",
+      "kind": "builtin_aeitron",
+      "revision": "builtin-task-contract-v1",
+      "license": "Proprietary-Evaluation",
+      "output_file": "aeitron_security.jsonl",
+      "minimum_rows": 25,
+      "maximum_bytes": 10000000,
+      "train_policy": "eval_holdout"
+    }
+  ]
+}

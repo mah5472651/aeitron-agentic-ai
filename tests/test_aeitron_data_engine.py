@@ -1041,7 +1041,7 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(Path(root / "production" / "reports" / "source_reputation_report.json").exists())
             self.assertTrue(Path(root / "production" / "reports" / "train_val_test_split_manifest.json").exists())
 
-    def test_production_dataset_pack_fails_when_real_thresholds_are_not_met(self) -> None:
+    def test_production_dataset_pack_rejects_missing_5k_advancement_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             raw = root / "raw.jsonl"
@@ -1063,22 +1063,33 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
 
-            manifest = build_production_dataset(
-                ProductionDatasetConfig(
-                    input_paths=[str(raw)],
-                    output_dir=str(root / "production"),
-                    benchmark_holdout_paths=[],
-                    min_promoted_records=100_000,
-                    min_verified_patch_records=100,
-                    min_human_review_approved_records=100,
-                    min_train_records=90_000,
+            with self.assertRaisesRegex(ValueError, "passed calibration_5k"):
+                build_production_dataset(
+                    ProductionDatasetConfig(
+                        input_paths=[str(raw)],
+                        output_dir=str(root / "production"),
+                        benchmark_holdout_paths=[],
+                        min_promoted_records=100_000,
+                        min_verified_patch_records=100,
+                        min_human_review_approved_records=100,
+                        min_train_records=90_000,
+                    )
                 )
-            )
 
-            self.assertEqual(manifest.status, "rejected")
-            self.assertTrue(any(issue.startswith("promoted_records_below_minimum") for issue in manifest.issues))
-            self.assertTrue(any(issue.startswith("verified_patch_records_below_minimum") for issue in manifest.issues))
-            self.assertTrue(any(issue.startswith("human_review_approved_records_below_minimum") for issue in manifest.issues))
+    def test_production_dataset_rejects_arbitrary_non_dev_stage_size(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly 100,000"):
+            ProductionDatasetConfig(
+                input_paths=["unused.jsonl"],
+                output_dir="unused-output",
+                min_promoted_records=5_000,
+            )
+        dev_config = ProductionDatasetConfig(
+            input_paths=["unused.jsonl"],
+            output_dir="unused-output",
+            dev_smoke=True,
+            min_promoted_records=5,
+        )
+        self.assertEqual(dev_config.min_promoted_records, 5)
 
     def test_task_review_and_feedback_loop_reports_promotion_or_blockers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

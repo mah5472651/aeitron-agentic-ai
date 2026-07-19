@@ -29,6 +29,10 @@ from src.aeitron.learning.benchmark_contamination_filter import (
     build_protected_fingerprint_index,
     filter_benchmark_contamination_jsonl,
 )
+from src.aeitron.learning.calibration_gate import (
+    CalibrationDecision,
+    validate_advancement_decision,
+)
 from src.aeitron.learning.dataset_validation import DatasetValidationConfig, DatasetValidationReport, validate_dataset
 from src.aeitron.learning.license_filter import LicenseFilterReport, filter_jsonl_by_license
 from src.aeitron.learning.near_dedup import NearDedupReport, deduplicate_jsonl
@@ -47,11 +51,17 @@ CHECKOUT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
 class ProductionDatasetConfig(StrictModel):
+    stage: Literal["production_100k"] = "production_100k"
     input_paths: list[str]
     output_dir: str = "data/production/aeitron-corpus"
     dataset_id: str = "aeitron-corpus"
     source_registry_path: str = "config/data_sources.ultimate.json"
     trust_policy_path: str = "config/dataset_trust_policy.json"
+    legal_evidence_dir: str = "governance/source-approvals"
+    reviewer_roster_path: str = "config/data_reviewers.json"
+    protected_benchmark_config_path: str = "config/protected_benchmarks.json"
+    protected_benchmark_manifest_path: str = "data/eval/protected/protected_benchmark_manifest.json"
+    advancement_decision_path: str | None = None
     tokenizer_path: str | None = None
     source_review_report_path: str | None = None
     benchmark_holdout_paths: list[str] = Field(default_factory=lambda: ["data/eval/humaneval.jsonl", "data/eval/mbpp.jsonl"])
@@ -80,6 +90,8 @@ class ProductionDatasetConfig(StrictModel):
         total = round(self.train_fraction + self.val_fraction + self.test_fraction, 6)
         if total != 1.0:
             raise ValueError("train_fraction + val_fraction + test_fraction must equal 1.0")
+        if not self.dev_smoke and self.min_promoted_records != 100_000:
+            raise ValueError("production_100k requires exactly 100,000 as the minimum promoted row count")
         return self
 
 
@@ -163,6 +175,9 @@ class ProductionDatasetManifest(StrictModel):
     artifact_sha256: dict[str, str] = Field(default_factory=dict)
     policy_sha256: str = ""
     tokenizer_sha256: str | None = None
+    advancement_decision_path: str | None = None
+    advancement_decision_sha256: str | None = None
+    governance_paths: dict[str, str] = Field(default_factory=dict)
     promotion_decision: dict[str, Any] = Field(default_factory=dict)
 
     def write(self, output_dir: str | Path) -> Path:
@@ -1053,10 +1068,57 @@ def validate_dataset_manifest_for_promotion(
             raise ValueError(f"dataset artifact escapes version output root: {role}") from exc
         if _sha256_file(artifact_path) != expected:
             raise ValueError(f"dataset artifact hash mismatch: {role}")
+    if not manifest.dev_smoke:
+        if not manifest.advancement_decision_path or not manifest.advancement_decision_sha256:
+            raise ValueError("production dataset manifest is missing calibration_5k advancement evidence")
+        if _sha256_file(manifest.advancement_decision_path) != manifest.advancement_decision_sha256:
+            raise ValueError("production dataset advancement decision hash changed")
+        required_paths = {
+            "source_registry_path",
+            "protected_benchmark_config_path",
+            "protected_benchmark_manifest_path",
+            "reviewer_roster_path",
+            "legal_evidence_dir",
+            "trust_policy_path",
+        }
+        missing = sorted(required_paths.difference(manifest.governance_paths))
+        if missing:
+            raise ValueError(f"production dataset manifest is missing governance paths: {missing}")
+        validate_advancement_decision(
+            manifest.advancement_decision_path,
+            expected_stage="calibration_5k",
+            expected_next_stage="100k_dataset_build_allowed",
+            sources_path=manifest.governance_paths["source_registry_path"],
+            protected_config_path=manifest.governance_paths["protected_benchmark_config_path"],
+            protected_manifest_path=manifest.governance_paths["protected_benchmark_manifest_path"],
+            reviewer_roster_path=manifest.governance_paths["reviewer_roster_path"],
+            legal_evidence_dir=manifest.governance_paths["legal_evidence_dir"],
+            trust_policy_path=manifest.governance_paths["trust_policy_path"],
+        )
     return manifest
 
 
 def build_production_dataset(config: ProductionDatasetConfig) -> ProductionDatasetManifest:
+    advancement_decision: CalibrationDecision | None = None
+    advancement_decision_sha256: str | None = None
+    if not config.dev_smoke:
+        if not config.advancement_decision_path:
+            raise ValueError(
+                "production_100k requires --advancement-decision from a passed calibration_5k stage"
+            )
+        advancement_decision = validate_advancement_decision(
+            config.advancement_decision_path,
+            expected_stage="calibration_5k",
+            expected_next_stage="100k_dataset_build_allowed",
+            sources_path=config.source_registry_path,
+            protected_config_path=config.protected_benchmark_config_path,
+            protected_manifest_path=config.protected_benchmark_manifest_path,
+            reviewer_roster_path=config.reviewer_roster_path,
+            legal_evidence_dir=config.legal_evidence_dir,
+            trust_policy_path=config.trust_policy_path,
+        )
+        advancement_decision_sha256 = _sha256_file(config.advancement_decision_path)
+
     input_paths = _expand_input_paths(config.input_paths)
     if not input_paths:
         raise ValueError("no input JSONL files found for production dataset build")
@@ -1075,6 +1137,21 @@ def build_production_dataset(config: ProductionDatasetConfig) -> ProductionDatas
     final_dir = root / "final"
     for directory in (reports_dir, work_dir, final_dir):
         directory.mkdir(parents=True, exist_ok=True)
+    advancement_report = _write_json(
+        reports_dir / "advancement_evidence_report.json",
+        {
+            "stage": config.stage,
+            "required_prior_stage": "calibration_5k",
+            "decision_path": (
+                str(Path(config.advancement_decision_path).resolve())
+                if config.advancement_decision_path
+                else None
+            ),
+            "decision_sha256": advancement_decision_sha256,
+            "decision": advancement_decision.model_dump(mode="json") if advancement_decision else None,
+            "dev_smoke_bypass": config.dev_smoke,
+        },
+    )
     _write_json(reports_dir / "source_registry_report.json", source_registry_report)
 
     license_clean = work_dir / "01_license_clean.jsonl"
@@ -1310,6 +1387,7 @@ def build_production_dataset(config: ProductionDatasetConfig) -> ProductionDatas
         "mix_manifest": str(mix_manifest),
         "promotion_decision": str(promotion_decision_path),
         "quality_dashboard": str(quality_dashboard),
+        "advancement_evidence": str(advancement_report),
     }
     artifact_sha256 = _hash_existing_artifacts(artifacts)
     manifest = ProductionDatasetManifest(
@@ -1333,6 +1411,11 @@ def build_production_dataset(config: ProductionDatasetConfig) -> ProductionDatas
         },
         issues=issues,
         reports={
+            "advancement_evidence": (
+                advancement_decision.model_dump(mode="json")
+                if advancement_decision is not None
+                else {"status": "dev_smoke_bypass"}
+            ),
             "license_filter": license_report.model_dump(),
             "quality_gate": quality_report.model_dump(),
             "benchmark_contamination_filter": benchmark_report.model_dump(),
@@ -1354,6 +1437,20 @@ def build_production_dataset(config: ProductionDatasetConfig) -> ProductionDatas
         artifact_sha256=artifact_sha256,
         policy_sha256=_sha256_file(config.trust_policy_path),
         tokenizer_sha256=_sha256_file(config.tokenizer_path) if config.tokenizer_path else None,
+        advancement_decision_path=(
+            str(Path(config.advancement_decision_path).resolve())
+            if config.advancement_decision_path
+            else None
+        ),
+        advancement_decision_sha256=advancement_decision_sha256,
+        governance_paths={
+            "source_registry_path": str(Path(config.source_registry_path).resolve()),
+            "protected_benchmark_config_path": str(Path(config.protected_benchmark_config_path).resolve()),
+            "protected_benchmark_manifest_path": str(Path(config.protected_benchmark_manifest_path).resolve()),
+            "reviewer_roster_path": str(Path(config.reviewer_roster_path).resolve()),
+            "legal_evidence_dir": str(Path(config.legal_evidence_dir).resolve()),
+            "trust_policy_path": str(Path(config.trust_policy_path).resolve()),
+        },
         promotion_decision=promotion_decision.model_dump(),
     )
     manifest.write(root)
@@ -1397,6 +1494,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-id", default="aeitron-corpus")
     parser.add_argument("--source-registry", default="config/data_sources.ultimate.json")
     parser.add_argument("--trust-policy", default="config/dataset_trust_policy.json")
+    parser.add_argument("--legal-evidence-dir", default="governance/source-approvals")
+    parser.add_argument("--reviewer-roster", default="config/data_reviewers.json")
+    parser.add_argument("--protected-config", default="config/protected_benchmarks.json")
+    parser.add_argument(
+        "--protected-manifest",
+        default="data/eval/protected/protected_benchmark_manifest.json",
+    )
+    parser.add_argument("--advancement-decision")
     parser.add_argument("--tokenizer")
     parser.add_argument("--source-review-report")
     parser.add_argument("--benchmark-holdout", action="append", default=[])
@@ -1420,6 +1525,11 @@ def main() -> None:
         dataset_id=args.dataset_id,
         source_registry_path=args.source_registry,
         trust_policy_path=args.trust_policy,
+        legal_evidence_dir=args.legal_evidence_dir,
+        reviewer_roster_path=args.reviewer_roster,
+        protected_benchmark_config_path=args.protected_config,
+        protected_benchmark_manifest_path=args.protected_manifest,
+        advancement_decision_path=args.advancement_decision,
         tokenizer_path=args.tokenizer,
         source_review_report_path=args.source_review_report,
         benchmark_holdout_paths=args.benchmark_holdout or ["data/eval/humaneval.jsonl", "data/eval/mbpp.jsonl"],

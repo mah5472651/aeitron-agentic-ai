@@ -4656,8 +4656,13 @@ python -m src.aeitron.learning.production_dataset `
   --input artifacts\aeitron\data-runs\foundation\clean\*.jsonl `
   --output-dir data\production\aeitron-foundation-v1 `
   --dataset-id aeitron-foundation-v1 `
+  --advancement-decision artifacts\aeitron\calibration-5k-v1\calibration_decision.json `
   --source-registry config\data_sources.governed.json `
   --trust-policy config\dataset_trust_policy.json `
+  --legal-evidence-dir governance\source-approvals `
+  --reviewer-roster config\data_reviewers.json `
+  --protected-config config\protected_benchmarks.json `
+  --protected-manifest data\eval\protected\protected_benchmark_manifest.json `
   --source-review-report artifacts\aeitron\review\review_evidence_report.json `
   --benchmark-holdout data\eval\humaneval.jsonl `
   --benchmark-holdout data\eval\mbpp.jsonl `
@@ -4726,6 +4731,235 @@ Operators must first bind real legal/source approvals, install governed holdout
 files, and complete an independent review sample. Then rerun the 200-record
 calibration with a fresh output directory. Only a passing corrected run may
 advance to 5,000 records.
+
+### Governed 200-Record Calibration Gate
+
+The corrected workflow is implemented in
+`src/aeitron/learning/calibration_gate.py`. It coordinates the existing
+Source Registry, Data Engine, contamination filter, deduplicator, quality
+inspector, and Dataset Authority. It is not a second promotion pipeline.
+
+#### Protected benchmark binding
+
+`config/protected_benchmarks.json` pins every external holdout by immutable
+revision and declares it `eval_holdout`. The pack currently covers:
+
+- HumanEval, 164 tasks, pinned Git revision;
+- MBPP, 974 tasks, pinned Git revision;
+- SWE-bench Verified, 500 tasks, pinned Hugging Face revision;
+- CyberSecEval Instruct v2, pinned PurpleLlama revision;
+- CyberSecEval MITRE FRR, pinned PurpleLlama revision;
+- Aeitron's built-in defensive regression tasks.
+
+Materialize the pack into a new directory:
+
+```powershell
+python -m src.aeitron.evaluation.benchmark_pack --materialize-protected `
+  --protected-config config\protected_benchmarks.json `
+  --target-dir data\eval\protected
+```
+
+The materializer permits only fixed HTTPS domains, validates redirects again,
+enforces download limits and minimum row counts, writes SHA-256 for every
+artifact, and creates a disk-backed protected fingerprint database. The
+fingerprint index covers prompt, canonical solution, patch, tests, code, and
+other meaningful textual fields. It uses linear one-permutation MinHash plus
+exact, task-ID, and structural fingerprints. The generated dataset files are
+local governed artifacts and are intentionally not committed to Git.
+
+Validate an existing pack:
+
+```powershell
+python -m src.aeitron.evaluation.benchmark_pack `
+  --validate-protected-manifest data\eval\protected\protected_benchmark_manifest.json `
+  --protected-config config\protected_benchmarks.json
+```
+
+Any revision, row-count, path, content hash, index hash, or source-contract
+change invalidates the pack.
+
+#### Legal source approval binding
+
+Generate approval requests:
+
+```powershell
+python -m src.aeitron.learning.calibration_gate prepare `
+  --sources config\data_sources.ultimate.json `
+  --protected-config config\protected_benchmarks.json `
+  --protected-manifest data\eval\protected\protected_benchmark_manifest.json `
+  --reviewer-roster config\data_reviewers.json `
+  --output-dir artifacts\aeitron\calibration-preflight
+```
+
+Each request binds the source ID, complete registry entry SHA-256, source
+family, allowed domains, seed URLs, declared license, and intended use. An
+authorized legal operator must produce a JSON decision containing:
+
+```text
+schema_version
+approval_id
+decision=approved
+source_id
+registry_entry_sha256
+immutable_revision
+license
+license_evidence_sha256
+approved_use
+approved_by
+approved_at with timezone
+scope
+rationale
+```
+
+The source approval command compares every field with the request and the
+actual license-evidence file. It refuses a rolling revision, changed registry
+entry, mismatched license, mismatched use, or mismatched evidence hash:
+
+```powershell
+python -m src.aeitron.learning.source_registry `
+  --sources config\data_sources.ultimate.json `
+  --approve-source SOURCE_ID `
+  --immutable-revision IMMUTABLE_REVISION `
+  --license-evidence governance\source-approvals\SOURCE_ID\license.txt `
+  --legal-approval governance\source-approvals\SOURCE_ID\approval.json `
+  --trust-tier reviewed `
+  --output config\data_sources.governed.json
+```
+
+Subsequent approvals must read and rewrite the governed registry so previous
+approvals remain present. Legal decisions are real organizational evidence;
+Aeitron does not create them automatically.
+
+#### Reviewer identity and blindness
+
+`config/data_reviewers.json` is the governed reviewer roster. A ready roster
+requires:
+
+- two active reviewer identities with distinct identity-provider subjects;
+- one active adjudicator whose subject is distinct from both reviewers;
+- governance approver and timestamp metadata for each identity.
+
+The repository ships with an empty roster so no fictional human approval can
+unlock data. Gateway use also requires exact `data:review`,
+`data:adjudicate`, or `data:promote` scopes. Offline commands validate the same
+roster:
+
+```powershell
+python -m src.aeitron.learning.dataset_authority list `
+  --database artifacts\aeitron\dataset-authority.sqlite3 `
+  --reviewer-id REVIEWER_ID --status pending
+
+python -m src.aeitron.learning.dataset_authority claim `
+  --database artifacts\aeitron\dataset-authority.sqlite3 `
+  --reviewer-roster config\data_reviewers.json `
+  --review-item-id REVIEW_ITEM_ID --reviewer-id REVIEWER_ID
+
+python -m src.aeitron.learning.dataset_authority decide `
+  --database artifacts\aeitron\dataset-authority.sqlite3 `
+  --reviewer-roster config\data_reviewers.json `
+  --review-item-id REVIEW_ITEM_ID --reviewer-id REVIEWER_ID `
+  --decision approve --rationale "REAL REVIEW RATIONALE"
+```
+
+Reviewer two cannot read reviewer one's decision before submitting their own.
+The same identity cannot occupy both reviewer slots. Conflict requires a third
+rostered adjudicator. Every decision is bound to content hash and source
+snapshot hash; changed content invalidates the review item.
+
+#### Fresh calibration and advancement
+
+Only a `ready` preflight may run the crawler:
+
+```powershell
+python -m src.aeitron.learning.calibration_gate run `
+  --stage calibration_200 `
+  --sources config\data_sources.governed.json `
+  --protected-config config\protected_benchmarks.json `
+  --protected-manifest data\eval\protected\protected_benchmark_manifest.json `
+  --reviewer-roster config\data_reviewers.json `
+  --trust-policy config\dataset_trust_policy.json `
+  --work-dir artifacts\aeitron\calibration-200-v1 `
+  --authority-db artifacts\aeitron\dataset-authority.sqlite3
+```
+
+The work directory must be new and empty. The crawler may fetch up to twice the
+target to replace rejected records. The gate then applies strict license
+filtering, protected exact/near/structural matching, disk-backed deduplication,
+selects exactly the first 200 deterministic clean rows, records immutable
+per-source snapshots, and enqueues all high-value rows plus the routine sample.
+Every calibration sample is forced through two independent decisions.
+
+After both reviewers finish, finalize:
+
+```powershell
+python -m src.aeitron.learning.calibration_gate finalize `
+  --manifest artifacts\aeitron\calibration-200-v1\calibration_manifest.json `
+  --sources config\data_sources.governed.json `
+  --protected-manifest data\eval\protected\protected_benchmark_manifest.json `
+  --reviewer-roster config\data_reviewers.json
+```
+
+`5k_calibration_allowed` is returned only when:
+
+- all 200 final records exist;
+- every sampled record has two bound decisions;
+- sampled acceptance is at least 95%;
+- Cohen's kappa is at least 0.80;
+- average automated quality is at least 0.80;
+- no source contributes more than 20%;
+- protected contamination hits are zero;
+- source registry, reviewer roster, policy, holdout manifest, calibration rows,
+  reports, and progress log are all unchanged.
+
+An incomplete review returns `blocked`. Completed but failed quality,
+contamination, balance, or agreement checks return `failed`. Both require a new
+fresh 200-record directory after correction. Neither state allows 5k, 100k,
+tokenizer training, or GPU training.
+
+The advancement ladder is immutable and count-locked:
+
+```text
+calibration_200 (exactly 200 final rows)
+  -> passed decision SHA-256
+calibration_5k (exactly 5,000 final rows)
+  -> passed decision SHA-256
+production_100k (fixed minimum of 100,000 promoted rows)
+```
+
+Start the 5k stage only with the passed 200 decision:
+
+```powershell
+python -m src.aeitron.learning.calibration_gate run `
+  --stage calibration_5k `
+  --prior-decision artifacts\aeitron\calibration-200-v1\calibration_decision.json `
+  --sources config\data_sources.governed.json `
+  --protected-config config\protected_benchmarks.json `
+  --protected-manifest data\eval\protected\protected_benchmark_manifest.json `
+  --reviewer-roster config\data_reviewers.json `
+  --legal-evidence-dir governance\source-approvals `
+  --trust-policy config\dataset_trust_policy.json `
+  --work-dir artifacts\aeitron\calibration-5k-v1 `
+  --authority-db artifacts\aeitron\dataset-authority.sqlite3
+```
+
+Each decision binds the calibration manifest SHA-256, prior decision SHA-256,
+source registry, legal-evidence directory, reviewer roster, protected benchmark
+manifest, trust policy, every calibration artifact, and the exact Dataset
+Authority review and source-snapshot records. Validation recursively replays
+the complete chain. Missing, failed, stale, or tampered evidence fails before a
+new crawl starts. A passed 5k decision emits
+`100k_dataset_build_allowed` and must be supplied to
+`production_dataset --advancement-decision`.
+
+The normal CLI does not accept an arbitrary target count. Small engineering
+fixtures require both `--dev-test` and `--dev-test-target-records`; their
+decisions always return `repeat_current_stage` and cannot unlock 5k or 100k.
+
+The measured local protected-pack proof contains six immutable artifacts and
+a validated fingerprint index. The current ultimate training registry still
+has 17 pending/quarantine/rolling sources, and the reviewer roster intentionally
+has no real identities. Therefore the current preflight correctly blocks the
+crawl. Legal and human decisions are the remaining external actions.
 
 ## Final Rule
 

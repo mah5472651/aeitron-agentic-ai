@@ -113,15 +113,32 @@ def code_style_to_tasks(path: str | Path, *, tag: str) -> list[BenchmarkTask]:
 def cyberseceval_style_to_tasks(path: str | Path) -> list[BenchmarkTask]:
     tasks = []
     for index, row in enumerate(_load_jsonl(path)):
-        code = str(row.get("code") or row.get("content") or row.get("snippet") or "")
-        expected = row.get("expected_findings") or row.get("cwe") or row.get("vulnerability") or []
+        code = str(
+            row.get("code")
+            or row.get("origin_code")
+            or row.get("content")
+            or row.get("snippet")
+            or ""
+        )
+        expected = (
+            row.get("expected_findings")
+            or row.get("cwe")
+            or row.get("cwe_identifier")
+            or row.get("vulnerability")
+            or []
+        )
         if isinstance(expected, str):
             expected = [expected]
         tasks.append(
             BenchmarkTask(
                 task_id=str(row.get("task_id") or row.get("id") or f"security-{index}"),
                 benchmark="security_static",
-                prompt=str(row.get("prompt") or row.get("question") or "Find defensive security issues."),
+                prompt=str(
+                    row.get("prompt")
+                    or row.get("test_case_prompt")
+                    or row.get("question")
+                    or "Find defensive security issues."
+                ),
                 files={str(row.get("filename") or "snippet.txt"): code},
                 expected_findings=[str(item) for item in expected],
                 tags=["cyberseceval_style"],

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 
 from src.aeitron.learning.web_ingest import SourceSpec, allowed_url, load_sources
 from src.aeitron.shared.schemas import StrictModel
@@ -37,6 +39,68 @@ class SourceRegistryReport(StrictModel):
     quarantine_sources: int = 0
     source_snapshot_sha256: str
     warnings: list[str] = Field(default_factory=list)
+
+
+class LegalApprovalEvidence(StrictModel):
+    schema_version: Literal[1] = 1
+    approval_id: str = Field(min_length=8, max_length=160)
+    decision: Literal["approved"]
+    source_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{1,127}$")
+    registry_entry_sha256: str
+    immutable_revision: str = Field(min_length=2, max_length=256)
+    license: str = Field(min_length=2, max_length=80)
+    license_evidence_sha256: str
+    approved_use: Literal["foundation", "defensive", "authorized_lab", "evaluation_only"]
+    approved_by: str = Field(min_length=3, max_length=256)
+    approved_at: str
+    scope: Literal["training_collection", "evaluation_only"]
+    rationale: str = Field(min_length=30, max_length=4_000)
+
+    @field_validator("registry_entry_sha256", "license_evidence_sha256")
+    @classmethod
+    def validate_sha256(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
+            raise ValueError("approval hashes must be SHA-256 hex")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_timestamp_and_scope(self) -> "LegalApprovalEvidence":
+        try:
+            parsed = datetime.fromisoformat(self.approved_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("approved_at must be an RFC3339 timestamp") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("approved_at must include a timezone")
+        if self.approved_use == "evaluation_only" and self.scope != "evaluation_only":
+            raise ValueError("evaluation-only sources require evaluation_only scope")
+        if self.approved_use != "evaluation_only" and self.scope != "training_collection":
+            raise ValueError("training sources require training_collection scope")
+        return self
+
+
+class SourceApprovalRequestArtifact(StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["awaiting_legal_decision"] = "awaiting_legal_decision"
+    source_id: str
+    source_name: str
+    source_family: str
+    registry_entry_sha256: str
+    current_license: str
+    approved_use: str
+    seed_urls: list[str]
+    allowed_domains: list[str]
+    required_legal_fields: list[str]
+
+
+def source_registry_entry_sha256(source: SourceSpec) -> str:
+    payload = json.dumps(
+        source.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class SourceRegistry:
@@ -83,17 +147,6 @@ class SourceRegistry:
             else:
                 quarantine_sources += 1
                 warnings.append(f"{source.name}: source remains {source.approval_status}/{source.trust_tier}")
-            if production:
-                if source.approval_status != "approved":
-                    raise ValueError(f"{source.name}: production collection requires approval_status='approved'")
-                if source.trust_tier not in {"reviewed", "trusted"}:
-                    raise ValueError(f"{source.name}: production training source must be reviewed or trusted")
-                if source.approved_use == "evaluation_only":
-                    raise ValueError(f"{source.name}: evaluation-only source cannot enter production training collection")
-                if source.immutable_revision == "rolling":
-                    raise ValueError(f"{source.name}: production source requires an immutable_revision")
-                if source.license_evidence_sha256 is None or source.legal_approval_sha256 is None:
-                    raise ValueError(f"{source.name}: production source requires license and legal approval evidence hashes")
             if not source.allowed_domains:
                 raise ValueError(f"{source.name}: allowed_domains cannot be empty")
             categories.add(source.category)
@@ -118,7 +171,7 @@ class SourceRegistry:
         )
         import hashlib
 
-        return SourceRegistryReport(
+        report = SourceRegistryReport(
             source_count=len(self.sources),
             url_count=url_count,
             domains=sorted(domains),
@@ -128,6 +181,32 @@ class SourceRegistry:
             source_snapshot_sha256=hashlib.sha256(snapshot_payload.encode("utf-8")).hexdigest(),
             warnings=warnings,
         )
+        if production:
+            blockers = self.production_blockers()
+            if blockers:
+                raise ValueError("; ".join(blockers))
+        return report
+
+    def production_blockers(self) -> list[str]:
+        blockers: list[str] = []
+        for source in self.sources:
+            if source.approval_status != "approved":
+                blockers.append(f"{source.name}: production collection requires approval_status='approved'")
+            if source.trust_tier not in {"reviewed", "trusted"}:
+                blockers.append(f"{source.name}: production training source must be reviewed or trusted")
+            if source.approved_use == "evaluation_only":
+                blockers.append(f"{source.name}: evaluation-only source cannot enter production training collection")
+            if source.immutable_revision == "rolling":
+                blockers.append(f"{source.name}: production source requires an immutable_revision")
+            if (
+                source.license_evidence_sha256 is None
+                or source.legal_approval_sha256 is None
+                or source.approval_request_sha256 is None
+            ):
+                blockers.append(
+                    f"{source.name}: production source requires request, license, and legal approval evidence hashes"
+                )
+        return blockers
 
     def to_sources(self) -> list[SourceSpec]:
         return self.sources
@@ -163,17 +242,143 @@ class SourceRegistry:
         )
         if index is None:
             raise KeyError(source_id)
-        approved = self.sources[index].model_copy(
+        source = self.sources[index]
+        license_evidence_sha256 = file_hash(license_path)
+        try:
+            legal_payload = json.loads(legal_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"legal approval evidence must be valid JSON: {exc.msg}") from exc
+        legal_evidence = LegalApprovalEvidence.model_validate(legal_payload)
+        expected_entry_sha256 = source_registry_entry_sha256(source)
+        expected = {
+            "source_id": source.source_id,
+            "registry_entry_sha256": expected_entry_sha256,
+            "immutable_revision": immutable_revision.strip(),
+            "license": source.license.lower(),
+            "license_evidence_sha256": license_evidence_sha256,
+            "approved_use": source.approved_use,
+        }
+        actual = {
+            "source_id": legal_evidence.source_id,
+            "registry_entry_sha256": legal_evidence.registry_entry_sha256,
+            "immutable_revision": legal_evidence.immutable_revision,
+            "license": legal_evidence.license.lower(),
+            "license_evidence_sha256": legal_evidence.license_evidence_sha256,
+            "approved_use": legal_evidence.approved_use,
+        }
+        mismatches = [name for name, expected_value in expected.items() if actual[name] != expected_value]
+        if mismatches:
+            raise ValueError("legal approval evidence does not match source contract: " + ", ".join(mismatches))
+        approved = source.model_copy(
             update={
                 "immutable_revision": immutable_revision.strip(),
-                "license_evidence_sha256": file_hash(license_path),
+                "license_evidence_sha256": license_evidence_sha256,
                 "legal_approval_sha256": file_hash(legal_path),
+                "approval_request_sha256": expected_entry_sha256,
                 "trust_tier": trust_tier,
                 "approval_status": "approved",
             }
         )
         self.sources[index] = SourceSpec.model_validate(approved.model_dump())
         return self.sources[index]
+
+    def verify_approval_evidence_directory(self, evidence_dir: str | Path) -> list[str]:
+        """Re-verify stored approval claims against durable evidence files."""
+
+        root = Path(evidence_dir).resolve()
+        blockers: list[str] = []
+        for source in self.sources:
+            if source.approval_status != "approved" or source.source_id is None:
+                continue
+            source_root = (root / source.source_id).resolve()
+            if root not in source_root.parents:
+                blockers.append(f"{source.name}: evidence path escaped governance root")
+                continue
+            license_path = source_root / "license.txt"
+            legal_path = source_root / "approval.json"
+            if not license_path.is_file() or not legal_path.is_file():
+                blockers.append(
+                    f"{source.name}: expected evidence files {source.source_id}/license.txt and approval.json"
+                )
+                continue
+
+            def hash_file(path: Path) -> str:
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                return digest.hexdigest()
+
+            if hash_file(license_path) != source.license_evidence_sha256:
+                blockers.append(f"{source.name}: license evidence hash changed")
+            if hash_file(legal_path) != source.legal_approval_sha256:
+                blockers.append(f"{source.name}: legal approval evidence hash changed")
+                continue
+            try:
+                evidence = LegalApprovalEvidence.model_validate_json(legal_path.read_text(encoding="utf-8"))
+            except ValueError as exc:
+                blockers.append(f"{source.name}: invalid legal approval evidence: {exc}")
+                continue
+            expected = {
+                "source_id": source.source_id,
+                "registry_entry_sha256": source.approval_request_sha256,
+                "immutable_revision": source.immutable_revision,
+                "license": source.license.lower(),
+                "license_evidence_sha256": source.license_evidence_sha256,
+                "approved_use": source.approved_use,
+            }
+            actual = {
+                "source_id": evidence.source_id,
+                "registry_entry_sha256": evidence.registry_entry_sha256,
+                "immutable_revision": evidence.immutable_revision,
+                "license": evidence.license.lower(),
+                "license_evidence_sha256": evidence.license_evidence_sha256,
+                "approved_use": evidence.approved_use,
+            }
+            mismatches = [key for key, value in expected.items() if actual[key] != value]
+            if mismatches:
+                blockers.append(
+                    f"{source.name}: legal approval contract mismatch: {', '.join(mismatches)}"
+                )
+        return blockers
+
+    def prepare_approval_requests(self, output_dir: str | Path) -> list[Path]:
+        root = Path(output_dir).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        written: list[Path] = []
+        for source in sorted(self.sources, key=lambda item: item.source_id or ""):
+            assert source.source_id is not None
+            assert source.source_family is not None
+            artifact = SourceApprovalRequestArtifact(
+                source_id=source.source_id,
+                source_name=source.name,
+                source_family=source.source_family,
+                registry_entry_sha256=source_registry_entry_sha256(source),
+                current_license=source.license,
+                approved_use=source.approved_use,
+                seed_urls=source.urls,
+                allowed_domains=source.allowed_domains,
+                required_legal_fields=list(LegalApprovalEvidence.model_fields),
+            )
+            target = root / f"{source.source_id}.approval-request.json"
+            target.write_text(json.dumps(artifact.model_dump(mode="json"), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            written.append(target)
+        manifest = {
+            "schema_version": 1,
+            "request_count": len(written),
+            "requests": [
+                {
+                    "path": str(path),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+                for path in written
+            ],
+        }
+        (root / "approval-request-manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return written
 
     def write(self, path: str | Path) -> Path:
         target = Path(path)
@@ -195,8 +400,11 @@ def main() -> None:
     parser.add_argument("--license-evidence")
     parser.add_argument("--legal-approval")
     parser.add_argument("--trust-tier", choices=["reviewed", "trusted"], default="reviewed")
+    parser.add_argument("--prepare-approval-dir")
     args = parser.parse_args()
     registry = SourceRegistry.from_files(args.sources)
+    if args.prepare_approval_dir:
+        registry.prepare_approval_requests(args.prepare_approval_dir)
     if args.approve_source:
         required = {
             "--immutable-revision": args.immutable_revision,

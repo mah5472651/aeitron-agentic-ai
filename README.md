@@ -612,8 +612,13 @@ python -m src.aeitron.learning.production_dataset \
   --input artifacts/aeitron/data-runs/first-serious-run/clean/*.jsonl \
   --output-dir data/production/aeitron-corpus-v1 \
   --dataset-id aeitron-corpus-v1 \
+  --advancement-decision artifacts/aeitron/calibration-5k-v1/calibration_decision.json \
   --source-registry config/data_sources.governed.json \
   --trust-policy config/dataset_trust_policy.json \
+  --legal-evidence-dir governance/source-approvals \
+  --reviewer-roster config/data_reviewers.json \
+  --protected-config config/protected_benchmarks.json \
+  --protected-manifest data/eval/protected/protected_benchmark_manifest.json \
   --source-review-report artifacts/aeitron/review/review_evidence_report.json \
   --benchmark-holdout data/eval/humaneval.jsonl \
   --benchmark-holdout data/eval/mbpp.jsonl \
@@ -988,6 +993,59 @@ binds that root to a shared workspace PVC.
 The workspace UI is exposed at `http://localhost:8088`. Production ingress must
 terminate HTTPS. Profile status remains `built_not_cluster_proven` until its
 actual scheduler, topology, checkpoint reload, and scale gate pass.
+
+## Governed Data Calibration
+
+GPU training and 5k/100k crawls are blocked until the governed 200-record gate
+passes. First materialize the pinned eval-only holdouts:
+
+```powershell
+python -m src.aeitron.evaluation.benchmark_pack --materialize-protected `
+  --protected-config config\protected_benchmarks.json `
+  --target-dir data\eval\protected
+```
+
+Then run the preflight. It writes one legal approval request per source and
+reports every missing source/reviewer/holdout dependency without starting a
+crawler:
+
+```powershell
+python -m src.aeitron.learning.calibration_gate prepare `
+  --sources config\data_sources.ultimate.json `
+  --output-dir artifacts\aeitron\calibration-preflight
+```
+
+`config/data_reviewers.json` intentionally contains no invented identities.
+Governance operators must configure two independent reviewers and a separate
+adjudicator. Legal operators must approve every immutable source contract using
+the generated request hashes. Only a `ready` preflight permits:
+
+```powershell
+python -m src.aeitron.learning.calibration_gate run `
+  --stage calibration_200 `
+  --sources config\data_sources.governed.json `
+  --work-dir artifacts\aeitron\calibration-200-v1
+```
+
+The run binds its deterministic human-review sample to the Dataset Authority.
+`finalize` unlocks 5k only when all sampled records have two decisions,
+acceptance is at least 95%, Cohen's kappa is at least 0.80, average automated
+quality is at least 0.80, no source exceeds 20%, and protected contamination is
+zero. Run 5k only with the passed 200 decision:
+
+```powershell
+python -m src.aeitron.learning.calibration_gate run `
+  --stage calibration_5k `
+  --prior-decision artifacts\aeitron\calibration-200-v1\calibration_decision.json `
+  --sources config\data_sources.governed.json `
+  --work-dir artifacts\aeitron\calibration-5k-v1
+```
+
+A passed 5k decision emits `100k_dataset_build_allowed`; production dataset
+construction requires that exact hash-bound decision. Custom row counts are
+accepted only with `--dev-test --dev-test-target-records N` and can never
+authorize a governed next stage. Missing real approvals remain `blocked`; they
+are never synthesized.
 
 ## Final Rule
 

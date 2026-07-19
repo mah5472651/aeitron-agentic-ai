@@ -123,6 +123,54 @@ def _text(row: dict[str, Any]) -> str:
     )
 
 
+def _protected_texts(row: dict[str, Any]) -> list[str]:
+    """Collect every meaningful protected payload, not only the first field.
+
+    Benchmark records commonly store the prompt, reference patch, tests and
+    canonical solution in separate fields. Indexing only ``prompt`` would
+    permit reference solutions to leak into training undetected.
+    """
+
+    texts: list[str] = []
+    ignored_keys = {
+        "content_hash",
+        "created_at",
+        "created_at_unix",
+        "license",
+        "metadata",
+        "revision",
+        "sha256",
+        "source",
+        "url",
+    }
+
+    def visit(value: Any, key: str = "") -> None:
+        if key.lower() in ignored_keys:
+            return
+        if isinstance(value, str):
+            normalized = " ".join(value.split())
+            if len(normalized) >= 16:
+                texts.append(value)
+            return
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                visit(child, str(child_key))
+            return
+        if isinstance(value, list):
+            for child in value:
+                visit(child, key)
+
+    visit(row)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        digest = stable_hash(" ".join(text.split()))
+        if digest not in seen:
+            seen.add(digest)
+            unique.append(text)
+    return unique
+
+
 def _task_id(row: dict[str, Any]) -> str | None:
     value = row.get("task_id") or row.get("id") or row.get("name")
     return str(value).strip() if value not in {None, ""} else None
@@ -141,19 +189,43 @@ def _shingles(text: str, width: int = 5) -> set[str]:
 
 
 def minhash_signature(text: str) -> tuple[int, ...]:
+    """Return a linear-time one-permutation MinHash signature.
+
+    The previous implementation re-hashed every shingle 64 times. That was
+    correct but too expensive for million-row contamination scans. Here one
+    64-bit digest selects a bucket and value, followed by deterministic
+    densification for empty buckets.
+    """
+
     shingles = _shingles(text)
     if not shingles:
         return tuple([0] * MINHASH_SIZE)
-    values: list[int] = []
-    for seed in range(MINHASH_SIZE):
-        minimum = min(
-            int.from_bytes(
-                hashlib.blake2b(f"{seed}:{shingle}".encode("utf-8", "replace"), digest_size=8).digest(),
-                "big",
-            )
-            for shingle in shingles
+    maximum = (1 << 64) - 1
+    values = [maximum] * MINHASH_SIZE
+    for shingle in shingles:
+        digest = int.from_bytes(
+            hashlib.blake2b(shingle.encode("utf-8", "replace"), digest_size=8).digest(),
+            "big",
         )
-        values.append(minimum)
+        bucket = digest & (MINHASH_SIZE - 1)
+        candidate = digest >> 6
+        if candidate < values[bucket]:
+            values[bucket] = candidate
+    nonempty = [index for index, value in enumerate(values) if value != maximum]
+    if not nonempty:
+        return tuple([0] * MINHASH_SIZE)
+    for bucket, value in enumerate(values):
+        if value != maximum:
+            continue
+        source = min(nonempty, key=lambda index: (index - bucket) % MINHASH_SIZE)
+        distance = (source - bucket) % MINHASH_SIZE
+        values[bucket] = int.from_bytes(
+            hashlib.blake2b(
+                f"{distance}:{source}:{values[source]}".encode("ascii"),
+                digest_size=8,
+            ).digest(),
+            "big",
+        )
     return tuple(values)
 
 
@@ -184,33 +256,37 @@ class ProtectedBenchmarkFingerprintIndex:
         self.connection.close()
 
     def add(self, row: dict[str, Any], benchmark: str) -> None:
-        text = _text(row)
-        if not text:
+        texts = _protected_texts(row)
+        if not texts:
             return
-        digest = stable_hash(" ".join(text.split()))
-        self.connection.execute("INSERT OR IGNORE INTO protected_exact(hash,benchmark) VALUES (?,?)", (digest, benchmark))
         task_id = _task_id(row)
         if task_id:
             self.connection.execute(
                 "INSERT OR IGNORE INTO protected_task_id(task_hash,benchmark) VALUES (?,?)",
                 (stable_hash(task_id.lower()), benchmark),
             )
-        structure = normalized_structure_hash(text, _language(row))
-        if structure:
+        for text in texts:
+            digest = stable_hash(" ".join(text.split()))
             self.connection.execute(
-                "INSERT OR IGNORE INTO protected_structure(hash,benchmark) VALUES (?,?)",
-                (structure, benchmark),
+                "INSERT OR IGNORE INTO protected_exact(hash,benchmark) VALUES (?,?)",
+                (digest, benchmark),
             )
-        signature = minhash_signature(text)
-        cursor = self.connection.execute(
-            "INSERT INTO protected_signatures(benchmark,signature_json) VALUES (?,?)",
-            (benchmark, json.dumps(signature, separators=(",", ":"))),
-        )
-        signature_id = int(cursor.lastrowid)
-        self.connection.executemany(
-            "INSERT INTO protected_bands(band_key,signature_id) VALUES (?,?)",
-            [(key, signature_id) for key in _signature_band_keys(signature)],
-        )
+            structure = normalized_structure_hash(text, _language(row))
+            if structure:
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO protected_structure(hash,benchmark) VALUES (?,?)",
+                    (structure, benchmark),
+                )
+            signature = minhash_signature(text)
+            cursor = self.connection.execute(
+                "INSERT INTO protected_signatures(benchmark,signature_json) VALUES (?,?)",
+                (benchmark, json.dumps(signature, separators=(",", ":"))),
+            )
+            signature_id = int(cursor.lastrowid)
+            self.connection.executemany(
+                "INSERT INTO protected_bands(band_key,signature_id) VALUES (?,?)",
+                [(key, signature_id) for key in _signature_band_keys(signature)],
+            )
 
     def match(self, row: dict[str, Any], *, minimum_similarity: float = 0.80) -> tuple[str | None, str | None]:
         text = _text(row)
