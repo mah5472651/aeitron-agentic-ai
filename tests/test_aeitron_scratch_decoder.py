@@ -105,7 +105,8 @@ class AeitronScratchDecoderTest(unittest.TestCase):
             )
         )
         output.loss.backward()
-        self.assertIsNotNone(model.mtp_projection.weight.grad)
+        self.assertIsNotNone(model.mtp_head.fusion.weight.grad)
+        self.assertIsNotNone(model.mtp_head.block.attention.q_down.weight.grad)
         self.assertTrue(any(expert.gate_proj.weight.grad is not None for expert in model.layers[-1].mlp.routed_experts))
 
         model.eval()
@@ -121,6 +122,28 @@ class AeitronScratchDecoderTest(unittest.TestCase):
         latent, rotary = cached.past_key_values[0]
         self.assertEqual(latent.size(-1), config.kv_lora_rank)
         self.assertEqual(rotary.size(-1), config.qk_rope_head_dim)
+
+        actual_parameters = sum(parameter.numel() for parameter in model.parameters())
+        self.assertEqual(actual_parameters, config.parameter_report()["total"])
+
+    def test_mla_cache_and_input_contracts_fail_closed(self) -> None:
+        config = model_profile("tiny_moe").model_copy(update={"attention_impl": "eager"})
+        model = AeitronDecoderLM(config).eval()
+        valid = torch.randint(0, config.vocab_size, (1, 4))
+        cached = model(valid, use_cache=True)
+        self.assertIsNotNone(cached.past_key_values)
+
+        malformed = list(cached.past_key_values)
+        latent, rotary = malformed[0]
+        malformed[0] = (latent[:, :, :-1], rotary)
+        with self.assertRaisesRegex(ValueError, "latent cache"):
+            model(valid[:, :1], past_key_values=tuple(malformed), use_cache=True)
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            model(valid[:, :1], past_key_values=cached.past_key_values[:-1], use_cache=True)
+        with self.assertRaisesRegex(ValueError, "outside"):
+            model(torch.tensor([[config.vocab_size]], dtype=torch.long))
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            model(valid, labels=valid[:, :-1])
 
     def test_invalid_moe_contract_rejects_token_dropping(self) -> None:
         with self.assertRaises(ValueError):

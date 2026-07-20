@@ -37,8 +37,15 @@ from urllib.parse import urlparse
 from pydantic import Field, field_validator, model_validator
 
 from src.aeitron.learning.storage import ObjectStore, ObjectStoreConfig, S3ObjectStore, create_object_store
-from src.aeitron.model_ops.foundation import ParallelismPlan, model_profile as get_model_profile
-from src.aeitron.model_ops.production_adapters import megatron_model_arguments
+from src.aeitron.model_ops.foundation import (
+    ParallelismPlan,
+    ScratchDecoderConfig,
+    model_profile as get_model_profile,
+)
+from src.aeitron.model_ops.production_adapters import (
+    megatron_model_arguments,
+    resolve_megatron_data_prefix,
+)
 from src.aeitron.shared.schemas import StrictModel
 from src.aeitron.shared.integrity import canonical_json_text as canonical_json, sha256_file as sha256_path
 
@@ -628,7 +635,7 @@ class TrainingJobCreateRequest(StrictModel):
 
 
 class TrainingJobSpec(StrictModel):
-    schema_version: int = 1
+    schema_version: int = Field(default=2, ge=1, le=2)
     scratch_only: Literal[True] = True
     validation_only: bool = False
     profile_id: str
@@ -637,6 +644,9 @@ class TrainingJobSpec(StrictModel):
     project_id: str | None = None
     run_type: Literal["data_pipeline", "pretrain", "evaluation"]
     model_profile: str
+    model_contract: dict[str, Any] | None = None
+    model_contract_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    model_parameter_report_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     curriculum_mode: str
     scheduler: str
     distributed_strategy: str
@@ -677,6 +687,17 @@ class TrainingJobSpec(StrictModel):
 
     @model_validator(mode="after")
     def validate_and_hash(self) -> "TrainingJobSpec":
+        if self.schema_version >= 2:
+            if not self.model_contract or not self.model_contract_sha256 or not self.model_parameter_report_sha256:
+                raise ValueError("schema v2 training jobs require an immutable canonical model contract")
+            bound_model = ScratchDecoderConfig.model_validate(self.model_contract)
+            if not hmac.compare_digest(bound_model.contract_sha256(), self.model_contract_sha256):
+                raise ValueError("training job model contract hash mismatch")
+            parameter_report_sha256 = sha256_text(
+                canonical_json(bound_model.parameter_report())
+            )
+            if not hmac.compare_digest(parameter_report_sha256, self.model_parameter_report_sha256):
+                raise ValueError("training job model parameter report hash mismatch")
         if self.run_type == "pretrain":
             missing = [
                 name
@@ -711,6 +732,19 @@ class TrainingJobSpec(StrictModel):
             raise ValueError("training job spec hash mismatch")
         object.__setattr__(self, "spec_hash", calculated)
         return self
+
+    def assert_current_model_contract(self) -> ScratchDecoderConfig:
+        """Reject execution if the named runtime contract drifted after submission."""
+        current = get_model_profile(self.model_profile)
+        if self.schema_version < 2:
+            raise ValueError("legacy schema v1 jobs cannot execute without a bound model contract")
+        if not self.model_contract_sha256 or not hmac.compare_digest(
+            current.contract_sha256(), self.model_contract_sha256
+        ):
+            raise ValueError(
+                "current canonical model contract differs from the immutable training job binding"
+            )
+        return current
 
 
 class TrainingAttempt(StrictModel):
@@ -1993,6 +2027,7 @@ class RedisEventBus:
 def build_training_command(spec: TrainingJobSpec, *, output_dir: str) -> list[str]:
     """Build argv from validated fields only; no user-provided command is accepted."""
 
+    spec.assert_current_model_contract()
     if spec.run_type == "data_pipeline":
         command = [
             sys.executable,
@@ -2942,20 +2977,10 @@ class SlurmSchedulerAdapter(SchedulerAdapter):
         tokenizer_path = Path(tokenizer).expanduser().resolve()
         if not dataset_manifest.is_file() or sha256_path(dataset_manifest) != job.spec.dataset_manifest_sha256:
             raise ValueError("Megatron dataset manifest is missing or does not match its immutable checksum")
-        try:
-            manifest_payload = json.loads(dataset_manifest.read_text(encoding="utf-8-sig"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise ValueError("Megatron dataset manifest is invalid JSON") from exc
-        prefix_value = str(manifest_payload.get("megatron_data_prefix") or "")
-        data_path = Path(prefix_value).expanduser().resolve()
-        allowed_root = dataset_manifest.parent.resolve()
-        if data_path != allowed_root and allowed_root not in data_path.parents:
-            raise ValueError("Megatron data prefix must remain inside the immutable dataset directory")
-        if not data_path.with_suffix(".bin").is_file() or not data_path.with_suffix(".idx").is_file():
-            raise FileNotFoundError("Megatron data prefix must resolve to existing .bin and .idx files")
+        data_path = resolve_megatron_data_prefix(dataset_manifest)
         if not tokenizer_path.is_file() or sha256_path(tokenizer_path) != job.spec.tokenizer_sha256:
             raise ValueError("Megatron tokenizer is missing or does not match its immutable checksum")
-        profile = get_model_profile(job.spec.model_profile)
+        profile = job.spec.assert_current_model_contract()
         parallelism = job.spec.parallelism
         world_size = job.spec.resources.nodes * job.spec.resources.gpus_per_node
         topology = profile.distributed_topology_report(
@@ -3229,6 +3254,11 @@ class TrainingWorkspaceService:
                 raise ValueError("production pretraining requires metadata.dataset_promotion='promoted'")
         metadata = dict(request.metadata)
         metadata["requested_overrides"] = request.overrides
+        canonical_model = get_model_profile(profile.model_profile)
+        model_contract = canonical_model.model_dump(mode="json")
+        parameter_report_sha256 = sha256_text(
+            canonical_json(canonical_model.parameter_report())
+        )
         return TrainingJobSpec(
             profile_id=profile.profile_id,
             profile_version=profile.version,
@@ -3237,6 +3267,9 @@ class TrainingWorkspaceService:
             run_type=profile.run_type,
             validation_only=profile.dev_only,
             model_profile=profile.model_profile,
+            model_contract=model_contract,
+            model_contract_sha256=canonical_model.contract_sha256(),
+            model_parameter_report_sha256=parameter_report_sha256,
             curriculum_mode=profile.curriculum_mode,
             scheduler=profile.scheduler,
             distributed_strategy=profile.distributed_strategy,

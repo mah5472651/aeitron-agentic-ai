@@ -292,6 +292,38 @@ class MultiLatentAttention(nn.Module):  # type: ignore[misc]
         )
         self.dropout = config.dropout
 
+    def _validate_cache(
+        self,
+        cache: tuple["torch.Tensor", "torch.Tensor"],
+        *,
+        x: "torch.Tensor",
+    ) -> int:
+        if not isinstance(cache, tuple) or len(cache) != 2:
+            raise ValueError("MLA cache must be a (kv_latent, rotary_key) tuple")
+        latent, rotary = cache
+        expected_latent = (x.size(0), self.kv_rank)
+        expected_rotary = (x.size(0), 1, self.rope_dim)
+        if latent.ndim != 3 or (latent.size(0), latent.size(2)) != expected_latent:
+            raise ValueError(
+                "MLA latent cache must have shape "
+                f"[{x.size(0)}, past_sequence, {self.kv_rank}]"
+            )
+        if rotary.ndim != 4 or (rotary.size(0), rotary.size(1), rotary.size(3)) != expected_rotary:
+            raise ValueError(
+                "MLA rotary cache must have shape "
+                f"[{x.size(0)}, 1, past_sequence, {self.rope_dim}]"
+            )
+        if latent.size(1) != rotary.size(2):
+            raise ValueError("MLA latent and rotary cache sequence lengths differ")
+        if latent.device != x.device or rotary.device != x.device:
+            raise ValueError("MLA cache and hidden states must be on the same device")
+        if latent.dtype != x.dtype or rotary.dtype != x.dtype:
+            raise ValueError("MLA cache and hidden states must have the same dtype")
+        past_len = int(latent.size(1))
+        if past_len + x.size(1) > self.config.max_sequence_length:
+            raise ValueError("MLA cache plus input exceeds max_sequence_length")
+        return past_len
+
     def _mask(self, *, query_len: int, key_len: int, past_len: int, device: "torch.device") -> "torch.Tensor | None":
         if self.config.attention_window is None and past_len == 0:
             return None
@@ -329,7 +361,7 @@ class MultiLatentAttention(nn.Module):  # type: ignore[misc]
         use_cache: bool = False,
     ) -> tuple["torch.Tensor", tuple["torch.Tensor", "torch.Tensor"] | None]:
         batch, sequence, _ = x.shape
-        past_len = 0 if past_key_value is None else int(past_key_value[0].size(1))
+        past_len = 0 if past_key_value is None else self._validate_cache(past_key_value, x=x)
         q = self.q_up(self.q_norm(self.q_down(x))).view(
             batch,
             sequence,
@@ -429,10 +461,14 @@ class DroplessMixtureOfExperts(nn.Module):  # type: ignore[misc]
         original_shape = x.shape
         flat = x.reshape(-1, self.config.hidden_size)
         raw_logits = self.router(flat).float()
-        selection_scores = torch.sigmoid(raw_logits) + self.selection_bias[None, :]
+        router_probabilities = torch.sigmoid(raw_logits)
+        selection_scores = router_probabilities + self.selection_bias[None, :]
         selected = torch.topk(selection_scores, k=self.config.experts_per_token, dim=-1).indices
-        selected_logits = raw_logits.gather(1, selected)
-        weights = F.softmax(selected_logits, dim=-1).to(dtype=x.dtype)
+        selected_probabilities = router_probabilities.gather(1, selected)
+        weights = (
+            selected_probabilities
+            / selected_probabilities.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
+        ).to(dtype=x.dtype)
         output = torch.zeros_like(flat)
         counts = torch.bincount(selected.reshape(-1), minlength=self.config.num_routed_experts)
         for expert_index, expert in enumerate(self.routed_experts):
@@ -475,7 +511,13 @@ class DroplessMixtureOfExperts(nn.Module):  # type: ignore[misc]
 
 
 class DecoderBlock(nn.Module):  # type: ignore[misc]
-    def __init__(self, config: ScratchDecoderConfig, *, layer_index: int = 0) -> None:
+    def __init__(
+        self,
+        config: ScratchDecoderConfig,
+        *,
+        layer_index: int = 0,
+        force_dense: bool = False,
+    ) -> None:
         require_torch()
         super().__init__()
         self.input_norm = RMSNorm(config.hidden_size, config.norm_eps)
@@ -485,7 +527,11 @@ class DecoderBlock(nn.Module):  # type: ignore[misc]
             else CausalSelfAttention(config)
         )
         self.post_attention_norm = RMSNorm(config.hidden_size, config.norm_eps)
-        self.is_moe = config.feed_forward_architecture == "moe" and layer_index >= config.dense_layer_count
+        self.is_moe = (
+            not force_dense
+            and config.feed_forward_architecture == "moe"
+            and layer_index >= config.dense_layer_count
+        )
         self.mlp = DroplessMixtureOfExperts(config) if self.is_moe else SwiGLU(config)
 
     def forward(
@@ -511,6 +557,47 @@ class DecoderBlock(nn.Module):  # type: ignore[misc]
         return x, present, router_metrics
 
 
+class MultiTokenPredictionLayer(nn.Module):  # type: ignore[misc]
+    """Training-only next-next-token prediction transformer.
+
+    For position ``t`` the layer combines the main decoder state at ``t`` with
+    the observed token embedding at ``t + 1`` and predicts the token at
+    ``t + 2``. The prediction block is dense even when the main decoder is MoE;
+    this keeps the auxiliary route deterministic and matches the canonical
+    parameter accounting in ``ScratchDecoderConfig``.
+    """
+
+    def __init__(self, config: ScratchDecoderConfig) -> None:
+        require_torch()
+        super().__init__()
+        self.hidden_norm = RMSNorm(config.hidden_size, config.norm_eps)
+        self.next_embedding_norm = RMSNorm(config.hidden_size, config.norm_eps)
+        self.fusion = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.block = DecoderBlock(config, layer_index=0, force_dense=True)
+        self.output_norm = RMSNorm(config.hidden_size, config.norm_eps)
+
+    def forward(
+        self,
+        hidden_states: "torch.Tensor",
+        next_token_embeddings: "torch.Tensor",
+    ) -> "torch.Tensor":
+        if hidden_states.shape != next_token_embeddings.shape:
+            raise ValueError("MTP hidden states and next-token embeddings must have identical shapes")
+        fused = self.fusion(
+            torch.cat(
+                [
+                    self.hidden_norm(hidden_states),
+                    self.next_embedding_norm(next_token_embeddings),
+                ],
+                dim=-1,
+            )
+        )
+        predicted, present, router_metrics = self.block(fused, use_cache=False)
+        if present is not None or router_metrics is not None:
+            raise RuntimeError("MTP dense prediction block produced unexpected cache or router state")
+        return self.output_norm(predicted)
+
+
 class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
     def __init__(self, config: ScratchDecoderConfig) -> None:
         require_torch()
@@ -527,8 +614,8 @@ class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
         )
         self.norm = RMSNorm(config.hidden_size, config.norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.mtp_projection = (
-            nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+        self.mtp_head = (
+            MultiTokenPredictionLayer(config)
             if config.mtp_num_layers
             else None
         )
@@ -558,6 +645,19 @@ class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
     ) -> DecoderForwardOutput:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must be [batch, sequence]")
+        if input_ids.size(0) < 1 or input_ids.size(1) < 1:
+            raise ValueError("input_ids cannot contain an empty batch or sequence")
+        if input_ids.dtype not in {torch.int32, torch.int64}:
+            raise ValueError("input_ids must use an integer tensor dtype")
+        if int(input_ids.min().item()) < 0 or int(input_ids.max().item()) >= self.config.vocab_size:
+            raise ValueError("input_ids contain a token outside the configured vocabulary")
+        if labels is not None:
+            if labels.shape != input_ids.shape:
+                raise ValueError("labels must have the same shape as input_ids")
+            if labels.dtype not in {torch.int32, torch.int64}:
+                raise ValueError("labels must use an integer tensor dtype")
+        if past_key_values is not None and len(past_key_values) != len(self.layers):
+            raise ValueError("past_key_values must contain exactly one cache tuple per decoder layer")
         past_len = 0 if not past_key_values else int(past_key_values[0][0].size(-2))
         if past_len + input_ids.size(1) > self.config.max_sequence_length:
             raise ValueError("input sequence exceeds max_sequence_length")
@@ -604,8 +704,9 @@ class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
                 shift_labels.view(-1),
             )
             loss = language_model_loss
-            if self.mtp_projection is not None and labels.size(1) >= 3:
-                mtp_hidden = F.silu(self.mtp_projection(normalized[:, :-2, :]))
+            if self.mtp_head is not None and labels.size(1) >= 3:
+                next_token_embeddings = self.embed_tokens(input_ids[:, 1:-1])
+                mtp_hidden = self.mtp_head(normalized[:, :-2, :], next_token_embeddings)
                 mtp_logits = self.lm_head(mtp_hidden)
                 mtp_targets = labels[:, 2:].contiguous()
                 mtp_loss = F.cross_entropy(

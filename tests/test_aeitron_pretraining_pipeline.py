@@ -871,6 +871,16 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
             self.assertIn("--multi-latent-attention", sparse_plan.command)
             self.assertIn("--moe-router-topk", sparse_plan.command)
             self.assertIn("--expert-model-parallel-size", sparse_plan.command)
+            self.assertIn("--qk-layernorm", sparse_plan.command)
+            self.assertIn("--moe-layer-freq", sparse_plan.command)
+            self.assertIn("([0]*4+[1]*92)", sparse_plan.command)
+            self.assertIn("--moe-shared-expert-intermediate-size", sparse_plan.command)
+            self.assertIn("--moe-router-score-function", sparse_plan.command)
+            self.assertIn("sigmoid", sparse_plan.command)
+            self.assertIn("--mtp-num-layers", sparse_plan.command)
+            self.assertIn("--mtp-loss-scaling-factor", sparse_plan.command)
+            model_flags = [item for item in sparse_plan.command if item.startswith("--")]
+            self.assertEqual(len(model_flags), len(set(model_flags)))
             self.assertTrue(any(note.startswith("topology_report=") for note in sparse_plan.notes))
             with self.assertRaisesRegex(ValueError, "must be positive"):
                 build_megatron_launch_plan(

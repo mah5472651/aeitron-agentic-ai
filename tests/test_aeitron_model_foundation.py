@@ -41,6 +41,10 @@ class AeitronModelFoundationTest(unittest.TestCase):
         final = presets["aeitron-4t-moe"].parameter_report()
         self.assertTrue(final["total_target_passed"])
         self.assertTrue(final["active_target_passed"])
+        self.assertEqual(final["total"], 3_994_840_025_600)
+        self.assertEqual(final["active"], 129_520_454_144)
+        self.assertEqual(final["kv_cache_elements_per_token_per_layer"], 576)
+        self.assertLess(final["kv_cache_compression_ratio"], 0.02)
 
     def test_pretraining_readiness_requires_real_assets_and_data_gates(self) -> None:
         spec = PretrainingRunSpec(

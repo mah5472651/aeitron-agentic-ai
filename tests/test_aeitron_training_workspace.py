@@ -32,6 +32,7 @@ from src.aeitron.training_workspace import (
     TrainingEventBatch,
     TrainingEventInput,
     TrainingJobCreateRequest,
+    TrainingJobSpec,
     TrainingProfileRegistry,
     TrainingWorkspaceService,
     build_training_command,
@@ -146,11 +147,28 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
     def test_resolved_policy_recomputes_tokens_and_reaches_runtime_command(self) -> None:
         request = self.request(overrides={"steps": 2000})
         spec = self.service.resolve_spec(request)
+        self.assertEqual(spec.schema_version, 2)
+        self.assertEqual(len(spec.model_contract_sha256 or ""), 64)
+        self.assertEqual(len(spec.model_parameter_report_sha256 or ""), 64)
+        self.assertEqual(spec.model_contract["name"], "aeitron-t4-validation")
         self.assertEqual(spec.token_budget.target_tokens, 256_000)
         command = build_training_command(spec, output_dir="artifacts/aeitron/test")
         self.assertIn("--learning-rate-schedule", command)
         self.assertIn("--checkpoint-every", command)
         self.assertIn("--optimizer-beta2", command)
+
+    def test_training_job_rejects_tampered_or_drifted_model_contract(self) -> None:
+        spec = self.service.resolve_spec(self.request())
+        tampered = spec.model_dump(mode="json", exclude={"spec_hash"})
+        tampered["model_contract"]["hidden_size"] = 128
+        with self.assertRaisesRegex(ValueError, "contract hash mismatch"):
+            TrainingJobSpec.model_validate(tampered)
+
+        drifted = spec.model_copy(
+            update={"model_contract_sha256": "0" * 64}
+        )
+        with self.assertRaisesRegex(ValueError, "differs"):
+            build_training_command(drifted, output_dir="artifacts/aeitron/test")
 
     def test_synced_profile_version_is_append_only(self) -> None:
         profiles = self.service.profiles.profiles

@@ -715,7 +715,7 @@ class AeitronEnterpriseReadinessTest(unittest.TestCase):
             )
             self.assertEqual(
                 architecture.evidence["parameter_report"]["total"],
-                3_991_575_740_416,
+                3_994_840_025_600,
             )
             self.assertTrue(architecture.production_blocker)
             self.assertTrue(any(check.production_blocker for check in report.checks))

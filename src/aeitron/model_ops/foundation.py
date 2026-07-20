@@ -165,6 +165,26 @@ class ScratchDecoderConfig(StrictModel):
             + self.num_attention_heads * value * self.hidden_size
         )
 
+    def _mtp_parameters_per_layer(self) -> int:
+        """Parameters in one training-only multi-token prediction block.
+
+        The block fuses the main decoder hidden state with the embedding of the
+        next observed token, then applies one dense transformer block and an
+        output norm. Token embeddings and the language-model head are shared
+        with the main decoder and are therefore not counted a second time.
+        """
+        if not self.mtp_num_layers:
+            return 0
+        fusion_projection = 2 * self.hidden_size * self.hidden_size
+        dense_transformer = (
+            self._attention_parameters_per_layer()
+            + 3 * self.hidden_size * self.intermediate_size
+        )
+        # Hidden input norm, next-token embedding norm, two block norms, and
+        # the prediction output norm.
+        normalization = 5 * self.hidden_size
+        return fusion_projection + dense_transformer + normalization
+
     def parameter_report(self) -> dict[str, Any]:
         embedding = self.vocab_size * self.hidden_size
         attention = self.num_layers * self._attention_parameters_per_layer()
@@ -180,12 +200,23 @@ class ScratchDecoderConfig(StrictModel):
             active_experts = self.moe_layer_count * (
                 self.experts_per_token + self.num_shared_experts
             ) * expert_size
-        mtp = self.mtp_num_layers * (self.hidden_size * self.hidden_size + self.hidden_size)
+        mtp = self.mtp_num_layers * self._mtp_parameters_per_layer()
         lm_head = 0 if self.tie_word_embeddings else embedding
         total = embedding + attention + norms + dense_mlp + routed_experts + shared_experts + routers + mtp + lm_head
         active = embedding + attention + norms + dense_mlp + active_experts + routers + mtp + lm_head
         total_delta = None if self.target_total_parameters is None else (total - self.target_total_parameters) / self.target_total_parameters
         active_delta = None if self.target_active_parameters is None else (active - self.target_active_parameters) / self.target_active_parameters
+        if self.attention_architecture == "mla":
+            compressed_cache_elements = int(self.kv_lora_rank or 0) + int(self.qk_rope_head_dim or 0)
+            expanded_cache_elements = self.num_attention_heads * (
+                int(self.qk_nope_head_dim or 0)
+                + int(self.qk_rope_head_dim or 0)
+                + int(self.v_head_dim or 0)
+            )
+        else:
+            compressed_cache_elements = 2 * self.num_key_value_heads * self.head_dim
+            expanded_cache_elements = 2 * self.num_attention_heads * self.head_dim
+        cache_compression_ratio = compressed_cache_elements / max(expanded_cache_elements, 1)
         return {
             "embedding": embedding,
             "attention": attention,
@@ -205,6 +236,18 @@ class ScratchDecoderConfig(StrictModel):
             "active_target_relative_delta": active_delta,
             "total_target_passed": total_delta is None or abs(total_delta) <= 0.005,
             "active_target_passed": active_delta is None or abs(active_delta) <= 0.05,
+            "kv_cache_elements_per_token_per_layer": compressed_cache_elements,
+            "expanded_kv_elements_per_token_per_layer": expanded_cache_elements,
+            "kv_cache_compression_ratio": cache_compression_ratio,
+            "kv_cache_bf16_bytes_per_token_all_layers": (
+                compressed_cache_elements * self.num_layers * 2
+            ),
+            "bf16_parameter_bytes": total * 2,
+            "fp32_parameter_bytes": total * 4,
+            # BF16 parameters and gradients, FP32 master parameters, and two
+            # FP32 Adam moments. Activations and communication buffers vary by
+            # topology and are intentionally not hidden inside this estimate.
+            "adamw_mixed_precision_state_bytes_lower_bound": total * 16,
         }
 
     def parameter_estimate(self) -> int:

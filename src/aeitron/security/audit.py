@@ -383,7 +383,10 @@ def _run_codeql(root: Path) -> dict[str, Any]:
     # preserve the full security-extended query suite while bounding resource
     # use; larger runners can opt in to greater parallelism explicitly.
     threads = _scanner_positive_int("codeql", "threads", 1, minimum=1, maximum=64)
-    ram_mb = _scanner_positive_int("codeql", "ram_mb", 3072, minimum=1024, maximum=524_288)
+    # Keep the local default viable on an 8 GiB developer/CI worker. Larger
+    # runners should raise AEITRON_CODEQL_RAM_MB explicitly; CodeQL fails
+    # closed if the bounded process cannot complete.
+    ram_mb = _scanner_positive_int("codeql", "ram_mb", 2048, minimum=1024, maximum=524_288)
     timeout = _scanner_timeout_seconds("codeql", 3600)
     try:
         create_command = [

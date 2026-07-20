@@ -5506,10 +5506,13 @@ one training-only MTP layer
 The deterministic estimator currently reports:
 
 ```text
-total parameters: 3,991,575,740,416
-active parameters per token: 126,256,168,960
-total target delta: -0.2106064896%
-active target delta: -1.362368%
+total parameters: 3,994,840,025,600
+active parameters per token: 129,520,454,144
+total target delta: -0.12899936%
+active target delta: +1.1878548%
+compressed MLA cache elements per token/layer: 576
+expanded per-head KV elements per token/layer: 40,960
+compressed/expanded element ratio: 1.40625%
 ```
 
 Both pass the locked tolerances of 4T +/-0.5% and 128B +/-5%. The contract SHA
@@ -5527,18 +5530,24 @@ version 2:
   model construction;
 - MLA query and KV low-rank projections;
 - compressed inference cache containing latent KV plus decoupled rotary keys;
+- strict cache shape, sequence, dtype, device and configured-context checks;
 - dropless top-k MoE dispatch with FP32 routing scores;
+- sigmoid route weights normalized only across the selected top-k experts;
 - one or more always-active shared experts;
 - auxiliary-loss-free expert selection-bias updates;
 - per-layer assignment count, dropped-token count and p99/mean load metrics;
-- MTP next-next-token training loss with a configurable objective weight;
+- a training-only MTP transformer block that combines the decoder state at
+  position `t` with the observed embedding at `t+1`, applies dense
+  attention/SwiGLU processing and predicts the token at `t+2`;
 - gradient checkpointing, eager/SDPA attention and checkpoint export.
 
 The transparent expert loop is deliberately a correctness implementation, not
 the 4T throughput kernel. Megatron grouped GEMM and all-to-all dispatch own the
 distributed production path. Training aborts if any routed assignment is
 dropped and reports whether router p99 load is within the configured 1.20x
-limit.
+limit. The reference MLA cache is storage-compressed, but it expands latent KV
+for the current attention computation. It is a numerical/parity authority, not
+a claim of a fused production MLA kernel.
 
 The `1b` dense and `1b_moe` profiles are an iso-active-compute A/B gate. The MoE
 profile has approximately 5.44B total and 1.31B active parameters; it must beat
@@ -5556,9 +5565,20 @@ scaling advances.
 - node count and GPUs per node equal world size;
 - each report binds the canonical architecture SHA.
 
-The Megatron launch planner emits model dimensions, MLA ranks, MoE router
-settings, grouped GEMM, all-to-all dispatch, expert bias balancing and
-TP/PP/CP/EP arguments. A generated command remains
+The Megatron launch planner emits model dimensions, RMSNorm/SwiGLU/RoPE
+settings, MLA ranks and QK normalization, the exact
+`([0]*4+[1]*92)` dense/MoE layer pattern, shared-expert width, sigmoid top-4
+routing, grouped GEMM, all-to-all dispatch, expert bias balancing, MTP settings
+and TP/PP/CP/EP arguments. The indexed data prefix is resolved from a governed
+manifest and must remain inside that manifest directory with matching `.bin`
+and `.idx` files.
+
+Every new training job embeds the complete canonical model contract, its
+SHA-256 and the parameter-report SHA-256. Runtime command construction rejects
+the job if the named current profile no longer matches that immutable binding.
+Legacy schema-v1 jobs remain readable for audit but cannot execute.
+
+A generated command remains
 `built_not_cluster_proven` until the exact Megatron checkout, indexed dataset,
 GPU topology, NCCL/RDMA health and distributed checkpoint proof are present.
 
@@ -5620,13 +5640,24 @@ benchmark files fail rather than becoming synthetic passes.
 
 ### Honest current status
 
-The canonical contract, exact estimator, small-scale MLA/MoE/MTP reference,
-compressed-cache decode, Megatron argument mapping, 128K migration and
-long-context evaluation path are built and locally tested. The 4T system is
-still `built_not_cluster_proven`. Legal/reviewer data gates, promoted 100k and
-larger datasets, real 128K tokenizer, 1B A/B run, multi-node Megatron training,
-1M context benchmark, 4T checkpoint recovery and converted-serving parity are
-external measured work and remain blocked/not-run until their evidence exists.
+| Capability | Current evidence status | Exact meaning |
+|---|---|---|
+| Canonical 4T contract and parameter accounting | `code_complete_reference` | Deterministic contract, locked totals, cache/state estimates and actual-parameter parity on materializable profiles are locally tested. |
+| MLA compressed cache | `code_complete_reference` | Cache storage, full/cached decode parity and malformed-cache rejection are tested; fused distributed throughput is not proven. |
+| Dropless Top-4 MoE | `code_complete_reference` | No-drop routing invariant, selected sigmoid normalization, gradients and load diagnostics are tested on small profiles. |
+| MTP objective | `code_complete_reference` | A real dense prediction transformer and weighted next-next-token loss are forward/backward tested. |
+| Megatron TP/PP/DP/CP/EP adapter | `built_not_cluster_proven` | Canonical argv and topology are validated; a pinned real checkout and multi-node run are still required. |
+| 1B dense/MoE profiles | `built_not_gpu_proven` | Active-compute delta is approximately 2.25%; no governed iso-token GPU A/B result exists yet. |
+| 128K tokenizer contract | `blocked_missing_artifact` | Trainer and strict qualification gates exist; the real governed 128K tokenizer has not been produced. |
+| 1M native context | `built_not_cluster_proven` | Shape/curriculum contracts exist; no 1M distributed benchmark run exists. |
+| 5M effective context | `built_not_quality_proven` | Hierarchical retrieval contract exists; end-to-end effective-context quality is not measured yet. |
+| RULER/HELMET/RepoQA-style adapters | `code_complete_local_adapter` | Governed local-format scoring exists; these are not substitutes for official full benchmark runs. |
+
+Therefore the 4T system is not production-ready today. Legal/reviewer data
+gates, promoted 100K and larger datasets, a real 128K tokenizer, the 1B A/B
+run, multi-node Megatron training, 1M context evaluation, 4T checkpoint
+recovery and converted-serving parity are measured external work and remain
+blocked or not-run until immutable evidence exists.
 
 
 

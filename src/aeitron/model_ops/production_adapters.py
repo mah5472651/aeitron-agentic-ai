@@ -48,6 +48,37 @@ class AdapterReport(StrictModel):
         return target
 
 
+def resolve_megatron_data_prefix(manifest: str | Path) -> Path:
+    """Resolve and validate a Megatron indexed-dataset prefix from a manifest.
+
+    The prefix is constrained to the immutable manifest directory. Both
+    ``<prefix>.bin`` and ``<prefix>.idx`` must exist, preventing a launch plan
+    from silently passing a JSON manifest where Megatron expects indexed data.
+    """
+    manifest_path = Path(manifest).expanduser().resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Megatron dataset manifest not found: {manifest_path}")
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("Megatron dataset manifest is invalid JSON") from exc
+    prefix_value = payload.get("megatron_data_prefix")
+    if not isinstance(prefix_value, str) or not prefix_value.strip():
+        raise ValueError("Megatron dataset manifest must define megatron_data_prefix")
+    raw_prefix = Path(prefix_value).expanduser()
+    prefix = (
+        raw_prefix.resolve()
+        if raw_prefix.is_absolute()
+        else (manifest_path.parent / raw_prefix).resolve()
+    )
+    allowed_root = manifest_path.parent.resolve()
+    if prefix != allowed_root and allowed_root not in prefix.parents:
+        raise ValueError("Megatron data prefix must remain inside the immutable dataset directory")
+    if not prefix.with_suffix(".bin").is_file() or not prefix.with_suffix(".idx").is_file():
+        raise FileNotFoundError("Megatron data prefix must resolve to existing .bin and .idx files")
+    return prefix
+
+
 def megatron_model_arguments(profile: ScratchDecoderConfig) -> list[str]:
     """Translate one canonical model contract into Megatron-Core argv."""
     arguments = [
@@ -63,11 +94,28 @@ def megatron_model_arguments(profile: ScratchDecoderConfig) -> list[str]:
         str(profile.num_key_value_heads),
         "--vocab-size",
         str(profile.vocab_size),
+        "--normalization",
+        "RMSNorm",
+        "--norm-epsilon",
+        str(profile.norm_eps),
+        "--swiglu",
+        "--disable-bias-linear",
+        "--position-embedding-type",
+        "rope",
+        "--rotary-base",
+        str(profile.rope_theta),
+        "--rotary-percent",
+        "1.0",
     ]
+    if profile.rope_scaling_factor != 1.0:
+        arguments.extend(["--rotary-scaling-factor", str(profile.rope_scaling_factor)])
+    if not profile.tie_word_embeddings:
+        arguments.append("--untie-embeddings-and-output-weights")
     if profile.attention_architecture == "mla":
         arguments.extend(
             [
                 "--multi-latent-attention",
+                "--qk-layernorm",
                 "--q-lora-rank",
                 str(profile.q_lora_rank),
                 "--kv-lora-rank",
@@ -87,18 +135,33 @@ def megatron_model_arguments(profile: ScratchDecoderConfig) -> list[str]:
                 str(profile.num_routed_experts),
                 "--moe-router-topk",
                 str(profile.experts_per_token),
+                "--moe-layer-freq",
+                f"([0]*{profile.dense_layer_count}+[1]*{profile.moe_layer_count})",
                 "--moe-ffn-hidden-size",
                 str(profile.moe_intermediate_size),
+                "--moe-shared-expert-intermediate-size",
+                str(profile.num_shared_experts * int(profile.moe_intermediate_size or 0)),
                 "--moe-grouped-gemm",
                 "--moe-token-dispatcher-type",
                 "alltoall",
                 "--moe-router-load-balancing-type",
                 "none",
+                "--moe-router-score-function",
+                "sigmoid",
                 "--moe-aux-loss-coeff",
                 "0.0",
                 "--moe-router-enable-expert-bias",
                 "--moe-router-bias-update-rate",
                 str(profile.router_bias_update_rate),
+            ]
+        )
+    if profile.mtp_num_layers:
+        arguments.extend(
+            [
+                "--mtp-num-layers",
+                str(profile.mtp_num_layers),
+                "--mtp-loss-scaling-factor",
+                str(profile.mtp_loss_weight),
             ]
         )
     return arguments
@@ -386,8 +449,11 @@ def build_megatron_launch_plan(
     missing = []
     manifest_path = Path(manifest).expanduser().resolve()
     tokenizer_file = Path(tokenizer_path).expanduser().resolve()
-    if not manifest_path.is_file():
-        missing.append(f"manifest:{manifest}")
+    data_prefix: Path | None = None
+    try:
+        data_prefix = resolve_megatron_data_prefix(manifest_path)
+    except (FileNotFoundError, ValueError) as exc:
+        missing.append(f"dataset:{exc}")
     if not tokenizer_file.is_file():
         missing.append(f"tokenizer:{tokenizer_path}")
     pretrain = (root / "pretrain_gpt.py").resolve()
@@ -431,7 +497,7 @@ def build_megatron_launch_plan(
         "--load",
         str(output / "checkpoints"),
         "--data-path",
-        str(manifest_path),
+        str(data_prefix) if data_prefix is not None else "__missing_megatron_data_prefix__",
         "--tokenizer-type",
         "HuggingFaceTokenizer",
         "--tokenizer-model",
