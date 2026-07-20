@@ -113,7 +113,8 @@ def _bounded(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def _has_independent_review(row: dict[str, Any]) -> bool:
+def has_independent_review(row: dict[str, Any]) -> bool:
+    """Return whether two independent reviewers approved, directly or by adjudication."""
     review = row.get("human_review") if isinstance(row.get("human_review"), dict) else {}
     decisions = review.get("decisions") if isinstance(review.get("decisions"), list) else []
     reviewer_ids = {
@@ -199,7 +200,7 @@ def score_row(row: dict[str, Any], *, reputation_by_source: dict[str, dict[str, 
     elif (
         (config.require_high_value_review or config.require_governed_sources)
         and mandatory_review
-        and not _has_independent_review(row)
+        and not has_independent_review(row)
     ):
         status = "review_queue"
         reasons.append("independent_high_value_review_required")
@@ -208,7 +209,7 @@ def score_row(row: dict[str, Any], *, reputation_by_source: dict[str, dict[str, 
         config.routine_review_fraction,
         config.seed,
         f"{source}:{data_type}",
-    ) and not _has_independent_review(row):
+    ) and not has_independent_review(row):
         status = "review_queue"
         reasons.append("routine_stratified_review_sample")
     else:

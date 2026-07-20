@@ -26,6 +26,7 @@ from src.aeitron.deployment.production_qualification import (
     check_observability,
     load_json_evidence,
     validate_canary,
+    validate_scratch_training_chain,
     validate_security_review,
     validate_training_proofs,
     utc_now,
@@ -105,6 +106,143 @@ def build_report(report_id: str) -> ProductionQualificationReport:
 
 
 class AeitronProductionQualificationTest(unittest.TestCase):
+    def test_scratch_training_chain_blocks_missing_and_rejects_tampering(self) -> None:
+        missing = validate_scratch_training_chain(
+            calibration_200_decision=None,
+            calibration_5k_decision=None,
+            production_dataset_manifest=None,
+            tokenizer_audit_report=None,
+            t4_1k_training_report=None,
+            t4_10k_training_report=None,
+            maximum_age_seconds=3600,
+        )
+        self.assertEqual(missing.status, "blocked")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            common = {
+                "schema_version": 2,
+                "calibration_id": "calibration",
+                "status": "passed",
+                "dev_test": False,
+                "manifest_path": "manifest.json",
+                "manifest_sha256": "a" * 64,
+                "source_registry_sha256": "b" * 64,
+                "trust_policy_sha256": "c" * 64,
+                "reviewer_roster_sha256": "d" * 64,
+                "reviewer_qualification_sha256": "e" * 64,
+                "legal_evidence_sha256": "f" * 64,
+                "protected_manifest_sha256": "1" * 64,
+                "authority_evidence_sha256": "2" * 64,
+                "checks": {"all": True},
+                "metrics": {"records": 200},
+                "issues": [],
+                "created_at_unix": time.time(),
+            }
+            calibration_200 = root / "calibration-200.json"
+            calibration_200.write_text(
+                json.dumps(
+                    {
+                        **common,
+                        "stage": "calibration_200",
+                        "next_stage": "5k_calibration_allowed",
+                        "prior_decision_sha256": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calibration_5k = root / "calibration-5k.json"
+            calibration_5k.write_text(
+                json.dumps(
+                    {
+                        **common,
+                        "calibration_id": "calibration-5k",
+                        "stage": "calibration_5k",
+                        "next_stage": "100k_dataset_build_allowed",
+                        "prior_decision_sha256": sha256_file(calibration_200),
+                        "metrics": {"records": 5_000},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            dataset = root / "dataset.json"
+            dataset.write_text(
+                json.dumps(
+                    {
+                        "dataset_id": "foundation",
+                        "version_id": "v1",
+                        "status": "promoted",
+                        "output_dir": str(root),
+                        "dev_smoke": False,
+                        "artifacts": {},
+                        "metrics": {"promoted_records": 100_000},
+                        "issues": [],
+                        "reports": {},
+                        "advancement_decision_sha256": sha256_file(calibration_5k),
+                        "promotion_decision": {"status": "promoted"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tokenizer = root / "tokenizer-audit.json"
+            tokenizer.write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "tokenizer_path": "tokenizer.json",
+                        "shard_manifest_path": "shards.json",
+                        "vocab_size_requested": 64_000,
+                        "vocab_size_actual": 64_000,
+                        "special_tokens_missing": [],
+                        "audit_failures": [],
+                        "sample_token_counts": {},
+                        "source_rows": 100_000,
+                        "source_chars": 1_000_000,
+                        "shard_manifest": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def write_training(path: Path, steps: int) -> None:
+                path.write_text(
+                    json.dumps(
+                        {
+                            "status": "passed",
+                            "scratch_only": True,
+                            "steps": steps,
+                            "checkpoint_reload_verified": True,
+                            "model_config": {
+                                "hidden_size": 512,
+                                "num_layers": 8,
+                                "max_sequence_length": 256,
+                            },
+                            "train_losses": [7.0, 6.0],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            t4_1k = root / "t4-1k.json"
+            t4_10k = root / "t4-10k.json"
+            write_training(t4_1k, 1_000)
+            write_training(t4_10k, 10_000)
+            kwargs = {
+                "calibration_200_decision": str(calibration_200),
+                "calibration_5k_decision": str(calibration_5k),
+                "production_dataset_manifest": str(dataset),
+                "tokenizer_audit_report": str(tokenizer),
+                "t4_1k_training_report": str(t4_1k),
+                "t4_10k_training_report": str(t4_10k),
+                "maximum_age_seconds": 3600,
+            }
+            valid = validate_scratch_training_chain(**kwargs)
+            self.assertEqual(valid.status, "passed", valid.model_dump())
+            calibration_200.write_text(calibration_200.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            tampered = validate_scratch_training_chain(**kwargs)
+            self.assertEqual(tampered.status, "failed")
+            self.assertTrue(any("hash-bound" in item for item in tampered.blockers))
+
     def test_observability_requires_operator_delivery_evidence(self) -> None:
         result = asyncio.run(
             check_observability(

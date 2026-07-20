@@ -54,6 +54,7 @@ from src.aeitron.learning.source_registry import (
 from src.aeitron.shared.config_contracts import DatasetTrustPolicyContract, load_dataset_trust_policy
 from src.aeitron.shared.progress import ProgressReporter, progress_from_options
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.shared.integrity import sha256_file as _sha256_file
 
 
 CalibrationStage = Literal["calibration_200", "calibration_5k"]
@@ -185,14 +186,6 @@ class CalibrationDecision(StrictModel):
         if self.dev_test and self.next_stage != "repeat_current_stage":
             raise ValueError("dev-test decisions cannot unlock governed advancement")
         return self
-
-
-def _sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _write_json_atomic(path: str | Path, payload: StrictModel | dict[str, Any]) -> Path:

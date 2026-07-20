@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from src.aeitron.architecture_integrity import run_architecture_integrity
 from src.aeitron.db import LocalStore
 from src.aeitron.db.migration_runner import expand_psql_includes, load_migrations
 from src.aeitron.evaluation.benchmarks import BenchmarkHarness, built_in_security_tasks
@@ -43,6 +44,37 @@ from src.aeitron.verifier.runtime import VerificationRequest, VerifierRuntime, l
 
 
 class AeitronProductionHardeningTest(unittest.TestCase):
+    def test_architecture_integrity_passes_repository_and_detects_synthetic_drift(self) -> None:
+        current = run_architecture_integrity()
+        self.assertEqual(current.status, "passed", current.model_dump())
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package = root / "src" / "aeitron"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            repeated = """
+def repeated(value):
+    first = value + 1
+    second = first * 2
+    third = second - 3
+    fourth = third / 4
+    if fourth:
+        return fourth
+    return 0
+"""
+            (package / "a.py").write_text(
+                "from src.aeitron.b import repeated\n" + repeated,
+                encoding="utf-8",
+            )
+            (package / "b.py").write_text(
+                "from src.aeitron.a import repeated\n" + repeated,
+                encoding="utf-8",
+            )
+            drift = run_architecture_integrity(repository_root=root)
+            self.assertEqual(drift.status, "failed")
+            self.assertTrue(drift.duplicate_function_bodies)
+            self.assertTrue(drift.import_cycles)
+
     def test_migrations_load_and_expand_schema_include(self) -> None:
         migrations = load_migrations()
         self.assertTrue(migrations)

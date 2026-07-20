@@ -14,7 +14,7 @@ from src.aeitron.shared.config import ROOT
 from src.aeitron.shared.config_contracts import VerifierPolicyContract, load_verifier_policy_contract
 from src.aeitron.shared.schemas import StrictModel
 from src.aeitron.tools import HardenedToolExecutor, SecurityScanner, ToolExecuteRequest
-from src.aeitron.tools.runtime import project_root
+from src.aeitron.tools.policy import project_root
 
 
 SECRET_PATTERNS = [

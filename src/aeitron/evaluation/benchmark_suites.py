@@ -20,10 +20,10 @@ from src.aeitron.evaluation.benchmarks import BenchmarkHarness, BenchmarkRunRepo
 from src.aeitron.model_ops.checkpoint_compare import (
     GenerationConfig,
     _load_model,
-    _select_device,
     generate_text,
 )
 from src.aeitron.model_ops.tokenizer_pipeline import load_tokenizer
+from src.aeitron.model_ops.torch_decoder import select_torch_device
 from src.aeitron.shared.schemas import StrictModel
 from src.aeitron.tools.sandbox import (
     DockerSandboxRunner,
@@ -371,7 +371,7 @@ def run_executable_benchmark_suites(
     pass_k = config.normalized_pass_k
     if not pass_k:
         raise ValueError("no requested pass@k value fits candidates_per_task")
-    device = _select_device(config.device)
+    device = select_torch_device(config.device)
     model, _manifest = _load_model(config.checkpoint_manifest, device=device)
     tokenizer = load_tokenizer(config.tokenizer_path)
     policy = HardenedSandboxPolicy(

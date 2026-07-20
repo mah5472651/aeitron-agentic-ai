@@ -14,7 +14,7 @@ from pydantic import Field, field_validator
 from src.aeitron.db import LocalStore
 from src.aeitron.indexing import RepositoryIndexer
 from src.aeitron.shared.schemas import StrictModel
-from src.aeitron.tools.runtime import project_root
+from src.aeitron.tools.policy import project_root
 from src.aeitron.verifier import VerificationRequest, VerifierRuntime
 
 

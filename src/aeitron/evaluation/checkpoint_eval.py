@@ -12,14 +12,7 @@ from pydantic import Field
 
 from src.aeitron.evaluation.benchmarks import BenchmarkHarness, BenchmarkRunReport, built_in_security_tasks
 from src.aeitron.model_ops.foundation import CheckpointManifest, sha256_file
-from src.aeitron.shared.schemas import StrictModel
-
-
-class EvalGate(StrictModel):
-    name: str
-    status: str
-    reason: str
-    metrics: dict[str, Any] = Field(default_factory=dict)
+from src.aeitron.shared.schemas import EvaluationGate as EvalGate, StrictModel
 
 
 class CheckpointEvalReport(StrictModel):

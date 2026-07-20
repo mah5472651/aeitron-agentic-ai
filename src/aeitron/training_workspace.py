@@ -38,6 +38,7 @@ from pydantic import Field, field_validator, model_validator
 
 from src.aeitron.learning.storage import ObjectStore, ObjectStoreConfig, S3ObjectStore, create_object_store
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.shared.integrity import canonical_json_text as canonical_json, sha256_file as sha256_path
 
 
 PROFILE_PATH = Path("config/training_profiles.json")
@@ -92,20 +93,8 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def canonical_json(payload: Any) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

@@ -41,9 +41,15 @@ from src.aeitron.learning.source_budget import SourceBudgetPlan, write_source_bu
 from src.aeitron.learning.source_quality import SourceQualityReport, write_source_quality_report
 from src.aeitron.learning.source_registry import SourceRegistry, SourceRegistryReport
 from src.aeitron.learning.source_reputation import SourceReputationReport, write_source_reputation_report
-from src.aeitron.learning.training_data_gate import TrainingDataGateConfig, TrainingDataGateReport, apply_training_data_gate
+from src.aeitron.learning.training_data_gate import (
+    TrainingDataGateConfig,
+    TrainingDataGateReport,
+    apply_training_data_gate,
+    has_independent_review,
+)
 from src.aeitron.shared.config_contracts import DatasetTrustPolicyContract, load_dataset_trust_policy
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.shared.integrity import sha256_file as _sha256_file
 
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -244,14 +250,6 @@ def _write_json(path: str | Path, payload: StrictModel | dict[str, Any]) -> Path
     return target
 
 
-def _sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _hash_existing_artifacts(artifacts: dict[str, str]) -> dict[str, str]:
     hashes: dict[str, str] = {}
     for role, value in sorted(artifacts.items()):
@@ -317,31 +315,6 @@ def _source_identity(row: dict[str, Any]) -> tuple[str, str]:
     return source_id, family
 
 
-def _review_verified(row: dict[str, Any]) -> bool:
-    review = row.get("human_review") if isinstance(row.get("human_review"), dict) else {}
-    decisions = review.get("decisions") if isinstance(review.get("decisions"), list) else []
-    reviewer_ids = {
-        str(item.get("reviewer_id"))
-        for item in decisions
-        if isinstance(item, dict) and item.get("reviewer_id")
-    }
-    values = [
-        str(item.get("decision"))
-        for item in decisions
-        if isinstance(item, dict) and item.get("decision") in {"approve", "reject"}
-    ]
-    if len(reviewer_ids) < 2 or len(values) < 2:
-        return False
-    if set(values) == {"approve"}:
-        return True
-    adjudication = review.get("adjudication") if isinstance(review.get("adjudication"), dict) else {}
-    return (
-        len(set(values)) > 1
-        and adjudication.get("decision") == "approve"
-        and adjudication.get("adjudicator_id") not in reviewer_ids
-    )
-
-
 def _is_high_value(row: dict[str, Any], policy: DatasetTrustPolicyContract) -> bool:
     category = str(row.get("category") or "").lower()
     quality = row.get("quality") if isinstance(row.get("quality"), dict) else {}
@@ -400,7 +373,7 @@ def calculate_dataset_trust_metrics(
                 secret_or_pii_hits += 1
             if _is_high_value(row, policy):
                 high_value += 1
-                if _review_verified(row):
+                if has_independent_review(row):
                     high_value_reviewed += 1
             if _record_category(row) == "verified_patch":
                 verified_patches += 1

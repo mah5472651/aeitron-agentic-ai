@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import platform
 import re
@@ -35,7 +36,10 @@ from src.aeitron.deployment.production_proof import (
     run_native_serving_load_test,
     run_production_proof,
 )
-from src.aeitron.model_ops.foundation import sha256_file
+from src.aeitron.learning.calibration_gate import CalibrationDecision
+from src.aeitron.learning.production_dataset import ProductionDatasetManifest
+from src.aeitron.model_ops.tokenizer_pipeline import TokenizerAuditReport
+from src.aeitron.shared.integrity import canonical_json_bytes, sha256_file
 from src.aeitron.shared.schemas import StrictModel
 
 
@@ -45,15 +49,6 @@ HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def canonical_bytes(payload: Any) -> bytes:
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
 
 
 class LoadStagePolicy(StrictModel):
@@ -158,6 +153,7 @@ class LoadStageResult(StrictModel):
 
 class ProductionQualificationReport(StrictModel):
     schema_version: int = 1
+    authority: Literal["production_release_decision"] = "production_release_decision"
     report_id: str
     status: QualificationStatus
     mode: Literal["validation", "production"]
@@ -272,7 +268,7 @@ class ImmutableQualificationStore:
                 "signature": None,
             }
         )
-        digest = hashlib.sha256(canonical_bytes(unsigned.model_dump())).hexdigest()
+        digest = hashlib.sha256(canonical_json_bytes(unsigned.model_dump())).hexdigest()
         signature = None
         algorithm = None
         if self.signing_key:
@@ -292,7 +288,7 @@ class ImmutableQualificationStore:
         run_dir = self.root / "runs" / final.report_id
         run_dir.mkdir(parents=True, exist_ok=False)
         report_path = run_dir / "production_qualification_report.json"
-        self._write_exclusive(report_path, canonical_bytes(final.model_dump()) + b"\n")
+        self._write_exclusive(report_path, canonical_json_bytes(final.model_dump()) + b"\n")
         self._write_exclusive(
             report_path.with_suffix(".json.sha256"),
             f"{sha256_file(report_path)}  {report_path.name}\n".encode("ascii"),
@@ -305,7 +301,7 @@ class ImmutableQualificationStore:
             "report_sha256": final.report_sha256,
             "updated_at": utc_now(),
         }
-        self._write_atomic(self.root / "latest.json", canonical_bytes(pointer) + b"\n")
+        self._write_atomic(self.root / "latest.json", canonical_json_bytes(pointer) + b"\n")
         return report_path
 
     def _latest_digest(self) -> str | None:
@@ -358,7 +354,7 @@ def verify_qualification_report(
             "signature": None,
         }
     )
-    expected_digest = hashlib.sha256(canonical_bytes(unsigned.model_dump())).hexdigest()
+    expected_digest = hashlib.sha256(canonical_json_bytes(unsigned.model_dump())).hexdigest()
     if not hmac.compare_digest(expected_digest, report.report_sha256):
         raise ValueError("qualification report digest verification failed")
     if report.signature_algorithm or report.signature:
@@ -683,6 +679,144 @@ def validate_training_proofs(
             blockers=[str(exc)],
         )
         return failed, soak
+
+
+def validate_scratch_training_chain(
+    *,
+    calibration_200_decision: str | None,
+    calibration_5k_decision: str | None,
+    production_dataset_manifest: str | None,
+    tokenizer_audit_report: str | None,
+    t4_1k_training_report: str | None,
+    t4_10k_training_report: str | None,
+    maximum_age_seconds: int,
+) -> QualificationCheck:
+    paths = {
+        "calibration-200-decision": calibration_200_decision,
+        "calibration-5k-decision": calibration_5k_decision,
+        "production-dataset-manifest": production_dataset_manifest,
+        "tokenizer-audit-report": tokenizer_audit_report,
+        "t4-1k-training-report": t4_1k_training_report,
+        "t4-10k-training-report": t4_10k_training_report,
+    }
+    missing = [name for name, path in paths.items() if not path]
+    if missing:
+        return QualificationCheck(
+            subsystem="scratch_training_chain",
+            status="blocked",
+            summary="Governed 200 -> 5k -> 100k -> tokenizer -> T4 qualification chain is incomplete.",
+            blockers=[f"missing evidence: {name}" for name in missing],
+        )
+
+    bindings: dict[str, EvidenceBinding] = {}
+    blockers: list[str] = []
+    metrics: dict[str, Any] = {}
+    try:
+        for name, path in paths.items():
+            bindings[name] = bind_evidence(
+                str(path),
+                evidence_id=name,
+                maximum_age_seconds=maximum_age_seconds,
+            )
+
+        calibration_200 = CalibrationDecision.model_validate(
+            load_json_evidence(bindings["calibration-200-decision"])
+        )
+        calibration_5k = CalibrationDecision.model_validate(
+            load_json_evidence(bindings["calibration-5k-decision"])
+        )
+        dataset = ProductionDatasetManifest.model_validate(
+            load_json_evidence(bindings["production-dataset-manifest"])
+        )
+        tokenizer = TokenizerAuditReport.model_validate(
+            load_json_evidence(bindings["tokenizer-audit-report"])
+        )
+        t4_reports = {
+            "t4_1k": load_json_evidence(bindings["t4-1k-training-report"]),
+            "t4_10k": load_json_evidence(bindings["t4-10k-training-report"]),
+        }
+
+        if (
+            calibration_200.stage != "calibration_200"
+            or calibration_200.status != "passed"
+            or calibration_200.dev_test
+            or calibration_200.next_stage != "5k_calibration_allowed"
+        ):
+            blockers.append("calibration_200 decision did not unlock calibration_5k")
+        if (
+            calibration_5k.stage != "calibration_5k"
+            or calibration_5k.status != "passed"
+            or calibration_5k.dev_test
+            or calibration_5k.next_stage != "100k_dataset_build_allowed"
+        ):
+            blockers.append("calibration_5k decision did not unlock production_100k")
+        if calibration_5k.prior_decision_sha256 != bindings["calibration-200-decision"].sha256:
+            blockers.append("calibration_5k is not hash-bound to the supplied calibration_200 decision")
+
+        if dataset.status != "promoted" or dataset.dev_smoke:
+            blockers.append("production dataset manifest is not a non-smoke promoted version")
+        if int(dataset.metrics.get("promoted_records", 0)) < 100_000:
+            blockers.append("production dataset has fewer than 100,000 promoted records")
+        if dataset.advancement_decision_sha256 != bindings["calibration-5k-decision"].sha256:
+            blockers.append("production dataset is not hash-bound to the supplied calibration_5k decision")
+        if dataset.promotion_decision.get("status") != "promoted":
+            blockers.append("dataset promotion decision is not promoted")
+
+        if (
+            tokenizer.status != "passed"
+            or tokenizer.vocab_size_requested != 64_000
+            or tokenizer.vocab_size_actual != 64_000
+            or tokenizer.special_tokens_missing
+            or tokenizer.audit_failures
+        ):
+            blockers.append("64k tokenizer qualification did not pass")
+
+        required_steps = {"t4_1k": 1_000, "t4_10k": 10_000}
+        for name, payload in t4_reports.items():
+            if not isinstance(payload, dict):
+                blockers.append(f"{name} training report must be an object")
+                continue
+            model = payload.get("model_config") if isinstance(payload.get("model_config"), dict) else {}
+            if payload.get("status") not in {"passed", "early_stopped"}:
+                blockers.append(f"{name} training status did not pass")
+            if payload.get("scratch_only") is not True:
+                blockers.append(f"{name} is not scratch-only")
+            if int(payload.get("steps", 0)) < required_steps[name]:
+                blockers.append(f"{name} did not complete {required_steps[name]} measured steps")
+            if payload.get("checkpoint_reload_verified") is not True:
+                blockers.append(f"{name} checkpoint reload was not verified")
+            if (
+                int(model.get("hidden_size", 0)) < 512
+                or int(model.get("num_layers", 0)) < 8
+                or int(model.get("max_sequence_length", 0)) < 256
+            ):
+                blockers.append(f"{name} model is below the T4 technical qualification profile")
+            losses = payload.get("train_losses")
+            if not isinstance(losses, list) or not losses or any(
+                not isinstance(value, (int, float)) or not math.isfinite(float(value))
+                for value in losses
+            ):
+                blockers.append(f"{name} training loss evidence is missing or non-finite")
+
+        metrics = {
+            "calibration_200": calibration_200.status,
+            "calibration_5k": calibration_5k.status,
+            "promoted_records": int(dataset.metrics.get("promoted_records", 0)),
+            "tokenizer_vocab_size": tokenizer.vocab_size_actual,
+            "t4_1k_steps": int(t4_reports["t4_1k"].get("steps", 0)),
+            "t4_10k_steps": int(t4_reports["t4_10k"].get("steps", 0)),
+        }
+    except Exception as exc:
+        blockers.append(str(exc))
+
+    return QualificationCheck(
+        subsystem="scratch_training_chain",
+        status="passed" if not blockers else "failed",
+        summary="Hash-bound governed data, tokenizer, and T4 scratch-training advancement.",
+        evidence=list(bindings.values()),
+        metrics=metrics,
+        blockers=blockers,
+    )
 
 
 def _validate_training_proof_semantics(
@@ -1198,6 +1332,15 @@ async def run_qualification(args: argparse.Namespace) -> tuple[ProductionQualifi
         blockers=[item for stage in load_stages for item in stage.blockers],
     )
     failure, soak = validate_training_proofs(args.training_proof_report, policy=policy)
+    scratch_training_chain = validate_scratch_training_chain(
+        calibration_200_decision=args.calibration_200_decision,
+        calibration_5k_decision=args.calibration_5k_decision,
+        production_dataset_manifest=args.production_dataset_manifest,
+        tokenizer_audit_report=args.tokenizer_audit_report,
+        t4_1k_training_report=args.t4_1k_training_report,
+        t4_10k_training_report=args.t4_10k_training_report,
+        maximum_age_seconds=policy.evidence_max_age_seconds,
+    )
     observability = await check_observability(
         metrics_url=args.metrics_url,
         prometheus_url=args.prometheus_url,
@@ -1240,6 +1383,7 @@ async def run_qualification(args: argparse.Namespace) -> tuple[ProductionQualifi
         ),
         dependency_check,
         functional,
+        scratch_training_chain,
         serving_check,
         load_check,
         failure,
@@ -1301,6 +1445,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--executable-benchmark-report")
     parser.add_argument("--scorecard-report")
     parser.add_argument("--training-proof-report")
+    parser.add_argument("--calibration-200-decision")
+    parser.add_argument("--calibration-5k-decision")
+    parser.add_argument("--production-dataset-manifest")
+    parser.add_argument("--tokenizer-audit-report")
+    parser.add_argument("--t4-1k-training-report")
+    parser.add_argument("--t4-10k-training-report")
     parser.add_argument("--manual-security-review")
     parser.add_argument("--canary-report")
     parser.add_argument("--metrics-url")

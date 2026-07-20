@@ -5422,5 +5422,38 @@ The complete production command is documented in README under
 not retroactively prove the 24-hour run, 7-day run, independent review, or
 real-user canary.
 
+## Architecture Ownership and Scratch Advancement
+
+Aeitron now treats one implementation as authoritative for each shared
+cross-cutting concern:
+
+| Concern | Authority |
+|---|---|
+| Canonical file SHA-256 and canonical JSON | `shared.integrity` |
+| Versioned configuration contracts | `shared.config_contracts` |
+| Independent two-reviewer predicate | `learning.training_data_gate` |
+| Hardened host tool schemas and policy | `tools.policy` |
+| Final production release decision | `deployment.production_qualification` |
+
+Compatibility facades may preserve old imports, but they do not reimplement
+logic. `architecture_integrity` parses all Aeitron Python modules without
+importing them, builds the top-level dependency graph, fingerprints meaningful
+function bodies, and checks the ownership table. `release_gate` requires this
+report to pass in addition to tests.
+
+The final qualifier binds the data/model progression as immutable evidence.
+The 5k decision must contain the supplied 200 decision file hash. The promoted
+100k manifest must contain the supplied 5k decision file hash. The tokenizer
+audit must report exactly 64,000 requested and actual vocabulary entries with
+no missing special tokens or audit failures. T4 qualification reports must be
+scratch-only, complete at least 1,000 and 10,000 measured steps respectively,
+use at least the 512-hidden/8-layer/256-context technical profile, contain
+finite losses, and prove checkpoint reload.
+
+Missing legal approval, reviewer qualification, governed dataset decisions,
+GPU reports, native-serving evidence, live dependency proofs, soak reports, or
+canary evidence remains `blocked`. Code completion never changes those external
+facts to `passed`.
+
 
 

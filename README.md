@@ -381,6 +381,12 @@ python -m src.aeitron.deployment.production_qualification `
   --executable-benchmark-report artifacts\aeitron\executable-eval\benchmark_suites_report.json `
   --scorecard-report artifacts\aeitron\agent-scorecard\agent_scorecard.json `
   --training-proof-report artifacts\aeitron\production-proofs\production_proof_report.json `
+  --calibration-200-decision artifacts\aeitron\calibration-200-v1\calibration_decision.json `
+  --calibration-5k-decision artifacts\aeitron\calibration-5k-v1\calibration_decision.json `
+  --production-dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
+  --tokenizer-audit-report artifacts\aeitron\tokenizer-64k\tokenizer_audit_report.json `
+  --t4-1k-training-report artifacts\aeitron\t4-1k\pretrain_report.json `
+  --t4-10k-training-report artifacts\aeitron\t4-10k\pretrain_report.json `
   --manual-security-review C:\AeitronGovernance\manual-security-review.json `
   --canary-report C:\AeitronGovernance\canary-report.json `
   --metrics-url https://api.example.com/metrics `
@@ -398,6 +404,25 @@ The default capacity ladder is 10, 100, 500, then 1,000 concurrent requests.
 Each stage measures normal and SSE responses, p50/p95/p99 latency, throughput,
 error rate, status distribution, and response volume. A failed stage stops
 advancement.
+
+The qualification runner is the only component allowed to issue a
+`production_release_decision`. Individual live-proof reports are explicitly
+`evidence_only`. It verifies the complete scratch advancement chain:
+
+```text
+passed governed 200
+-> passed governed 5k, bound to the 200 decision hash
+-> promoted non-smoke 100k dataset, bound to the 5k decision hash
+-> passed exactly-64k tokenizer audit
+-> measured T4 1k and 10k scratch runs with checkpoint reload proof
+-> active native checkpoint, executable benchmarks, and repository scorecard
+```
+
+`python -m src.aeitron.architecture_integrity` statically enforces canonical
+ownership for shared integrity, config contracts, independent review, tool
+policy, and the production decision. The release gate blocks exact duplicate
+cross-module function bodies, top-level import cycles, parse errors, and
+ownership violations.
 
 The measured training proof must contain real Postgres/Redis/MinIO lifecycle,
 Qdrant persistence after controlled restart, one million ordered events,

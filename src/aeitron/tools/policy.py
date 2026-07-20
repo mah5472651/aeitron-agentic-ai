@@ -21,7 +21,6 @@ from pydantic import Field
 
 from src.aeitron.db import LocalStore
 from src.aeitron.shared.schemas import StrictModel
-from src.aeitron.tools.runtime import ToolExecuteRequest, ToolExecuteResponse, project_root
 
 
 MAX_OUTPUT_CHARS = 20_000
@@ -32,6 +31,53 @@ ALLOWED_TOOL_COMMANDS: dict[str, set[str]] = {
     "test": {"python", "python.exe", "python3", "pytest", "pytest.exe", "npm", "npm.cmd", "node", "node.exe"},
     "shell": {"python", "python.exe", "python3", "pytest", "pytest.exe", "git", "npm", "npm.cmd", "node", "node.exe"},
 }
+
+
+class ToolExecuteRequest(StrictModel):
+    project_id: str
+    run_id: str | None = None
+    tool: str = Field(pattern="^(shell|test|git_diff)$")
+    command: list[str] = Field(min_length=1)
+    timeout_ms: int = Field(default=30_000, ge=1_000, le=300_000)
+
+
+class ToolExecuteResponse(StrictModel):
+    tool_call_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    project_id: str
+    run_id: str | None = None
+    tool: str
+    status: str
+    stdout: str
+    stderr: str
+    exit_code: int | None
+    duration_ms: float
+
+
+class SandboxPolicy(StrictModel):
+    timeout_ms: int = 30_000
+    network_disabled: bool = True
+
+
+class SandboxRequest(StrictModel):
+    command: list[str] = Field(min_length=1)
+
+
+class ExecutionRequest(ToolExecuteRequest):
+    pass
+
+
+class ExecutionResult(ToolExecuteResponse):
+    pass
+
+
+def project_root(store: LocalStore, project_id: str) -> Path:
+    project = store.get_project(project_id)
+    if project is None:
+        raise KeyError(f"unknown project: {project_id}")
+    root = Path(str(project["repo_path"])).resolve()
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"project repo_path is not a directory: {root}")
+    return root
 
 
 class ResolvedCommand(StrictModel):

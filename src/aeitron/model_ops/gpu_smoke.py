@@ -9,21 +9,19 @@ from pathlib import Path
 from typing import Any
 
 from src.aeitron.model_ops.foundation import CheckpointManifest
-from src.aeitron.model_ops.torch_decoder import AeitronDecoderLM, ScratchDecoderConfig, require_torch, save_trusted_checkpoint, tiny_smoke_config
+from src.aeitron.model_ops.torch_decoder import (
+    AeitronDecoderLM,
+    ScratchDecoderConfig,
+    require_torch,
+    save_trusted_checkpoint,
+    select_torch_device,
+    tiny_smoke_config,
+)
 
 try:
     import torch
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
-
-
-def select_device(requested: str) -> "torch.device":
-    require_torch()
-    if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
-    return torch.device(requested)
 
 
 def gpu_name(device: "torch.device") -> str:
@@ -50,7 +48,7 @@ def run_scratch_gpu_smoke(
     if steps < 1:
         raise ValueError("steps must be >= 1")
     started = time.perf_counter()
-    selected_device = select_device(device)
+    selected_device = select_torch_device(device)
     torch.manual_seed(seed)
     if selected_device.type == "cuda":
         torch.cuda.manual_seed_all(seed)

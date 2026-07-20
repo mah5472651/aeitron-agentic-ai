@@ -15,6 +15,7 @@ from pydantic import Field, field_validator, model_validator
 
 from src.aeitron.learning.web_ingest import SourceSpec, allowed_url, load_sources
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.shared.integrity import sha256_file
 
 
 APPROVED_LICENSES = {
@@ -317,13 +318,6 @@ class SourceRegistry:
         if not license_path.is_file() or not legal_path.is_file():
             raise ValueError("approval evidence must be regular files")
 
-        def file_hash(path: Path) -> str:
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return digest.hexdigest()
-
         index = next(
             (position for position, source in enumerate(self.sources) if source.source_id == source_id),
             None,
@@ -331,7 +325,7 @@ class SourceRegistry:
         if index is None:
             raise KeyError(source_id)
         source = self.sources[index]
-        license_evidence_sha256 = file_hash(license_path)
+        license_evidence_sha256 = sha256_file(license_path)
         try:
             legal_payload = json.loads(legal_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
@@ -361,7 +355,7 @@ class SourceRegistry:
             update={
                 "immutable_revision": immutable_revision.strip(),
                 "license_evidence_sha256": license_evidence_sha256,
-                "legal_approval_sha256": file_hash(legal_path),
+                "legal_approval_sha256": sha256_file(legal_path),
                 "approval_request_sha256": expected_entry_sha256,
                 "trust_tier": trust_tier,
                 "approval_status": "approved",
@@ -390,16 +384,9 @@ class SourceRegistry:
                 )
                 continue
 
-            def hash_file(path: Path) -> str:
-                digest = hashlib.sha256()
-                with path.open("rb") as handle:
-                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                return digest.hexdigest()
-
-            if hash_file(license_path) != source.license_evidence_sha256:
+            if sha256_file(license_path) != source.license_evidence_sha256:
                 blockers.append(f"{source.name}: license evidence hash changed")
-            if hash_file(legal_path) != source.legal_approval_sha256:
+            if sha256_file(legal_path) != source.legal_approval_sha256:
                 blockers.append(f"{source.name}: legal approval evidence hash changed")
                 continue
             try:

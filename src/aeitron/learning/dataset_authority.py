@@ -26,6 +26,7 @@ from typing import Any, Literal, Protocol
 from pydantic import Field, field_validator, model_validator
 
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.shared.integrity import canonical_json_text as _json, sha256_file as _hash_file
 
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -132,10 +133,6 @@ def _validate_hash(value: str, name: str) -> str:
     if SHA256_RE.fullmatch(normalized) is None:
         raise ValueError(f"{name} must be SHA-256 hex")
     return normalized
-
-
-def _json(value: dict[str, Any]) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 class ReviewItemCreate(StrictModel):
@@ -2482,14 +2479,6 @@ def _write_text_atomically(output_path: str | Path, payload: str) -> Path:
     finally:
         temporary.unlink(missing_ok=True)
     return target
-
-
-def _hash_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _write_deterministic_zip_entry(

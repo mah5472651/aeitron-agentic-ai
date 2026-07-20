@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import gzip
-import hashlib
 import io
 import json
 import time
@@ -19,6 +18,7 @@ from src.aeitron.evaluation.benchmarks import built_in_security_tasks
 from src.aeitron.evaluation.benchmark_suites import BenchmarkSuiteSpec, BenchmarkSuitesReport, run_benchmark_suites
 from src.aeitron.learning.benchmark_contamination_filter import build_protected_fingerprint_index
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.shared.integrity import sha256_file as _sha256_file
 
 
 class BenchmarkPackConfig(StrictModel):
@@ -192,14 +192,6 @@ def _allowed_remote_benchmark_host(hostname: str | None) -> bool:
         return False
     host = hostname.lower()
     return host in REMOTE_BENCHMARK_DOMAINS or host.endswith(".aws.cdn.hf.co")
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _download_bytes(url: str, *, max_bytes: int = 20_000_000) -> bytes:

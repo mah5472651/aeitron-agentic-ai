@@ -13,6 +13,15 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
+class EvaluationGate(StrictModel):
+    """Shared measured gate result used by checkpoint and regression evaluators."""
+
+    name: str
+    status: str
+    reason: str
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
 class AeitronRunRequest(StrictModel):
     prompt: str = Field(min_length=1)
     workspace: str = Field(default_factory=lambda: str(Path.cwd()))

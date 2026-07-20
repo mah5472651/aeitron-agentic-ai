@@ -8,7 +8,6 @@ is attached.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
@@ -20,6 +19,7 @@ from typing import Any, Literal
 from pydantic import Field, model_validator
 
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.shared.integrity import sha256_file
 
 
 class TokenizerContract(StrictModel):
@@ -216,17 +216,6 @@ class CheckpointManifest(StrictModel):
             temp_name = handle.name
         os.replace(temp_name, target)
         return target
-
-
-def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(chunk_size)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def architecture_presets() -> dict[str, DecoderArchitectureSpec]:

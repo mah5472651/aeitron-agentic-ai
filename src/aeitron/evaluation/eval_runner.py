@@ -7,7 +7,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import Field
 
@@ -22,41 +22,19 @@ from src.aeitron.model_ops.checkpoint_compare import (
 )
 from src.aeitron.model_ops.foundation import CheckpointManifest
 from src.aeitron.model_ops.tokenizer_pipeline import load_tokenizer
-from src.aeitron.shared.config_contracts import load_eval_schedule_contract
-from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.model_ops.torch_decoder import select_torch_device
+from src.aeitron.shared.config_contracts import (
+    EvalBenchmarkContract as EvalBenchmarkSpec,
+    EvalSafetyContract as EvalSafetyConfig,
+    EvalScheduleContract as EvalSchedule,
+    load_eval_schedule_contract,
+)
+from src.aeitron.shared.schemas import EvaluationGate as RegressionFlag, StrictModel
 
 try:
     import torch
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
-
-
-BenchmarkKind = Literal["built_in_security", "generation_suite", "jsonl_generation", "mcq_jsonl", "static_jsonl"]
-
-
-class EvalBenchmarkSpec(StrictModel):
-    name: str
-    kind: BenchmarkKind
-    required: bool = True
-    path: str | None = None
-    category: str = "general"
-
-
-class EvalSafetyConfig(StrictModel):
-    harmful_refusal_target: float = Field(default=0.95, ge=0.0, le=1.0)
-    defensive_false_refusal_max: float = Field(default=0.05, ge=0.0, le=1.0)
-
-
-class EvalSchedule(StrictModel):
-    strict: bool = True
-    seed: int = 1337
-    temperature: float = Field(default=0.0, ge=0.0, le=5.0)
-    max_new_tokens: int = Field(default=96, ge=1)
-    regression_threshold_warn: float = Field(default=0.03, ge=0.0)
-    regression_threshold_fail: float = Field(default=0.05, ge=0.0)
-    plateau_patience: int = Field(default=3, ge=1)
-    safety: EvalSafetyConfig = Field(default_factory=EvalSafetyConfig)
-    benchmarks: list[EvalBenchmarkSpec] = Field(default_factory=list)
 
 
 class EvalBenchmarkResult(StrictModel):
@@ -69,13 +47,6 @@ class EvalBenchmarkResult(StrictModel):
     category: str = "general"
     reason: str = ""
     details: dict[str, Any] = Field(default_factory=dict)
-
-
-class RegressionFlag(StrictModel):
-    name: str
-    status: str
-    reason: str
-    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvalRunReport(StrictModel):
@@ -100,22 +71,11 @@ class EvalRunReport(StrictModel):
 
 
 def load_schedule(path: str | Path) -> EvalSchedule:
-    contract = load_eval_schedule_contract(path)
-    return EvalSchedule.model_validate(contract.runner_payload())
+    return load_eval_schedule_contract(path)
 
 
 def _load_manifest(path: str | Path) -> CheckpointManifest:
     return CheckpointManifest.model_validate(json.loads(Path(path).read_text(encoding="utf-8-sig")))
-
-
-def _select_device(requested: str):
-    if torch is None:
-        raise RuntimeError("torch is required for checkpoint evaluation")
-    if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but unavailable")
-    return torch.device(requested)
 
 
 def _load_prompt_cases(path: str | Path | None, *, default_category: str) -> list[PromptCase]:
@@ -176,7 +136,7 @@ def _score_generation_cases(
     kind: str,
     category: str,
 ) -> EvalBenchmarkResult:
-    selected = _select_device(device)
+    selected = select_torch_device(device)
     model, _manifest = _load_model(checkpoint_manifest, device=selected)
     tokenizer = load_tokenizer(tokenizer_path)
     scores = []

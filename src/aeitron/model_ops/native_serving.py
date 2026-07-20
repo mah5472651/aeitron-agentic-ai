@@ -26,7 +26,13 @@ from src.aeitron.identity.quota import QuotaConfig, install_quota
 from src.aeitron.model_ops.checkpoint_compare import GenerationConfig, generate_text
 from src.aeitron.model_ops.foundation import CheckpointManifest, sha256_file
 from src.aeitron.model_ops.tokenizer_pipeline import load_tokenizer
-from src.aeitron.model_ops.torch_decoder import AeitronDecoderLM, ScratchDecoderConfig, load_trusted_checkpoint, require_torch
+from src.aeitron.model_ops.torch_decoder import (
+    AeitronDecoderLM,
+    ScratchDecoderConfig,
+    load_trusted_checkpoint,
+    require_torch,
+    select_torch_device,
+)
 from src.aeitron.observability import METRICS, install_observability
 from src.aeitron.shared.schemas import StrictModel
 
@@ -79,7 +85,7 @@ class NativeServingState:
             raise FileNotFoundError(f"checkpoint model file not found: {self.checkpoint_path}")
         if not self.tokenizer_path.exists():
             raise FileNotFoundError(f"tokenizer file not found: {self.tokenizer_path}")
-        self.device = self._select_device(config.device)
+        self.device = select_torch_device(config.device)
         payload = load_trusted_checkpoint(self.checkpoint_path, map_location=self.device)
         self.payload = payload
         self.model_config = ScratchDecoderConfig.model_validate(payload["config"])
@@ -102,13 +108,6 @@ class NativeServingState:
         self._completed = 0
         self._failed = 0
         self._timed_out = 0
-
-    def _select_device(self, requested: str) -> "torch.device":
-        if requested == "auto":
-            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if requested == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but unavailable")
-        return torch.device(requested)
 
     def health(self) -> dict[str, Any]:
         payload: dict[str, Any] = {

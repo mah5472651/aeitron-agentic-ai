@@ -30,6 +30,7 @@ from pydantic import Field
 from src.aeitron.db.migration_runner import apply_migrations
 from src.aeitron.learning.storage import ObjectStoreConfig, S3ObjectStore, verify_object_store_lifecycle
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.shared.integrity import sha256_file
 from src.aeitron.training_workspace import (
     JobStatus,
     PostgresTrainingStore,
@@ -73,14 +74,6 @@ class ProductionProofReport(StrictModel):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def command_evidence(argv: list[str], *, timeout: int = 30) -> dict[str, Any]:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import random
@@ -15,6 +14,7 @@ from typing import Any, Iterable
 from pydantic import Field
 
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.shared.integrity import sha256_file
 
 
 SPECIAL_TOKENS = [
@@ -58,14 +58,6 @@ class ShardManifest(StrictModel):
     sequence_length: int
     shard_sha256: dict[str, str] = Field(default_factory=dict)
     created_at_unix: float = Field(default_factory=time.time)
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 TOKENIZER_STRESS_TEXT = """

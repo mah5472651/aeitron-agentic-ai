@@ -14,7 +14,13 @@ from pydantic import Field
 
 from src.aeitron.model_ops.foundation import CheckpointManifest
 from src.aeitron.model_ops.tokenizer_pipeline import load_tokenizer
-from src.aeitron.model_ops.torch_decoder import AeitronDecoderLM, ScratchDecoderConfig, load_trusted_checkpoint, require_torch
+from src.aeitron.model_ops.torch_decoder import (
+    AeitronDecoderLM,
+    ScratchDecoderConfig,
+    load_trusted_checkpoint,
+    require_torch,
+    select_torch_device,
+)
 from src.aeitron.shared.schemas import StrictModel
 
 try:
@@ -140,15 +146,6 @@ class CheckpointComparisonReport(StrictModel):
         json_path.write_text(json.dumps(self.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
         write_markdown(self, root / "checkpoint_comparison_report.md")
         return json_path
-
-
-def _select_device(requested: str) -> "torch.device":
-    require_torch()
-    if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but unavailable")
-    return torch.device(requested)
 
 
 def _load_manifest(path: str | Path) -> CheckpointManifest:
@@ -438,7 +435,7 @@ def evaluate_checkpoint_prompt_suite(
 
     require_torch()
     active_generation = generation_config or GenerationConfig()
-    selected = _select_device(device)
+    selected = select_torch_device(device)
     tokenizer = load_tokenizer(tokenizer_path)
     prompts = _load_prompt_suite(prompt_suite)
     if not prompts:
@@ -498,7 +495,7 @@ def compare_checkpoints(
 ) -> CheckpointComparisonReport:
     require_torch()
     active_generation = generation_config or GenerationConfig()
-    selected = _select_device(device)
+    selected = select_torch_device(device)
     tokenizer = load_tokenizer(tokenizer_path)
     prompts = _load_prompt_suite(prompt_suite)
     baseline = _evaluate_side(

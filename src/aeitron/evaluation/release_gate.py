@@ -8,6 +8,7 @@ import subprocess  # nosec B404
 import sys
 from types import SimpleNamespace
 
+from src.aeitron.architecture_integrity import run_architecture_integrity
 from src.aeitron.production_readiness import run_production_readiness
 
 
@@ -24,6 +25,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     readiness = run_production_readiness(mode="dev").model_dump()
+    architecture = run_architecture_integrity().model_dump(mode="json")
     completed = (
         SimpleNamespace(returncode=0, stdout="tests reused from parent qualification", stderr="")
         if args.skip_tests
@@ -34,11 +36,13 @@ def main() -> None:
             check=False,
         )
     )
+    passed = completed.returncode == 0 and architecture["status"] == "passed"
     print(
         json.dumps(
             {
-                "decision": "release" if completed.returncode == 0 else "block",
-                "passed": completed.returncode == 0,
+                "decision": "release" if passed else "block",
+                "passed": passed,
+                "architecture_integrity": architecture,
                 "production_readiness": readiness,
                 "stdout": completed.stdout[-4000:],
                 "stderr": completed.stderr[-4000:],
@@ -46,7 +50,7 @@ def main() -> None:
             indent=2,
         )
     )
-    raise SystemExit(completed.returncode)
+    raise SystemExit(0 if passed else 2)
 
 
 if __name__ == "__main__":

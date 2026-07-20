@@ -16,7 +16,7 @@ import statistics
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -28,9 +28,9 @@ from src.aeitron.evaluation.benchmark_pack import BenchmarkPackConfig, run_bench
 from src.aeitron.evaluation.benchmark_suites import BenchmarkSuitesReport
 from src.aeitron.identity.quota import RedisQuotaStore
 from src.aeitron.learning.storage import ObjectStoreConfig, verify_object_store_lifecycle
-from src.aeitron.model_ops.foundation import sha256_file
 from src.aeitron.security.audit import run_security_audit
 from src.aeitron.shared.config_contracts import load_active_model_contract
+from src.aeitron.shared.integrity import canonical_json_bytes, sha256_file
 from src.aeitron.shared.schemas import StrictModel
 
 
@@ -91,6 +91,7 @@ class ProductionProofConfig(StrictModel):
 
 
 class ProductionProofReport(StrictModel):
+    authority: Literal["evidence_only"] = "evidence_only"
     status: str
     mode: str
     checks: list[ProofCheckResult]
@@ -583,15 +584,6 @@ async def run_production_proof(config: ProductionProofConfig) -> ProductionProof
     return report
 
 
-def canonical_payload_bytes(payload: Any) -> bytes:
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-
-
 async def run_native_serving_load_test(
     *,
     endpoint: str,
@@ -681,7 +673,7 @@ async def run_native_serving_load_test(
                     response_bytes += (
                         len(raw_content)
                         if isinstance(raw_content, bytes)
-                        else len(canonical_payload_bytes(payload))
+                        else len(canonical_json_bytes(payload))
                     )
                     choices = payload.get("choices") or []
                     content = (

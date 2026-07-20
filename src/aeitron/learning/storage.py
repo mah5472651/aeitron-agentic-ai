@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from pydantic import Field
 
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.shared.integrity import sha256_file as file_sha256
 
 
 class StoredObject(StrictModel):
@@ -42,14 +43,6 @@ class ObjectStore(Protocol):
 
     def list_objects(self, prefix: str = "") -> list[StoredObject]:
         ...
-
-
-def file_sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 class LocalObjectStore:

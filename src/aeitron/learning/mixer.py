@@ -15,7 +15,12 @@ from pydantic import Field, model_validator
 
 from src.aeitron.learning.quality import iter_jsonl, stable_hash
 from src.aeitron.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer
-from src.aeitron.shared.config_contracts import load_mix_ratios_contract
+from src.aeitron.shared.config_contracts import (
+    CurriculumStageContract as CurriculumStage,
+    MixExperimentContract as MixExperiment,
+    MixRatiosContract as MixConfig,
+    load_mix_ratios_contract,
+)
 from src.aeitron.shared.schemas import StrictModel
 
 
@@ -69,34 +74,6 @@ OFFENSIVE_MISUSE_PATTERNS = [
     r"\bpayload\s+(?:to|that)\s+(?:execute|run|spawn|bypass)\b",
     r"\bbypass\s+(?:edr|antivirus|av|waf)\b",
 ]
-
-
-class MixExperiment(StrictModel):
-    name: str
-    ratios: dict[str, float]
-
-    @model_validator(mode="after")
-    def validate_ratios(self) -> "MixExperiment":
-        total = sum(float(value) for value in self.ratios.values())
-        if total <= 0:
-            raise ValueError("mix ratios must sum to a positive value")
-        return self
-
-
-class CurriculumStage(StrictModel):
-    name: str
-    step_fraction_end: float = Field(gt=0.0, le=1.0)
-    ratios: dict[str, float]
-
-
-class MixConfig(StrictModel):
-    seed: int = 1337
-    tokenizer_path: str | None = None
-    max_rows: int | None = Field(default=None, ge=1)
-    experiments: list[MixExperiment]
-    progressive_curriculum: list[CurriculumStage] = Field(default_factory=list)
-    holdout_policies: list[str] = Field(default_factory=lambda: ["eval_holdout", "benchmark_holdout"])
-    min_quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class MixBucketReport(StrictModel):
@@ -172,8 +149,7 @@ class ScratchInstructionMixReport(StrictModel):
 
 
 def load_mix_config(path: str | Path) -> MixConfig:
-    contract = load_mix_ratios_contract(path)
-    return MixConfig.model_validate(contract.legacy_payload())
+    return load_mix_ratios_contract(path)
 
 
 def _row_text(row: dict[str, Any]) -> str:

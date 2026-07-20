@@ -26,6 +26,7 @@ from src.aeitron.model_ops.torch_decoder import (
     model_profile,
     require_torch,
     save_trusted_checkpoint,
+    select_torch_device,
     tiny_smoke_config,
 )
 from src.aeitron.shared.progress import NullProgressReporter, ProgressReporter
@@ -450,15 +451,6 @@ def wrap_for_deepspeed(
         config=ds_config,
     )
     return engine, active_optimizer, active_scheduler
-
-
-def select_device(requested: str) -> "torch.device":
-    require_torch()
-    if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but unavailable")
-    return torch.device(requested)
 
 
 def autocast_dtype(name: str) -> "torch.dtype":
@@ -1111,7 +1103,7 @@ def run_pretraining_loop(
     resolved_warmup_steps = warmup_steps or int(steps * warmup_ratio)
     if resolved_warmup_steps >= steps:
         raise ValueError("warmup must be shorter than the training run")
-    selected = select_device(device)
+    selected = select_torch_device(device)
     runtime_versions = validate_runtime_versions(
         expected_python=expected_python_version,
         expected_pytorch=expected_pytorch_version,

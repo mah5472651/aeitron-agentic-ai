@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -25,8 +25,7 @@ from src.aeitron.indexing import ContextBuilder, RepositoryIndexer
 from src.aeitron.model_ops.backends import ModelBackend, build_active_backend
 from src.aeitron.patches import FileEdit, PatchPreviewRequest, PatchService
 from src.aeitron.planning.engine import IntentPlanningEngine, PlanningResult
-from src.aeitron.runtime.collaboration import FailureIntelligence
-from src.aeitron.runtime.engine import AgentWorkerPool
+from src.aeitron.runtime.collaboration import CriticScore as CriticArtifact, FailureIntelligence
 from src.aeitron.runtime.taskgraph import AgentRunCreateRequest, TaskGraphRuntime
 from src.aeitron.shared.schemas import StrictModel
 from src.aeitron.tools import (
@@ -35,8 +34,11 @@ from src.aeitron.tools import (
     SandboxRunRequest,
     SecurityScanner,
 )
-from src.aeitron.tools.runtime import project_root
+from src.aeitron.tools.policy import project_root
 from src.aeitron.verifier import VerificationRequest, VerifierRuntime
+
+if TYPE_CHECKING:
+    from src.aeitron.runtime.engine import AgentWorkerPool
 
 
 MAX_PATCH_FILES = 50
@@ -168,15 +170,6 @@ class PerformanceReviewArtifact(StrictModel):
     accepted: bool
     confidence: float = Field(ge=0.0, le=1.0)
     issues: list[str] = Field(default_factory=list, max_length=100)
-
-
-class CriticArtifact(StrictModel):
-    confidence: float = Field(ge=0.0, le=1.0)
-    flaws: list[str] = Field(default_factory=list, max_length=100)
-    assumptions_wrong: list[str] = Field(default_factory=list, max_length=100)
-    failure_modes: list[str] = Field(default_factory=list, max_length=100)
-    security_risks: list[str] = Field(default_factory=list, max_length=100)
-    unverified_evidence: list[str] = Field(default_factory=list, max_length=100)
 
 
 class FinalSummaryArtifact(StrictModel):
@@ -735,6 +728,8 @@ class AgentExecutionService:
                             RepositoryIndexer(self.store).index_project,
                             project_id=state.stage_project_id,
                         )
+                        from src.aeitron.runtime.engine import AgentWorkerPool
+
                         pool = AgentWorkerPool(
                             TaskGraphRuntime(self.store),
                             concurrency=request.concurrency,

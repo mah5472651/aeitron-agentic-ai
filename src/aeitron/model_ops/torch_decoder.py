@@ -88,6 +88,20 @@ def require_torch() -> None:
         raise RuntimeError("torch is required for Aeitron scratch decoder execution")
 
 
+def select_torch_device(requested: str) -> "torch.device":
+    """Resolve a requested PyTorch device with consistent CUDA fail-fast behavior."""
+    require_torch()
+    normalized = requested.strip().lower()
+    if normalized == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if normalized.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable")
+    try:
+        return torch.device(normalized)
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError(f"invalid torch device: {requested!r}") from exc
+
+
 def save_trusted_checkpoint(payload: dict[str, Any], path: str | Path) -> None:
     """Save a Aeitron-owned local training checkpoint.
 

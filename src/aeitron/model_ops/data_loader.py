@@ -14,6 +14,7 @@ from typing import Iterator
 from urllib.parse import unquote, urlparse
 
 from src.aeitron.model_ops.tokenizer_pipeline import ShardManifest, read_uint32_tokens
+from src.aeitron.shared.integrity import sha256_file
 
 
 class ArtifactCache:
@@ -30,14 +31,6 @@ class ArtifactCache:
         self.root.mkdir(parents=True, exist_ok=True)
         self.s3_endpoint_url = s3_endpoint_url
         self.lock_timeout_seconds = lock_timeout_seconds
-
-    @staticmethod
-    def _sha256(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
 
     @staticmethod
     def _local_path(uri: str) -> Path | None:
@@ -67,14 +60,14 @@ class ArtifactCache:
         if local is not None:
             if not local.is_file():
                 raise FileNotFoundError(f"training artifact does not exist: {local}")
-            if expected_sha256 and self._sha256(local) != expected_sha256:
+            if expected_sha256 and sha256_file(local) != expected_sha256:
                 raise ValueError(f"training artifact checksum mismatch: {local}")
             return local
         parsed = urlparse(value)
         if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
             raise ValueError(f"unsupported training artifact URI: {value!r}")
         target = self._target(value)
-        if target.is_file() and (not expected_sha256 or self._sha256(target) == expected_sha256):
+        if target.is_file() and (not expected_sha256 or sha256_file(target) == expected_sha256):
             return target
         lock = target.with_suffix(target.suffix + ".lock")
         deadline = time.monotonic() + self.lock_timeout_seconds
@@ -85,7 +78,7 @@ class ArtifactCache:
                 os.close(descriptor)
                 acquired = True
             except FileExistsError:
-                if target.is_file() and (not expected_sha256 or self._sha256(target) == expected_sha256):
+                if target.is_file() and (not expected_sha256 or sha256_file(target) == expected_sha256):
                     return target
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"timed out waiting for training artifact cache lock: {lock}")
@@ -96,7 +89,7 @@ class ArtifactCache:
 
             client = boto3.client("s3", endpoint_url=self.s3_endpoint_url)
             client.download_file(parsed.netloc, parsed.path.strip("/"), str(temporary))
-            digest = self._sha256(temporary)
+            digest = sha256_file(temporary)
             if expected_sha256 and digest != expected_sha256:
                 raise ValueError(f"downloaded training artifact checksum mismatch: {value}")
             with temporary.open("rb") as handle:
@@ -149,7 +142,7 @@ class TokenShardStream:
             return self.artifact_cache.materialize(path, expected_sha256=self.expected_sha256.get(path))
         local = Path(path)
         expected = self.expected_sha256.get(path)
-        if expected and ArtifactCache._sha256(local) != expected:
+        if expected and sha256_file(local) != expected:
             raise ValueError(f"training shard checksum mismatch: {path}")
         return local
 
