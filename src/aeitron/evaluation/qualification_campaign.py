@@ -33,6 +33,13 @@ from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
 
+from src.aeitron.evaluation.benchmark_pack import validate_protected_benchmark_manifest
+from src.aeitron.evaluation.benchmark_suites import (
+    BenchmarkSuiteSpec,
+    BenchmarkSuitesReport,
+    ExecutableBenchmarkConfig,
+    run_executable_benchmark_suites,
+)
 from src.aeitron.evaluation.checkpoint_eval import evaluate_checkpoint
 from src.aeitron.model_ops.checkpoint_compare import (
     CheckpointComparisonReport,
@@ -256,6 +263,8 @@ class QualificationGatePolicy(StrictModel):
     require_checkpoint_eval_pass: bool = True
     require_best_validation_checkpoint: bool = True
     require_improvement_from_stage: int = 10_000
+    require_executable_benchmark_from_stage: int = 10_000
+    minimum_executable_pass_at_1: float = Field(default=0.01, gt=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_ladder(self) -> "QualificationGatePolicy":
@@ -265,6 +274,35 @@ class QualificationGatePolicy(StrictModel):
             raise ValueError("defensive qualification ladder must be 1k, 10k, 20k, 50k, 100k")
         if self.require_improvement_from_stage not in self.stage_steps:
             raise ValueError("require_improvement_from_stage must be a qualification stage")
+        if self.require_executable_benchmark_from_stage not in self.stage_steps:
+            raise ValueError("require_executable_benchmark_from_stage must be a qualification stage")
+        return self
+
+
+class ExecutableQualificationConfig(StrictModel):
+    protected_config: str = "config/protected_benchmarks.json"
+    protected_manifest: str = "data/eval/protected/protected_benchmark_manifest.json"
+    suites: list[BenchmarkSuiteSpec] = Field(min_length=1)
+    candidates_per_task: int = Field(default=5, ge=1, le=20)
+    pass_k: list[int] = Field(default_factory=lambda: [1, 5], min_length=1)
+    max_tasks_per_suite: int = Field(default=25, ge=1, le=200)
+    sandbox_image: str = "python:3.12-slim"
+    sandbox_timeout_ms: int = Field(default=10_000, ge=100, le=300_000)
+
+    @model_validator(mode="after")
+    def validate_executable_suites(self) -> "ExecutableQualificationConfig":
+        if any(item.kind not in {"human_eval_style", "mbpp_style"} for item in self.suites):
+            raise ValueError("checkpoint executable qualification supports only HumanEval and MBPP")
+        if any(not item.required for item in self.suites):
+            raise ValueError("every checkpoint executable qualification suite must be required")
+        kinds = {item.kind for item in self.suites}
+        if kinds != {"human_eval_style", "mbpp_style"}:
+            raise ValueError("checkpoint qualification requires both HumanEval and MBPP")
+        normalized = sorted(set(self.pass_k))
+        if normalized != self.pass_k or normalized[0] != 1:
+            raise ValueError("checkpoint qualification pass_k must be unique, sorted, and start with pass@1")
+        if any(value > self.candidates_per_task for value in normalized):
+            raise ValueError("checkpoint qualification pass_k exceeds candidates_per_task")
         return self
 
 
@@ -286,6 +324,7 @@ class DefensiveCampaignConfig(StrictModel):
     early_stopping_patience: int = Field(ge=1)
     early_stopping_min_delta: float = Field(ge=0.0)
     progress_every_steps: int = Field(ge=1)
+    executable_evaluation: ExecutableQualificationConfig
     gate: QualificationGatePolicy
 
 
@@ -300,6 +339,9 @@ class QualificationStageRecord(StrictModel):
     checkpoint_eval_path: str
     checkpoint_comparison_path: str
     tokenizer_audit_path: str
+    executable_benchmark_path: str = ""
+    executable_benchmark_sha256: str = ""
+    executable_pass_at_1: float | None = Field(default=None, ge=0.0, le=1.0)
     score_delta: float
     pass_delta: int
     best_validation_loss: float
@@ -965,6 +1007,35 @@ def load_campaign_config(path: str | Path) -> DefensiveCampaignConfig:
     return DefensiveCampaignConfig.model_validate(_json_file(path))
 
 
+def _governed_executable_suites(
+    policy: ExecutableQualificationConfig,
+) -> list[BenchmarkSuiteSpec]:
+    protected_config = Path(policy.protected_config).expanduser().resolve(strict=True)
+    protected_manifest_path = Path(policy.protected_manifest).expanduser().resolve(strict=True)
+    manifest = validate_protected_benchmark_manifest(
+        protected_config,
+        protected_manifest_path,
+    )
+    manifest_root = protected_manifest_path.parent
+    governed = {
+        (manifest_root / artifact.path).resolve(strict=True): artifact
+        for artifact in manifest.artifacts
+        if artifact.train_policy == "eval_holdout"
+    }
+    resolved: list[BenchmarkSuiteSpec] = []
+    for suite in policy.suites:
+        source = Path(suite.path).expanduser().resolve(strict=True)
+        artifact = governed.get(source)
+        if artifact is None:
+            raise ValueError(
+                f"executable suite {suite.name!r} is not bound to the protected benchmark manifest"
+            )
+        if sha256_file(source) != artifact.sha256:
+            raise ValueError(f"protected executable suite hash changed: {suite.name}")
+        resolved.append(suite.model_copy(update={"path": str(source)}))
+    return resolved
+
+
 def _load_or_create_state(
     *,
     state_path: Path,
@@ -1108,6 +1179,8 @@ def decide_stage(
     checkpoint_eval_path: Path,
     checkpoint_comparison_path: Path,
     tokenizer_audit_path: Path,
+    executable_benchmark: BenchmarkSuitesReport | None = None,
+    executable_benchmark_path: Path | None = None,
 ) -> QualificationStageRecord:
     failures: list[str] = []
     if training_report.get("status") not in {"passed", "early_stopped"}:
@@ -1140,6 +1213,30 @@ def decide_stage(
     improvement_required = target_curriculum_steps >= policy.require_improvement_from_stage
     if improvement_required and comparison.score_delta < policy.minimum_score_improvement:
         failures.append("minimum_score_improvement_not_met")
+    executable_required = (
+        target_curriculum_steps >= policy.require_executable_benchmark_from_stage
+    )
+    executable_pass_at_1: float | None = None
+    if executable_benchmark is not None:
+        measured = [
+            suite.pass_at_k.get("pass@1", 0.0)
+            for suite in executable_benchmark.suites
+            if suite.status != "skipped"
+        ]
+        executable_pass_at_1 = min(measured) if measured else 0.0
+        if (
+            executable_benchmark.status != "passed"
+            or executable_benchmark.evaluation_mode != "executable_model"
+            or not measured
+            or any(suite.status != "passed" for suite in executable_benchmark.suites)
+        ):
+            failures.append("executable_benchmark_failed")
+        elif executable_pass_at_1 < policy.minimum_executable_pass_at_1:
+            failures.append("minimum_executable_pass_at_1_not_met")
+    elif executable_required:
+        failures.append("executable_benchmark_missing")
+    if executable_required and executable_benchmark_path is None:
+        failures.append("executable_benchmark_artifact_missing")
     promotion_allowed = not failures
     status: StageStatus = "qualified" if promotion_allowed else "completed_not_promoted"
     return QualificationStageRecord(
@@ -1153,6 +1250,13 @@ def decide_stage(
         checkpoint_eval_path=str(checkpoint_eval_path),
         checkpoint_comparison_path=str(checkpoint_comparison_path),
         tokenizer_audit_path=str(tokenizer_audit_path),
+        executable_benchmark_path=str(executable_benchmark_path or ""),
+        executable_benchmark_sha256=(
+            sha256_file(executable_benchmark_path)
+            if executable_benchmark_path and executable_benchmark_path.is_file()
+            else ""
+        ),
+        executable_pass_at_1=executable_pass_at_1,
         score_delta=comparison.score_delta,
         pass_delta=comparison.pass_delta,
         best_validation_loss=best_loss,
@@ -1277,6 +1381,25 @@ def run_defensive_stage(
         device=device,
         generation_config=GenerationConfig(max_new_tokens=128),
     )
+    executable_report: BenchmarkSuitesReport | None = None
+    executable_report_path: Path | None = None
+    if target_curriculum_steps >= config.gate.require_executable_benchmark_from_stage:
+        executable_root = stage_root / "executable-benchmark"
+        executable_report = run_executable_benchmark_suites(
+            _governed_executable_suites(config.executable_evaluation),
+            ExecutableBenchmarkConfig(
+                checkpoint_manifest=str(best_manifest),
+                tokenizer_path=str(tokenizer_source),
+                device=device,
+                candidates_per_task=config.executable_evaluation.candidates_per_task,
+                pass_k=config.executable_evaluation.pass_k,
+                max_tasks_per_suite=config.executable_evaluation.max_tasks_per_suite,
+                sandbox_image=config.executable_evaluation.sandbox_image,
+                sandbox_timeout_ms=config.executable_evaluation.sandbox_timeout_ms,
+                minimum_pass_at_1=config.gate.minimum_executable_pass_at_1,
+            ),
+        )
+        executable_report_path = executable_report.write(executable_root).resolve(strict=True)
     record = decide_stage(
         target_curriculum_steps=target_curriculum_steps,
         global_target_steps=global_target,
@@ -1289,6 +1412,8 @@ def run_defensive_stage(
         checkpoint_eval_path=eval_root / "checkpoint_eval_report.json",
         checkpoint_comparison_path=compare_root / "checkpoint_comparison_report.json",
         tokenizer_audit_path=audit_path,
+        executable_benchmark=executable_report,
+        executable_benchmark_path=executable_report_path,
     )
     state.stages.append(record)
     state.updated_at_unix = time.time()
@@ -1347,9 +1472,39 @@ def write_campaign_plan(*, config_path: str | Path, output_dir: str | Path) -> P
                 "target_curriculum_steps": steps,
                 "requires_previous_promotion": index > 0,
                 "requires_measured_improvement": steps >= config.gate.require_improvement_from_stage,
+                "requires_executable_benchmark": (
+                    steps >= config.gate.require_executable_benchmark_from_stage
+                ),
+                "minimum_executable_pass_at_1": (
+                    config.gate.minimum_executable_pass_at_1
+                    if steps >= config.gate.require_executable_benchmark_from_stage
+                    else None
+                ),
             }
             for index, steps in enumerate(config.gate.stage_steps)
         ],
+        "executable_evaluation": {
+            "protected_config": str(
+                Path(config.executable_evaluation.protected_config).resolve(strict=True)
+            ),
+            "protected_config_sha256": sha256_file(
+                Path(config.executable_evaluation.protected_config).resolve(strict=True)
+            ),
+            "protected_manifest": str(
+                Path(config.executable_evaluation.protected_manifest).resolve(strict=True)
+            ),
+            "protected_manifest_sha256": sha256_file(
+                Path(config.executable_evaluation.protected_manifest).resolve(strict=True)
+            ),
+            "suites": [
+                suite.model_dump() for suite in _governed_executable_suites(
+                    config.executable_evaluation
+                )
+            ],
+            "candidates_per_task": config.executable_evaluation.candidates_per_task,
+            "pass_k": config.executable_evaluation.pass_k,
+            "max_tasks_per_suite": config.executable_evaluation.max_tasks_per_suite,
+        },
         "failure_path": [
             "stop progression",
             "inspect tokenizer audit and generation collapse",

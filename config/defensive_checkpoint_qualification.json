@@ -16,6 +16,32 @@
   "early_stopping_patience": 8,
   "early_stopping_min_delta": 0.0001,
   "progress_every_steps": 10,
+  "executable_evaluation": {
+    "protected_config": "config/protected_benchmarks.json",
+    "protected_manifest": "data/eval/protected/protected_benchmark_manifest.json",
+    "suites": [
+      {
+        "name": "humaneval",
+        "kind": "human_eval_style",
+        "path": "data/eval/protected/humaneval.jsonl",
+        "required": true
+      },
+      {
+        "name": "mbpp",
+        "kind": "mbpp_style",
+        "path": "data/eval/protected/mbpp.jsonl",
+        "required": true
+      }
+    ],
+    "candidates_per_task": 5,
+    "pass_k": [
+      1,
+      5
+    ],
+    "max_tasks_per_suite": 25,
+    "sandbox_image": "python:3.12-slim",
+    "sandbox_timeout_ms": 10000
+  },
   "gate": {
     "stage_steps": [
       1000,
@@ -32,6 +58,8 @@
     "require_tokenizer_audit_pass": true,
     "require_checkpoint_eval_pass": true,
     "require_best_validation_checkpoint": true,
-    "require_improvement_from_stage": 10000
+    "require_improvement_from_stage": 10000,
+    "require_executable_benchmark_from_stage": 10000,
+    "minimum_executable_pass_at_1": 0.01
   }
 }

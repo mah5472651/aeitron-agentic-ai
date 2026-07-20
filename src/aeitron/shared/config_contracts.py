@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -283,6 +284,7 @@ class ActiveModelProfileContract(StrictModel):
     requires_cuda: bool = False
     dev_only: bool = False
     scratch_only: bool = True
+    evidence: dict[str, str] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -296,6 +298,20 @@ class ActiveModelProfileContract(StrictModel):
                 raise ValueError("production model profile requires endpoint or checkpoint_manifest")
             if self.checkpoint_manifest and not self.tokenizer_path:
                 raise ValueError("checkpoint profile requires tokenizer_path")
+            if self.checkpoint_manifest:
+                required = {
+                    "checkpoint_manifest_sha256",
+                    "tokenizer_sha256",
+                    "evaluation_report_sha256",
+                }
+                missing = sorted(required - set(self.evidence))
+                if missing:
+                    raise ValueError(
+                        "checkpoint profile is missing activation evidence: " + ", ".join(missing)
+                    )
+                for key in required:
+                    if not re.fullmatch(r"[0-9a-f]{64}", self.evidence[key]):
+                        raise ValueError(f"checkpoint profile evidence {key} is not a SHA-256 digest")
         return self
 
 

@@ -18,6 +18,7 @@ from src.aeitron.model_ops.foundation import (
     TrainingDataContract,
     architecture_presets,
     foundation_status,
+    sha256_file,
 )
 
 
@@ -179,6 +180,14 @@ class AeitronModelFoundationTest(unittest.TestCase):
                     "regression_count": 0,
                     "average_confidence": 0.95,
                     "average_score": 1.0,
+                    "model_backend": "aeitron_serving",
+                    "model_evidence": {
+                        "checkpoint_manifest_sha256": sha256_file(manifest_path),
+                        "tokenizer_sha256": sha256_file(tokenizer_path),
+                        "evaluation_report_sha256": sha256_file(evaluation_path),
+                        "active_profile_sha256": "f" * 64,
+                        "serving_identity_sha256": "e" * 64,
+                    },
                     "tasks": [{**score_task, "task_id": f"task-{index}"} for index in range(50)],
                     "failures": [],
                 }
@@ -250,6 +259,24 @@ class AeitronModelFoundationTest(unittest.TestCase):
                 promotion_mode="production",
             )
             self.assertEqual(contract.production_blockers, [])
+
+    def test_production_promotion_rejects_scorecard_from_another_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, tokenizer, evaluation, scorecard = self._promotion_evidence(root)
+            payload = json.loads(scorecard.read_text(encoding="utf-8"))
+            payload["model_evidence"]["checkpoint_manifest_sha256"] = "0" * 64
+            scorecard.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "scorecard is not bound"):
+                promote_scratch_checkpoint(
+                    checkpoint_manifest=manifest,
+                    tokenizer_path=tokenizer,
+                    evaluation_report=evaluation,
+                    scorecard_report=scorecard,
+                    output_path=root / "mismatched-scorecard.json",
+                    endpoint="https://serving.example/v1",
+                    promotion_mode="production",
+                )
 
     def test_checkpoint_promotion_rejects_static_evaluation_and_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

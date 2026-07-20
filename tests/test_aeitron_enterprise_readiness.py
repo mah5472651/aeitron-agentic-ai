@@ -10,6 +10,10 @@ from unittest.mock import patch
 from src.aeitron.deployment.k8s_validate import validate_manifests
 from src.aeitron.deployment.production_proof import (
     ProductionProofConfig,
+    _check_qdrant,
+    _check_serving_health,
+    _check_serving_load,
+    _validated_service_url,
     run_native_serving_load_test,
     run_production_proof,
 )
@@ -89,7 +93,7 @@ class AeitronEnterpriseReadinessTest(unittest.TestCase):
             self.assertEqual(report.status, "passed")
             self.assertEqual(checks["object_store_lifecycle"].status, "passed")
             self.assertEqual(checks["postgres_migrations"].status, "skipped")
-            self.assertEqual(checks["qdrant_health"].status, "skipped")
+            self.assertEqual(checks["qdrant_round_trip"].status, "skipped")
             self.assertTrue((root / "proof" / "production_proof_report.json").exists())
 
     def test_production_proof_strict_mode_fails_without_required_infra(self) -> None:
@@ -114,7 +118,11 @@ class AeitronEnterpriseReadinessTest(unittest.TestCase):
                 return None
 
             def json(self) -> dict[str, object]:
-                return {"choices": [{"message": {"content": "ok"}}]}
+                return {
+                    "model": "aeitron-scratch",
+                    "choices": [{"message": {"content": "ok"}}],
+                    "aeitron": {"scratch_only": True},
+                }
 
         class FakeClient:
             def __init__(self, *args: object, **kwargs: object) -> None:
@@ -144,6 +152,270 @@ class AeitronEnterpriseReadinessTest(unittest.TestCase):
         self.assertEqual(report.status, "passed")
         self.assertEqual(report.passed, 5)
         self.assertEqual(report.failed, 0)
+
+    def test_qdrant_proof_is_transactional_and_cleans_up(self) -> None:
+        state: dict[str, object] = {"deleted": False}
+
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object] | None = None, status_code: int = 200) -> None:
+                self.payload = payload or {"result": True}
+                self.status_code = status_code
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+            def json(self) -> dict[str, object]:
+                return self.payload
+
+        class FakeClient:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                return None
+
+            async def __aenter__(self) -> "FakeClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def put(self, url: str, **kwargs: object) -> FakeResponse:
+                payload = kwargs.get("json")
+                if isinstance(payload, dict) and "points" in payload:
+                    point = payload["points"][0]
+                    state["point"] = point
+                return FakeResponse()
+
+            async def post(self, url: str, **kwargs: object) -> FakeResponse:
+                point = state["point"]
+                return FakeResponse({"result": {"points": [point]}})
+
+            async def delete(self, url: str, **kwargs: object) -> FakeResponse:
+                state["deleted"] = True
+                return FakeResponse(status_code=int(state.get("delete_status", 200)))
+
+        with patch("src.aeitron.deployment.production_proof.httpx.AsyncClient", FakeClient):
+            result = asyncio.run(
+                _check_qdrant(
+                    ProductionProofConfig(
+                        qdrant_url="http://qdrant.internal:6333",
+                        allowed_insecure_service_hosts=["qdrant.internal"],
+                    )
+                )
+            )
+        self.assertEqual(result.status, "passed")
+        self.assertTrue(state["deleted"])
+        self.assertTrue(result.details["query_verified"])
+        state["delete_status"] = 500
+        with patch("src.aeitron.deployment.production_proof.httpx.AsyncClient", FakeClient):
+            cleanup_failed = asyncio.run(
+                _check_qdrant(
+                    ProductionProofConfig(
+                        qdrant_url="http://qdrant.internal:6333",
+                        allowed_insecure_service_hosts=["qdrant.internal"],
+                    )
+                )
+            )
+        self.assertEqual(cleanup_failed.status, "failed")
+        self.assertIn("cleanup returned HTTP 500", cleanup_failed.error)
+
+    def test_native_serving_load_test_validates_sse_completion(self) -> None:
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "model": "aeitron-scratch",
+                    "choices": [{"message": {"content": "safe output"}}],
+                    "aeitron": {"scratch_only": True},
+                }
+
+        class FakeStream(FakeResponse):
+            async def __aenter__(self) -> "FakeStream":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def aiter_lines(self):
+                yield (
+                    'data: {"model":"aeitron-scratch","choices":'
+                    '[{"delta":{"content":"safe "}}]}'
+                )
+                yield "data: [DONE]"
+
+        class FakeClient:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                return None
+
+            async def __aenter__(self) -> "FakeClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def post(self, *args: object, **kwargs: object) -> FakeResponse:
+                return FakeResponse()
+
+            def stream(self, *args: object, **kwargs: object) -> FakeStream:
+                return FakeStream()
+
+        with patch("src.aeitron.deployment.production_proof.httpx.AsyncClient", FakeClient):
+            report = asyncio.run(
+                run_native_serving_load_test(
+                    endpoint="http://127.0.0.1:8001",
+                    model="aeitron-scratch",
+                    api_key="token",
+                    requests=3,
+                    streaming_requests=2,
+                    concurrency=2,
+                    timeout_seconds=5.0,
+                )
+            )
+        self.assertEqual(report.status, "passed")
+        self.assertEqual(report.streaming_passed, 2)
+        self.assertEqual(report.content_validation_failures, 0)
+
+    def test_production_service_urls_fail_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            _validated_service_url(
+                "http://qdrant.internal:6333",
+                label="Qdrant",
+                allowed_insecure_hosts=[],
+            )
+
+    def test_malformed_qdrant_url_is_reported_not_raised(self) -> None:
+        result = asyncio.run(
+            _check_qdrant(
+                ProductionProofConfig(
+                    strict=True,
+                    qdrant_url="http://user:secret@qdrant.internal:6333",
+                    allowed_insecure_service_hosts=["qdrant.internal"],
+                )
+            )
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("embedded credentials", result.error)
+
+    def test_strict_serving_load_requires_streaming_proof(self) -> None:
+        result = asyncio.run(
+            _check_serving_load(
+                ProductionProofConfig(
+                    strict=True,
+                    serving_url="http://127.0.0.1:8001",
+                    serving_api_key="test-token",
+                    load_test_requests=2,
+                    load_test_streaming_requests=0,
+                )
+            )
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("streaming SSE request", result.error)
+
+    def test_strict_serving_health_matches_active_profile_hashes(self) -> None:
+        checkpoint_hash = "a" * 64
+        tokenizer_hash = "b" * 64
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, payload: dict[str, object]) -> None:
+                self.payload = payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return self.payload
+
+        class FakeClient:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                return None
+
+            async def __aenter__(self) -> "FakeClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def get(self, url: str, **kwargs: object) -> FakeResponse:
+                if url.endswith("/health/ready"):
+                    return FakeResponse(
+                        {
+                            "status": "ready",
+                            "model_name": "aeitron-scratch",
+                            "checkpoint_manifest": "/models/checkpoint.json",
+                            "checkpoint_manifest_sha256": checkpoint_hash,
+                            "tokenizer_sha256": tokenizer_hash,
+                            "scratch_only": True,
+                        }
+                    )
+                return FakeResponse({"data": [{"id": "aeitron-scratch"}]})
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile = root / "active.json"
+            profile.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "profile": {
+                            "name": "aeitron-production",
+                            "kind": "local",
+                            "family": "aeitron-scratch",
+                            "size_class": "test",
+                            "backend": "aeitron_serving",
+                            "model_name": "aeitron-scratch",
+                            "endpoint": "http://127.0.0.1:8001/v1",
+                            "checkpoint_manifest": "/models/checkpoint.json",
+                            "tokenizer_path": "/models/tokenizer.json",
+                            "scratch_only": True,
+                            "evidence": {
+                                "checkpoint_manifest_sha256": checkpoint_hash,
+                                "tokenizer_sha256": tokenizer_hash,
+                                "evaluation_report_sha256": "c" * 64,
+                                "scorecard_report_sha256": "d" * 64,
+                            },
+                        },
+                        "env": {},
+                        "run_id": "test-production-profile",
+                        "production_blockers": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = ProductionProofConfig(
+                strict=True,
+                serving_url="http://127.0.0.1:8001",
+                serving_api_key="test-token",
+                active_model_profile=str(profile),
+            )
+            with patch(
+                "src.aeitron.deployment.production_proof.httpx.AsyncClient",
+                FakeClient,
+            ):
+                result = asyncio.run(_check_serving_health(config))
+            self.assertEqual(result.status, "passed")
+            self.assertTrue(result.details["checkpoint_hash_verified"])
+
+            payload = json.loads(profile.read_text(encoding="utf-8"))
+            payload["profile"]["evidence"]["checkpoint_manifest_sha256"] = "0" * 64
+            profile.write_text(json.dumps(payload), encoding="utf-8")
+            with patch(
+                "src.aeitron.deployment.production_proof.httpx.AsyncClient",
+                FakeClient,
+            ):
+                failed = asyncio.run(_check_serving_health(config))
+            self.assertEqual(failed.status, "failed")
+            self.assertIn("live serving hashes", failed.error)
+        with self.assertRaisesRegex(ValueError, "embedded credentials"):
+            _validated_service_url(
+                "https://user:secret@qdrant.example",
+                label="Qdrant",
+                allowed_insecure_hosts=[],
+            )
 
     def test_object_store_upload_paths_keeps_duplicate_shard_names(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import tempfile
 import unittest
@@ -267,6 +268,71 @@ class AeitronAgentExecutionTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "50-100"):
             runner._validate_suite([task])
+
+    def test_strict_scorecard_replays_live_serving_identity(self) -> None:
+        class IdentityBackend(ModelBackend):
+            name = "aeitron_serving"
+
+            def __init__(self, checkpoint_hash: str, tokenizer_hash: str) -> None:
+                self.checkpoint_hash = checkpoint_hash
+                self.tokenizer_hash = tokenizer_hash
+
+            async def identity(self) -> dict[str, object]:
+                return {
+                    "status": "ready",
+                    "model_name": "aeitron-scratch",
+                    "checkpoint_manifest_sha256": self.checkpoint_hash,
+                    "tokenizer_sha256": self.tokenizer_hash,
+                    "scratch_only": True,
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoint.json"
+            tokenizer = root / "tokenizer.json"
+            profile_path = root / "active-profile.json"
+            checkpoint.write_text("{}\n", encoding="utf-8")
+            tokenizer.write_text("{}\n", encoding="utf-8")
+            profile_path.write_text('{"profile":"validation"}\n', encoding="utf-8")
+            checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+            tokenizer_hash = hashlib.sha256(tokenizer.read_bytes()).hexdigest()
+            profile = {
+                "profile": {
+                    "checkpoint_manifest": str(checkpoint),
+                    "tokenizer_path": str(tokenizer),
+                    "evidence": {
+                        "checkpoint_manifest_sha256": checkpoint_hash,
+                        "tokenizer_sha256": tokenizer_hash,
+                        "evaluation_report_sha256": "a" * 64,
+                    },
+                }
+            }
+            backend = IdentityBackend(checkpoint_hash, tokenizer_hash)
+            with (
+                patch(
+                    "src.aeitron.evaluation.agent_scorecard.load_active_profile",
+                    return_value=profile,
+                ),
+                patch(
+                    "src.aeitron.evaluation.agent_scorecard.active_profile_path",
+                    return_value=profile_path,
+                ),
+            ):
+                evidence = asyncio.run(
+                    AgentScorecardRunner._model_evidence(
+                        backend,
+                        require_complete=True,
+                    )
+                )
+                self.assertRegex(evidence["serving_identity_sha256"], r"^[0-9a-f]{64}$")
+                backend.checkpoint_hash = "0" * 64
+                with self.assertRaisesRegex(RuntimeError, "serving checkpoint identity"):
+                    asyncio.run(
+                        AgentScorecardRunner._model_evidence(
+                            backend,
+                            require_complete=True,
+                        )
+                    )
 
     def test_gateway_one_command_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

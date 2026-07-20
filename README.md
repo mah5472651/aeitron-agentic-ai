@@ -321,7 +321,10 @@ python -m src.aeitron.deployment.production_proof `
   --serving-url "$env:AEITRON_SERVING_URL" `
   --serving-api-key "$env:AEITRON_MODEL_API_KEY" `
   --load-test-requests 100 `
-  --benchmark-dir data\eval `
+  --load-test-streaming-requests 20 `
+  --executable-benchmark-report artifacts\aeitron\executable-eval\benchmark_suites_report.json `
+  --scorecard-report artifacts\aeitron\agent-scorecard\agent_scorecard.json `
+  --active-model-profile C:\AeitronGovernance\active-model-profile.json `
   --run-security-audit `
   --strict-security-tools `
   --output-dir artifacts\\aeitron\production-proof
@@ -330,6 +333,13 @@ python -m src.aeitron.deployment.production_proof `
 For local or Kaggle validation without live services, omit `--strict`; missing
 Postgres/Redis/Qdrant/serving/benchmark inputs are marked as skipped, never as
 production-ready.
+
+Strict proof applies real Postgres migrations, performs a temporary Qdrant
+create/upsert/query/delete transaction, verifies authenticated scratch-model
+identity, exercises normal and SSE responses, and replays the
+checkpoint/tokenizer/evaluation/scorecard hash chain. Internal HTTP service
+hosts must be individually allowlisted with `--allow-insecure-service-host`;
+remote services otherwise require HTTPS.
 
 The production stack includes Prometheus, Grafana, and optional OpenTelemetry:
 
@@ -1166,7 +1176,15 @@ python -m src.aeitron.model_ops.backends promote-checkpoint `
 
 Set `AEITRON_ACTIVE_MODEL_PROFILE_PATH` to that external immutable profile.
 Remote endpoints must use HTTPS. Checkpoint files, tokenizer, executable eval,
-and scorecard are hash-verified before profile creation.
+and scorecard are hash-verified before profile creation. The scorecard must
+declare the exact checkpoint, tokenizer, and executable-evaluation hashes; a
+report from another model is rejected.
+
+The defensive qualification campaign runs the governed executable HumanEval
+and MBPP holdouts automatically from `10k` onward. Both artifacts must replay
+against `protected_benchmark_manifest.json`, every measured suite must pass,
+and the minimum suite pass@1 must meet the configured threshold. The `1k`
+stage remains a technical pipeline proof, not a model-quality claim.
 
 7. Qdrant indexing is explicit and idempotent:
 

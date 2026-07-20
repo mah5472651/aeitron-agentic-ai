@@ -22,6 +22,7 @@ from src.aeitron.model_ops.pretrain_loop import (
     validate_production_training_args,
 )
 from src.aeitron.model_ops.native_serving import NativeServingConfig, create_app
+from src.aeitron.model_ops.foundation import sha256_file
 from src.aeitron.model_ops.production_adapters import build_megatron_launch_plan, build_tensorrt_llm_plan, export_hf_llama_package, validate_vllm_package
 from src.aeitron.model_ops.checkpoint_compare import GenerationConfig, compare_checkpoints
 from src.aeitron.model_ops.checkpoint_compare import PromptCase, hallucination_flags_for_output
@@ -736,6 +737,14 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
             client = TestClient(app)
             ready = client.get("/health/ready")
             self.assertEqual(ready.status_code, 200, ready.text)
+            self.assertEqual(
+                ready.json()["checkpoint_manifest_sha256"],
+                sha256_file(Path(training["checkpoint_manifest"])),
+            )
+            self.assertEqual(
+                ready.json()["tokenizer_sha256"],
+                sha256_file(Path(tokenizer_path)),
+            )
             response = client.post(
                 "/v1/chat/completions",
                 json={

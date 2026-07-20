@@ -11,19 +11,26 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import statistics
 import time
+import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import Field
 
 from src.aeitron.db.migration_runner import apply_migrations
+from src.aeitron.evaluation.agent_scorecard import AgentScorecardReport
 from src.aeitron.evaluation.benchmark_pack import BenchmarkPackConfig, run_benchmark_pack
+from src.aeitron.evaluation.benchmark_suites import BenchmarkSuitesReport
 from src.aeitron.identity.quota import RedisQuotaStore
 from src.aeitron.learning.storage import ObjectStoreConfig, verify_object_store_lifecycle
+from src.aeitron.model_ops.foundation import sha256_file
 from src.aeitron.security.audit import run_security_audit
+from src.aeitron.shared.config_contracts import load_active_model_contract
 from src.aeitron.shared.schemas import StrictModel
 
 
@@ -47,6 +54,9 @@ class NativeServingLoadReport(StrictModel):
     latency_ms_p95: float
     max_latency_ms: float
     timeout_count: int
+    streaming_requests: int = Field(default=0, ge=0)
+    streaming_passed: int = Field(default=0, ge=0)
+    content_validation_failures: int = Field(default=0, ge=0)
     error_samples: list[str] = Field(default_factory=list)
 
 
@@ -59,13 +69,18 @@ class ProductionProofConfig(StrictModel):
     object_store_uri: str | None = None
     object_store_endpoint_url: str | None = None
     qdrant_url: str | None = None
+    allowed_insecure_service_hosts: list[str] = Field(default_factory=list)
     serving_url: str | None = None
     serving_api_key: str | None = None
     serving_model: str = "aeitron-scratch"
     load_test_requests: int = Field(default=0, ge=0, le=10_000)
     load_test_concurrency: int = Field(default=4, ge=1, le=512)
     load_test_timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
+    load_test_streaming_requests: int = Field(default=0, ge=0, le=1_000)
     benchmark_dir: str | None = None
+    executable_benchmark_report: str | None = None
+    scorecard_report: str | None = None
+    active_model_profile: str | None = None
     run_security_audit: bool = False
     strict_security_tools: bool = False
 
@@ -91,6 +106,34 @@ def _env(name: str) -> str | None:
     return value if value else None
 
 
+def _validated_service_url(
+    value: str,
+    *,
+    label: str,
+    allowed_insecure_hosts: list[str],
+) -> str:
+    normalized = value.rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"{label} URL must be an absolute HTTP(S) URL")
+    if parsed.username or parsed.password:
+        raise ValueError(f"{label} URL must not contain embedded credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"{label} URL must not contain a query string or fragment")
+    allowed = {host.lower() for host in allowed_insecure_hosts}
+    if parsed.scheme != "https" and parsed.hostname.lower() not in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        *allowed,
+    }:
+        raise ValueError(
+            f"remote {label} URL must use HTTPS unless its exact host is explicitly "
+            "listed with --allow-insecure-service-host"
+        )
+    return normalized
+
+
 def config_from_env(args: argparse.Namespace) -> ProductionProofConfig:
     return ProductionProofConfig(
         strict=args.strict,
@@ -101,13 +144,20 @@ def config_from_env(args: argparse.Namespace) -> ProductionProofConfig:
         object_store_uri=args.object_store_uri or _env("AEITRON_OBJECT_STORE_URI"),
         object_store_endpoint_url=args.object_store_endpoint_url or _env("AEITRON_OBJECT_STORE_ENDPOINT_URL"),
         qdrant_url=args.qdrant_url or _env("AEITRON_QDRANT_URL"),
+        allowed_insecure_service_hosts=args.allow_insecure_service_host,
         serving_url=args.serving_url or _env("AEITRON_SERVING_URL"),
         serving_api_key=args.serving_api_key or _env("AEITRON_MODEL_API_KEY"),
         serving_model=args.serving_model,
         load_test_requests=args.load_test_requests,
         load_test_concurrency=args.load_test_concurrency,
         load_test_timeout_seconds=args.load_test_timeout_seconds,
+        load_test_streaming_requests=args.load_test_streaming_requests,
         benchmark_dir=args.benchmark_dir or _env("AEITRON_BENCHMARK_DIR"),
+        executable_benchmark_report=(
+            args.executable_benchmark_report or _env("AEITRON_EXECUTABLE_BENCHMARK_REPORT")
+        ),
+        scorecard_report=args.scorecard_report or _env("AEITRON_AGENT_SCORECARD_REPORT"),
+        active_model_profile=args.active_model_profile or _env("AEITRON_ACTIVE_MODEL_PROFILE_PATH"),
         run_security_audit=args.run_security_audit,
         strict_security_tools=args.strict_security_tools,
     )
@@ -117,6 +167,14 @@ async def _check_postgres(config: ProductionProofConfig) -> ProofCheckResult:
     started = time.perf_counter()
     if not config.postgres_url:
         return _missing("postgres_migrations", config.strict, started, "AEITRON_DATABASE_URL or --postgres-url is required")
+    if config.strict and not config.apply_postgres_migrations:
+        return _result(
+            "postgres_migrations",
+            "failed",
+            True,
+            started,
+            {"reason": "strict proof requires --apply-postgres-migrations; a dry-run is not deployment evidence"},
+        )
     try:
         result = await apply_migrations(config.postgres_url, dry_run=not config.apply_postgres_migrations)
         return _result("postgres_migrations", "passed", True, started, result)
@@ -160,14 +218,103 @@ async def _check_object_store(config: ProductionProofConfig) -> ProofCheckResult
 async def _check_qdrant(config: ProductionProofConfig) -> ProofCheckResult:
     started = time.perf_counter()
     if not config.qdrant_url:
-        return _missing("qdrant_health", config.strict, started, "AEITRON_QDRANT_URL or --qdrant-url is required")
+        return _missing("qdrant_round_trip", config.strict, started, "AEITRON_QDRANT_URL or --qdrant-url is required")
+    collection = f"aeitron_proof_{uuid.uuid4().hex}"
+    endpoint = ""
+    marker = uuid.uuid4().hex
+    point_id = str(uuid.uuid4())
+    cleanup_error = ""
+    primary_error = ""
+    collection_created = False
+    matched = False
     try:
+        endpoint = _validated_service_url(
+            config.qdrant_url,
+            label="Qdrant",
+            allowed_insecure_hosts=config.allowed_insecure_service_hosts,
+        )
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{config.qdrant_url.rstrip('/')}/collections")
-        response.raise_for_status()
-        return _result("qdrant_health", "passed", True, started, {"status_code": response.status_code, "collections": response.json()})
+            created = await client.put(
+                f"{endpoint}/collections/{collection}",
+                json={"vectors": {"size": 4, "distance": "Cosine"}},
+            )
+            created.raise_for_status()
+            collection_created = True
+            upserted = await client.put(
+                f"{endpoint}/collections/{collection}/points",
+                params={"wait": "true"},
+                json={
+                    "points": [
+                        {
+                            "id": point_id,
+                            "vector": [1.0, 0.0, 0.0, 0.0],
+                            "payload": {"proof_marker": marker},
+                        }
+                    ]
+                },
+            )
+            upserted.raise_for_status()
+            queried = await client.post(
+                f"{endpoint}/collections/{collection}/points/query",
+                json={
+                    "query": [1.0, 0.0, 0.0, 0.0],
+                    "limit": 1,
+                    "with_payload": True,
+                },
+            )
+            queried.raise_for_status()
+            payload = queried.json()
+            points = payload.get("result", {}).get("points", [])
+            matched = bool(
+                points
+                and str(points[0].get("id")) == point_id
+                and points[0].get("payload", {}).get("proof_marker") == marker
+            )
+            if not matched:
+                raise RuntimeError("Qdrant query did not return the inserted proof point")
     except Exception as exc:
-        return _result("qdrant_health", "failed", True, started, error=str(exc))
+        primary_error = str(exc)
+    finally:
+        if endpoint and collection_created:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    deleted = await client.delete(f"{endpoint}/collections/{collection}")
+                    if deleted.status_code not in {200, 404}:
+                        cleanup_error = (
+                            "Qdrant proof collection cleanup returned "
+                            f"HTTP {deleted.status_code}"
+                        )
+            except Exception as exc:
+                cleanup_error = f"Qdrant proof collection cleanup failed: {exc}"
+        if cleanup_error:
+            primary_error = primary_error or cleanup_error
+    if primary_error:
+        return _result(
+            "qdrant_round_trip",
+            "failed",
+            True,
+            started,
+            {
+                "collection": collection,
+                "created": collection_created,
+                "query_verified": matched,
+                "cleanup_verified": not cleanup_error,
+            },
+            error=primary_error,
+        )
+    return _result(
+        "qdrant_round_trip",
+        "passed",
+        True,
+        started,
+        {
+            "collection": collection,
+            "created": True,
+            "upsert_verified": True,
+            "query_verified": True,
+            "cleanup_verified": True,
+        },
+    )
 
 
 async def _check_serving_health(config: ProductionProofConfig) -> ProofCheckResult:
@@ -175,18 +322,67 @@ async def _check_serving_health(config: ProductionProofConfig) -> ProofCheckResu
     if not config.serving_url:
         return _missing("native_serving_health", config.strict, started, "AEITRON_SERVING_URL or --serving-url is required")
     try:
+        if config.strict and not config.serving_api_key:
+            raise RuntimeError("strict serving proof requires an authenticated service token")
+        endpoint = _validated_service_url(
+            config.serving_url,
+            label="serving",
+            allowed_insecure_hosts=config.allowed_insecure_service_hosts,
+        )
+        if config.strict and urlparse(endpoint).path not in {"", "/"}:
+            raise RuntimeError("strict serving proof URL must identify the service root")
         headers = _auth_headers(config)
         async with httpx.AsyncClient(timeout=10.0) as client:
-            ready = await client.get(f"{config.serving_url.rstrip('/')}/health/ready", headers=headers)
-            models = await client.get(f"{config.serving_url.rstrip('/')}/v1/models", headers=headers)
+            ready = await client.get(f"{endpoint}/health/ready", headers=headers)
+            models = await client.get(f"{endpoint}/v1/models", headers=headers)
         ready.raise_for_status()
         models.raise_for_status()
+        readiness = ready.json()
+        model_payload = models.json()
+        model_ids = {
+            str(item.get("id") or "")
+            for item in model_payload.get("data", [])
+            if isinstance(item, dict)
+        }
+        if readiness.get("status") != "ready" or readiness.get("scratch_only") is not True:
+            raise RuntimeError("serving readiness does not prove a loaded scratch checkpoint")
+        if readiness.get("model_name") != config.serving_model or config.serving_model not in model_ids:
+            raise RuntimeError("serving model identity does not match the requested Aeitron model")
+        checkpoint_manifest = str(readiness.get("checkpoint_manifest") or "")
+        if not checkpoint_manifest:
+            raise RuntimeError("serving readiness is missing checkpoint identity")
+        for key in ("checkpoint_manifest_sha256", "tokenizer_sha256"):
+            if not re.fullmatch(r"[0-9a-f]{64}", str(readiness.get(key) or "")):
+                raise RuntimeError(f"serving readiness is missing {key}")
+        if config.strict:
+            if not config.active_model_profile:
+                raise RuntimeError("strict serving proof requires --active-model-profile")
+            active = load_active_model_contract(
+                Path(config.active_model_profile).expanduser().resolve(strict=True)
+            )
+            expected_endpoint = f"{endpoint.rstrip('/')}/v1"
+            if active.profile.endpoint.rstrip("/") != expected_endpoint:
+                raise RuntimeError("active model profile endpoint does not match the live service")
+            if (
+                readiness["checkpoint_manifest_sha256"]
+                != active.profile.evidence.get("checkpoint_manifest_sha256")
+                or readiness["tokenizer_sha256"]
+                != active.profile.evidence.get("tokenizer_sha256")
+            ):
+                raise RuntimeError("live serving hashes do not match the active model profile")
         return _result(
             "native_serving_health",
             "passed",
             True,
             started,
-            {"ready": ready.json(), "models": models.json()},
+            {
+                "ready": readiness,
+                "models": model_payload,
+                "model_identity_verified": True,
+                "checkpoint_hash_verified": True,
+                "tokenizer_hash_verified": True,
+                "authenticated": bool(config.serving_api_key),
+            },
         )
     except Exception as exc:
         return _result("native_serving_health", "failed", True, started, error=str(exc))
@@ -199,13 +395,23 @@ async def _check_serving_load(config: ProductionProofConfig) -> ProofCheckResult
     if config.load_test_requests <= 0:
         return _result("native_serving_load", "skipped" if not config.strict else "failed", config.strict, started, {"reason": "--load-test-requests is 0"})
     try:
+        endpoint = _validated_service_url(
+            config.serving_url,
+            label="serving",
+            allowed_insecure_hosts=config.allowed_insecure_service_hosts,
+        )
+        if config.strict and config.load_test_streaming_requests < 1:
+            raise RuntimeError(
+                "strict serving proof requires at least one streaming SSE request"
+            )
         report = await run_native_serving_load_test(
-            endpoint=config.serving_url,
+            endpoint=endpoint,
             model=config.serving_model,
             api_key=config.serving_api_key,
             requests=config.load_test_requests,
             concurrency=config.load_test_concurrency,
             timeout_seconds=config.load_test_timeout_seconds,
+            streaming_requests=config.load_test_streaming_requests,
         )
         return _result("native_serving_load", report.status, True, started, report.model_dump())
     except Exception as exc:
@@ -214,6 +420,103 @@ async def _check_serving_load(config: ProductionProofConfig) -> ProofCheckResult
 
 def _check_benchmarks(config: ProductionProofConfig) -> ProofCheckResult:
     started = time.perf_counter()
+    if config.strict:
+        required_paths = {
+            "executable benchmark report": config.executable_benchmark_report,
+            "repository scorecard report": config.scorecard_report,
+            "active model profile": config.active_model_profile,
+        }
+        missing = [name for name, value in required_paths.items() if not value]
+        if missing:
+            return _result(
+                "benchmark_and_model_evidence",
+                "failed",
+                True,
+                started,
+                {"reason": "strict proof requires " + ", ".join(missing)},
+            )
+        try:
+            assert config.executable_benchmark_report
+            assert config.scorecard_report
+            assert config.active_model_profile
+            evaluation_path = Path(config.executable_benchmark_report).expanduser().resolve(strict=True)
+            scorecard_path = Path(config.scorecard_report).expanduser().resolve(strict=True)
+            profile_path = Path(config.active_model_profile).expanduser().resolve(strict=True)
+            evaluation = BenchmarkSuitesReport.model_validate_json(
+                evaluation_path.read_text(encoding="utf-8-sig")
+            )
+            scorecard = AgentScorecardReport.model_validate_json(
+                scorecard_path.read_text(encoding="utf-8-sig")
+            )
+            active = load_active_model_contract(profile_path)
+            if (
+                evaluation.status != "passed"
+                or evaluation.evaluation_mode != "executable_model"
+                or not evaluation.suites
+                or any(
+                    suite.status != "passed"
+                    or suite.total < 1
+                    or suite.pass_at_k.get("pass@1", 0.0) <= 0.0
+                    for suite in evaluation.suites
+                )
+            ):
+                raise ValueError("executable benchmark report did not pass every measured suite")
+            if (
+                scorecard.status != "passed"
+                or scorecard.policy_mode != "strict"
+                or scorecard.task_count < 50
+                or len(scorecard.tasks) != scorecard.task_count
+            ):
+                raise ValueError("repository scorecard is not a passed strict 50-task run")
+            if active.production_blockers:
+                raise ValueError("active model profile still has production blockers")
+            expected = {
+                "checkpoint_manifest_sha256": active.profile.evidence.get(
+                    "checkpoint_manifest_sha256", ""
+                ),
+                "tokenizer_sha256": active.profile.evidence.get("tokenizer_sha256", ""),
+                "evaluation_report_sha256": sha256_file(evaluation_path),
+                "scorecard_report_sha256": sha256_file(scorecard_path),
+            }
+            if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in expected.values()):
+                raise ValueError("active model profile contains incomplete evidence hashes")
+            if active.profile.evidence != expected:
+                raise ValueError("active model profile evidence does not exactly match current artifacts")
+            if any(
+                scorecard.model_evidence.get(key) != expected[key]
+                for key in (
+                    "checkpoint_manifest_sha256",
+                    "tokenizer_sha256",
+                    "evaluation_report_sha256",
+                )
+            ):
+                raise ValueError("scorecard evidence does not match the active checkpoint")
+            if not re.fullmatch(
+                r"[0-9a-f]{64}",
+                scorecard.model_evidence.get("serving_identity_sha256", ""),
+            ):
+                raise ValueError("scorecard is missing live serving identity evidence")
+            return _result(
+                "benchmark_and_model_evidence",
+                "passed",
+                True,
+                started,
+                {
+                    "evaluation_report_sha256": expected["evaluation_report_sha256"],
+                    "scorecard_report_sha256": expected["scorecard_report_sha256"],
+                    "active_profile_sha256": sha256_file(profile_path),
+                    "suite_count": len(evaluation.suites),
+                    "scorecard_tasks": scorecard.task_count,
+                },
+            )
+        except Exception as exc:
+            return _result(
+                "benchmark_and_model_evidence",
+                "failed",
+                True,
+                started,
+                error=str(exc),
+            )
     if not config.benchmark_dir:
         return _missing("benchmark_pack", config.strict, started, "AEITRON_BENCHMARK_DIR or --benchmark-dir is required")
     root = Path(config.benchmark_dir)
@@ -283,34 +586,86 @@ async def run_native_serving_load_test(
     requests: int,
     concurrency: int,
     timeout_seconds: float,
+    streaming_requests: int = 0,
 ) -> NativeServingLoadReport:
+    if streaming_requests < 0 or streaming_requests > requests:
+        raise ValueError("streaming_requests must be between zero and total requests")
     semaphore = asyncio.Semaphore(concurrency)
     latencies: list[float] = []
     errors: list[str] = []
     timeout_count = 0
+    streaming_passed = 0
+    content_validation_failures = 0
     headers = _auth_headers_value(api_key)
     timeout = httpx.Timeout(timeout_seconds)
 
     async def one(client: httpx.AsyncClient, index: int) -> None:
-        nonlocal timeout_count
+        nonlocal timeout_count, streaming_passed, content_validation_failures
         async with semaphore:
             started = time.perf_counter()
             try:
-                response = await client.post(
-                    f"{endpoint.rstrip('/')}/v1/chat/completions",
-                    headers=headers,
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": f"Return a concise safe coding checklist. Request {index}."}],
-                        "temperature": 0.0,
-                        "max_tokens": 32,
-                        "stream": False,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-                if not payload.get("choices"):
-                    raise RuntimeError("response missing choices")
+                request_payload = {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"Return a concise safe coding checklist. Request {index}.",
+                        }
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 32,
+                    "stream": index < streaming_requests,
+                }
+                if index < streaming_requests:
+                    done = False
+                    content_parts: list[str] = []
+                    async with client.stream(
+                        "POST",
+                        f"{endpoint.rstrip('/')}/v1/chat/completions",
+                        headers=headers,
+                        json=request_payload,
+                    ) as response:
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:]
+                            if data == "[DONE]":
+                                done = True
+                                break
+                            payload = json.loads(data)
+                            if payload.get("model") != model:
+                                raise RuntimeError("streaming response model identity mismatch")
+                            choices = payload.get("choices") or []
+                            if choices:
+                                content = choices[0].get("delta", {}).get("content")
+                                if content:
+                                    content_parts.append(str(content))
+                    if not done or not "".join(content_parts).strip():
+                        content_validation_failures += 1
+                        raise RuntimeError("streaming response did not contain content and [DONE]")
+                    streaming_passed += 1
+                else:
+                    response = await client.post(
+                        f"{endpoint.rstrip('/')}/v1/chat/completions",
+                        headers=headers,
+                        json=request_payload,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    choices = payload.get("choices") or []
+                    content = (
+                        choices[0].get("message", {}).get("content")
+                        if choices and isinstance(choices[0], dict)
+                        else ""
+                    )
+                    if (
+                        payload.get("model") != model
+                        or not str(content or "").strip()
+                        or payload.get("aeitron", {}).get("scratch_only") is not True
+                    ):
+                        content_validation_failures += 1
+                        raise RuntimeError("non-streaming response failed model/content/scratch validation")
                 latencies.append((time.perf_counter() - started) * 1000)
             except httpx.TimeoutException as exc:
                 timeout_count += 1
@@ -324,7 +679,14 @@ async def run_native_serving_load_test(
     sorted_latencies = sorted(latencies)
     p50 = statistics.median(sorted_latencies) if sorted_latencies else 0.0
     p95 = sorted_latencies[min(len(sorted_latencies) - 1, int(len(sorted_latencies) * 0.95))] if sorted_latencies else 0.0
-    status = "passed" if passed == requests and timeout_count == 0 else "failed"
+    status = (
+        "passed"
+        if passed == requests
+        and timeout_count == 0
+        and streaming_passed == streaming_requests
+        and content_validation_failures == 0
+        else "failed"
+    )
     return NativeServingLoadReport(
         status=status,
         endpoint=endpoint,
@@ -336,6 +698,9 @@ async def run_native_serving_load_test(
         latency_ms_p95=round(p95, 3),
         max_latency_ms=round(max(sorted_latencies) if sorted_latencies else 0.0, 3),
         timeout_count=timeout_count,
+        streaming_requests=streaming_requests,
+        streaming_passed=streaming_passed,
+        content_validation_failures=content_validation_failures,
         error_samples=errors[:10],
     )
 
@@ -403,13 +768,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object-store-uri")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--qdrant-url")
+    parser.add_argument(
+        "--allow-insecure-service-host",
+        action="append",
+        default=[],
+        help="Exact private service hostname allowed to use HTTP; repeat for each host.",
+    )
     parser.add_argument("--serving-url")
     parser.add_argument("--serving-api-key")
     parser.add_argument("--serving-model", default="aeitron-scratch")
     parser.add_argument("--load-test-requests", type=int, default=0)
     parser.add_argument("--load-test-concurrency", type=int, default=4)
     parser.add_argument("--load-test-timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--load-test-streaming-requests", type=int, default=0)
     parser.add_argument("--benchmark-dir")
+    parser.add_argument("--executable-benchmark-report")
+    parser.add_argument("--scorecard-report")
+    parser.add_argument("--active-model-profile")
     parser.add_argument("--run-security-audit", action="store_true")
     parser.add_argument("--strict-security-tools", action="store_true")
     return parser.parse_args()

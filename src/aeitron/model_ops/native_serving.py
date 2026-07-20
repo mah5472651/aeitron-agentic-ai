@@ -99,9 +99,13 @@ class NativeServingState:
             "status": "ready",
             "model_name": self.config.model_name,
             "checkpoint_manifest": self.config.checkpoint_manifest,
+            "checkpoint_manifest_sha256": sha256_file(
+                Path(self.config.checkpoint_manifest).expanduser().resolve(strict=True)
+            ),
             "checkpoint_step": self.manifest.step,
             "trained_tokens": self.manifest.trained_tokens,
             "tokenizer_path": str(self.tokenizer_path),
+            "tokenizer_sha256": sha256_file(self.tokenizer_path),
             "device": str(self.device),
             "uptime_seconds": round(time.time() - self.started_at_unix, 3),
             "scratch_only": True,

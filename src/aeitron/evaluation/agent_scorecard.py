@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -21,11 +22,13 @@ from pydantic import Field, field_validator, model_validator
 
 from src.aeitron.db import LocalStore
 from src.aeitron.model_ops.backends import ModelBackend, build_active_backend
+from src.aeitron.model_ops.foundation import sha256_file
 from src.aeitron.runtime.execution import (
     AgentExecutionRequest,
     AgentExecutionService,
     stage_repository_copy,
 )
+from src.aeitron.shared.config import active_profile_path, load_active_profile
 from src.aeitron.shared.schemas import StrictModel
 
 
@@ -107,6 +110,8 @@ class AgentScorecardReport(StrictModel):
     regression_count: int
     average_confidence: float
     average_score: float
+    model_backend: str = ""
+    model_evidence: dict[str, str] = Field(default_factory=dict)
     tasks: list[AgentTaskScore]
     failures: list[str] = Field(default_factory=list)
     created_at_unix: float = Field(default_factory=time.time)
@@ -153,6 +158,10 @@ class AgentScorecardRunner:
             if owns_backend:
                 await backend.aclose()
             raise RuntimeError("strict scorecard requires a non-mock Aeitron scratch model backend")
+        model_evidence = await self._model_evidence(
+            backend,
+            require_complete=self.policy_mode == "strict",
+        )
 
         scores: list[AgentTaskScore] = []
         failures: list[str] = []
@@ -191,7 +200,12 @@ class AgentScorecardRunner:
             if owns_backend:
                 await backend.aclose()
 
-        report = self._aggregate(scores, failures)
+        report = self._aggregate(
+            scores,
+            failures,
+            model_backend=backend.name,
+            model_evidence=model_evidence,
+        )
         self._write_reports(output_dir, report)
         return report
 
@@ -287,7 +301,14 @@ class AgentScorecardRunner:
                     store.delete_project(str(project["id"]))
                 store.close()
 
-    def _aggregate(self, scores: list[AgentTaskScore], failures: list[str]) -> AgentScorecardReport:
+    def _aggregate(
+        self,
+        scores: list[AgentTaskScore],
+        failures: list[str],
+        *,
+        model_backend: str,
+        model_evidence: dict[str, str],
+    ) -> AgentScorecardReport:
         def rate(values: list[bool]) -> float:
             return sum(1 for value in values if value) / len(values) if values else 0.0
 
@@ -328,9 +349,77 @@ class AgentScorecardRunner:
             regression_count=regressions,
             average_confidence=average_confidence,
             average_score=average_score,
+            model_backend=model_backend,
+            model_evidence=model_evidence,
             tasks=scores,
             failures=failures,
         )
+
+    @staticmethod
+    async def _model_evidence(
+        backend: ModelBackend,
+        *,
+        require_complete: bool,
+    ) -> dict[str, str]:
+        profile_payload = load_active_profile()
+        profile = profile_payload.get("profile") if isinstance(profile_payload.get("profile"), dict) else {}
+        evidence = dict(profile.get("evidence") or {}) if isinstance(profile, dict) else {}
+        profile_source = active_profile_path()
+        checkpoint_value = str(profile.get("checkpoint_manifest") or "") if isinstance(profile, dict) else ""
+        tokenizer_value = str(profile.get("tokenizer_path") or "") if isinstance(profile, dict) else ""
+
+        if profile_source.is_file():
+            evidence["active_profile_sha256"] = sha256_file(profile_source)
+        if checkpoint_value:
+            checkpoint = Path(checkpoint_value).expanduser().resolve(strict=True)
+            actual_checkpoint_hash = sha256_file(checkpoint)
+            if evidence.get("checkpoint_manifest_sha256") != actual_checkpoint_hash:
+                raise RuntimeError("active model profile checkpoint evidence does not match the checkpoint manifest")
+        if tokenizer_value:
+            tokenizer = Path(tokenizer_value).expanduser().resolve(strict=True)
+            actual_tokenizer_hash = sha256_file(tokenizer)
+            if evidence.get("tokenizer_sha256") != actual_tokenizer_hash:
+                raise RuntimeError("active model profile tokenizer evidence does not match the tokenizer")
+
+        if require_complete:
+            required = {
+                "active_profile_sha256",
+                "checkpoint_manifest_sha256",
+                "tokenizer_sha256",
+                "evaluation_report_sha256",
+            }
+            missing = sorted(
+                key
+                for key in required
+                if not re.fullmatch(r"[0-9a-f]{64}", str(evidence.get(key) or ""))
+            )
+            if missing:
+                raise RuntimeError(
+                    "strict scorecard requires an evidence-bound validation model profile; missing "
+                    + ", ".join(missing)
+                )
+            if backend.name != "aeitron_serving":
+                raise RuntimeError("strict scorecard requires the evidence-bound Aeitron serving backend")
+            identity = await backend.identity()
+            if identity.get("checkpoint_manifest_sha256") != evidence["checkpoint_manifest_sha256"]:
+                raise RuntimeError("serving checkpoint identity does not match the active model profile")
+            if identity.get("tokenizer_sha256") != evidence["tokenizer_sha256"]:
+                raise RuntimeError("serving tokenizer identity does not match the active model profile")
+            identity_evidence = {
+                "status": identity.get("status"),
+                "model_name": identity.get("model_name"),
+                "checkpoint_manifest_sha256": identity.get("checkpoint_manifest_sha256"),
+                "tokenizer_sha256": identity.get("tokenizer_sha256"),
+                "scratch_only": identity.get("scratch_only"),
+            }
+            evidence["serving_identity_sha256"] = hashlib.sha256(
+                json.dumps(
+                    identity_evidence,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        return {str(key): str(value) for key, value in evidence.items()}
 
     def _load_tasks(self, path: Path) -> list[RepositoryAgentTask]:
         tasks: list[RepositoryAgentTask] = []

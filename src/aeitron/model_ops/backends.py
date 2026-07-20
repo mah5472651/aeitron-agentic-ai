@@ -33,6 +33,9 @@ class ModelBackend:
     async def aclose(self) -> None:
         return None
 
+    async def identity(self) -> dict[str, Any]:
+        return {}
+
 
 class MockModelBackend(ModelBackend):
     name = "mock"
@@ -48,7 +51,7 @@ class AeitronServingBackend(ModelBackend):
     name = "aeitron_serving"
 
     def __init__(self, *, endpoint: str, model_name: str, api_key: str | None = None) -> None:
-        self.endpoint = endpoint.rstrip("/")
+        self.endpoint = _validate_serving_endpoint(endpoint)
         self.model_name = model_name
         self.api_key = api_key
         self.client = httpx.AsyncClient(timeout=60)
@@ -68,6 +71,25 @@ class AeitronServingBackend(ModelBackend):
         response.raise_for_status()
         payload = response.json()
         return str(payload["choices"][0]["message"]["content"])
+
+    async def identity(self) -> dict[str, Any]:
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        response = await self.client.get(
+            f"{self.endpoint[:-3]}/health/ready",
+            headers=headers,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if (
+            payload.get("status") != "ready"
+            or payload.get("scratch_only") is not True
+            or payload.get("model_name") != self.model_name
+        ):
+            raise RuntimeError("Aeitron serving readiness identity is invalid")
+        for key in ("checkpoint_manifest_sha256", "tokenizer_sha256"):
+            if not re.fullmatch(r"[0-9a-f]{64}", str(payload.get(key) or "")):
+                raise RuntimeError(f"Aeitron serving readiness is missing {key}")
+        return payload
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -166,6 +188,8 @@ def _validate_serving_endpoint(endpoint: str) -> str:
         raise ValueError("serving endpoint must not contain embedded credentials")
     if parsed.query or parsed.fragment:
         raise ValueError("serving endpoint must not contain a query string or fragment")
+    if parsed.path.rstrip("/") != "/v1":
+        raise ValueError("serving endpoint path must be exactly /v1")
     if parsed.scheme != "https" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("remote serving endpoint must use HTTPS")
     return normalized
@@ -249,6 +273,26 @@ def promote_scratch_checkpoint(
             or len(scorecard_contract.tasks) != scorecard_contract.task_count
         ):
             raise ValueError("production promotion requires a passed scorecard with at least 50 tasks")
+        expected_scorecard_evidence = {
+            "checkpoint_manifest_sha256": evidence["checkpoint_manifest_sha256"],
+            "tokenizer_sha256": evidence["tokenizer_sha256"],
+            "evaluation_report_sha256": evidence["evaluation_report_sha256"],
+        }
+        if any(
+            scorecard_contract.model_evidence.get(key) != expected
+            for key, expected in expected_scorecard_evidence.items()
+        ):
+            raise ValueError(
+                "production scorecard is not bound to the selected checkpoint, tokenizer, "
+                "and executable evaluation report"
+            )
+        if not re.fullmatch(
+            r"[0-9a-f]{64}",
+            scorecard_contract.model_evidence.get("serving_identity_sha256", ""),
+        ):
+            raise ValueError(
+                "production scorecard is missing verified live serving identity evidence"
+            )
         evidence["scorecard_report_sha256"] = sha256_file(scorecard_path)
 
     endpoint_value = _validate_serving_endpoint(endpoint)
@@ -265,10 +309,10 @@ def promote_scratch_checkpoint(
         "requires_cuda": False,
         "dev_only": False,
         "scratch_only": True,
+        "evidence": evidence,
         "notes": [
             f"Promotion mode: {promotion_mode}.",
             f"Checkpoint step: {manifest.step}; trained tokens: {manifest.trained_tokens}.",
-            "Activation evidence: " + json.dumps(evidence, sort_keys=True),
         ],
     }
     contract = ActiveModelConfigContract.model_validate(

@@ -21,6 +21,11 @@ from src.aeitron.evaluation.qualification_campaign import (
     write_approval_template,
     write_campaign_plan,
 )
+from src.aeitron.evaluation.benchmark_suites import (
+    BenchmarkSuiteResult,
+    BenchmarkSuitesReport,
+)
+from src.aeitron.evaluation.benchmark_pack import materialize_protected_benchmark_pack
 from src.aeitron.model_ops.checkpoint_compare import (
     CandidateResult,
     CheckpointComparisonReport,
@@ -344,6 +349,99 @@ class AeitronQualificationCampaignTest(unittest.TestCase):
             )
             self.assertFalse(stage_10k.promotion_allowed)
             self.assertIn("minimum_score_improvement_not_met", stage_10k.gate_failures)
+            self.assertIn("executable_benchmark_missing", stage_10k.gate_failures)
+
+    def test_10k_stage_requires_passing_executable_humaneval_and_mbpp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            selected = root / "best.json"
+            selected.write_text("{}\n", encoding="utf-8")
+            training = {
+                "status": "passed",
+                "steps": 10_000,
+                "checkpoint_reload_verified": True,
+                "train_losses": [7.0, 5.0],
+                "best_validation_loss": 4.9,
+                "best_checkpoint_manifest": str(selected),
+            }
+            benchmark_path = root / "benchmark.json"
+            report = BenchmarkSuitesReport(
+                status="passed",
+                evaluation_mode="executable_model",
+                suites=[
+                    BenchmarkSuiteResult(
+                        name="humaneval",
+                        kind="human_eval_style",
+                        status="passed",
+                        score=0.10,
+                        total=25,
+                        passed=2,
+                        pass_at_k={"pass@1": 0.08, "pass@5": 0.20},
+                    ),
+                    BenchmarkSuiteResult(
+                        name="mbpp",
+                        kind="mbpp_style",
+                        status="passed",
+                        score=0.04,
+                        total=25,
+                        passed=1,
+                        pass_at_k={"pass@1": 0.04, "pass@5": 0.12},
+                    ),
+                ],
+                aggregate_score=0.07,
+            )
+            benchmark_path.write_text(report.model_dump_json(), encoding="utf-8")
+            record = decide_stage(
+                target_curriculum_steps=10_000,
+                global_target_steps=10_000,
+                policy=QualificationGatePolicy(),
+                training_report=training,
+                checkpoint_eval_status="passed",
+                tokenizer_audit_status="passed",
+                comparison=self._comparison(root, delta=0.02),
+                training_report_path=root / "train.json",
+                checkpoint_eval_path=root / "eval.json",
+                checkpoint_comparison_path=root / "compare.json",
+                tokenizer_audit_path=root / "audit.json",
+                executable_benchmark=report,
+                executable_benchmark_path=benchmark_path,
+            )
+            self.assertTrue(record.promotion_allowed)
+            self.assertEqual(record.executable_pass_at_1, 0.04)
+            self.assertEqual(record.executable_benchmark_sha256, sha256_file(benchmark_path))
+
+            failed_report = report.model_copy(
+                update={
+                    "status": "failed",
+                    "suites": [
+                        report.suites[0],
+                        report.suites[1].model_copy(
+                            update={
+                                "status": "failed",
+                                "passed": 0,
+                                "pass_at_k": {"pass@1": 0.0, "pass@5": 0.0},
+                            }
+                        ),
+                    ],
+                }
+            )
+            failed = decide_stage(
+                target_curriculum_steps=10_000,
+                global_target_steps=10_000,
+                policy=QualificationGatePolicy(),
+                training_report=training,
+                checkpoint_eval_status="passed",
+                tokenizer_audit_status="passed",
+                comparison=self._comparison(root, delta=0.02),
+                training_report_path=root / "train.json",
+                checkpoint_eval_path=root / "eval.json",
+                checkpoint_comparison_path=root / "compare.json",
+                tokenizer_audit_path=root / "audit.json",
+                executable_benchmark=failed_report,
+                executable_benchmark_path=benchmark_path,
+            )
+            self.assertFalse(failed.promotion_allowed)
+            self.assertIn("executable_benchmark_failed", failed.gate_failures)
 
     def test_defensive_dataset_binding_rejects_wrong_curriculum(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -389,9 +487,60 @@ class AeitronQualificationCampaignTest(unittest.TestCase):
 
     def test_campaign_plan_is_exact_1k_to_100k_ladder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            protected_config = root / "protected.json"
+            protected_config.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "pack_id": "qualification-plan-test-pack",
+                        "sources": [
+                            {
+                                "name": "humaneval",
+                                "kind": "builtin_aeitron",
+                                "revision": "test-contract-v1",
+                                "license": "Proprietary-Evaluation",
+                                "output_file": "humaneval.jsonl",
+                                "minimum_rows": 25,
+                                "train_policy": "eval_holdout",
+                            },
+                            {
+                                "name": "mbpp",
+                                "kind": "builtin_aeitron",
+                                "revision": "test-contract-v1",
+                                "license": "Proprietary-Evaluation",
+                                "output_file": "mbpp.jsonl",
+                                "minimum_rows": 25,
+                                "train_policy": "eval_holdout",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            protected_root = root / "protected"
+            materialize_protected_benchmark_pack(protected_config, protected_root)
+            campaign_payload = json.loads(
+                Path("config/defensive_checkpoint_qualification.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            campaign_payload["executable_evaluation"]["protected_config"] = str(
+                protected_config
+            )
+            campaign_payload["executable_evaluation"]["protected_manifest"] = str(
+                protected_root / "protected_benchmark_manifest.json"
+            )
+            for suite in campaign_payload["executable_evaluation"]["suites"]:
+                suite["path"] = str(protected_root / f"{suite['name']}.jsonl")
+            campaign_config = root / "campaign.json"
+            campaign_config.write_text(
+                json.dumps(campaign_payload),
+                encoding="utf-8",
+            )
             path = write_campaign_plan(
-                config_path="config/defensive_checkpoint_qualification.json",
-                output_dir=temp_dir,
+                config_path=campaign_config,
+                output_dir=root / "plan",
             )
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -399,6 +548,16 @@ class AeitronQualificationCampaignTest(unittest.TestCase):
                 [1_000, 10_000, 20_000, 50_000, 100_000],
             )
             self.assertTrue(payload["scratch_only"])
+            self.assertFalse(payload["stages"][0]["requires_executable_benchmark"])
+            self.assertTrue(payload["stages"][1]["requires_executable_benchmark"])
+            self.assertEqual(
+                payload["executable_evaluation"]["protected_manifest_sha256"],
+                sha256_file(protected_root / "protected_benchmark_manifest.json"),
+            )
+            self.assertEqual(
+                {suite["name"] for suite in payload["executable_evaluation"]["suites"]},
+                {"humaneval", "mbpp"},
+            )
 
     def test_external_checkpoint_continuation_is_hash_verified_and_resumable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

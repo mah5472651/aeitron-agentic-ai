@@ -3032,13 +3032,13 @@ Live production proof:
 `production_proof` actually touches the running dependencies and writes measured
 evidence. It verifies:
 
-- Postgres migration dry-run or live migration apply
+- live Postgres migration apply in strict mode
 - Redis regenerative quota execution through the Lua-backed quota store
 - local or S3/MinIO object-store write/read/delete lifecycle
-- Qdrant HTTP health
-- native Aeitron serving health and model listing
-- optional OpenAI-compatible chat load test
-- governed benchmark pack presence and minimum production coverage
+- Qdrant temporary collection create/upsert/query/delete lifecycle
+- authenticated native Aeitron serving identity and checkpoint readiness
+- bounded OpenAI-compatible normal and SSE streaming load tests
+- executable benchmark, strict 50-task scorecard, and active-profile hash replay
 - security audit report
 
 Validation mode:
@@ -3066,7 +3066,10 @@ python -m src.aeitron.deployment.production_proof `
   --serving-url "$env:AEITRON_SERVING_URL" `
   --serving-api-key "$env:AEITRON_MODEL_API_KEY" `
   --load-test-requests 100 `
-  --benchmark-dir data\eval `
+  --load-test-streaming-requests 20 `
+  --executable-benchmark-report artifacts\aeitron\executable-eval\benchmark_suites_report.json `
+  --scorecard-report artifacts\aeitron\agent-scorecard\agent_scorecard.json `
+  --active-model-profile C:\AeitronGovernance\active-model-profile.json `
   --run-security-audit `
   --strict-security-tools `
   --output-dir artifacts\\aeitron\production-proof
@@ -3074,7 +3077,10 @@ python -m src.aeitron.deployment.production_proof `
 
 Strict mode fails if required dependencies are missing or unhealthy. This is the
 command to use after starting the production Docker Compose stack or a
-Kubernetes deployment.
+Kubernetes deployment. Service URLs reject embedded credentials,
+query/fragment ambiguity, and unapproved remote HTTP. Use
+`--allow-insecure-service-host HOST` only for an explicitly approved private
+HTTP host; HTTPS remains the default.
 
 Configuration contract layer:
 
@@ -4501,16 +4507,20 @@ Each stage performs:
 5. checkpoint save/reload integrity proof;
 6. checkpoint evaluation;
 7. fixed 50-prompt before/after comparison;
-8. atomic promotion or stop decision.
+8. from 10k onward, protected executable HumanEval and MBPP pass@k evaluation;
+9. atomic promotion or stop decision.
 
 The 1k stage can advance when technical gates pass even if quality is neutral,
 because it is a pipeline qualification. Starting at 10k, score improvement of
-at least one percentage point is mandatory. Any individual task regression,
+at least one percentage point is mandatory. HumanEval and MBPP are loaded only
+through the SHA-256-validated protected holdout manifest; a substituted local
+file is rejected. Every measured executable suite must pass and the minimum
+suite pass@1 must meet the configured floor. Any individual task regression,
 hallucination, collapse, non-finite loss, missing best checkpoint, tokenizer
-warning, failed checkpoint evaluation, or validation failure blocks promotion.
-The report recommends data-mix audit, verified instruction-data expansion,
-overfit sanity testing, or optimizer correction instead of blindly adding
-steps.
+warning, failed executable/checkpoint evaluation, or validation failure blocks
+promotion. The report recommends data-mix audit, verified instruction-data
+expansion, overfit sanity testing, or optimizer correction instead of blindly
+adding steps.
 
 #### Scale Admission
 
@@ -5230,6 +5240,12 @@ artifact hashes. It becomes `production_ready` for benchmark evaluation only
 when `AEITRON_EXECUTABLE_BENCHMARK_REPORT` points to a passed executable-model
 report containing measured pass@1 for every active suite.
 
+The defensive campaign adds a second enforcement point: stages at 10k and
+above automatically execute the governed HumanEval and MBPP subsets using the
+stage's validation-loss-selected checkpoint. The stage record stores the
+report SHA-256 and minimum measured pass@1. Missing, failed, tampered, or
+below-threshold executable evidence prevents stage promotion.
+
 ### Native checkpoint activation
 
 `model_ops.backends promote-checkpoint` verifies every checkpoint file against
@@ -5238,6 +5254,12 @@ executable-model report bound to that exact checkpoint, and requires a passed
 50-task scorecard for production promotion. It rejects static reports,
 tampering, insecure remote HTTP endpoints, embedded endpoint credentials,
 query/fragment endpoint ambiguity, and output overwrite.
+
+The scorecard carries its model backend and immutable evidence hashes.
+Production promotion compares those values with the selected checkpoint,
+tokenizer, and executable report. The active profile then stores the same
+evidence as structured fields. Strict production proof requires exact replay
+of that complete chain and rejects an unrelated or edited scorecard.
 
 The command writes an immutable external active-profile artifact. Set
 `AEITRON_ACTIVE_MODEL_PROFILE_PATH` to select it without editing the tracked
@@ -5256,6 +5278,14 @@ validated, and production Qdrant refuses the local hashing fallback.
 Qdrant, embedding service, Postgres, Redis, S3/MinIO, GPU execution, and the
 50-task governed repository run remain external operational proofs. The code
 reports those states as blocked or built-not-proven until live evidence exists.
+
+`deployment.production_proof` performs operational checks rather than health
+URL checks alone: Postgres migrations must be applied, Qdrant must survive a
+temporary write/query/delete transaction, native serving must prove
+authenticated scratch-checkpoint identity, both normal and SSE generation must
+return valid model-bound content, and benchmark/scorecard/profile hashes must
+match. These checks still require real services and cannot be completed by a
+local unit test.
 
 
 
