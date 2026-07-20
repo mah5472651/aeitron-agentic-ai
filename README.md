@@ -384,7 +384,7 @@ python -m src.aeitron.deployment.production_qualification `
   --calibration-200-decision artifacts\aeitron\calibration-200-v1\calibration_decision.json `
   --calibration-5k-decision artifacts\aeitron\calibration-5k-v1\calibration_decision.json `
   --production-dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
-  --tokenizer-audit-report artifacts\aeitron\tokenizer-64k\tokenizer_audit_report.json `
+  --tokenizer-audit-report artifacts\aeitron\tokenizer-128k\tokenizer_audit_report.json `
   --t4-1k-training-report artifacts\aeitron\t4-1k\pretrain_report.json `
   --t4-10k-training-report artifacts\aeitron\t4-10k\pretrain_report.json `
   --manual-security-review C:\AeitronGovernance\manual-security-review.json `
@@ -413,7 +413,7 @@ The qualification runner is the only component allowed to issue a
 passed governed 200
 -> passed governed 5k, bound to the 200 decision hash
 -> promoted non-smoke 100k dataset, bound to the 5k decision hash
--> passed exactly-64k tokenizer audit
+-> passed exactly-128k tokenizer audit
 -> measured T4 1k and 10k scratch runs with checkpoint reload proof
 -> active native checkpoint, executable benchmarks, and repository scorecard
 ```
@@ -552,7 +552,7 @@ python -m src.aeitron.model_ops.tokenizer_pipeline \
   --input data/training/clean.jsonl \
   --tokenizer-out artifacts/aeitron/tokenizer/tokenizer.json \
   --shards-out artifacts/aeitron/shards \
-  --vocab-size 64000 \
+  --vocab-size 128000 \
   --sequence-length 128
 
 python -m src.aeitron.model_ops.pretrain_loop \
@@ -636,7 +636,7 @@ python -m src.aeitron.learning.data_pipeline \
   --max-docs 1000000 \
   --workers 64 \
   --max-depth 2 \
-  --vocab-size 64000 \
+  --vocab-size 128000 \
   --sequence-length 2048 \
   --shard-token-count 1000000 \
   --train-device cuda \
@@ -1223,15 +1223,15 @@ cannot authorize advancement.
 ```powershell
 python -m src.aeitron.model_ops.tokenizer_pipeline `
   --input data\production\aeitron-foundation-v1\train.jsonl `
-  --output-dir artifacts\aeitron\tokenizer-64k-v1 `
+  --output-dir artifacts\aeitron\tokenizer-128k-v1 `
   --dataset-id aeitron-foundation-v1 `
-  --vocab-size 64000 `
+  --vocab-size 128000 `
   --real-corpus-audit
 ```
 
-The audit now fails unless the actual vocabulary is exactly 64,000 and every
+The audit now fails unless the actual vocabulary is exactly 128,000 and every
 required control token is present. A small corpus that cannot supply enough
-valid BPE merges is rejected instead of being called a 64k tokenizer.
+valid BPE merges is rejected instead of being called a 128k tokenizer.
 
 5. Run executable HumanEval/MBPP evaluation against a scratch checkpoint:
 
@@ -1277,6 +1277,44 @@ and MBPP holdouts automatically from `10k` onward. Both artifacts must replay
 against `protected_benchmark_manifest.json`, every measured suite must pass,
 and the minimum suite pass@1 must meet the configured threshold. The `1k`
 stage remains a technical pipeline proof, not a model-quality claim.
+
+## 4T MoE Architecture Contract
+
+The only model-shape authority is
+`src/aeitron/model_ops/foundation.py`. The `4t_moe` profile is a
+96-layer MLA decoder with 256 routed experts, top-4 routing, one shared expert,
+one MTP layer, a 128k tokenizer, 1M native-context contract and 5M effective
+hierarchical context. Its exact estimator reports 3.9916T total and 126.26B
+active parameters, inside the locked tolerances.
+
+The native PyTorch decoder implements small-scale MLA, compressed KV cache,
+dropless MoE, router diagnostics and MTP for numerical qualification. It
+refuses to instantiate the 4T profile. Megatron-Core owns the production
+TP/PP/DP/CP/EP runtime, and remains `built_not_cluster_proven` until real
+cluster checkpoint/recovery and load evidence exists.
+
+The immutable `aeitron-4t-moe` workspace profile binds TP8/PP12/DP16/CP4/EP16,
+6,144 GPUs, and a 30T governed-token exposure target. Training-token accounting
+uses only data-parallel replicas; model-parallel ranks do not multiply the
+global batch. Dense HF export deliberately rejects MLA/MoE checkpoints, so
+custom vLLM/TensorRT conversion remains blocked until fixed-prompt logit parity
+is measured.
+
+Long-context checkpoint evaluation uses governed local files:
+
+```powershell
+python -m src.aeitron.evaluation.benchmark_suites `
+  --mode long-context-model `
+  --suite ruler ruler_style data\eval\protected\ruler.jsonl `
+  --suite helmet helmet_style data\eval\protected\helmet.jsonl `
+  --suite repoqa repoqa_style data\eval\protected\repoqa.jsonl `
+  --checkpoint-manifest CHECKPOINT_MANIFEST.json `
+  --tokenizer-path TOKENIZER.json `
+  --output-dir artifacts\aeitron\long-context-eval
+```
+
+This measures evidence recall, order sensitivity and unsupported claims. A 5M
+effective-context result is not represented as a 5M full-attention claim.
 
 7. Qdrant indexing is explicit and idempotent:
 

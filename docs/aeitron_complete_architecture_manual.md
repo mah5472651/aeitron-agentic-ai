@@ -937,7 +937,7 @@ Commands:
 ```bash
 pip install -r requirements-linux-gpu.txt
 python deploy/gpu/run_scratch_gpu_smoke.py --device cuda --steps 2 --sequence-length 64
-python -m src.aeitron.model_ops.tokenizer_pipeline --input data/training/clean.jsonl --tokenizer-out artifacts/aeitron/tokenizer/tokenizer.json --shards-out artifacts/aeitron/shards --vocab-size 64000 --sequence-length 128
+python -m src.aeitron.model_ops.tokenizer_pipeline --input data/training/clean.jsonl --tokenizer-out artifacts/aeitron/tokenizer/tokenizer.json --shards-out artifacts/aeitron/shards --vocab-size 128000 --sequence-length 128
 python -m src.aeitron.model_ops.pretrain_loop --device cuda --manifest artifacts/aeitron/shards/manifest.json --steps 100 --batch-size 2 --sequence-length 128 --gradient-accumulation-steps 4 --dtype bf16
 python deploy/gpu/run_pretraining_pipeline.py --input data/training/clean.jsonl --device cuda --steps 100 --sequence-length 128
 ```
@@ -1767,7 +1767,7 @@ Order:
 Command:
 
 ```bash
-python -m src.aeitron.learning.data_pipeline --sources config/data_sources.ultimate.json --dataset-id aeitron-defensive-coding-corpus --work-dir artifacts/aeitron/data-pipeline --frontier-backend postgres --postgres-dsn "$AEITRON_DATABASE_URL" --object-store-uri s3://aeitron-datasets/pretraining --object-store-endpoint-url "$S3_ENDPOINT_URL" --max-docs 1000000 --workers 64 --max-depth 2 --vocab-size 64000 --sequence-length 2048 --shard-token-count 1000000 --skip-train
+python -m src.aeitron.learning.data_pipeline --sources config/data_sources.ultimate.json --dataset-id aeitron-defensive-coding-corpus --work-dir artifacts/aeitron/data-pipeline --frontier-backend postgres --postgres-dsn "$AEITRON_DATABASE_URL" --object-store-uri s3://aeitron-datasets/pretraining --object-store-endpoint-url "$S3_ENDPOINT_URL" --max-docs 1000000 --workers 64 --max-depth 2 --vocab-size 128000 --sequence-length 2048 --shard-token-count 1000000 --skip-train
 ```
 
 When to use `--skip-train`:
@@ -1949,7 +1949,7 @@ python deploy/gpu/run_real_data_training_pipeline.py \
   --workers 16 \
   --max-depth 2 \
   --delay-seconds 0.5 \
-  --vocab-size 64000 \
+  --vocab-size 128000 \
   --sequence-length 128 \
   --validation-fraction 0.02 \
   --train-steps 1000 \
@@ -1973,7 +1973,7 @@ python deploy/gpu/run_real_data_training_pipeline.py \
   --workers 24 \
   --max-depth 2 \
   --delay-seconds 0.35 \
-  --vocab-size 64000 \
+  --vocab-size 128000 \
   --sequence-length 256 \
   --validation-fraction 0.02 \
   --steps 5000 \
@@ -2010,7 +2010,7 @@ python deploy/gpu/run_real_data_training_pipeline.py \
   --workers 32 \
   --max-depth 3 \
   --delay-seconds 0.5 \
-  --vocab-size 64000 \
+  --vocab-size 128000 \
   --sequence-length 128 \
   --validation-fraction 0.02 \
   --train-steps 10000 \
@@ -2343,7 +2343,7 @@ python -m src.aeitron.learning.data_pipeline `
   --sources config\data_sources.ultimate.json `
   --dataset-id aeitron-defensive-coding-corpus `
   --work-dir artifacts\\aeitron\data-pipeline `
-  --vocab-size 64000 `
+  --vocab-size 128000 `
   --sequence-length 2048 `
   --shard-token-count 1000000
 ```
@@ -2755,7 +2755,7 @@ python -m src.aeitron.model_ops.tokenizer_pipeline \
   --real-corpus-audit \
   --input artifacts/aeitron/real-data-5k-quality-gated/gated/training-promoted.jsonl \
   --output-dir artifacts/aeitron/real-tokenizer-v1 \
-  --vocab-size 64000 \
+  --vocab-size 128000 \
   --min-frequency 2 \
   --shard-token-count 1000000 \
   --sequence-length 128 \
@@ -3218,9 +3218,10 @@ deepspeed --num_nodes 1 --num_gpus 8 -m src.aeitron.model_ops.pretrain_loop \
 ```
 
 This path is built, but still not cluster-proven until an actual multi-GPU
-DeepSpeed run saves, reloads, and evaluates a checkpoint. Megatron-LM remains an
-external-checkout requirement until a real Megatron adapter is implemented and
-cluster-tested.
+DeepSpeed run saves, reloads, and evaluates a checkpoint. The Megatron launch
+adapter now maps the canonical model contract into bounded TP/PP/DP/CP/EP
+arguments and a validated multi-node rendezvous. It still requires a pinned
+external Megatron-Core checkout and real cluster checkpoint/recovery proof.
 
 ## vLLM / TensorRT-LLM / Megatron Adapters
 
@@ -3242,6 +3243,11 @@ python -m src.aeitron.model_ops.production_adapters export-hf \
   --output-dir artifacts/aeitron/exports/hf-llama \
   --torch-dtype bfloat16
 ```
+
+The HF export path is intentionally dense/GQA-only. It rejects MLA or MoE
+checkpoints because mapping those weights into a Llama package would be
+incorrect. The 4T profile therefore requires a dedicated MLA/MoE converter and
+fixed-prompt logit-parity proof before vLLM or TensorRT-LLM promotion.
 
 This writes:
 
@@ -3283,6 +3289,11 @@ python -m src.aeitron.model_ops.production_adapters plan-megatron \
   --micro-batch-size 1 \
   --global-batch-size 16 \
   --train-iters 10000 \
+  --num-nodes 2 \
+  --gpus-per-node 8 \
+  --node-rank 0 \
+  --master-addr training-controller.internal \
+  --master-port 29500 \
   --megatron-root /opt/Megatron-LM
 ```
 
@@ -3754,11 +3765,19 @@ The registry currently includes:
 - `aeitron-7b-fsdp`: multi-node native FSDP.
 - `aeitron-32b-zero3`: multi-node DeepSpeed ZeRO-3.
 - `aeitron-60b-hybrid`: Slurm and hybrid/Megatron target.
+- `aeitron-4t-moe`: immutable 4T-total/128B-active Megatron target with
+  TP8/PP12/DP16/CP4/EP16 over 6,144 GPUs and a 30T governed-token exposure
+  target.
 
 A profile version is immutable. Postgres uses `(profile_id, version)` as the
 identity and stores its SHA-256. Synchronization fails if content changes
 without a version bump. A job stores the exact profile hash, spec hash, Git
 commit, image digest, tokenizer hash, and dataset manifest hash.
+
+Token accounting uses only independent data-parallel replicas. TP, PP, CP and
+EP partition one model execution and do not multiply consumed training tokens.
+This prevents large model-parallel profiles from silently overstating their
+global batch or token budget.
 
 Allowed overrides have explicit integer ranges. A client cannot submit an
 executable, shell fragment, environment secret, mount, image, or scheduler
@@ -4777,7 +4796,7 @@ operational gates, not completed proofs:
 4. a corrected 200-record calibration and then a 5,000-record calibration pass;
 5. the one-million-fingerprint scale report passes;
 6. the first 100,000-record version reaches `promoted`;
-7. the 64,000-token tokenizer is trained only from that promoted version;
+7. the 128,000-token tokenizer is trained only from that promoted version;
 8. T4 1k/10k qualification runs bind the promoted manifest and tokenizer;
 9. only a checkpoint that passes evaluation and reload parity becomes the
    native active backend.
@@ -5213,7 +5232,7 @@ evidence, and immutable promotion manifests. Raw crawl rows cannot train.
 
 ### Tokenizer qualification
 
-The production tokenizer has exactly 64,000 vocabulary entries. The
+The production tokenizer has exactly 128,000 vocabulary entries. The
 real-corpus audit now fails when `vocab_size_actual != vocab_size_requested`;
 it does not pad a small corpus with fake tokens. It also requires all Aeitron
 control tokens and reports code indentation, hexadecimal/address, compile-log,
@@ -5444,7 +5463,7 @@ report to pass in addition to tests.
 The final qualifier binds the data/model progression as immutable evidence.
 The 5k decision must contain the supplied 200 decision file hash. The promoted
 100k manifest must contain the supplied 5k decision file hash. The tokenizer
-audit must report exactly 64,000 requested and actual vocabulary entries with
+audit must report exactly 128,000 requested and actual vocabulary entries with
 no missing special tokens or audit failures. T4 qualification reports must be
 scratch-only, complete at least 1,000 and 10,000 measured steps respectively,
 use at least the 512-hidden/8-layer/256-context technical profile, contain
@@ -5454,6 +5473,160 @@ Missing legal approval, reviewer qualification, governed dataset decisions,
 GPU reports, native-serving evidence, live dependency proofs, soak reports, or
 canary evidence remains `blocked`. Code completion never changes those external
 facts to `passed`.
+
+## Canonical 4T MoE and Hybrid 5M Context Contract
+
+### One architecture authority
+
+`src/aeitron/model_ops/foundation.py` is the only owner of model shapes,
+tokenizer size, parameter accounting, context curriculum and distributed
+topology contracts. `torch_decoder.py` imports that contract and remains the
+numerical reference runtime. The architecture-integrity release gate rejects a
+second `ScratchDecoderConfig`, `TokenizerContract`, or `ParallelismPlan`
+definition anywhere else in the package.
+
+The final profile is `4t_moe`:
+
+```text
+96 layers
+hidden size 16,384
+128 attention heads
+MLA q rank 2,048 and KV rank 512
+first 4 dense FFN layers
+remaining 92 MoE layers
+256 routed experts plus one shared expert per MoE layer
+top-4 routed experts per token
+expert intermediate size 3,392
+one training-only MTP layer
+128,000-token vocabulary
+1,000,000 native-context contract
+5,000,000 effective hierarchical-context contract
+```
+
+The deterministic estimator currently reports:
+
+```text
+total parameters: 3,991,575,740,416
+active parameters per token: 126,256,168,960
+total target delta: -0.2106064896%
+active target delta: -1.362368%
+```
+
+Both pass the locked tolerances of 4T +/-0.5% and 128B +/-5%. The contract SHA
+is derived from canonical JSON, so any model-shape change invalidates bound
+plans and evidence. The native reference runtime refuses to instantiate this
+profile; its production authority is Megatron-Core. This prevents an accidental
+multi-terabyte allocation on a workstation.
+
+### Numerical reference implementation
+
+The native decoder supports both legacy dense/GQA checkpoints and architecture
+version 2:
+
+- dynamic RoPE generation without allocating a one-million-position cache at
+  model construction;
+- MLA query and KV low-rank projections;
+- compressed inference cache containing latent KV plus decoupled rotary keys;
+- dropless top-k MoE dispatch with FP32 routing scores;
+- one or more always-active shared experts;
+- auxiliary-loss-free expert selection-bias updates;
+- per-layer assignment count, dropped-token count and p99/mean load metrics;
+- MTP next-next-token training loss with a configurable objective weight;
+- gradient checkpointing, eager/SDPA attention and checkpoint export.
+
+The transparent expert loop is deliberately a correctness implementation, not
+the 4T throughput kernel. Megatron grouped GEMM and all-to-all dispatch own the
+distributed production path. Training aborts if any routed assignment is
+dropped and reports whether router p99 load is within the configured 1.20x
+limit.
+
+The `1b` dense and `1b_moe` profiles are an iso-active-compute A/B gate. The MoE
+profile has approximately 5.44B total and 1.31B active parameters; it must beat
+the dense run under the same governed tokens and active compute before sparse
+scaling advances.
+
+### Distributed topology
+
+`distributed_topology_report()` validates TP, PP, DP, CP and EP together:
+
+- hidden size and attention heads divide across tensor ranks;
+- layers divide across pipeline stages;
+- routed experts divide across expert ranks;
+- expert parallelism divides the data-parallel domain;
+- node count and GPUs per node equal world size;
+- each report binds the canonical architecture SHA.
+
+The Megatron launch planner emits model dimensions, MLA ranks, MoE router
+settings, grouped GEMM, all-to-all dispatch, expert bias balancing and
+TP/PP/CP/EP arguments. A generated command remains
+`built_not_cluster_proven` until the exact Megatron checkout, indexed dataset,
+GPU topology, NCCL/RDMA health and distributed checkpoint proof are present.
+
+### Tokenizer migration
+
+All new production tokenizer and real-data pipeline defaults are 128,000.
+Production qualification requires exactly 128,000 requested and actual entries,
+all control tokens and no audit failures. Old 64k tokenizers and dense-v1
+checkpoints remain readable for historical validation, but they cannot resume
+an architecture-v2 run. Every token shard must be rebuilt and hash-bound to the
+new tokenizer.
+
+```powershell
+python -m src.aeitron.model_ops.tokenizer_pipeline `
+  --input data\production\aeitron-foundation-v1\train.jsonl `
+  --output-dir artifacts\aeitron\tokenizer-128k-v1 `
+  --dataset-id aeitron-foundation-v1 `
+  --vocab-size 128000 `
+  --real-corpus-audit
+```
+
+### Context qualification
+
+The context ladder is a versioned contract:
+
+```text
+32K pretrain
+-> 64K pretrain
+-> 128K mixed length
+-> 256K context parallel
+-> 1M context parallel
+-> 5M effective hierarchical evaluation
+```
+
+`ContextBuilder` enforces a maximum 1M active prompt budget and reports indexed,
+active and effective project tokens with stable chunk evidence. The 5M claim
+means active context plus symbol graph, semantic vector retrieval, project
+memory and archive memory. It never means an unverified 5M full-attention pass.
+
+The benchmark service accepts governed local `ruler_style`, `helmet_style` and
+`repoqa_style` JSONL. Its model mode measures answer recall, context-order
+sensitivity and forbidden/unsupported claims. Evidence blocks are XML-escaped
+and explicitly treated as untrusted data.
+
+```powershell
+python -m src.aeitron.evaluation.benchmark_suites `
+  --mode long-context-model `
+  --suite ruler ruler_style data\eval\protected\ruler.jsonl `
+  --suite helmet helmet_style data\eval\protected\helmet.jsonl `
+  --suite repoqa repoqa_style data\eval\protected\repoqa.jsonl `
+  --checkpoint-manifest CHECKPOINT_MANIFEST.json `
+  --tokenizer-path TOKENIZER.json `
+  --output-dir artifacts\aeitron\long-context-eval
+```
+
+At 1M, promotion requires at least 98% short-context retention, at least 80%
+RULER aggregate and zero unsupported claims in the governed suite. Missing
+benchmark files fail rather than becoming synthetic passes.
+
+### Honest current status
+
+The canonical contract, exact estimator, small-scale MLA/MoE/MTP reference,
+compressed-cache decode, Megatron argument mapping, 128K migration and
+long-context evaluation path are built and locally tested. The 4T system is
+still `built_not_cluster_proven`. Legal/reviewer data gates, promoted 100k and
+larger datasets, real 128K tokenizer, 1B A/B run, multi-node Megatron training,
+1M context benchmark, 4T checkpoint recovery and converted-serving parity are
+external measured work and remain blocked/not-run until their evidence exists.
 
 
 

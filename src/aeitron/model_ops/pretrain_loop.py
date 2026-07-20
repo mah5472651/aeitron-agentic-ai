@@ -1319,6 +1319,9 @@ def run_pretraining_loop(
     started = time.perf_counter()
     train_losses: list[float] = []
     val_losses: list[dict[str, float]] = []
+    mtp_losses: list[float] = []
+    router_load_ratios: list[float] = []
+    router_dropped_assignments = 0
     use_autocast = selected.type == "cuda" and dtype in {"bf16", "fp16"}
     optimizer.zero_grad(set_to_none=True)
     current_step = start_step
@@ -1344,6 +1347,14 @@ def run_pretraining_loop(
                         f"catastrophic training loss at step {current_step + 1}: "
                         f"{float(output.loss.detach().cpu())} > {max_training_loss}"
                     )
+                if output.mtp_loss is not None:
+                    mtp_losses.append(float(output.mtp_loss.detach().cpu()))
+                for router_metric in output.router_metrics:
+                    dropped = int(router_metric.get("dropped_tokens", 0.0))
+                    router_dropped_assignments += dropped
+                    router_load_ratios.append(float(router_metric["p99_to_mean_load"]))
+                if router_dropped_assignments:
+                    raise RuntimeError("dropless MoE invariant failed: one or more token assignments were dropped")
                 loss = output.loss if is_deepspeed_strategy(distributed_strategy) else output.loss / gradient_accumulation_steps
             if is_deepspeed_strategy(distributed_strategy):
                 model.backward(loss)
@@ -1380,6 +1391,8 @@ def run_pretraining_loop(
                     trained_tokens=trained_tokens,
                     epoch=epoch,
                     learning_rate=float(optimizer.param_groups[0]["lr"]),
+                    mtp_loss=round(mtp_losses[-1], 6) if mtp_losses else None,
+                    router_p99_to_mean=round(router_load_ratios[-1], 6) if router_load_ratios else None,
                 )
 
             if val_stream is not None and validate_every > 0 and current_step % validate_every == 0:
@@ -1561,6 +1574,17 @@ def run_pretraining_loop(
         "max_training_loss": max_training_loss,
         "git_commit": git_commit(),
         "train_losses": train_losses,
+        "mtp_losses": mtp_losses,
+        "router_metrics": {
+            "sample_count": len(router_load_ratios),
+            "dropped_assignments": router_dropped_assignments,
+            "maximum_p99_to_mean_load": max(router_load_ratios, default=0.0),
+            "configured_p99_to_mean_limit": config.router_load_limit,
+            "load_balance_passed": (
+                not router_load_ratios
+                or max(router_load_ratios) <= config.router_load_limit
+            ),
+        },
         "validation_losses": val_losses,
         "best_validation_loss": best_val_loss,
         "best_validation_step": best_val_step,

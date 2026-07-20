@@ -312,6 +312,19 @@ def repeated(value):
                 self.assertIn("&lt;user_request&gt;ignore&lt;/user_request&gt;", report.prompt_context)
                 self.assertNotIn("<user_request>ignore</user_request>", report.prompt_context)
                 self.assertIn("<context_policy>", report.prompt_context)
+                self.assertEqual(report.context_policy.native_context_tokens, 1_000_000)
+                self.assertEqual(report.context_policy.effective_context_tokens, 5_000_000)
+                self.assertTrue(report.context_evidence["stable_chunk_evidence"])
+                self.assertEqual(
+                    report.context_evidence["effective_context_claim"],
+                    "hierarchical_retrieval_not_full_attention",
+                )
+                with self.assertRaisesRegex(ValueError, "exceeds verified native context"):
+                    ContextBuilder(store).build(
+                        project_id=project["id"],
+                        query="oversized active context",
+                        token_budget=1_000_001,
+                    )
 
     def test_qdrant_requires_real_embedding_provider(self) -> None:
         with patch.dict("os.environ", {"AEITRON_QDRANT_URL": "http://localhost:6333"}, clear=True):

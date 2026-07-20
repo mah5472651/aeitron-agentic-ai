@@ -23,9 +23,17 @@ from src.aeitron.shared.schemas import StrictModel
 AUTHORITATIVE_MODULES = {
     "canonical_integrity": "src.aeitron.shared.integrity",
     "configuration_contracts": "src.aeitron.shared.config_contracts",
+    "model_architecture_contract": "src.aeitron.model_ops.foundation",
     "independent_review": "src.aeitron.learning.training_data_gate",
     "production_release_decision": "src.aeitron.deployment.production_qualification",
     "tool_execution_policy": "src.aeitron.tools.policy",
+}
+OWNED_CLASS_NAMES = {
+    "model_architecture_contract": {
+        "ScratchDecoderConfig",
+        "TokenizerContract",
+        "ParallelismPlan",
+    },
 }
 OWNED_FUNCTION_NAMES = {
     "canonical_integrity": {
@@ -196,6 +204,18 @@ def run_architecture_integrity(
             continue
         trees[module] = tree
         for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for capability, symbols in OWNED_CLASS_NAMES.items():
+                    if node.name in symbols and module != AUTHORITATIVE_MODULES[capability]:
+                        ownership_violations.append(
+                            OwnershipViolation(
+                                capability=capability,
+                                expected_module=AUTHORITATIVE_MODULES[capability],
+                                actual_module=module,
+                                symbol=node.name,
+                                line=node.lineno,
+                            )
+                        )
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             fingerprint = _function_fingerprint(node)

@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--max-depth", type=int, default=2)
     parser.add_argument("--delay-seconds", type=float, default=0.5)
-    parser.add_argument("--vocab-size", type=int, default=64_000)
+    parser.add_argument("--vocab-size", type=int, default=128_000)
     parser.add_argument("--shard-token-count", type=int, default=1_000_000)
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--validation-fraction", type=float, default=0.02)

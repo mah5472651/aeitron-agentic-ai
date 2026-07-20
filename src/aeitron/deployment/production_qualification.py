@@ -764,12 +764,12 @@ def validate_scratch_training_chain(
 
         if (
             tokenizer.status != "passed"
-            or tokenizer.vocab_size_requested != 64_000
-            or tokenizer.vocab_size_actual != 64_000
+            or tokenizer.vocab_size_requested != 128_000
+            or tokenizer.vocab_size_actual != 128_000
             or tokenizer.special_tokens_missing
             or tokenizer.audit_failures
         ):
-            blockers.append("64k tokenizer qualification did not pass")
+            blockers.append("128k tokenizer qualification did not pass")
 
         required_steps = {"t4_1k": 1_000, "t4_10k": 10_000}
         for name, payload in t4_reports.items():

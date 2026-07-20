@@ -24,6 +24,7 @@ from src.aeitron.evaluation.benchmark_pack import validate_protected_benchmark_m
 from src.aeitron.identity.auth import AuthConfig
 from src.aeitron.identity.quota import QuotaConfig
 from src.aeitron.model_ops.backends import active_model_health
+from src.aeitron.model_ops.foundation import model_profile
 from src.aeitron.shared.config import load_active_profile
 from src.aeitron.shared.schemas import StrictModel
 from src.aeitron.training_workspace import TrainingProfileRegistry
@@ -291,15 +292,57 @@ def _check_training_stack(mode: str) -> list[ReadinessCheck]:
         deepspeed_missing.append("python module: deepspeed")
     if not megatron_available:
         deepspeed_missing.append("MEGATRON_LM_ROOT existing checkout")
+    four_t_profile = model_profile("4t_moe")
+    four_t_parameters = four_t_profile.parameter_report()
     return [
         ReadinessCheck(
+            subsystem="canonical_4t_architecture",
+            status="built_not_cluster_proven",
+            summary=(
+                "The canonical 4T-total/128B-active MLA-MoE contract passes deterministic "
+                "parameter accounting; no cluster training, checkpoint, context, or serving proof exists yet."
+            ),
+            required_dependencies=[
+                "governed 128K tokenizer",
+                "promoted immutable dataset",
+                "Megatron-Core TP/PP/DP/CP/EP cluster",
+                "distributed checkpoint reload proof",
+                "1M native-context benchmark proof",
+                "converted-serving logit parity",
+            ],
+            missing_dependencies=[
+                "real 4T distributed training/checkpoint proof",
+                "real 1M native-context evaluation",
+                "real MLA/MoE serving conversion parity",
+            ],
+            evidence={
+                "profile": four_t_profile.name,
+                "architecture_version": four_t_profile.architecture_version,
+                "contract_sha256": four_t_profile.contract_sha256(),
+                "parameter_report": four_t_parameters,
+                "native_context_tokens": four_t_profile.max_sequence_length,
+                "effective_context_tokens": four_t_profile.effective_context_length,
+                "runtime_backend": four_t_profile.runtime_backend,
+                "cluster_proven": False,
+            },
+            production_blocker=mode == "production",
+        ),
+        ReadinessCheck(
             subsystem="pretraining",
-            status="production_ready" if cuda_available else "blocked_missing_dependency",
-            summary="CUDA training runtime is available." if cuda_available else "CUDA training runtime is not available on this host.",
-            required_dependencies=["CUDA-capable GPU", "PyTorch CUDA build"],
-            missing_dependencies=[] if cuda_available else ["CUDA-capable GPU or compatible PyTorch CUDA build"],
-            evidence={"torch_version": torch_version, "cuda_available": cuda_available},
-            production_blocker=mode == "production" and not cuda_available,
+            status="built_not_cluster_proven" if cuda_available else "blocked_missing_dependency",
+            summary=(
+                "A CUDA runtime is available for technical validation, but serious distributed pretraining is not proven."
+                if cuda_available
+                else "CUDA training runtime is not available on this host."
+            ),
+            required_dependencies=["CUDA-capable GPU", "PyTorch CUDA build", "measured distributed training proof"],
+            missing_dependencies=(
+                ["measured distributed training proof"]
+                if cuda_available
+                else ["CUDA-capable GPU or compatible PyTorch CUDA build", "measured distributed training proof"]
+            ),
+            evidence={"torch_version": torch_version, "cuda_available": cuda_available, "cluster_proven": False},
+            production_blocker=mode == "production",
         ),
         ReadinessCheck(
             subsystem="fsdp",
@@ -312,10 +355,10 @@ def _check_training_stack(mode: str) -> list[ReadinessCheck]:
         ),
         ReadinessCheck(
             subsystem="deepspeed_megatron",
-            status="built_not_cluster_proven" if deepspeed_available else "blocked_missing_dependency",
+            status="built_not_cluster_proven" if not deepspeed_missing else "blocked_missing_dependency",
             summary=(
-                "DeepSpeed ZeRO runtime adapter is wired; Megatron still requires an external checkout and cluster gate."
-                if deepspeed_available
+                "DeepSpeed and Megatron launch contracts are wired; both still require measured cluster gates."
+                if not deepspeed_missing
                 else "DeepSpeed/Megatron dependencies are missing."
             ),
             required_dependencies=["deepspeed", "Megatron-LM checkout", "cluster release gate"],
@@ -325,15 +368,29 @@ def _check_training_stack(mode: str) -> list[ReadinessCheck]:
         ),
         ReadinessCheck(
             subsystem="vllm_tensorrt",
-            status="production_ready_requires_external_service" if not vllm_trt_missing else "blocked_missing_dependency",
+            status="built_not_cluster_proven" if not vllm_trt_missing else "blocked_missing_dependency",
             summary=(
-                "HF/vLLM export path is built; TensorRT-LLM requires runtime engine build validation."
+                "Dense HF export dependencies exist; runtime decode parity is still required and MLA/MoE conversion is not implemented."
                 if hf_export_ready
                 else "HF/vLLM/TensorRT export artifacts or runtime dependencies are missing."
             ),
-            required_dependencies=["Aeitron-to-HF/vLLM converter", "TensorRT-LLM conversion plugin"],
-            missing_dependencies=vllm_trt_missing,
-            evidence={"hf_export_dir": hf_export_dir, "hf_export_ready": hf_export_ready, "vllm_module": vllm_available, "trtllm_build": trt_build},
+            required_dependencies=[
+                "dense Aeitron-to-HF converter",
+                "custom MLA/MoE vLLM or TensorRT-LLM conversion",
+                "fixed-prompt logit parity proof",
+            ],
+            missing_dependencies=[
+                *vllm_trt_missing,
+                "custom MLA/MoE serving conversion and fixed-prompt parity proof",
+            ],
+            evidence={
+                "hf_export_dir": hf_export_dir,
+                "hf_export_ready": hf_export_ready,
+                "vllm_module": vllm_available,
+                "trtllm_build": trt_build,
+                "mla_moe_conversion_implemented": False,
+                "decode_parity_proven": False,
+            },
             production_blocker=mode == "production",
         ),
     ]

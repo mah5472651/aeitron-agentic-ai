@@ -69,7 +69,7 @@ class DataPipelineConfig(StrictModel):
     delay_seconds: float = Field(default=1.0, ge=0.0)
     shard_rows: int = Field(default=10_000, ge=1)
     respect_robots: bool = True
-    vocab_size: int = Field(default=64_000, ge=1_000)
+    vocab_size: int = Field(default=128_000, ge=1_000)
     tokenizer_min_frequency: int = Field(default=2, ge=1)
     shard_token_count: int = Field(default=1_000_000, ge=128)
     sequence_length: int = Field(default=2048, ge=16)
@@ -1026,7 +1026,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delay-seconds", type=float, default=1.0)
     parser.add_argument("--shard-rows", type=int, default=10_000)
     parser.add_argument("--ignore-robots", action="store_true")
-    parser.add_argument("--vocab-size", type=int, default=64_000)
+    parser.add_argument("--vocab-size", type=int, default=128_000)
     parser.add_argument("--tokenizer-min-frequency", type=int, default=2)
     parser.add_argument("--shard-token-count", type=int, default=1_000_000)
     parser.add_argument("--sequence-length", type=int, default=2048)

@@ -30,13 +30,17 @@ class AeitronModelFoundationTest(unittest.TestCase):
         self.assertFalse(status["external_model_training"])
         presets = architecture_presets()
         self.assertIn("aeitron-7b", presets)
-        self.assertIn("aeitron-100b", presets)
+        self.assertIn("aeitron-62b", presets)
+        self.assertIn("aeitron-4t-moe", presets)
         for name, spec in presets.items():
-            estimate = spec.estimate_parameters()
-            self.assertEqual(spec.name, name)
+            estimate = spec.parameter_report()
+            self.assertTrue(spec.name.startswith("aeitron-"))
             self.assertGreater(estimate["total"], 0)
             self.assertGreater(estimate["total_billions"], 1)
-            self.assertLess(abs(estimate["delta_billions"]), spec.parameter_target_billions)
+            self.assertEqual(len(spec.contract_sha256()), 64)
+        final = presets["aeitron-4t-moe"].parameter_report()
+        self.assertTrue(final["total_target_passed"])
+        self.assertTrue(final["active_target_passed"])
 
     def test_pretraining_readiness_requires_real_assets_and_data_gates(self) -> None:
         spec = PretrainingRunSpec(
@@ -51,6 +55,20 @@ class AeitronModelFoundationTest(unittest.TestCase):
         self.assertTrue(report["scratch_training"])
         self.assertTrue(report["scratch_only"])
         self.assertFalse(report["external_model_training"])
+
+    def test_pretraining_readiness_rejects_noncanonical_architecture(self) -> None:
+        tampered = architecture_presets()["aeitron-7b"].model_copy(
+            update={"hidden_size": 8192}
+        )
+        with self.assertRaisesRegex(ValueError, "immutable canonical"):
+            PretrainingRunSpec(
+                architecture=tampered,
+                tokenizer=TokenizerContract(),
+                data=TrainingDataContract(
+                    manifest_path="missing-dataset.jsonl",
+                    token_count_estimate=0,
+                ),
+            )
 
     def test_checkpoint_manifest_hashes_files_and_writes_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

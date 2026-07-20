@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess  # nosec B404
 import time
@@ -19,7 +20,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
-from src.aeitron.model_ops.foundation import CheckpointManifest, sha256_file
+from src.aeitron.model_ops.foundation import CheckpointManifest, model_profile as get_model_profile, sha256_file
 from src.aeitron.model_ops.torch_decoder import ScratchDecoderConfig, load_trusted_checkpoint, require_torch
 from src.aeitron.shared.schemas import StrictModel
 
@@ -47,6 +48,62 @@ class AdapterReport(StrictModel):
         return target
 
 
+def megatron_model_arguments(profile: ScratchDecoderConfig) -> list[str]:
+    """Translate one canonical model contract into Megatron-Core argv."""
+    arguments = [
+        "--num-layers",
+        str(profile.num_layers),
+        "--hidden-size",
+        str(profile.hidden_size),
+        "--ffn-hidden-size",
+        str(profile.intermediate_size),
+        "--num-attention-heads",
+        str(profile.num_attention_heads),
+        "--num-query-groups",
+        str(profile.num_key_value_heads),
+        "--vocab-size",
+        str(profile.vocab_size),
+    ]
+    if profile.attention_architecture == "mla":
+        arguments.extend(
+            [
+                "--multi-latent-attention",
+                "--q-lora-rank",
+                str(profile.q_lora_rank),
+                "--kv-lora-rank",
+                str(profile.kv_lora_rank),
+                "--qk-head-dim",
+                str(profile.qk_nope_head_dim),
+                "--qk-pos-emb-head-dim",
+                str(profile.qk_rope_head_dim),
+                "--v-head-dim",
+                str(profile.v_head_dim),
+            ]
+        )
+    if profile.feed_forward_architecture == "moe":
+        arguments.extend(
+            [
+                "--num-experts",
+                str(profile.num_routed_experts),
+                "--moe-router-topk",
+                str(profile.experts_per_token),
+                "--moe-ffn-hidden-size",
+                str(profile.moe_intermediate_size),
+                "--moe-grouped-gemm",
+                "--moe-token-dispatcher-type",
+                "alltoall",
+                "--moe-router-load-balancing-type",
+                "none",
+                "--moe-aux-loss-coeff",
+                "0.0",
+                "--moe-router-enable-expert-bias",
+                "--moe-router-bias-update-rate",
+                str(profile.router_bias_update_rate),
+            ]
+        )
+    return arguments
+
+
 def _load_checkpoint(manifest_path: str | Path) -> tuple[CheckpointManifest, dict[str, Any], ScratchDecoderConfig]:
     require_torch()
     manifest = CheckpointManifest.model_validate(json.loads(Path(manifest_path).read_text(encoding="utf-8-sig")))
@@ -59,6 +116,11 @@ def _load_checkpoint(manifest_path: str | Path) -> tuple[CheckpointManifest, dic
 
 
 def _hf_llama_config(config: ScratchDecoderConfig, *, torch_dtype: str) -> dict[str, Any]:
+    if config.attention_architecture != "gqa" or config.feed_forward_architecture != "dense":
+        raise ValueError(
+            "HF Llama export supports only canonical dense/GQA checkpoints; "
+            "MLA/MoE requires a native custom converter with fixed-token logit parity"
+        )
     payload = {
         "architectures": ["LlamaForCausalLM"],
         "model_type": "llama",
@@ -88,6 +150,8 @@ def _hf_llama_config(config: ScratchDecoderConfig, *, torch_dtype: str) -> dict[
 
 
 def _convert_state_dict_to_hf_llama(state: dict[str, Any], config: ScratchDecoderConfig) -> dict[str, Any]:
+    if config.attention_architecture != "gqa" or config.feed_forward_architecture != "dense":
+        raise ValueError("MLA/MoE state cannot be represented by the Llama checkpoint schema")
     converted: dict[str, Any] = {
         "model.embed_tokens.weight": state["embed_tokens.weight"],
         "model.norm.weight": state["norm.weight"],
@@ -250,10 +314,17 @@ def build_megatron_launch_plan(
     tensor_parallel: int,
     pipeline_parallel: int,
     data_parallel: int,
+    context_parallel: int = 1,
+    expert_parallel: int = 1,
     sequence_length: int,
     micro_batch_size: int,
     global_batch_size: int,
     train_iters: int,
+    num_nodes: int = 1,
+    gpus_per_node: int | None = None,
+    node_rank: int = 0,
+    master_addr: str = "127.0.0.1",
+    master_port: int = 29500,
     megatron_root: str | Path | None = None,
     execute: bool = False,
 ) -> AdapterReport:
@@ -261,15 +332,48 @@ def build_megatron_launch_plan(
         "tensor_parallel": tensor_parallel,
         "pipeline_parallel": pipeline_parallel,
         "data_parallel": data_parallel,
+        "context_parallel": context_parallel,
+        "expert_parallel": expert_parallel,
         "sequence_length": sequence_length,
         "micro_batch_size": micro_batch_size,
         "global_batch_size": global_batch_size,
         "train_iters": train_iters,
+        "num_nodes": num_nodes,
+        "master_port": master_port,
     }
     invalid = [name for name, value in numeric_values.items() if not isinstance(value, int) or value <= 0]
     if invalid:
         raise ValueError("Megatron integer settings must be positive: " + ", ".join(invalid))
-    world_size = tensor_parallel * pipeline_parallel * data_parallel
+    if node_rank < 0 or node_rank >= num_nodes:
+        raise ValueError("node_rank must be between zero and num_nodes - 1")
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", master_addr):
+        raise ValueError("master_addr must be a bounded hostname or IP literal")
+    if num_nodes > 1 and master_addr in {"127.0.0.1", "localhost"}:
+        raise ValueError("multi-node Megatron plans require a non-loopback master_addr")
+    if not 1024 <= master_port <= 65535:
+        raise ValueError("master_port must be between 1024 and 65535")
+    profile = get_model_profile(model_profile)
+    if sequence_length > profile.max_sequence_length:
+        raise ValueError(
+            f"sequence_length={sequence_length} exceeds profile context={profile.max_sequence_length}"
+        )
+    world_size = tensor_parallel * pipeline_parallel * context_parallel * data_parallel
+    if gpus_per_node is None:
+        if world_size % num_nodes:
+            raise ValueError("world_size must be divisible by num_nodes")
+        gpus_per_node = world_size // num_nodes
+    topology = profile.distributed_topology_report(
+        tensor_parallel=tensor_parallel,
+        pipeline_parallel=pipeline_parallel,
+        data_parallel=data_parallel,
+        context_parallel=context_parallel,
+        expert_parallel=expert_parallel,
+        gpus_per_node=gpus_per_node,
+    )
+    if not topology["passed"]:
+        raise ValueError("invalid Megatron topology: " + "; ".join(topology["failures"]))
+    if num_nodes * gpus_per_node != world_size:
+        raise ValueError("num_nodes * gpus_per_node must equal the parallel world_size")
     if global_batch_size % (micro_batch_size * data_parallel) != 0:
         raise ValueError("global_batch_size must be divisible by micro_batch_size * data_parallel")
     if tensor_parallel * pipeline_parallel > world_size:
@@ -295,12 +399,23 @@ def build_megatron_launch_plan(
     command = [
         str(Path(torchrun).resolve()) if torchrun else "torchrun",
         "--nproc_per_node",
-        str(world_size),
+        str(gpus_per_node),
+        "--nnodes",
+        str(num_nodes),
+        "--node_rank",
+        str(node_rank),
+        "--master_addr",
+        master_addr,
+        "--master_port",
+        str(master_port),
         str(pretrain),
         "--tensor-model-parallel-size",
         str(tensor_parallel),
         "--pipeline-model-parallel-size",
         str(pipeline_parallel),
+        "--context-parallel-size",
+        str(context_parallel),
+        *megatron_model_arguments(profile),
         "--seq-length",
         str(sequence_length),
         "--max-position-embeddings",
@@ -322,13 +437,20 @@ def build_megatron_launch_plan(
         "--tokenizer-model",
         str(tokenizer_file),
     ]
+    if profile.feed_forward_architecture == "moe":
+        command.extend(["--expert-model-parallel-size", str(expert_parallel)])
     report = AdapterReport(
         status="blocked_missing_dependency" if missing else "built_not_cluster_proven",
         adapter="megatron_lm",
         output_dir=str(output),
         command=command,
         missing_dependencies=missing,
-        notes=[f"model_profile={model_profile}", "Megatron execution requires preprocessed indexed dataset and cluster validation."],
+        notes=[
+            f"model_profile={model_profile}",
+            f"parameter_report={json.dumps(profile.parameter_report(), sort_keys=True)}",
+            f"topology_report={json.dumps(topology, sort_keys=True)}",
+            "Megatron execution requires preprocessed indexed dataset and cluster validation.",
+        ],
     )
     report.write(output, "megatron_launch_plan.json")
     if execute:
@@ -369,10 +491,17 @@ def _parse_args() -> argparse.Namespace:
     mega.add_argument("--tensor-parallel", type=int, default=1)
     mega.add_argument("--pipeline-parallel", type=int, default=1)
     mega.add_argument("--data-parallel", type=int, default=1)
+    mega.add_argument("--context-parallel", type=int, default=1)
+    mega.add_argument("--expert-parallel", type=int, default=1)
     mega.add_argument("--sequence-length", type=int, default=2048)
     mega.add_argument("--micro-batch-size", type=int, default=1)
     mega.add_argument("--global-batch-size", type=int, default=8)
     mega.add_argument("--train-iters", type=int, default=1000)
+    mega.add_argument("--num-nodes", type=int, default=1)
+    mega.add_argument("--gpus-per-node", type=int)
+    mega.add_argument("--node-rank", type=int, default=0)
+    mega.add_argument("--master-addr", default="127.0.0.1")
+    mega.add_argument("--master-port", type=int, default=29500)
     mega.add_argument("--megatron-root")
     mega.add_argument("--execute", action="store_true")
     return parser.parse_args()
@@ -400,10 +529,17 @@ def main() -> None:
             tensor_parallel=args.tensor_parallel,
             pipeline_parallel=args.pipeline_parallel,
             data_parallel=args.data_parallel,
+            context_parallel=args.context_parallel,
+            expert_parallel=args.expert_parallel,
             sequence_length=args.sequence_length,
             micro_batch_size=args.micro_batch_size,
             global_batch_size=args.global_batch_size,
             train_iters=args.train_iters,
+            num_nodes=args.num_nodes,
+            gpus_per_node=args.gpus_per_node,
+            node_rank=args.node_rank,
+            master_addr=args.master_addr,
+            master_port=args.master_port,
             megatron_root=args.megatron_root,
             execute=args.execute,
         )

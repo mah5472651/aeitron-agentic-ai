@@ -848,6 +848,30 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
                 megatron_root=root / "missing-megatron",
             )
             self.assertEqual(megatron.status, "blocked_missing_dependency")
+            sparse_plan = build_megatron_launch_plan(
+                manifest=root / "shards" / "manifest.json",
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "mega-4t",
+                model_profile="4t_moe",
+                tensor_parallel=8,
+                pipeline_parallel=12,
+                data_parallel=32,
+                context_parallel=8,
+                expert_parallel=32,
+                sequence_length=32_768,
+                micro_batch_size=1,
+                global_batch_size=32,
+                train_iters=1,
+                num_nodes=3072,
+                gpus_per_node=8,
+                master_addr="controller.internal",
+                megatron_root=root / "missing-megatron",
+            )
+            self.assertEqual(sparse_plan.status, "blocked_missing_dependency")
+            self.assertIn("--multi-latent-attention", sparse_plan.command)
+            self.assertIn("--moe-router-topk", sparse_plan.command)
+            self.assertIn("--expert-model-parallel-size", sparse_plan.command)
+            self.assertTrue(any(note.startswith("topology_report=") for note in sparse_plan.notes))
             with self.assertRaisesRegex(ValueError, "must be positive"):
                 build_megatron_launch_plan(
                     manifest=root / "shards" / "manifest.json",

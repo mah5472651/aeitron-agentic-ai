@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", required=True, help="Clean JSONL/text corpus path.")
     parser.add_argument("--output-dir", default="artifacts/aeitron/pretraining-pipeline")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--vocab-size", type=int, default=64_000)
+    parser.add_argument("--vocab-size", type=int, default=128_000)
     parser.add_argument("--shard-token-count", type=int, default=1_000_000)
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--validation-fraction", type=float, default=0.01)

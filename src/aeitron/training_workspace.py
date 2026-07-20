@@ -37,6 +37,8 @@ from urllib.parse import urlparse
 from pydantic import Field, field_validator, model_validator
 
 from src.aeitron.learning.storage import ObjectStore, ObjectStoreConfig, S3ObjectStore, create_object_store
+from src.aeitron.model_ops.foundation import ParallelismPlan, model_profile as get_model_profile
+from src.aeitron.model_ops.production_adapters import megatron_model_arguments
 from src.aeitron.shared.schemas import StrictModel
 from src.aeitron.shared.integrity import canonical_json_text as canonical_json, sha256_file as sha256_path
 
@@ -335,6 +337,18 @@ class ImmutableInputPolicy(StrictModel):
     allowed_uri_schemes: list[Literal["s3", "file"]] = Field(default_factory=lambda: ["s3"])
 
 
+def training_data_parallel_size(
+    *,
+    resources: ResourceRequest,
+    distributed_strategy: str,
+    parallelism: ParallelismPlan,
+) -> int:
+    """Return ranks consuming distinct samples, excluding model-parallel ranks."""
+    if distributed_strategy == "megatron":
+        return parallelism.data_parallel
+    return resources.nodes * max(1, resources.gpus_per_node)
+
+
 class TrainingProfile(StrictModel):
     profile_id: str = Field(min_length=1, max_length=128)
     version: int = Field(ge=1)
@@ -345,6 +359,7 @@ class TrainingProfile(StrictModel):
     curriculum_mode: Literal["balanced", "fundamentals_only", "defensive_security_only", "debug_patch_only", "agentic_coding_only"]
     scheduler: Literal["notebook", "kubernetes", "kubernetes_pytorch", "slurm"]
     distributed_strategy: Literal["none", "fsdp", "deepspeed_zero2", "deepspeed_zero3", "megatron"]
+    parallelism: ParallelismPlan = Field(default_factory=ParallelismPlan)
     steps: int = Field(ge=1)
     sequence_length: int = Field(ge=32, le=1_048_576)
     batch_size: int = Field(ge=1, le=1024)
@@ -392,15 +407,38 @@ class TrainingProfile(StrictModel):
             raise ValueError("Kubernetes training profiles require a shared RWX checkpoint claim")
         if self.scheduler == "notebook" and not self.dev_only:
             raise ValueError("notebook profiles must be dev_only validation profiles")
-        if self.model_profile in {"32b", "62b"} and not self.resources.rdma_required:
-            raise ValueError("32B/60B-class profiles require RDMA")
+        if self.model_profile in {"32b", "62b", "4t_moe"} and not self.resources.rdma_required:
+            raise ValueError("32B and larger profiles require RDMA")
         world_size = self.resources.nodes * max(1, self.resources.gpus_per_node)
-        calculated_global_batch = self.batch_size * self.gradient_accumulation_steps * world_size
+        if self.distributed_strategy == "megatron":
+            model = get_model_profile(self.model_profile)
+            topology = model.distributed_topology_report(
+                tensor_parallel=self.parallelism.tensor_parallel,
+                pipeline_parallel=self.parallelism.pipeline_parallel,
+                data_parallel=self.parallelism.data_parallel,
+                context_parallel=self.parallelism.context_parallel,
+                expert_parallel=self.parallelism.expert_parallel,
+                gpus_per_node=self.resources.gpus_per_node,
+            )
+            if not topology["passed"]:
+                raise ValueError("invalid Megatron profile topology: " + "; ".join(topology["failures"]))
+            if topology["world_size"] != world_size:
+                raise ValueError("Megatron parallelism world size must match requested GPU resources")
+        data_parallel = training_data_parallel_size(
+            resources=self.resources,
+            distributed_strategy=self.distributed_strategy,
+            parallelism=self.parallelism,
+        )
+        calculated_global_batch = self.batch_size * self.gradient_accumulation_steps * data_parallel
         if self.token_budget.global_batch_sequences != calculated_global_batch:
             raise ValueError(
                 "global_batch_sequences must equal batch_size * gradient_accumulation_steps * world_size"
             )
-        minimum_tokens = self.steps * self.batch_size * self.sequence_length * world_size
+        minimum_tokens = self.steps * self.sequence_length * (
+            calculated_global_batch
+            if self.distributed_strategy == "megatron"
+            else self.batch_size * data_parallel
+        )
         if self.token_budget.target_tokens != minimum_tokens:
             raise ValueError("target_tokens must equal steps * batch_size * sequence_length * world_size")
         if self.learning_rate.warmup_steps >= self.steps:
@@ -602,6 +640,7 @@ class TrainingJobSpec(StrictModel):
     curriculum_mode: str
     scheduler: str
     distributed_strategy: str
+    parallelism: ParallelismPlan = Field(default_factory=ParallelismPlan)
     steps: int
     sequence_length: int
     batch_size: int
@@ -651,9 +690,17 @@ class TrainingJobSpec(StrictModel):
             ]
             if missing:
                 raise ValueError("pretraining job is missing immutable inputs: " + ", ".join(missing))
-        world_size = self.resources.nodes * max(1, self.resources.gpus_per_node)
-        expected_batch = self.batch_size * self.gradient_accumulation_steps * world_size
-        expected_tokens = self.steps * self.batch_size * self.sequence_length * world_size
+        data_parallel = training_data_parallel_size(
+            resources=self.resources,
+            distributed_strategy=self.distributed_strategy,
+            parallelism=self.parallelism,
+        )
+        expected_batch = self.batch_size * self.gradient_accumulation_steps * data_parallel
+        expected_tokens = self.steps * self.sequence_length * (
+            expected_batch
+            if self.distributed_strategy == "megatron"
+            else self.batch_size * data_parallel
+        )
         if self.token_budget.global_batch_sequences != expected_batch:
             raise ValueError("resolved global batch does not match the job topology")
         if self.token_budget.target_tokens != expected_tokens:
@@ -2908,19 +2955,35 @@ class SlurmSchedulerAdapter(SchedulerAdapter):
             raise FileNotFoundError("Megatron data prefix must resolve to existing .bin and .idx files")
         if not tokenizer_path.is_file() or sha256_path(tokenizer_path) != job.spec.tokenizer_sha256:
             raise ValueError("Megatron tokenizer is missing or does not match its immutable checksum")
+        profile = get_model_profile(job.spec.model_profile)
+        parallelism = job.spec.parallelism
         world_size = job.spec.resources.nodes * job.spec.resources.gpus_per_node
-        tensor_parallel = int(job.spec.metadata.get("tensor_parallel", 8))
-        pipeline_parallel = int(job.spec.metadata.get("pipeline_parallel", 4))
-        if tensor_parallel < 1 or pipeline_parallel < 1 or world_size % (tensor_parallel * pipeline_parallel):
-            raise ValueError("Megatron tensor/pipeline parallel topology does not divide world size")
+        topology = profile.distributed_topology_report(
+            tensor_parallel=parallelism.tensor_parallel,
+            pipeline_parallel=parallelism.pipeline_parallel,
+            data_parallel=parallelism.data_parallel,
+            context_parallel=parallelism.context_parallel,
+            expert_parallel=parallelism.expert_parallel,
+            gpus_per_node=job.spec.resources.gpus_per_node,
+        )
+        if not topology["passed"] or topology["world_size"] != world_size:
+            raise ValueError("Megatron job topology does not match the canonical model contract")
         return [
             sys.executable,
             "-u",
             str(pretrain),
             "--tensor-model-parallel-size",
-            str(tensor_parallel),
+            str(parallelism.tensor_parallel),
             "--pipeline-model-parallel-size",
-            str(pipeline_parallel),
+            str(parallelism.pipeline_parallel),
+            "--context-parallel-size",
+            str(parallelism.context_parallel),
+            *(
+                ["--expert-model-parallel-size", str(parallelism.expert_parallel)]
+                if profile.feed_forward_architecture == "moe"
+                else []
+            ),
+            *megatron_model_arguments(profile),
             "--sequence-parallel",
             "--use-distributed-optimizer",
             "--overlap-grad-reduce",
@@ -3131,14 +3194,26 @@ class TrainingWorkspaceService:
                 raise ValueError(f"unsupported bounded override: {key}")
         if self.production_mode and profile.dev_only:
             raise ValueError("dev-only notebook profile cannot be submitted in production mode")
-        world_size = resources.nodes * max(1, resources.gpus_per_node)
+        data_parallel = training_data_parallel_size(
+            resources=resources,
+            distributed_strategy=profile.distributed_strategy,
+            parallelism=profile.parallelism,
+        )
+        global_batch_sequences = (
+            values["batch_size"] * values["gradient_accumulation_steps"] * data_parallel
+        )
+        target_tokens = values["steps"] * values["sequence_length"] * (
+            global_batch_sequences
+            if profile.distributed_strategy == "megatron"
+            else values["batch_size"] * data_parallel
+        )
         token_budget = profile.token_budget.model_copy(
             update={
-                "global_batch_sequences": values["batch_size"] * values["gradient_accumulation_steps"] * world_size,
-                "target_tokens": values["steps"] * values["batch_size"] * values["sequence_length"] * world_size,
+                "global_batch_sequences": global_batch_sequences,
+                "target_tokens": target_tokens,
                 "maximum_tokens": max(
                     profile.token_budget.maximum_tokens,
-                    values["steps"] * values["batch_size"] * values["sequence_length"] * world_size,
+                    target_tokens,
                 ),
             }
         )
@@ -3165,6 +3240,7 @@ class TrainingWorkspaceService:
             curriculum_mode=profile.curriculum_mode,
             scheduler=profile.scheduler,
             distributed_strategy=profile.distributed_strategy,
+            parallelism=profile.parallelism,
             steps=values["steps"],
             sequence_length=values["sequence_length"],
             batch_size=values["batch_size"],

@@ -35,7 +35,7 @@ SPECIAL_TOKENS = [
 
 
 class TokenizerTrainConfig(StrictModel):
-    vocab_size: int = Field(default=64_000, ge=1_000)
+    vocab_size: int = Field(default=128_000, ge=1_000)
     min_frequency: int = Field(default=2, ge=1)
     special_tokens: list[str] = Field(default_factory=lambda: SPECIAL_TOKENS.copy())
 
@@ -81,7 +81,7 @@ class RealCorpusTokenizerConfig(StrictModel):
     input_paths: list[str]
     output_dir: str
     dataset_id: str = "aeitron-real-corpus"
-    vocab_size: int = Field(default=64_000, ge=1_000)
+    vocab_size: int = Field(default=128_000, ge=1_000)
     min_frequency: int = Field(default=2, ge=1)
     shard_token_count: int = Field(default=1_000_000, ge=128)
     sequence_length: int = Field(default=2048, ge=16)
@@ -343,7 +343,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shards-out")
     parser.add_argument("--output-dir", help="Use with --real-corpus-audit to write tokenizer, shards, and audit report.")
     parser.add_argument("--dataset-id", default="aeitron-corpus")
-    parser.add_argument("--vocab-size", type=int, default=64_000)
+    parser.add_argument("--vocab-size", type=int, default=128_000)
     parser.add_argument("--min-frequency", type=int, default=2)
     parser.add_argument("--shard-token-count", type=int, default=1_000_000)
     parser.add_argument("--sequence-length", type=int, default=2048)

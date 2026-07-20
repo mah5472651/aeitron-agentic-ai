@@ -33,6 +33,31 @@ class ContextChunk(StrictModel):
     content: str
 
 
+class HybridContextPolicy(StrictModel):
+    """Verified active-context and retrieval-backed effective-context limits."""
+
+    native_context_tokens: int = Field(default=1_000_000, ge=32_768)
+    effective_context_tokens: int = Field(default=5_000_000, ge=32_768)
+    require_stable_chunk_ids: bool = True
+    require_evidence_for_claims: bool = True
+    retrieval_layers: tuple[str, ...] = (
+        "active_context",
+        "symbol_graph",
+        "semantic_vector_index",
+        "project_memory",
+        "archive_memory",
+    )
+
+    def validate_budget(self, token_budget: int) -> None:
+        if token_budget < 512:
+            raise ValueError("token_budget must be at least 512")
+        if token_budget > self.native_context_tokens:
+            raise ValueError(
+                f"active token budget {token_budget} exceeds verified native context "
+                f"{self.native_context_tokens}; larger project context must be retrieved hierarchically"
+            )
+
+
 class ContextBuildReport(StrictModel):
     context_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     project_id: str
@@ -42,6 +67,8 @@ class ContextBuildReport(StrictModel):
     files: list[dict[str, Any]]
     chunks: list[ContextChunk]
     prompt_context: str
+    context_policy: HybridContextPolicy = Field(default_factory=HybridContextPolicy)
+    context_evidence: dict[str, Any] = Field(default_factory=dict)
     created_at_unix: float = Field(default_factory=time.time)
 
 
@@ -85,8 +112,14 @@ def cosine_sparse(left: Counter[str], right: Counter[str]) -> float:
 
 
 class ContextBuilder:
-    def __init__(self, store: LocalStore | None = None) -> None:
+    def __init__(
+        self,
+        store: LocalStore | None = None,
+        *,
+        context_policy: HybridContextPolicy | None = None,
+    ) -> None:
         self.store = store or LocalStore()
+        self.context_policy = context_policy or HybridContextPolicy()
 
     def build(
         self,
@@ -100,6 +133,7 @@ class ContextBuilder:
         project = self.store.get_project(project_id)
         if project is None:
             raise KeyError(f"unknown project: {project_id}")
+        self.context_policy.validate_budget(token_budget)
         terms = query_terms(query)
         pinned = {path.replace("\\", "/") for path in (pinned_files or [])}
         chunks = self.store.list_chunks(project_id)
@@ -124,6 +158,8 @@ class ContextBuilder:
                 break
         files = self.file_summary(selected)
         prompt_context = self.render_prompt_context(project, query, selected)
+        indexed_tokens = sum(estimate_tokens(str(chunk.get("content") or "")) for chunk in chunks)
+        stable_evidence = all(bool(item.get("id")) for item in selected)
         return ContextBuildReport(
             project_id=project_id,
             query=query,
@@ -145,6 +181,19 @@ class ContextBuilder:
                 for item in selected
             ],
             prompt_context=prompt_context,
+            context_policy=self.context_policy,
+            context_evidence={
+                "indexed_project_tokens": indexed_tokens,
+                "effective_context_tokens_available": min(
+                    indexed_tokens,
+                    self.context_policy.effective_context_tokens,
+                ),
+                "active_context_tokens": estimate_tokens(prompt_context),
+                "selected_chunk_count": len(selected),
+                "stable_chunk_evidence": stable_evidence,
+                "native_context_claim": "contract_defined_not_long_context_benchmark_proven",
+                "effective_context_claim": "hierarchical_retrieval_not_full_attention",
+            },
         )
 
     def score_chunk(self, chunk: dict[str, Any], terms: Counter[str], pinned: set[str]) -> dict[str, Any]:

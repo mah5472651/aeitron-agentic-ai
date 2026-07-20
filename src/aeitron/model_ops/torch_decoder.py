@@ -1,9 +1,9 @@
 ﻿"""PyTorch Aeitron decoder-only language model.
 
-This is the scratch model implementation path. The module intentionally keeps
-the complete transformer core in one place: architecture presets, RoPE, grouped
-query attention, SDPA/FlashAttention dispatch, KV-cache inference, generation,
-and export helpers.
+This is the numerical reference implementation for Aeitron-owned scratch
+weights. Canonical architecture contracts and profiles live in ``foundation``;
+this module owns the executable dense/GQA and small-scale MLA/MoE kernels used
+for parity, checkpoint qualification, and single-node validation.
 """
 
 from __future__ import annotations
@@ -12,11 +12,13 @@ import math
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import Field, model_validator
-
-from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.model_ops.foundation import (
+    ScratchDecoderConfig,
+    model_profile,
+    tiny_smoke_config,
+)
 
 try:
     import torch
@@ -29,58 +31,14 @@ except ImportError:  # pragma: no cover - exercised only on missing torch instal
     F = None  # type: ignore[assignment]
 
 
-class ScratchDecoderConfig(StrictModel):
-    name: str = "aeitron-tiny-smoke"
-    vocab_size: int = Field(default=4096, ge=256)
-    max_sequence_length: int = Field(default=512, ge=16)
-    hidden_size: int = Field(default=256, ge=64)
-    num_layers: int = Field(default=4, ge=1)
-    num_attention_heads: int = Field(default=4, ge=1)
-    num_key_value_heads: int = Field(default=4, ge=1)
-    intermediate_size: int = Field(default=1024, ge=128)
-    rope_theta: float = Field(default=1_000_000.0, gt=0)
-    norm_eps: float = Field(default=1e-6, gt=0)
-    dropout: float = Field(default=0.0, ge=0.0, le=0.5)
-    tie_word_embeddings: bool = True
-    attention_impl: Literal["auto", "sdpa", "eager"] = "auto"
-    attention_window: int | None = Field(default=None, ge=16)
-    rope_scaling_factor: float = Field(default=1.0, ge=1.0)
-    initializer_range: float = Field(default=0.02, gt=0.0, le=1.0)
-    use_cache: bool = True
-    gradient_checkpointing: bool = False
-    logits_soft_cap: float | None = Field(default=None, gt=0.0)
-
-    @model_validator(mode="after")
-    def validate_shape(self) -> "ScratchDecoderConfig":
-        if self.hidden_size % self.num_attention_heads != 0:
-            raise ValueError("hidden_size must be divisible by num_attention_heads")
-        if self.num_attention_heads % self.num_key_value_heads != 0:
-            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for rotary embeddings")
-        return self
-
-    @property
-    def head_dim(self) -> int:
-        return self.hidden_size // self.num_attention_heads
-
-    def parameter_estimate(self) -> int:
-        embedding = self.vocab_size * self.hidden_size
-        q = self.hidden_size * self.hidden_size
-        kv = 2 * self.hidden_size * self.head_dim * self.num_key_value_heads
-        out = self.hidden_size * self.hidden_size
-        mlp = 3 * self.hidden_size * self.intermediate_size
-        norms = 2 * self.hidden_size
-        transformer = self.num_layers * (q + kv + out + mlp + norms)
-        lm_head = 0 if self.tie_word_embeddings else embedding
-        return int(embedding + transformer + lm_head)
-
-
 @dataclass
 class DecoderForwardOutput:
     logits: "torch.Tensor"
     loss: "torch.Tensor | None" = None
     past_key_values: tuple[tuple["torch.Tensor", "torch.Tensor"], ...] | None = None
+    language_model_loss: "torch.Tensor | None" = None
+    mtp_loss: "torch.Tensor | None" = None
+    router_metrics: tuple[dict[str, float], ...] = ()
 
 
 def require_torch() -> None:
@@ -154,23 +112,42 @@ def apply_rope(x: "torch.Tensor", cos: "torch.Tensor", sin: "torch.Tensor") -> "
 
 
 class RotaryEmbedding(nn.Module):  # type: ignore[misc]
-    def __init__(self, dim: int, max_position: int, theta: float) -> None:
+    """RoPE without a sequence-length-sized persistent allocation.
+
+    A 1M context profile must not allocate multi-gigabyte cosine/sine tables at
+    model construction time. Frequencies are generated for the active span and
+    remain non-persistent, which also keeps checkpoint formats topology neutral.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_position: int,
+        theta: float,
+        *,
+        scaling_type: str = "none",
+        scaling_factor: float = 1.0,
+    ) -> None:
         require_torch()
         super().__init__()
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        positions = torch.arange(max_position).float()
-        freqs = torch.einsum("i,j->ij", positions, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos", emb.cos()[None, None, :, :], persistent=False)
-        self.register_buffer("sin", emb.sin()[None, None, :, :], persistent=False)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.max_position = max_position
+        self.scaling_type = scaling_type
+        self.scaling_factor = scaling_factor
 
     def forward(self, q: "torch.Tensor", k: "torch.Tensor", *, position_offset: int = 0) -> tuple["torch.Tensor", "torch.Tensor"]:
         seq_len = q.size(-2)
         end = position_offset + seq_len
-        if end > self.cos.size(2):
-            raise ValueError(f"sequence position {end} exceeds configured rotary cache {self.cos.size(2)}")
-        cos = self.cos[:, :, position_offset:end, :].to(dtype=q.dtype, device=q.device)
-        sin = self.sin[:, :, position_offset:end, :].to(dtype=q.dtype, device=q.device)
+        if end > self.max_position:
+            raise ValueError(f"sequence position {end} exceeds configured context {self.max_position}")
+        positions = torch.arange(position_offset, end, device=q.device, dtype=torch.float32)
+        if self.scaling_type != "none":
+            positions = positions / self.scaling_factor
+        freqs = torch.outer(positions, self.inv_freq.to(device=q.device, dtype=torch.float32))
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos()[None, None, :, :].to(dtype=q.dtype)
+        sin = emb.sin()[None, None, :, :].to(dtype=q.dtype)
         return apply_rope(q, cos, sin), apply_rope(k, cos, sin)
 
 
@@ -183,7 +160,17 @@ class CausalSelfAttention(nn.Module):  # type: ignore[misc]
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.rope = RotaryEmbedding(config.head_dim, config.max_sequence_length, config.rope_theta * config.rope_scaling_factor)
+        self.rope = RotaryEmbedding(
+            config.head_dim,
+            config.max_sequence_length,
+            (
+                config.rope_theta * config.rope_scaling_factor
+                if config.rope_scaling_type == "none" and config.rope_scaling_factor > 1.0
+                else config.rope_theta
+            ),
+            scaling_type=config.rope_scaling_type,
+            scaling_factor=config.rope_scaling_factor,
+        )
         self.dropout = config.dropout
 
     def build_attention_mask(
@@ -262,26 +249,77 @@ class CausalSelfAttention(nn.Module):  # type: ignore[misc]
         return self.o_proj(attn), present
 
 
-class SwiGLU(nn.Module):  # type: ignore[misc]
+class MultiLatentAttention(nn.Module):  # type: ignore[misc]
+    """DeepSeek-style latent attention with a compressed inference cache.
+
+    The cache stores the latent KV representation and the decoupled rotary key,
+    not expanded per-head keys and values. This is the reference algorithm;
+    trillion-scale execution is delegated to the validated Megatron backend.
+    """
+
     def __init__(self, config: ScratchDecoderConfig) -> None:
         require_torch()
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        if config.attention_architecture != "mla":
+            raise ValueError("MultiLatentAttention requires an MLA config")
+        self.config = config
+        self.q_rank = int(config.q_lora_rank or 0)
+        self.kv_rank = int(config.kv_lora_rank or 0)
+        self.nope_dim = int(config.qk_nope_head_dim or 0)
+        self.rope_dim = int(config.qk_rope_head_dim or 0)
+        self.value_dim = int(config.v_head_dim or 0)
+        self.q_down = nn.Linear(config.hidden_size, self.q_rank, bias=False)
+        self.q_norm = RMSNorm(self.q_rank, config.norm_eps)
+        self.q_up = nn.Linear(
+            self.q_rank,
+            config.num_attention_heads * (self.nope_dim + self.rope_dim),
+            bias=False,
+        )
+        self.kv_down = nn.Linear(config.hidden_size, self.kv_rank + self.rope_dim, bias=False)
+        self.kv_norm = RMSNorm(self.kv_rank, config.norm_eps)
+        self.kv_up = nn.Linear(
+            self.kv_rank,
+            config.num_attention_heads * (self.nope_dim + self.value_dim),
+            bias=False,
+        )
+        self.o_proj = nn.Linear(config.num_attention_heads * self.value_dim, config.hidden_size, bias=False)
+        self.rope = RotaryEmbedding(
+            self.rope_dim,
+            config.max_sequence_length,
+            config.rope_theta,
+            scaling_type=config.rope_scaling_type,
+            scaling_factor=config.rope_scaling_factor,
+        )
+        self.dropout = config.dropout
 
-    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+    def _mask(self, *, query_len: int, key_len: int, past_len: int, device: "torch.device") -> "torch.Tensor | None":
+        if self.config.attention_window is None and past_len == 0:
+            return None
+        query_positions = torch.arange(past_len, past_len + query_len, device=device)[:, None]
+        key_positions = torch.arange(key_len, device=device)[None, :]
+        mask = key_positions <= query_positions
+        if self.config.attention_window is not None:
+            mask &= key_positions >= query_positions - self.config.attention_window + 1
+        return mask[None, None, :, :]
 
-
-class DecoderBlock(nn.Module):  # type: ignore[misc]
-    def __init__(self, config: ScratchDecoderConfig) -> None:
-        require_torch()
-        super().__init__()
-        self.input_norm = RMSNorm(config.hidden_size, config.norm_eps)
-        self.attention = CausalSelfAttention(config)
-        self.post_attention_norm = RMSNorm(config.hidden_size, config.norm_eps)
-        self.mlp = SwiGLU(config)
+    def _eager(
+        self,
+        q: "torch.Tensor",
+        k: "torch.Tensor",
+        v: "torch.Tensor",
+        *,
+        mask: "torch.Tensor | None",
+    ) -> "torch.Tensor":
+        scale = 1.0 / math.sqrt(self.nope_dim + self.rope_dim)
+        scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+        if mask is None:
+            causal = torch.ones(scores.size(-2), scores.size(-1), device=scores.device, dtype=torch.bool).tril()
+            mask = causal[None, None, :, :]
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        probabilities = F.softmax(scores, dim=-1).to(dtype=q.dtype)
+        if self.training and self.dropout:
+            probabilities = F.dropout(probabilities, p=self.dropout)
+        return torch.matmul(probabilities, v)
 
     def forward(
         self,
@@ -290,21 +328,210 @@ class DecoderBlock(nn.Module):  # type: ignore[misc]
         past_key_value: tuple["torch.Tensor", "torch.Tensor"] | None = None,
         use_cache: bool = False,
     ) -> tuple["torch.Tensor", tuple["torch.Tensor", "torch.Tensor"] | None]:
+        batch, sequence, _ = x.shape
+        past_len = 0 if past_key_value is None else int(past_key_value[0].size(1))
+        q = self.q_up(self.q_norm(self.q_down(x))).view(
+            batch,
+            sequence,
+            self.config.num_attention_heads,
+            self.nope_dim + self.rope_dim,
+        ).transpose(1, 2)
+        q_nope, q_rope = torch.split(q, [self.nope_dim, self.rope_dim], dim=-1)
+
+        compressed = self.kv_down(x)
+        kv_latent, k_rope = torch.split(compressed, [self.kv_rank, self.rope_dim], dim=-1)
+        kv_latent = self.kv_norm(kv_latent)
+        k_rope_heads = k_rope[:, None, :, :]
+        q_rope, k_rope_heads = self.rope(q_rope, k_rope_heads, position_offset=past_len)
+
+        if past_key_value is not None:
+            past_latent, past_rope = past_key_value
+            kv_latent = torch.cat([past_latent, kv_latent], dim=1)
+            k_rope_heads = torch.cat([past_rope, k_rope_heads], dim=-2)
+        present = (kv_latent, k_rope_heads) if use_cache else None
+
+        expanded = self.kv_up(kv_latent).view(
+            batch,
+            kv_latent.size(1),
+            self.config.num_attention_heads,
+            self.nope_dim + self.value_dim,
+        ).transpose(1, 2)
+        k_nope, values = torch.split(expanded, [self.nope_dim, self.value_dim], dim=-1)
+        repeated_rope = k_rope_heads.expand(-1, self.config.num_attention_heads, -1, -1)
+        keys = torch.cat([k_nope, repeated_rope], dim=-1)
+        queries = torch.cat([q_nope, q_rope], dim=-1)
+        mask = self._mask(
+            query_len=sequence,
+            key_len=keys.size(-2),
+            past_len=past_len,
+            device=x.device,
+        )
+        use_eager = self.config.attention_impl == "eager" or not hasattr(F, "scaled_dot_product_attention")
+        if use_eager:
+            attended = self._eager(queries, keys, values, mask=mask)
+        else:
+            attended = F.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                attn_mask=mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=mask is None and past_len == 0,
+            )
+        attended = attended.transpose(1, 2).contiguous().view(
+            batch,
+            sequence,
+            self.config.num_attention_heads * self.value_dim,
+        )
+        return self.o_proj(attended), present
+
+
+class SwiGLU(nn.Module):  # type: ignore[misc]
+    def __init__(self, config: ScratchDecoderConfig, *, intermediate_size: int | None = None) -> None:
+        require_torch()
+        super().__init__()
+        width = config.intermediate_size if intermediate_size is None else intermediate_size
+        self.gate_proj = nn.Linear(config.hidden_size, width, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, width, bias=False)
+        self.down_proj = nn.Linear(width, config.hidden_size, bias=False)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class DroplessMixtureOfExperts(nn.Module):  # type: ignore[misc]
+    """Top-k routed MoE that never discards tokens.
+
+    This reference dispatcher intentionally favors transparent correctness over
+    throughput. Megatron-Core provides the grouped-GEMM/all-to-all production
+    implementation. Selection bias is updated without contributing an
+    auxiliary loss to the language-model objective.
+    """
+
+    def __init__(self, config: ScratchDecoderConfig) -> None:
+        require_torch()
+        super().__init__()
+        if config.feed_forward_architecture != "moe":
+            raise ValueError("DroplessMixtureOfExperts requires an MoE config")
+        width = int(config.moe_intermediate_size or 0)
+        self.config = config
+        self.router = nn.Linear(config.hidden_size, config.num_routed_experts, bias=False)
+        self.routed_experts = nn.ModuleList(
+            [SwiGLU(config, intermediate_size=width) for _ in range(config.num_routed_experts)]
+        )
+        self.shared_experts = nn.ModuleList(
+            [SwiGLU(config, intermediate_size=width) for _ in range(config.num_shared_experts)]
+        )
+        self.register_buffer("selection_bias", torch.zeros(config.num_routed_experts), persistent=True)
+        self.last_metrics: dict[str, float] = {}
+
+    def forward(self, x: "torch.Tensor") -> tuple["torch.Tensor", dict[str, float]]:
+        original_shape = x.shape
+        flat = x.reshape(-1, self.config.hidden_size)
+        raw_logits = self.router(flat).float()
+        selection_scores = torch.sigmoid(raw_logits) + self.selection_bias[None, :]
+        selected = torch.topk(selection_scores, k=self.config.experts_per_token, dim=-1).indices
+        selected_logits = raw_logits.gather(1, selected)
+        weights = F.softmax(selected_logits, dim=-1).to(dtype=x.dtype)
+        output = torch.zeros_like(flat)
+        counts = torch.bincount(selected.reshape(-1), minlength=self.config.num_routed_experts)
+        for expert_index, expert in enumerate(self.routed_experts):
+            token_indices, slots = torch.where(selected == expert_index)
+            if token_indices.numel() == 0:
+                continue
+            expert_output = expert(flat.index_select(0, token_indices))
+            output.index_add_(
+                0,
+                token_indices,
+                expert_output * weights[token_indices, slots, None],
+            )
+        for shared in self.shared_experts:
+            output = output + shared(flat)
+
+        expected = flat.size(0) * self.config.experts_per_token
+        routed = int(counts.sum().item())
+        if routed != expected:
+            raise RuntimeError(f"MoE token routing invariant violated: routed={routed}, expected={expected}")
+        mean_load = float(counts.float().mean().item())
+        p99_load = float(torch.quantile(counts.float(), 0.99).item())
+        load_ratio = p99_load / max(mean_load, 1.0)
+        metrics = {
+            "tokens": float(flat.size(0)),
+            "assignments": float(routed),
+            "dropped_tokens": 0.0,
+            "mean_expert_load": mean_load,
+            "p99_expert_load": p99_load,
+            "p99_to_mean_load": load_ratio,
+            "load_limit": self.config.router_load_limit,
+            "load_within_limit": float(load_ratio <= self.config.router_load_limit),
+        }
+        self.last_metrics = metrics
+        if self.training and self.config.router_bias_update_rate > 0:
+            with torch.no_grad():
+                direction = torch.sign(counts.float().mean() - counts.float())
+                self.selection_bias.add_(direction * self.config.router_bias_update_rate)
+                self.selection_bias.sub_(self.selection_bias.mean())
+        return output.view(original_shape), metrics
+
+
+class DecoderBlock(nn.Module):  # type: ignore[misc]
+    def __init__(self, config: ScratchDecoderConfig, *, layer_index: int = 0) -> None:
+        require_torch()
+        super().__init__()
+        self.input_norm = RMSNorm(config.hidden_size, config.norm_eps)
+        self.attention = (
+            MultiLatentAttention(config)
+            if config.attention_architecture == "mla"
+            else CausalSelfAttention(config)
+        )
+        self.post_attention_norm = RMSNorm(config.hidden_size, config.norm_eps)
+        self.is_moe = config.feed_forward_architecture == "moe" and layer_index >= config.dense_layer_count
+        self.mlp = DroplessMixtureOfExperts(config) if self.is_moe else SwiGLU(config)
+
+    def forward(
+        self,
+        x: "torch.Tensor",
+        *,
+        past_key_value: tuple["torch.Tensor", "torch.Tensor"] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[
+        "torch.Tensor",
+        tuple["torch.Tensor", "torch.Tensor"] | None,
+        dict[str, float] | None,
+    ]:
         attn, present = self.attention(self.input_norm(x), past_key_value=past_key_value, use_cache=use_cache)
         x = x + attn
-        x = x + self.mlp(self.post_attention_norm(x))
-        return x, present
+        normalized = self.post_attention_norm(x)
+        if self.is_moe:
+            mlp_output, router_metrics = self.mlp(normalized)
+        else:
+            mlp_output = self.mlp(normalized)
+            router_metrics = None
+        x = x + mlp_output
+        return x, present, router_metrics
 
 
 class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
     def __init__(self, config: ScratchDecoderConfig) -> None:
         require_torch()
         super().__init__()
+        if config.runtime_backend != "native_reference":
+            raise RuntimeError(
+                f"{config.name} requires runtime_backend={config.runtime_backend}; "
+                "the native reference runtime must not materialize production-scale profiles"
+            )
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([DecoderBlock(config) for _ in range(config.num_layers)])
+        self.layers = nn.ModuleList(
+            [DecoderBlock(config, layer_index=index) for index in range(config.num_layers)]
+        )
         self.norm = RMSNorm(config.hidden_size, config.norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.mtp_projection = (
+            nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+            if config.mtp_num_layers
+            else None
+        )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
         self.apply(self._init_weights)
@@ -337,31 +564,63 @@ class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
         if labels is not None and past_key_values is not None:
             raise ValueError("labels cannot be used with past_key_values")
         active_use_cache = self.config.use_cache if use_cache is None else use_cache
+        if self.gradient_checkpointing and self.training and active_use_cache:
+            active_use_cache = False
         x = self.embed_tokens(input_ids)
         presents: list[tuple["torch.Tensor", "torch.Tensor"]] = []
+        router_metrics: list[dict[str, float]] = []
         for index, layer in enumerate(self.layers):
             past = None if past_key_values is None else past_key_values[index]
             if self.gradient_checkpointing and self.training and not active_use_cache:
                 def custom_forward(hidden: "torch.Tensor", active_layer: DecoderBlock = layer) -> "torch.Tensor":
-                    output, _present = active_layer(hidden, use_cache=False)
+                    output, _present, _router = active_layer(hidden, use_cache=False)
                     return output
 
                 x = torch.utils.checkpoint.checkpoint(custom_forward, x, use_reentrant=False)
                 present = None
             else:
-                x, present = layer(x, past_key_value=past, use_cache=active_use_cache)
+                x, present, layer_router_metrics = layer(
+                    x,
+                    past_key_value=past,
+                    use_cache=active_use_cache,
+                )
+                if layer_router_metrics is not None:
+                    router_metrics.append(layer_router_metrics)
             if present is not None:
                 presents.append(present)
-        logits = self.lm_head(self.norm(x))
+        normalized = self.norm(x)
+        logits = self.lm_head(normalized)
         if self.config.logits_soft_cap is not None:
             cap = self.config.logits_soft_cap
             logits = torch.tanh(logits / cap) * cap
+        language_model_loss = None
+        mtp_loss = None
         loss = None
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        return DecoderForwardOutput(logits=logits, loss=loss, past_key_values=tuple(presents) if presents else None)
+            language_model_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+            loss = language_model_loss
+            if self.mtp_projection is not None and labels.size(1) >= 3:
+                mtp_hidden = F.silu(self.mtp_projection(normalized[:, :-2, :]))
+                mtp_logits = self.lm_head(mtp_hidden)
+                mtp_targets = labels[:, 2:].contiguous()
+                mtp_loss = F.cross_entropy(
+                    mtp_logits.reshape(-1, mtp_logits.size(-1)),
+                    mtp_targets.reshape(-1),
+                )
+                loss = language_model_loss + self.config.mtp_loss_weight * mtp_loss
+        return DecoderForwardOutput(
+            logits=logits,
+            loss=loss,
+            past_key_values=tuple(presents) if presents else None,
+            language_model_loss=language_model_loss,
+            mtp_loss=mtp_loss,
+            router_metrics=tuple(router_metrics),
+        )
 
     @torch.no_grad()
     def generate(
@@ -401,9 +660,9 @@ class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
         target = Path(output_dir)
         target.mkdir(parents=True, exist_ok=True)
         (target / "config.json").write_text(self.config.model_dump_json(indent=2), encoding="utf-8")
-        save_trusted_checkpoint({"model": self.state_dict(), "config": self.config.model_dump(), "format": "aeitron_decoder_v1", "dtype": dtype}, target / "model.pt")
+        save_trusted_checkpoint({"model": self.state_dict(), "config": self.config.model_dump(), "format": "aeitron_decoder_v2", "dtype": dtype}, target / "model.pt")
         serving_contract = {
-            "format": "aeitron_decoder_v1",
+            "format": "aeitron_decoder_v2",
             "scratch_only": True,
             "dtype": dtype,
             "architecture": {
@@ -411,11 +670,20 @@ class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
                 "rms_norm": True,
                 "swiglu": True,
                 "rope": True,
-                "gqa": True,
+                "attention_architecture": self.config.attention_architecture,
+                "feed_forward_architecture": self.config.feed_forward_architecture,
+                "gqa": self.config.attention_architecture == "gqa",
+                "mla": self.config.attention_architecture == "mla",
+                "moe": self.config.feed_forward_architecture == "moe",
+                "mtp_num_layers": self.config.mtp_num_layers,
                 "num_attention_heads": self.config.num_attention_heads,
                 "num_key_value_heads": self.config.num_key_value_heads,
+                "num_routed_experts": self.config.num_routed_experts,
+                "num_shared_experts": self.config.num_shared_experts,
+                "experts_per_token": self.config.experts_per_token,
                 "hidden_size": self.config.hidden_size,
                 "max_sequence_length": self.config.max_sequence_length,
+                "effective_context_length": self.config.effective_context_length,
                 "vocab_size": self.config.vocab_size,
             },
             "runtime_features": {
@@ -424,6 +692,7 @@ class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
                 "attention_window": self.config.attention_window,
                 "gradient_checkpointing": self.config.gradient_checkpointing,
                 "logits_soft_cap": self.config.logits_soft_cap,
+                "compressed_mla_cache": self.config.attention_architecture == "mla",
             },
             "serving_targets": {
                 "native_aeitron": "supported",
@@ -434,7 +703,8 @@ class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
                 "tokenizer vocab size matches config.vocab_size",
                 "tied embeddings preserved when tie_word_embeddings=true",
                 "RoPE scaling and theta preserved",
-                "GQA key/value head mapping preserved",
+                "attention projection and cache layout preserved",
+                "MoE router and expert placement preserved",
                 "KV-cache decode numerically matches native Aeitron decode on a fixed prompt",
             ],
         }
@@ -455,90 +725,4 @@ class AeitronDecoderLM(nn.Module):  # type: ignore[misc]
             encoding="utf-8",
         )
         return target
-
-
-def model_profile(name: str) -> ScratchDecoderConfig:
-    profiles = {
-        "tiny": tiny_smoke_config(),
-        "t4_validation": ScratchDecoderConfig(
-            name="aeitron-t4-validation",
-            vocab_size=64_000,
-            max_sequence_length=2048,
-            hidden_size=512,
-            num_layers=8,
-            num_attention_heads=8,
-            num_key_value_heads=4,
-            intermediate_size=2048,
-            attention_impl="auto",
-            rope_scaling_factor=1.0,
-            gradient_checkpointing=True,
-        ),
-        "1b": ScratchDecoderConfig(
-            name="aeitron-1b-scratch",
-            vocab_size=64_000,
-            max_sequence_length=65_536,
-            hidden_size=2048,
-            num_layers=24,
-            num_attention_heads=16,
-            num_key_value_heads=4,
-            intermediate_size=5504,
-            attention_impl="auto",
-            rope_scaling_factor=2.0,
-        ),
-        "7b": ScratchDecoderConfig(
-            name="aeitron-7b-scratch",
-            vocab_size=64_000,
-            max_sequence_length=131_072,
-            hidden_size=4096,
-            num_layers=32,
-            num_attention_heads=32,
-            num_key_value_heads=8,
-            intermediate_size=11008,
-            attention_impl="auto",
-            rope_scaling_factor=4.0,
-        ),
-        "32b": ScratchDecoderConfig(
-            name="aeitron-32b-scratch",
-            vocab_size=64_000,
-            max_sequence_length=131_072,
-            hidden_size=6656,
-            num_layers=60,
-            num_attention_heads=52,
-            num_key_value_heads=4,
-            intermediate_size=17920,
-            attention_impl="auto",
-            rope_scaling_factor=4.0,
-        ),
-        "62b": ScratchDecoderConfig(
-            name="aeitron-62b-scratch",
-            vocab_size=64_000,
-            max_sequence_length=262_144,
-            hidden_size=8192,
-            num_layers=72,
-            num_attention_heads=64,
-            num_key_value_heads=8,
-            intermediate_size=28672,
-            attention_impl="auto",
-            rope_scaling_factor=8.0,
-            gradient_checkpointing=True,
-        ),
-    }
-    key = name.lower()
-    if key not in profiles:
-        raise ValueError(f"unknown model profile: {name}")
-    return profiles[key]
-
-
-def tiny_smoke_config() -> ScratchDecoderConfig:
-    return ScratchDecoderConfig(
-        name="aeitron-tiny-gpu-smoke",
-        vocab_size=2048,
-        max_sequence_length=128,
-        hidden_size=128,
-        num_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        intermediate_size=512,
-        tie_word_embeddings=True,
-    )
 
