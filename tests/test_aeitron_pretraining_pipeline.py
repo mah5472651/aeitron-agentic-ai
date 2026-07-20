@@ -379,12 +379,37 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
                     shard_token_count=128,
                     sequence_length=16,
                     validation_fraction=0.0,
+                    require_exact_vocab_size=False,
                 )
             )
             self.assertEqual(report.status, "passed")
             self.assertFalse(report.special_tokens_missing)
             self.assertTrue(Path(report.tokenizer_path).exists())
             self.assertTrue(report.shard_manifest["train_shards"])
+
+    def test_real_corpus_tokenizer_fails_when_exact_vocab_cannot_be_trained(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "small.jsonl"
+            corpus.write_text(
+                json.dumps({"text": "def secure(value):\n    return value\n"}) + "\n",
+                encoding="utf-8",
+            )
+            report = train_real_corpus_tokenizer(
+                RealCorpusTokenizerConfig(
+                    input_paths=[str(corpus)],
+                    output_dir=str(root / "tokenizer_run"),
+                    vocab_size=64_000,
+                    min_frequency=1,
+                    shard_token_count=128,
+                    sequence_length=16,
+                    validation_fraction=0.0,
+                    include_stress_samples=False,
+                )
+            )
+            self.assertEqual(report.status, "failed")
+            self.assertLess(report.vocab_size_actual, report.vocab_size_requested)
+            self.assertTrue(any("vocabulary size mismatch" in failure for failure in report.audit_failures))
 
     def test_checkpoint_eval_reports_validation_interval_not_reached(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

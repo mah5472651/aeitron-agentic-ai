@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import time
 from pathlib import Path
 from typing import Any, Literal
@@ -15,7 +17,19 @@ from typing import Any, Literal
 from pydantic import Field
 
 from src.aeitron.evaluation.benchmarks import BenchmarkHarness, BenchmarkRunReport, BenchmarkTask
+from src.aeitron.model_ops.checkpoint_compare import (
+    GenerationConfig,
+    _load_model,
+    _select_device,
+    generate_text,
+)
+from src.aeitron.model_ops.tokenizer_pipeline import load_tokenizer
 from src.aeitron.shared.schemas import StrictModel
+from src.aeitron.tools.sandbox import (
+    DockerSandboxRunner,
+    HardenedSandboxPolicy,
+    SandboxRunRequest,
+)
 
 
 SuiteKind = Literal["swe_bench_style", "human_eval_style", "mbpp_style", "cyberseceval_style", "custom_security"]
@@ -37,10 +51,12 @@ class BenchmarkSuiteResult(StrictModel):
     passed: int
     reason: str = ""
     report: dict[str, Any] | None = None
+    pass_at_k: dict[str, float] = Field(default_factory=dict)
 
 
 class BenchmarkSuitesReport(StrictModel):
     status: str
+    evaluation_mode: Literal["dataset_validation", "executable_model"] = "dataset_validation"
     suites: list[BenchmarkSuiteResult]
     aggregate_score: float
     created_at_unix: float = Field(default_factory=time.time)
@@ -159,6 +175,336 @@ def load_suite_tasks(spec: BenchmarkSuiteSpec) -> list[BenchmarkTask]:
     raise ValueError(f"unsupported suite kind: {spec.kind}")
 
 
+class ExecutableBenchmarkConfig(StrictModel):
+    checkpoint_manifest: str
+    tokenizer_path: str
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    candidates_per_task: int = Field(default=10, ge=1, le=100)
+    pass_k: list[int] = Field(default_factory=lambda: [1, 5, 10], min_length=1)
+    max_tasks_per_suite: int | None = Field(default=None, ge=1)
+    sandbox_image: str = "python:3.12-slim"
+    sandbox_timeout_ms: int = Field(default=10_000, ge=100, le=300_000)
+    minimum_pass_at_1: float = Field(default=0.01, ge=0.0, le=1.0)
+    generation: GenerationConfig = Field(
+        default_factory=lambda: GenerationConfig(
+            max_new_tokens=384,
+            temperature=0.8,
+            top_k=50,
+            repetition_penalty=1.08,
+            no_repeat_ngram_size=4,
+        )
+    )
+
+    @property
+    def normalized_pass_k(self) -> list[int]:
+        return sorted({value for value in self.pass_k if 1 <= value <= self.candidates_per_task})
+
+
+class ExecutableCandidateResult(StrictModel):
+    candidate_index: int = Field(ge=0)
+    passed: bool
+    status: str
+    exit_code: int | None = None
+    duration_ms: float = Field(ge=0.0)
+    generated_tokens: int = Field(ge=0)
+    output_sha256: str
+    failure: str = ""
+
+
+class ExecutableTaskResult(StrictModel):
+    task_id: str
+    candidate_count: int = Field(ge=1)
+    passed_candidates: int = Field(ge=0)
+    pass_at_k: dict[str, float]
+    candidates: list[ExecutableCandidateResult]
+
+
+def _estimate_pass_at_k(candidate_count: int, correct_count: int, k: int) -> float:
+    if candidate_count <= 0 or correct_count < 0 or correct_count > candidate_count:
+        raise ValueError("invalid pass@k candidate counts")
+    if k <= 0 or k > candidate_count:
+        raise ValueError("pass@k must be between one and candidate_count")
+    if candidate_count - correct_count < k:
+        return 1.0
+    return 1.0 - math.comb(candidate_count - correct_count, k) / math.comb(candidate_count, k)
+
+
+def _extract_python_source(output: str, *, prompt_prefix: str = "", entry_point: str = "") -> str:
+    fenced = re.findall(r"```(?:python|py)?\s*\n(.*?)```", output, flags=re.IGNORECASE | re.DOTALL)
+    candidate = fenced[-1].strip() if fenced else output.strip()
+    for start_marker, end_marker in (
+        ("<|patch_start|>", "<|patch_end|>"),
+        ("<|code_start|>", "<|code_end|>"),
+    ):
+        if start_marker in candidate:
+            candidate = candidate.split(start_marker, 1)[1]
+            if end_marker in candidate:
+                candidate = candidate.split(end_marker, 1)[0]
+            candidate = candidate.strip()
+    if entry_point and not re.search(rf"(?m)^\s*def\s+{re.escape(entry_point)}\s*\(", candidate):
+        candidate = f"{prompt_prefix.rstrip()}\n{candidate}".strip()
+    encoded = candidate.encode("utf-8")
+    if not candidate or len(encoded) > 256_000 or "\x00" in candidate:
+        raise ValueError("generated Python candidate is empty or exceeds the code-evaluation limit")
+    return candidate + ("\n" if not candidate.endswith("\n") else "")
+
+
+def _safe_python_identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise ValueError(f"unsafe benchmark entry point: {value!r}")
+    return value
+
+
+def _human_eval_test_files(row: dict[str, Any], output: str) -> dict[str, str]:
+    prompt = str(row.get("prompt") or "")
+    entry_point = _safe_python_identifier(str(row.get("entry_point") or ""))
+    test_source = str(row.get("test") or "")
+    if not prompt.strip() or not test_source.strip():
+        raise ValueError("HumanEval row requires prompt, entry_point, and test")
+    candidate = _extract_python_source(output, prompt_prefix=prompt, entry_point=entry_point)
+    runner = (
+        f"from candidate import {entry_point} as candidate\n"
+        f"{test_source.rstrip()}\n"
+        "check(candidate)\n"
+    )
+    return {"candidate.py": candidate, "runner.py": runner}
+
+
+def _mbpp_test_files(row: dict[str, Any], output: str) -> dict[str, str]:
+    tests = row.get("test_list") or row.get("tests") or []
+    if isinstance(tests, str):
+        tests = [tests]
+    if not isinstance(tests, list) or not tests or not all(isinstance(item, str) for item in tests):
+        raise ValueError("MBPP row requires a non-empty test_list")
+    setup = str(row.get("test_setup_code") or "")
+    candidate = _extract_python_source(output)
+    runner = "\n".join(
+        [
+            "from candidate import *",
+            setup,
+            *[str(item) for item in tests],
+            "",
+        ]
+    )
+    return {"candidate.py": candidate, "runner.py": runner}
+
+
+def _code_prompt(row: dict[str, Any], kind: SuiteKind) -> str:
+    if kind == "human_eval_style":
+        prompt = str(row.get("prompt") or "")
+        return (
+            "Complete the following Python function. Return only executable Python code without Markdown.\n\n"
+            + prompt
+        )
+    text = str(row.get("text") or row.get("prompt") or row.get("question") or "")
+    return (
+        "Solve this Python programming task. Return only executable Python code without Markdown.\n\n"
+        + text
+    )
+
+
+def _run_code_candidate(
+    *,
+    row: dict[str, Any],
+    kind: SuiteKind,
+    output: str,
+    generated_tokens: int,
+    candidate_index: int,
+    policy: HardenedSandboxPolicy,
+) -> ExecutableCandidateResult:
+    import hashlib
+
+    output_hash = hashlib.sha256(output.encode("utf-8")).hexdigest()
+    started = time.perf_counter()
+    try:
+        files = (
+            _human_eval_test_files(row, output)
+            if kind == "human_eval_style"
+            else _mbpp_test_files(row, output)
+        )
+        result = DockerSandboxRunner().run(
+            SandboxRunRequest(
+                command=["python3", "-I", "runner.py"],
+                files=files,
+                policy=policy,
+            )
+        )
+        passed = result.status == "ok" and result.exit_code == 0
+        failure = "" if passed else (result.reason or result.stderr[-2_000:] or result.status)
+        return ExecutableCandidateResult(
+            candidate_index=candidate_index,
+            passed=passed,
+            status=result.status,
+            exit_code=result.exit_code,
+            duration_ms=result.duration_ms,
+            generated_tokens=generated_tokens,
+            output_sha256=output_hash,
+            failure=failure,
+        )
+    except (TypeError, ValueError) as exc:
+        return ExecutableCandidateResult(
+            candidate_index=candidate_index,
+            passed=False,
+            status="invalid_generation",
+            duration_ms=(time.perf_counter() - started) * 1_000,
+            generated_tokens=generated_tokens,
+            output_sha256=output_hash,
+            failure=str(exc),
+        )
+
+
+def run_executable_benchmark_suites(
+    specs: list[BenchmarkSuiteSpec],
+    config: ExecutableBenchmarkConfig,
+) -> BenchmarkSuitesReport:
+    unsupported = [
+        spec.name
+        for spec in specs
+        if spec.kind not in {"human_eval_style", "mbpp_style"}
+    ]
+    if unsupported:
+        raise ValueError(
+            "executable benchmark runner currently accepts only HumanEval/MBPP code suites; "
+            "use the governed repository scorecard for SWE-Bench and security tasks: "
+            + ", ".join(unsupported)
+        )
+    pass_k = config.normalized_pass_k
+    if not pass_k:
+        raise ValueError("no requested pass@k value fits candidates_per_task")
+    device = _select_device(config.device)
+    model, _manifest = _load_model(config.checkpoint_manifest, device=device)
+    tokenizer = load_tokenizer(config.tokenizer_path)
+    policy = HardenedSandboxPolicy(
+        image=config.sandbox_image,
+        timeout_ms=config.sandbox_timeout_ms,
+    )
+    suite_results: list[BenchmarkSuiteResult] = []
+    for spec in specs:
+        path = Path(spec.path)
+        if not path.is_file():
+            suite_results.append(
+                BenchmarkSuiteResult(
+                    name=spec.name,
+                    kind=spec.kind,
+                    status="failed" if spec.required else "skipped",
+                    score=0.0,
+                    total=0,
+                    passed=0,
+                    reason=f"benchmark file missing: {path}",
+                )
+            )
+            continue
+        rows = _load_jsonl(path)
+        if config.max_tasks_per_suite is not None:
+            rows = rows[: config.max_tasks_per_suite]
+        if not rows:
+            suite_results.append(
+                BenchmarkSuiteResult(
+                    name=spec.name,
+                    kind=spec.kind,
+                    status="failed",
+                    score=0.0,
+                    total=0,
+                    passed=0,
+                    reason="benchmark suite contains no tasks",
+                )
+            )
+            continue
+        task_results: list[ExecutableTaskResult] = []
+        infrastructure_failure = ""
+        for row_index, row in enumerate(rows):
+            task_id = str(row.get("task_id") or row.get("name") or f"{spec.name}-{row_index}")
+            candidates: list[ExecutableCandidateResult] = []
+            prompt = _code_prompt(row, spec.kind)
+            for candidate_index in range(config.candidates_per_task):
+                generation = config.generation.model_copy(
+                    update={"seed": config.generation.seed + row_index * 10_000 + candidate_index}
+                )
+                output, generated_tokens = generate_text(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    device=device,
+                    config=generation,
+                )
+                candidate = _run_code_candidate(
+                    row=row,
+                    kind=spec.kind,
+                    output=output,
+                    generated_tokens=generated_tokens,
+                    candidate_index=candidate_index,
+                    policy=policy,
+                )
+                candidates.append(candidate)
+                if candidate.status == "unavailable":
+                    infrastructure_failure = candidate.failure or "Docker sandbox unavailable"
+                    break
+            if infrastructure_failure:
+                break
+            correct = sum(item.passed for item in candidates)
+            task_results.append(
+                ExecutableTaskResult(
+                    task_id=task_id,
+                    candidate_count=len(candidates),
+                    passed_candidates=correct,
+                    pass_at_k={
+                        f"pass@{k}": round(_estimate_pass_at_k(len(candidates), correct, k), 6)
+                        for k in pass_k
+                    },
+                    candidates=candidates,
+                )
+            )
+        if infrastructure_failure:
+            suite_results.append(
+                BenchmarkSuiteResult(
+                    name=spec.name,
+                    kind=spec.kind,
+                    status="failed",
+                    score=0.0,
+                    total=len(rows),
+                    passed=0,
+                    reason=f"executable benchmark infrastructure failed: {infrastructure_failure}",
+                )
+            )
+            continue
+        aggregate_pass_k = {
+            f"pass@{k}": round(
+                sum(item.pass_at_k[f"pass@{k}"] for item in task_results) / len(task_results),
+                6,
+            )
+            for k in pass_k
+        }
+        pass_at_1 = aggregate_pass_k.get("pass@1", 0.0)
+        passed_tasks = sum(item.passed_candidates > 0 for item in task_results)
+        suite_results.append(
+            BenchmarkSuiteResult(
+                name=spec.name,
+                kind=spec.kind,
+                status="passed" if pass_at_1 >= config.minimum_pass_at_1 else "failed",
+                score=pass_at_1,
+                total=len(task_results),
+                passed=passed_tasks,
+                reason="checkpoint generations executed in the hardened Docker sandbox",
+                pass_at_k=aggregate_pass_k,
+                report={
+                    "checkpoint_manifest": str(Path(config.checkpoint_manifest).resolve()),
+                    "tokenizer_path": str(Path(config.tokenizer_path).resolve()),
+                    "candidates_per_task": config.candidates_per_task,
+                    "tasks": [item.model_dump(mode="json") for item in task_results],
+                },
+            )
+        )
+    active = [item for item in suite_results if item.status != "skipped"]
+    status = "failed" if not active or any(item.status == "failed" for item in active) else "passed"
+    aggregate = sum(item.score for item in active) / max(1, len(active))
+    return BenchmarkSuitesReport(
+        status=status,
+        evaluation_mode="executable_model",
+        suites=suite_results,
+        aggregate_score=round(aggregate, 6),
+    )
+
+
 def run_benchmark_suites(specs: list[BenchmarkSuiteSpec]) -> BenchmarkSuitesReport:
     harness = BenchmarkHarness()
     results: list[BenchmarkSuiteResult] = []
@@ -186,14 +532,19 @@ def run_benchmark_suites(specs: list[BenchmarkSuiteSpec]) -> BenchmarkSuitesRepo
                 score=suite_report.score,
                 total=suite_report.total,
                 passed=suite_report.passed,
-                reason="local benchmark suite executed",
+                reason="benchmark dataset contract validated; this is not a model capability score",
                 report=suite_report.model_dump(),
             )
         )
     active = [item for item in results if item.status != "skipped"]
     aggregate = sum(item.score for item in active) / max(1, len(active))
     status = "failed" if any(item.status == "failed" for item in active) else "passed"
-    return BenchmarkSuitesReport(status=status, suites=results, aggregate_score=round(aggregate, 6))
+    return BenchmarkSuitesReport(
+        status=status,
+        evaluation_mode="dataset_validation",
+        suites=results,
+        aggregate_score=round(aggregate, 6),
+    )
 
 
 def write_markdown(report: BenchmarkSuitesReport, path: str | Path) -> Path:
@@ -202,22 +553,37 @@ def write_markdown(report: BenchmarkSuitesReport, path: str | Path) -> Path:
         "# Aeitron Benchmark Suites Report",
         "",
         f"- status: {report.status}",
+        f"- evaluation_mode: {report.evaluation_mode}",
         f"- aggregate_score: {report.aggregate_score:.4f}",
         "",
-        "| suite | kind | status | score | total | passed | reason |",
-        "|---|---|---|---:|---:|---:|---|",
+        "| suite | kind | status | score | total | passed | pass@k | reason |",
+        "|---|---|---|---:|---:|---:|---|---|",
     ]
     for suite in report.suites:
-        lines.append(f"| {suite.name} | {suite.kind} | {suite.status} | {suite.score:.4f} | {suite.total} | {suite.passed} | {suite.reason} |")
+        pass_at_k = ", ".join(f"{key}={value:.4f}" for key, value in sorted(suite.pass_at_k.items()))
+        lines.append(
+            f"| {suite.name} | {suite.kind} | {suite.status} | {suite.score:.4f} | "
+            f"{suite.total} | {suite.passed} | {pass_at_k} | {suite.reason} |"
+        )
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return target
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run local SWE-Bench/CyberSecEval-style benchmark adapters.")
+    parser.add_argument("--mode", choices=["dataset-validation", "executable-model"], default="dataset-validation")
     parser.add_argument("--suite", action="append", nargs=3, metavar=("NAME", "KIND", "PATH"), default=[])
     parser.add_argument("--optional-suite", action="append", nargs=3, metavar=("NAME", "KIND", "PATH"), default=[])
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--checkpoint-manifest")
+    parser.add_argument("--tokenizer-path")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--candidates-per-task", type=int, default=10)
+    parser.add_argument("--pass-k", type=int, action="append", default=[])
+    parser.add_argument("--max-tasks-per-suite", type=int)
+    parser.add_argument("--sandbox-image", default="python:3.12-slim")
+    parser.add_argument("--sandbox-timeout-ms", type=int, default=10_000)
+    parser.add_argument("--minimum-pass-at-1", type=float, default=0.01)
     return parser.parse_args()
 
 
@@ -230,7 +596,33 @@ def main() -> None:
         BenchmarkSuiteSpec(name=name, kind=kind, path=path, required=False)
         for name, kind, path in args.optional_suite
     ]
-    report = run_benchmark_suites(specs)
+    if args.mode == "executable-model":
+        missing = [
+            flag
+            for flag, value in (
+                ("--checkpoint-manifest", args.checkpoint_manifest),
+                ("--tokenizer-path", args.tokenizer_path),
+            )
+            if not value
+        ]
+        if missing:
+            raise SystemExit("executable-model mode requires " + ", ".join(missing))
+        report = run_executable_benchmark_suites(
+            specs,
+            ExecutableBenchmarkConfig(
+                checkpoint_manifest=args.checkpoint_manifest,
+                tokenizer_path=args.tokenizer_path,
+                device=args.device,
+                candidates_per_task=args.candidates_per_task,
+                pass_k=args.pass_k or [1, 5, 10],
+                max_tasks_per_suite=args.max_tasks_per_suite,
+                sandbox_image=args.sandbox_image,
+                sandbox_timeout_ms=args.sandbox_timeout_ms,
+                minimum_pass_at_1=args.minimum_pass_at_1,
+            ),
+        )
+    else:
+        report = run_benchmark_suites(specs)
     report.write(args.output_dir)
     print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
     if report.status != "passed":

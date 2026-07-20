@@ -25,6 +25,7 @@
       AEITRON_DATABASE_URL: "postgresql://aeitron:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/aeitron"
       AEITRON_REDIS_URL: "redis://redis:6379/0"
       AEITRON_QDRANT_URL: "http://qdrant:6333"
+      AEITRON_EMBEDDING_URL: "${AEITRON_EMBEDDING_URL:?set AEITRON_EMBEDDING_URL}"
       AEITRON_OBJECT_STORE_URI: "s3://aeitron-datasets/training-workspace"
       AEITRON_OBJECT_STORE_ENDPOINT_URL: "http://minio:9000"
       AEITRON_OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318/v1/traces"

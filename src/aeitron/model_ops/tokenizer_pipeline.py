@@ -95,6 +95,7 @@ class RealCorpusTokenizerConfig(StrictModel):
     sequence_length: int = Field(default=2048, ge=16)
     validation_fraction: float = Field(default=0.01, ge=0.0, le=0.5)
     include_stress_samples: bool = True
+    require_exact_vocab_size: bool = True
 
 
 class TokenizerAuditReport(StrictModel):
@@ -104,6 +105,7 @@ class TokenizerAuditReport(StrictModel):
     vocab_size_requested: int
     vocab_size_actual: int
     special_tokens_missing: list[str]
+    audit_failures: list[str] = Field(default_factory=list)
     sample_token_counts: dict[str, int]
     source_rows: int
     source_chars: int
@@ -308,6 +310,13 @@ def train_real_corpus_tokenizer(config: RealCorpusTokenizerConfig) -> TokenizerA
     )
     tokenizer = load_tokenizer(trained)
     vocab = tokenizer.get_vocab()
+    actual_vocab_size = tokenizer.get_vocab_size()
+    missing_special_tokens = [token for token in SPECIAL_TOKENS if token not in vocab]
+    audit_failures = [f"missing special token: {token}" for token in missing_special_tokens]
+    if config.require_exact_vocab_size and actual_vocab_size != config.vocab_size:
+        audit_failures.append(
+            f"vocabulary size mismatch: requested {config.vocab_size}, trained {actual_vocab_size}"
+        )
     sample_texts = {
         "four_space_indent": "    if safe:\n        return value\n",
         "hex_dump": "0x00 0x7ffd00ff 0xdeadbeef 0xff",
@@ -316,12 +325,13 @@ def train_real_corpus_tokenizer(config: RealCorpusTokenizerConfig) -> TokenizerA
     }
     source_rows, source_chars = corpus_stats(config.input_paths)
     report = TokenizerAuditReport(
-        status="passed" if not [token for token in SPECIAL_TOKENS if token not in vocab] else "failed",
+        status="passed" if not audit_failures else "failed",
         tokenizer_path=str(trained),
         shard_manifest_path=str(shards_dir / "manifest.json"),
         vocab_size_requested=config.vocab_size,
-        vocab_size_actual=tokenizer.get_vocab_size(),
-        special_tokens_missing=[token for token in SPECIAL_TOKENS if token not in vocab],
+        vocab_size_actual=actual_vocab_size,
+        special_tokens_missing=missing_special_tokens,
+        audit_failures=audit_failures,
         sample_token_counts={name: len(tokenizer.encode(text).ids) for name, text in sample_texts.items()},
         source_rows=source_rows,
         source_chars=source_chars,

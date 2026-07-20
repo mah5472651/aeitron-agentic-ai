@@ -8,6 +8,7 @@ from src.aeitron.indexing.vector_index import (
     VectorIndexCapability,
     VectorSearchReport,
     VectorSearchResult,
+    VectorSyncReport,
     create_vector_index,
     vector_capabilities,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "VectorIndexCapability",
     "VectorSearchReport",
     "VectorSearchResult",
+    "VectorSyncReport",
     "WorkspaceContextBuilder",
     "create_vector_index",
     "vector_capabilities",

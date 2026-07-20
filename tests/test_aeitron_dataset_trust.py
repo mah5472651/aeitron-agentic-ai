@@ -24,6 +24,7 @@ from src.aeitron.learning.dataset_authority import (
     SQLiteDatasetAuthorityStore,
     SourceSnapshotCreate,
     build_reviewer_roster_onboarding_template,
+    evaluate_reviewer_qualification,
     finalize_reviewer_governance_bundle,
     initialize_reviewer_governance_bundle,
     initialize_reviewer_qualification_pack,
@@ -182,6 +183,126 @@ class DatasetAuthorityTest(unittest.IsolatedAsyncioTestCase):
                 prepare_reviewer_delivery_packages(
                     governance_dir,
                     Path(temp_dir) / "deliveries",
+                )
+
+    async def test_qualification_evaluator_is_hash_bound_blind_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            governance_dir = root / "governance"
+            initialize_reviewer_governance_bundle(governance_dir)
+            qualification = initialize_reviewer_qualification_pack(governance_dir)
+            roster = ReviewerRoster(
+                roster_id="aeitron-data-reviewers-v1",
+                identities=[
+                    ReviewerIdentity(
+                        reviewer_id="reviewer-one",
+                        identity_provider_subject="oidc:reviewer-one",
+                        roles={"reviewer"},
+                        approved_by="governance-owner",
+                        approved_at="2026-07-20T01:00:00+06:00",
+                    ),
+                    ReviewerIdentity(
+                        reviewer_id="reviewer-two",
+                        identity_provider_subject="oidc:reviewer-two",
+                        roles={"reviewer"},
+                        approved_by="governance-owner",
+                        approved_at="2026-07-20T01:00:00+06:00",
+                    ),
+                    ReviewerIdentity(
+                        reviewer_id="adjudicator-one",
+                        identity_provider_subject="oidc:adjudicator-one",
+                        roles={"adjudicator"},
+                        approved_by="governance-owner",
+                        approved_at="2026-07-20T01:00:00+06:00",
+                    ),
+                ],
+            )
+            (governance_dir / "data_reviewers.json").write_text(
+                roster.model_dump_json(indent=2) + "\n",
+                encoding="utf-8",
+            )
+            finalize_reviewer_governance_bundle(governance_dir)
+            answers = json.loads(
+                Path(qualification.answer_key_path).read_text(encoding="utf-8")
+            )["answers"]
+            response_paths: list[Path] = []
+            for reviewer_id in ("reviewer-one", "reviewer-two"):
+                response_path = root / f"{reviewer_id}-responses.jsonl"
+                _write_jsonl(
+                    response_path,
+                    [
+                        {
+                            "item_id": answer["item_id"],
+                            "reviewer_id": reviewer_id,
+                            "decision": answer["expected_decision"],
+                            "rationale": (
+                                "This decision follows the governed rubric and the supplied evidence "
+                                f"for {answer['item_id']}."
+                            ),
+                        }
+                        for answer in answers
+                    ],
+                )
+                response_paths.append(response_path)
+
+            report = evaluate_reviewer_qualification(
+                governance_dir=governance_dir,
+                response_paths=response_paths,
+                output_dir=root / "evaluation",
+            )
+            self.assertEqual(report.status, "passed")
+            self.assertEqual(report.reviewer_agreement_kappa, 1.0)
+            self.assertTrue(all(item.accuracy == 1.0 for item in report.reviewers))
+            serialized = (root / "evaluation" / "reviewer-qualification-evaluation.json").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("expected_decision", serialized)
+            self.assertNotIn("oidc:", serialized)
+            self.assertNotIn("This decision follows", serialized)
+            with self.assertRaises(FileExistsError):
+                evaluate_reviewer_qualification(
+                    governance_dir=governance_dir,
+                    response_paths=response_paths,
+                    output_dir=root / "evaluation",
+                )
+
+            bad_rows = [
+                {
+                    "item_id": answer["item_id"],
+                    "reviewer_id": "reviewer-two",
+                    "decision": (
+                        "reject"
+                        if index < 2 and answer["expected_decision"] == "approve"
+                        else "approve"
+                        if index < 2
+                        else answer["expected_decision"]
+                    ),
+                    "rationale": (
+                        "This independent decision records a concrete evidence assessment under "
+                        "the governed reviewer rubric."
+                    ),
+                }
+                for index, answer in enumerate(answers)
+            ]
+            _write_jsonl(response_paths[1], bad_rows)
+            failed = evaluate_reviewer_qualification(
+                governance_dir=governance_dir,
+                response_paths=response_paths,
+                output_dir=root / "failed-evaluation",
+            )
+            self.assertEqual(failed.status, "failed")
+            self.assertTrue(any("accuracy" in blocker for blocker in failed.blockers))
+
+            answer_key_path = Path(qualification.answer_key_path)
+            answer_key_path.write_text(
+                answer_key_path.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "answer key"):
+                evaluate_reviewer_qualification(
+                    governance_dir=governance_dir,
+                    response_paths=response_paths,
+                    output_dir=root / "tampered-evaluation",
                 )
 
     async def test_reviewer_onboarding_never_fabricates_identity_and_reports_readiness(self) -> None:
@@ -532,6 +653,25 @@ class DatasetFingerprintAndManifestTest(unittest.TestCase):
             registry.select_sources(["source-missing"], expected_count=1)
         with self.assertRaisesRegex(ValueError, "count mismatch"):
             registry.select_sources(["source-0"], expected_count=2)
+
+    def test_tracked_eight_source_staging_registry_is_exact_and_quarantined(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        ultimate = SourceRegistry.from_file(root / "config" / "data_sources.ultimate.json")
+        staging = SourceRegistry.from_file(root / "config" / "data_sources.governed.staging.json")
+        selection_payload = json.loads(
+            (root / "config" / "data_sources.governed.selection.json").read_text(encoding="utf-8")
+        )
+        selected, expected_manifest = ultimate.select_sources(
+            selection_payload["source_ids"],
+            expected_count=8,
+        )
+        self.assertEqual(
+            [source.model_dump(mode="json") for source in staging.sources],
+            [source.model_dump(mode="json") for source in selected.sources],
+        )
+        self.assertEqual(selection_payload, expected_manifest.model_dump(mode="json"))
+        self.assertTrue(all(source.approval_status == "pending" for source in staging.sources))
+        self.assertTrue(all(source.trust_tier == "quarantine" for source in staging.sources))
 
     def test_registry_write_refuses_approved_source_removal_or_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

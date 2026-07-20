@@ -510,6 +510,76 @@ class ReviewerQualificationPackReport(StrictModel):
         return self
 
 
+class ReviewerQualificationResponse(StrictModel):
+    item_id: str = Field(pattern=r"^reviewer-qualification-\d{2}$")
+    reviewer_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{2,127}$")
+    decision: Literal["approve", "reject"]
+    rationale: str = Field(min_length=30, max_length=1_000)
+
+    @field_validator("rationale")
+    @classmethod
+    def validate_rationale(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if len(normalized) < 30:
+            raise ValueError("qualification rationale must contain at least 30 non-whitespace characters")
+        if normalized.lower() in {"looks good", "approve", "reject", "not good"}:
+            raise ValueError("qualification rationale must be concrete")
+        return normalized
+
+
+class ReviewerQualificationScore(StrictModel):
+    reviewer_id: str
+    response_sha256: str
+    item_count: Literal[20] = 20
+    correct_count: int = Field(ge=0, le=20)
+    accuracy: float = Field(ge=0.0, le=1.0)
+    passed: bool
+
+    @field_validator("response_sha256")
+    @classmethod
+    def validate_response_hash(cls, value: str) -> str:
+        return _validate_hash(value, "response_sha256")
+
+
+class ReviewerQualificationEvaluationReport(StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["passed", "failed"]
+    roster_id: str
+    rubric_id: Literal["aeitron-review-rubric-v1"] = REVIEW_RUBRIC_ID
+    roster_sha256: str
+    rubric_sha256: str
+    qualification_pack_sha256: str
+    answer_key_sha256: str
+    minimum_accuracy: float = Field(default=0.95, ge=0.0, le=1.0)
+    minimum_kappa: float = Field(default=0.80, ge=-1.0, le=1.0)
+    reviewer_agreement_kappa: float = Field(ge=-1.0, le=1.0)
+    reviewers: list[ReviewerQualificationScore]
+    blockers: list[str]
+    created_at_unix: float = Field(default_factory=time.time)
+    handling_warning: str
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> "ReviewerQualificationEvaluationReport":
+        for field_name in (
+            "roster_sha256",
+            "rubric_sha256",
+            "qualification_pack_sha256",
+            "answer_key_sha256",
+        ):
+            object.__setattr__(self, field_name, _validate_hash(getattr(self, field_name), field_name))
+        if len(self.reviewers) != 2 or len({item.reviewer_id for item in self.reviewers}) != 2:
+            raise ValueError("qualification evaluation requires exactly two distinct reviewers")
+        expected_status = "failed" if self.blockers else "passed"
+        if self.status != expected_status:
+            raise ValueError(f"qualification evaluation status must be {expected_status!r}")
+        if not self.blockers:
+            if any(not item.passed for item in self.reviewers):
+                raise ValueError("passing qualification report contains a failed reviewer")
+            if self.reviewer_agreement_kappa < self.minimum_kappa:
+                raise ValueError("passing qualification report is below the kappa threshold")
+        return self
+
+
 def build_reviewer_rubric_markdown() -> str:
     return """# Aeitron Reviewer Rubric v1
 
@@ -1143,6 +1213,214 @@ def prepare_reviewer_delivery_packages(
     )
     _write_model_atomically(report, report_path)
     os.chmod(report_path, 0o600)
+    os.chmod(output_root, 0o700)
+    return report
+
+
+def evaluate_reviewer_qualification(
+    *,
+    governance_dir: str | Path,
+    response_paths: list[str | Path],
+    output_dir: str | Path,
+    minimum_accuracy: float = 0.95,
+    minimum_kappa: float = 0.80,
+) -> ReviewerQualificationEvaluationReport:
+    if not 0.0 <= minimum_accuracy <= 1.0:
+        raise ValueError("minimum_accuracy must be between 0 and 1")
+    if not -1.0 <= minimum_kappa <= 1.0:
+        raise ValueError("minimum_kappa must be between -1 and 1")
+    if len(response_paths) != 2:
+        raise ValueError("qualification evaluation requires exactly two response files")
+
+    root = Path(governance_dir).expanduser().resolve(strict=True)
+    governance_path = root / "reviewer-governance-manifest.json"
+    qualification_path = root / "reviewer-qualification-manifest.json"
+    roster_path = root / "data_reviewers.json"
+    rubric_path = root / "reviewer-rubric-v1.md"
+    pack_path = root / "reviewer-qualification-v1.jsonl"
+    answer_key_path = root / "reviewer-qualification-answer-key-v1.json"
+    for required_path in (
+        governance_path,
+        qualification_path,
+        roster_path,
+        rubric_path,
+        pack_path,
+        answer_key_path,
+    ):
+        if not required_path.is_file():
+            raise FileNotFoundError(f"qualification governance artifact is missing: {required_path}")
+
+    governance = ReviewerGovernanceBundleReport.model_validate_json(
+        governance_path.read_text(encoding="utf-8")
+    )
+    qualification = ReviewerQualificationPackReport.model_validate_json(
+        qualification_path.read_text(encoding="utf-8")
+    )
+    if governance.status != "ready_for_qualification":
+        raise ValueError("reviewer governance is not finalized")
+    integrity_checks = {
+        "reviewer roster": (_hash_file(roster_path), governance.roster_sha256),
+        "reviewer rubric": (_hash_file(rubric_path), governance.rubric_sha256),
+        "qualification pack": (_hash_file(pack_path), qualification.pack_sha256),
+        "qualification answer key": (_hash_file(answer_key_path), qualification.answer_key_sha256),
+    }
+    changed = [name for name, (actual, expected) in integrity_checks.items() if actual != expected]
+    if changed:
+        raise ValueError("qualification governance artifact changed after binding: " + ", ".join(changed))
+
+    roster = load_reviewer_roster(roster_path)
+    readiness = reviewer_roster_readiness(roster)
+    if readiness.status != "ready":
+        raise ValueError("reviewer roster is no longer ready: " + "; ".join(readiness.blockers))
+    expected_reviewers = {
+        identity.reviewer_id
+        for identity in roster.identities
+        if identity.active and "reviewer" in identity.roles
+    }
+    if len(expected_reviewers) != 2:
+        raise ValueError("qualification requires exactly two active reviewers")
+
+    pack_items = [
+        ReviewerQualificationItem.model_validate_json(line)
+        for line in pack_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    expected_item_ids = {item.item_id for item in pack_items}
+    if len(pack_items) != 20 or len(expected_item_ids) != 20:
+        raise ValueError("qualification pack must contain twenty unique items")
+
+    answer_payload = json.loads(answer_key_path.read_text(encoding="utf-8"))
+    if answer_payload.get("schema_version") != 1 or answer_payload.get("rubric_id") != REVIEW_RUBRIC_ID:
+        raise ValueError("qualification answer key contract is invalid")
+    answers = [
+        ReviewerQualificationAnswer.model_validate(item)
+        for item in answer_payload.get("answers", [])
+    ]
+    answer_by_id = {item.item_id: item for item in answers}
+    if len(answers) != 20 or set(answer_by_id) != expected_item_ids:
+        raise ValueError("qualification answer key does not match the governed pack")
+
+    submissions: dict[str, tuple[Path, dict[str, ReviewerQualificationResponse]]] = {}
+    resolved_paths: set[Path] = set()
+    for raw_path in response_paths:
+        response_path = Path(raw_path).expanduser().resolve(strict=True)
+        if response_path in resolved_paths:
+            raise ValueError("qualification response files must be distinct")
+        resolved_paths.add(response_path)
+        if not response_path.is_file() or response_path.stat().st_size > 1_048_576:
+            raise ValueError(f"qualification response must be a regular file no larger than 1 MiB: {response_path}")
+        rows: list[ReviewerQualificationResponse] = []
+        for line_number, line in enumerate(response_path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                rows.append(ReviewerQualificationResponse.model_validate_json(line))
+            except Exception as exc:
+                raise ValueError(
+                    f"invalid qualification response in {response_path} at line {line_number}: {exc}"
+                ) from exc
+        if len(rows) != 20:
+            raise ValueError(f"{response_path} must contain exactly twenty completed responses")
+        reviewer_ids = {row.reviewer_id for row in rows}
+        if len(reviewer_ids) != 1:
+            raise ValueError(f"{response_path} mixes reviewer identities")
+        reviewer_id = next(iter(reviewer_ids))
+        if reviewer_id not in expected_reviewers:
+            raise PermissionError(f"{reviewer_id!r} is not an active governed reviewer")
+        if reviewer_id in submissions:
+            raise ValueError(f"duplicate qualification submission for reviewer {reviewer_id!r}")
+        by_item = {row.item_id: row for row in rows}
+        if len(by_item) != 20 or set(by_item) != expected_item_ids:
+            raise ValueError(f"{response_path} contains duplicate, missing, or unexpected qualification items")
+        submissions[reviewer_id] = (response_path, by_item)
+    if set(submissions) != expected_reviewers:
+        raise ValueError("qualification submissions do not cover both active reviewers")
+
+    scores: list[ReviewerQualificationScore] = []
+    for reviewer_id in sorted(submissions):
+        response_path, by_item = submissions[reviewer_id]
+        correct = sum(
+            by_item[item_id].decision == answer_by_id[item_id].expected_decision
+            for item_id in sorted(expected_item_ids)
+        )
+        accuracy = correct / 20
+        scores.append(
+            ReviewerQualificationScore(
+                reviewer_id=reviewer_id,
+                response_sha256=_hash_file(response_path),
+                correct_count=correct,
+                accuracy=round(accuracy, 6),
+                passed=accuracy >= minimum_accuracy,
+            )
+        )
+
+    reviewer_ids = sorted(submissions)
+    pairs = [
+        (
+            submissions[reviewer_ids[0]][1][item_id].decision,
+            submissions[reviewer_ids[1]][1][item_id].decision,
+        )
+        for item_id in sorted(expected_item_ids)
+    ]
+    kappa = round(_cohen_kappa(pairs), 6)
+    blockers = [
+        f"{score.reviewer_id} accuracy {score.accuracy:.4f} is below {minimum_accuracy:.4f}"
+        for score in scores
+        if not score.passed
+    ]
+    if kappa < minimum_kappa:
+        blockers.append(f"reviewer agreement kappa {kappa:.4f} is below {minimum_kappa:.4f}")
+
+    report = ReviewerQualificationEvaluationReport(
+        status="failed" if blockers else "passed",
+        roster_id=roster.roster_id,
+        roster_sha256=governance.roster_sha256,
+        rubric_sha256=governance.rubric_sha256,
+        qualification_pack_sha256=qualification.pack_sha256,
+        answer_key_sha256=qualification.answer_key_sha256,
+        minimum_accuracy=minimum_accuracy,
+        minimum_kappa=minimum_kappa,
+        reviewer_agreement_kappa=kappa,
+        reviewers=scores,
+        blockers=blockers,
+        handling_warning=(
+            "This report contains aggregate scores and hashes only. Reviewer rationales, decisions, "
+            "OIDC subjects, and answer-key content remain restricted governance material."
+        ),
+    )
+    output_root = Path(output_dir).expanduser().resolve()
+    report_path = output_root / "reviewer-qualification-evaluation.json"
+    markdown_path = output_root / "reviewer-qualification-evaluation.md"
+    existing = [str(path) for path in (report_path, markdown_path) if path.exists()]
+    if existing:
+        raise FileExistsError("refusing to overwrite qualification evaluation artifacts: " + ", ".join(existing))
+    output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _write_model_atomically(report, report_path)
+    lines = [
+        "# Aeitron Reviewer Qualification Evaluation",
+        "",
+        f"- Status: `{report.status}`",
+        f"- Roster: `{report.roster_id}`",
+        f"- Minimum accuracy: `{report.minimum_accuracy:.2%}`",
+        f"- Minimum Cohen's kappa: `{report.minimum_kappa:.4f}`",
+        f"- Measured Cohen's kappa: `{report.reviewer_agreement_kappa:.4f}`",
+        "",
+        "| Reviewer | Correct | Accuracy | Passed | Response SHA-256 |",
+        "|---|---:|---:|---:|---|",
+    ]
+    for score in report.reviewers:
+        lines.append(
+            f"| {score.reviewer_id} | {score.correct_count}/20 | {score.accuracy:.2%} | "
+            f"{score.passed} | `{score.response_sha256}` |"
+        )
+    lines.extend(["", "## Blockers", ""])
+    lines.extend(f"- {blocker}" for blocker in report.blockers)
+    if not report.blockers:
+        lines.append("- None")
+    lines.extend(["", report.handling_warning, ""])
+    _write_text_atomically(markdown_path, "\n".join(lines))
+    for path in (report_path, markdown_path):
+        os.chmod(path, 0o600)
     os.chmod(output_root, 0o700)
     return report
 
@@ -2087,6 +2365,7 @@ def _validate_cli_identity(args: argparse.Namespace) -> None:
         "initialize-reviewer-qualification",
         "list",
         "prepare-reviewer-deliveries",
+        "evaluate-reviewer-qualification",
         "review-report",
         "reviewer-roster-template",
         "validate-reviewer-roster",
@@ -2123,6 +2402,14 @@ async def _run_cli_command(args: argparse.Namespace) -> StrictModel | list[Stric
         return prepare_reviewer_delivery_packages(
             args.governance_dir,
             args.output_dir,
+        )
+    if args.command == "evaluate-reviewer-qualification":
+        return evaluate_reviewer_qualification(
+            governance_dir=args.governance_dir,
+            response_paths=args.response,
+            output_dir=args.output_dir,
+            minimum_accuracy=args.minimum_accuracy,
+            minimum_kappa=args.minimum_kappa,
         )
     if args.command == "reviewer-roster-template":
         template = build_reviewer_roster_onboarding_template(
@@ -2245,6 +2532,15 @@ def main() -> None:
     )
     delivery_parser.add_argument("--governance-dir", required=True)
     delivery_parser.add_argument("--output-dir", required=True)
+    evaluation_parser = subparsers.add_parser(
+        "evaluate-reviewer-qualification",
+        help="Validate two blind reviewer submissions and emit a hash-bound aggregate qualification decision.",
+    )
+    evaluation_parser.add_argument("--governance-dir", required=True)
+    evaluation_parser.add_argument("--response", action="append", required=True)
+    evaluation_parser.add_argument("--output-dir", required=True)
+    evaluation_parser.add_argument("--minimum-accuracy", type=float, default=0.95)
+    evaluation_parser.add_argument("--minimum-kappa", type=float, default=0.80)
     report_parser = subparsers.add_parser(
         "review-report",
         help="Export aggregate independent-review evidence for dataset promotion.",

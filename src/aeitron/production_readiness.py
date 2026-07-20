@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
+from src.aeitron.evaluation.benchmark_pack import validate_protected_benchmark_manifest
 from src.aeitron.identity.auth import AuthConfig
 from src.aeitron.identity.quota import QuotaConfig
 from src.aeitron.model_ops.backends import active_model_health
@@ -180,7 +181,6 @@ def _check_external_services(mode: str) -> list[ReadinessCheck]:
     specs = [
         ("postgres", "AEITRON_DATABASE_URL", "Postgres persistence/migrations"),
         ("object_storage", "AEITRON_OBJECT_STORE_URI", "S3/MinIO dataset/checkpoint artifact storage"),
-        ("qdrant", "AEITRON_QDRANT_URL", "Distributed vector memory/index backend"),
         ("otel", "AEITRON_OTEL_EXPORTER_OTLP_ENDPOINT", "OpenTelemetry exporter"),
     ]
     checks: list[ReadinessCheck] = []
@@ -197,6 +197,37 @@ def _check_external_services(mode: str) -> list[ReadinessCheck]:
                 production_blocker=mode == "production" and not present,
             )
         )
+    qdrant_dependencies = {
+        "AEITRON_QDRANT_URL": bool(os.environ.get("AEITRON_QDRANT_URL")),
+        "AEITRON_EMBEDDING_URL": bool(os.environ.get("AEITRON_EMBEDDING_URL")),
+    }
+    missing_qdrant = [
+        f"env:{name}"
+        for name, present in qdrant_dependencies.items()
+        if not present
+    ]
+    checks.append(
+        ReadinessCheck(
+            subsystem="qdrant",
+            status=(
+                "production_ready_requires_external_service"
+                if not missing_qdrant
+                else "blocked_missing_dependency"
+            ),
+            summary=(
+                "Qdrant and semantic embedding endpoints are configured."
+                if not missing_qdrant
+                else "Qdrant semantic indexing dependencies are incomplete."
+            ),
+            required_dependencies=[f"env:{name}" for name in qdrant_dependencies],
+            missing_dependencies=missing_qdrant,
+            evidence={
+                "qdrant_url_present": qdrant_dependencies["AEITRON_QDRANT_URL"],
+                "embedding_url_present": qdrant_dependencies["AEITRON_EMBEDDING_URL"],
+            },
+            production_blocker=mode == "production" and bool(missing_qdrant),
+        )
+    )
     return checks
 
 
@@ -537,22 +568,68 @@ def _check_agent_execution(mode: str) -> ReadinessCheck:
 
 def _check_benchmark_files(mode: str, benchmark_dir: str | Path) -> ReadinessCheck:
     root = Path(benchmark_dir)
-    required = [
-        "humaneval.jsonl",
-        "mbpp.jsonl",
-        "swe_bench_style.jsonl",
-        "cyberseceval_style.jsonl",
-        "aeitron_security.jsonl",
-        "safety_prompts.jsonl",
-    ]
-    missing = [str(root / name) for name in required if not (root / name).exists()]
+    repository_root = Path(__file__).resolve().parents[2]
+    protected_manifest = root / "protected" / "protected_benchmark_manifest.json"
+    protected_config = repository_root / "config" / "protected_benchmarks.json"
+    executable_report_value = os.environ.get("AEITRON_EXECUTABLE_BENCHMARK_REPORT", "")
+    executable_report = Path(executable_report_value).expanduser() if executable_report_value else None
+    missing: list[str] = []
+    evidence: dict[str, Any] = {
+        "benchmark_dir": str(root),
+        "protected_manifest": str(protected_manifest),
+        "executable_report": str(executable_report or ""),
+    }
+    try:
+        manifest = validate_protected_benchmark_manifest(protected_config, protected_manifest)
+        evidence["protected_pack_id"] = manifest.pack_id
+        evidence["protected_artifact_count"] = len(manifest.artifacts)
+    except (OSError, ValueError) as exc:
+        missing.append(f"valid protected benchmark manifest: {exc}")
+
+    executable_proven = False
+    if executable_report is not None and executable_report.is_file():
+        try:
+            payload = json.loads(executable_report.read_text(encoding="utf-8-sig"))
+            suites = payload.get("suites") if isinstance(payload, dict) else None
+            executable_proven = (
+                payload.get("status") == "passed"
+                and payload.get("evaluation_mode") == "executable_model"
+                and isinstance(suites, list)
+                and bool(suites)
+                and all(
+                    isinstance(item, dict)
+                    and item.get("status") == "passed"
+                    and isinstance(item.get("pass_at_k"), dict)
+                    and "pass@1" in item["pass_at_k"]
+                    for item in suites
+                )
+            )
+        except (OSError, json.JSONDecodeError):
+            executable_proven = False
+    evidence["executable_model_proven"] = executable_proven
+    if mode == "production" and not executable_proven:
+        missing.append("passed AEITRON_EXECUTABLE_BENCHMARK_REPORT with measured pass@1")
+
+    if missing:
+        status: ReadinessStatus = "blocked_missing_dependency"
+        summary = "Protected benchmark or executable-model evidence is missing or invalid."
+    elif executable_proven:
+        status = "production_ready"
+        summary = "Protected benchmark bindings and executable-model evaluation are verified."
+    else:
+        status = "built_not_cluster_proven"
+        summary = "Protected benchmark bindings are verified; executable-model proof is pending."
     return ReadinessCheck(
         subsystem="benchmark_eval",
-        status="production_ready" if not missing else "blocked_missing_dependency",
-        summary="Required benchmark suites are present." if not missing else "Required benchmark files are missing.",
-        required_dependencies=[str(root / name) for name in required],
+        status=status,
+        summary=summary,
+        required_dependencies=[
+            str(protected_config),
+            str(protected_manifest),
+            "AEITRON_EXECUTABLE_BENCHMARK_REPORT",
+        ],
         missing_dependencies=missing,
-        evidence={"benchmark_dir": str(root), "required_count": len(required), "missing_count": len(missing)},
+        evidence=evidence,
         production_blocker=mode == "production" and bool(missing),
     )
 

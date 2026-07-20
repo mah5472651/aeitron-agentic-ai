@@ -1,13 +1,16 @@
 ﻿from __future__ import annotations
 
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from src.aeitron.gateway import api as gateway_api
-from src.aeitron.model_ops.backends import list_model_profiles
+from src.aeitron.model_ops.backends import list_model_profiles, promote_scratch_checkpoint
 from src.aeitron.model_ops.foundation import (
     CheckpointManifest,
     PretrainingRunSpec,
@@ -82,6 +85,203 @@ class AeitronModelFoundationTest(unittest.TestCase):
         forbidden = " ".join(str(value) for profile in profiles.values() for value in profile.values()).lower()
         for term in ["qw" + "en", "deep" + "seek", "lla" + "ma", "openai" + "_compatible"]:
             self.assertNotIn(term, forbidden)
+
+    def _promotion_evidence(self, root: Path) -> tuple[Path, Path, Path, Path]:
+        checkpoint = root / "checkpoint"
+        checkpoint.mkdir()
+        (checkpoint / "model.pt").write_bytes(b"trusted-scratch-checkpoint")
+        (checkpoint / "config.json").write_text('{"name":"aeitron-test"}', encoding="utf-8")
+        manifest = CheckpointManifest.from_directory(
+            architecture_name="aeitron-test",
+            run_id="run-promotion",
+            step=100,
+            trained_tokens=4096,
+            checkpoint_dir=checkpoint,
+            metrics={"validation_loss": 1.5},
+        )
+        manifest_path = manifest.write_atomic(root / "checkpoint_manifest.json").resolve()
+        tokenizer_path = root / "tokenizer.json"
+        tokenizer_path.write_text('{"version":"1.0"}', encoding="utf-8")
+        evaluation_path = root / "benchmark_suites_report.json"
+        evaluation_path.write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "evaluation_mode": "executable_model",
+                    "aggregate_score": 0.25,
+                    "suites": [
+                        {
+                            "name": "humaneval",
+                            "kind": "human_eval_style",
+                            "status": "passed",
+                            "score": 0.25,
+                            "total": 1,
+                            "passed": 1,
+                            "pass_at_k": {"pass@1": 0.25},
+                            "report": {
+                                "checkpoint_manifest": str(manifest_path),
+                                "tokenizer_path": str(tokenizer_path.resolve()),
+                                "tasks": [
+                                    {
+                                        "task_id": "task-1",
+                                        "candidate_count": 1,
+                                        "passed_candidates": 1,
+                                        "pass_at_k": {"pass@1": 1.0},
+                                        "candidates": [
+                                            {
+                                                "candidate_index": 0,
+                                                "passed": True,
+                                                "status": "ok",
+                                                "exit_code": 0,
+                                                "duration_ms": 1.0,
+                                                "generated_tokens": 10,
+                                                "output_sha256": "a" * 64,
+                                                "failure": "",
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        scorecard_path = root / "scorecard.json"
+        score_task = {
+            "task_id": "task",
+            "category": "coding",
+            "accepted": True,
+            "applied": True,
+            "source_immutable": True,
+            "expected_files_changed": True,
+            "content_assertions_passed": True,
+            "tests_passed": True,
+            "security_passed": True,
+            "confidence": 0.95,
+            "attempts": 1,
+            "duration_ms": 1.0,
+            "score": 1.0,
+            "errors": [],
+        }
+        scorecard_path.write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "policy_mode": "strict",
+                    "task_count": 50,
+                    "architecture_reliability_score": 1.0,
+                    "workflow_completion_score": 1.0,
+                    "security_detection_fix_score": 1.0,
+                    "short_prompt_understanding_score": 1.0,
+                    "sandbox_test_pass_rate": 1.0,
+                    "regression_count": 0,
+                    "average_confidence": 0.95,
+                    "average_score": 1.0,
+                    "tasks": [{**score_task, "task_id": f"task-{index}"} for index in range(50)],
+                    "failures": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return manifest_path, tokenizer_path, evaluation_path, scorecard_path
+
+    def test_checkpoint_promotion_is_evidence_bound_and_profile_is_loadable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, tokenizer, evaluation, _scorecard = self._promotion_evidence(root)
+            output = root / "active-profile.json"
+            contract = promote_scratch_checkpoint(
+                checkpoint_manifest=manifest,
+                tokenizer_path=tokenizer,
+                evaluation_report=evaluation,
+                output_path=output,
+                endpoint="http://127.0.0.1:8010/v1",
+                promotion_mode="validation",
+            )
+            self.assertEqual(contract.profile.backend, "aeitron_serving")
+            self.assertTrue(contract.profile.scratch_only)
+            self.assertTrue(contract.production_blockers)
+            with patch.dict(os.environ, {"AEITRON_ACTIVE_MODEL_PROFILE_PATH": str(output)}):
+                from src.aeitron.shared.config import load_active_profile
+
+                loaded = load_active_profile()
+            self.assertEqual(loaded["profile"]["checkpoint_manifest"], str(manifest))
+            with self.assertRaises(FileExistsError):
+                promote_scratch_checkpoint(
+                    checkpoint_manifest=manifest,
+                    tokenizer_path=tokenizer,
+                    evaluation_report=evaluation,
+                    output_path=output,
+                    endpoint="http://127.0.0.1:8010/v1",
+                )
+
+    def test_production_promotion_requires_scorecard_and_secure_remote_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, tokenizer, evaluation, scorecard = self._promotion_evidence(root)
+            with self.assertRaisesRegex(ValueError, "scorecard"):
+                promote_scratch_checkpoint(
+                    checkpoint_manifest=manifest,
+                    tokenizer_path=tokenizer,
+                    evaluation_report=evaluation,
+                    output_path=root / "missing-scorecard.json",
+                    endpoint="https://serving.example/v1",
+                    promotion_mode="production",
+                )
+            with self.assertRaisesRegex(ValueError, "HTTPS"):
+                promote_scratch_checkpoint(
+                    checkpoint_manifest=manifest,
+                    tokenizer_path=tokenizer,
+                    evaluation_report=evaluation,
+                    scorecard_report=scorecard,
+                    output_path=root / "insecure.json",
+                    endpoint="http://serving.example/v1",
+                    promotion_mode="production",
+                )
+            contract = promote_scratch_checkpoint(
+                checkpoint_manifest=manifest,
+                tokenizer_path=tokenizer,
+                evaluation_report=evaluation,
+                scorecard_report=scorecard,
+                output_path=root / "production.json",
+                endpoint="https://serving.example/v1",
+                promotion_mode="production",
+            )
+            self.assertEqual(contract.production_blockers, [])
+
+    def test_checkpoint_promotion_rejects_static_evaluation_and_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, tokenizer, evaluation, _scorecard = self._promotion_evidence(root)
+            payload = json.loads(evaluation.read_text(encoding="utf-8"))
+            payload["evaluation_mode"] = "dataset_validation"
+            evaluation.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "executable_model"):
+                promote_scratch_checkpoint(
+                    checkpoint_manifest=manifest,
+                    tokenizer_path=tokenizer,
+                    evaluation_report=evaluation,
+                    output_path=root / "static.json",
+                    endpoint="http://127.0.0.1:8010/v1",
+                )
+            checkpoint_payload = json.loads(manifest.read_text(encoding="utf-8"))
+            checkpoint_path = Path(checkpoint_payload["checkpoint_dir"]) / "model.pt"
+            checkpoint_path.write_bytes(b"tampered")
+            valid_evaluation = root / "valid-eval.json"
+            valid_evaluation.write_text(
+                evaluation.read_text(encoding="utf-8").replace("dataset_validation", "executable_model"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "changed"):
+                promote_scratch_checkpoint(
+                    checkpoint_manifest=manifest,
+                    tokenizer_path=tokenizer,
+                    evaluation_report=valid_evaluation,
+                    output_path=root / "tampered.json",
+                    endpoint="http://127.0.0.1:8010/v1",
+                )
 
 
 if __name__ == "__main__":

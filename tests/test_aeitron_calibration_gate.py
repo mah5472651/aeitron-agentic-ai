@@ -154,6 +154,44 @@ def _reviewer_roster(path: Path) -> Path:
     )
 
 
+def _reviewer_qualification(path: Path, roster_path: Path) -> Path:
+    roster = json.loads(roster_path.read_text(encoding="utf-8"))
+    reviewer_ids = [
+        identity["reviewer_id"]
+        for identity in roster["identities"]
+        if identity["active"] and "reviewer" in identity["roles"]
+    ]
+    return _write_json(
+        path,
+        {
+            "schema_version": 1,
+            "status": "passed",
+            "roster_id": roster["roster_id"],
+            "rubric_id": "aeitron-review-rubric-v1",
+            "roster_sha256": _sha256_file(roster_path),
+            "rubric_sha256": "a" * 64,
+            "qualification_pack_sha256": "b" * 64,
+            "answer_key_sha256": "c" * 64,
+            "minimum_accuracy": 0.95,
+            "minimum_kappa": 0.80,
+            "reviewer_agreement_kappa": 1.0,
+            "reviewers": [
+                {
+                    "reviewer_id": reviewer_id,
+                    "response_sha256": f"{index + 1:064x}",
+                    "item_count": 20,
+                    "correct_count": 20,
+                    "accuracy": 1.0,
+                    "passed": True,
+                }
+                for index, reviewer_id in enumerate(reviewer_ids)
+            ],
+            "blockers": [],
+            "handling_warning": "Synthetic unit-test evidence only; never use this fixture for production governance.",
+        },
+    )
+
+
 class ProtectedBenchmarkGovernanceTest(unittest.TestCase):
     def test_public_pack_is_revision_hash_and_holdout_bound(self) -> None:
         human_rows = [{"task_id": f"HumanEval/{index}", "prompt": "pass"} for index in range(164)]
@@ -224,6 +262,7 @@ class ProtectedBenchmarkGovernanceTest(unittest.TestCase):
                 protected_config_path=config,
                 protected_manifest_path=pack / "protected_benchmark_manifest.json",
                 reviewer_roster_path=_reviewer_roster(root / "reviewers.json"),
+                reviewer_qualification_report_path=None,
                 legal_evidence_dir=root / "legal-evidence",
                 approval_request_dir=root / "requests",
             )
@@ -242,6 +281,10 @@ class CalibrationFinalizationTest(unittest.IsolatedAsyncioTestCase):
         self.protected_manifest = self.protected_dir / "protected_benchmark_manifest.json"
         self.policy = Path("config/dataset_trust_policy.json").resolve()
         self.reviewers = _reviewer_roster(self.root / "reviewers.json")
+        self.reviewer_qualification = _reviewer_qualification(
+            self.root / "reviewer-qualification.json",
+            self.reviewers,
+        )
         self.legal_evidence = self.root / "legal-evidence"
         self.sources = [_approved_source(index, self.legal_evidence) for index in range(5)]
         self.registry = SourceRegistry(self.sources)
@@ -326,6 +369,8 @@ class CalibrationFinalizationTest(unittest.IsolatedAsyncioTestCase):
             source_registry_sha256=_registry_sha256(self.registry),
             trust_policy_sha256=_sha256_file(self.policy),
             reviewer_roster_sha256=_sha256_file(self.reviewers),
+            reviewer_qualification_path=str(self.reviewer_qualification),
+            reviewer_qualification_sha256=_sha256_file(self.reviewer_qualification),
             legal_evidence_sha256=_legal_evidence_sha256(self.legal_evidence),
             protected_manifest_sha256=_sha256_file(self.protected_manifest),
             authority_database=str(self.authority_path),
@@ -358,6 +403,30 @@ class CalibrationFinalizationTest(unittest.IsolatedAsyncioTestCase):
                         evidence={"checklist_version": 1},
                     ),
                 )
+
+    async def test_preflight_requires_passed_reviewer_qualification(self) -> None:
+        blocked = preflight_calibration(
+            sources_path=self.sources_path,
+            protected_config_path=self.protected_config,
+            protected_manifest_path=self.protected_manifest,
+            reviewer_roster_path=self.reviewers,
+            reviewer_qualification_report_path=None,
+            legal_evidence_dir=self.legal_evidence,
+            approval_request_dir=self.root / "requests-blocked",
+        )
+        self.assertEqual(blocked.status, "blocked")
+        self.assertTrue(any("reviewer_qualification" in issue for issue in blocked.blockers))
+        ready = preflight_calibration(
+            sources_path=self.sources_path,
+            protected_config_path=self.protected_config,
+            protected_manifest_path=self.protected_manifest,
+            reviewer_roster_path=self.reviewers,
+            reviewer_qualification_report_path=self.reviewer_qualification,
+            legal_evidence_dir=self.legal_evidence,
+            approval_request_dir=self.root / "requests-ready",
+        )
+        self.assertEqual(ready.status, "ready")
+        self.assertEqual(ready.reviewer_qualification["reviewer_count"], 2)
 
     async def test_finalize_remains_blocked_before_independent_reviews(self) -> None:
         manifest, _ = await self._manifest()
@@ -416,6 +485,7 @@ class CalibrationFinalizationTest(unittest.IsolatedAsyncioTestCase):
                 protected_config_path=self.protected_config,
                 protected_manifest_path=self.protected_manifest,
                 reviewer_roster_path=self.reviewers,
+                reviewer_qualification_report_path=self.reviewer_qualification,
                 legal_evidence_dir=self.legal_evidence,
                 trust_policy_path=self.policy,
                 work_dir=work_dir,
@@ -435,6 +505,8 @@ class CalibrationFinalizationTest(unittest.IsolatedAsyncioTestCase):
                 source_registry_sha256="1" * 64,
                 trust_policy_sha256="2" * 64,
                 reviewer_roster_sha256="3" * 64,
+                reviewer_qualification_path="missing-qualification.json",
+                reviewer_qualification_sha256="6" * 64,
                 legal_evidence_sha256="4" * 64,
                 protected_manifest_sha256="5" * 64,
                 authority_database=str(self.authority_path),
@@ -577,6 +649,13 @@ class CalibrationFinalizationTest(unittest.IsolatedAsyncioTestCase):
                         {**payload["identities"][0], "approved_at": "2026-07-20T12:00:00+06:00"},
                         *payload["identities"][1:],
                     ],
+                },
+            ),
+            (
+                self.reviewer_qualification,
+                lambda payload: {
+                    **payload,
+                    "created_at_unix": float(payload.get("created_at_unix", 0.0)) + 1.0,
                 },
             ),
             (

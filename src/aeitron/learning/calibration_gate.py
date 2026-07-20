@@ -36,6 +36,7 @@ from src.aeitron.learning.benchmark_contamination_filter import (
 from src.aeitron.learning.data_engine import DataEngine, DataEngineConfig, FrontierStore
 from src.aeitron.learning.dataset_authority import (
     ReviewItemCreate,
+    ReviewerQualificationEvaluationReport,
     ReviewerRoster,
     SQLiteDatasetAuthorityStore,
     SourceSnapshotCreate,
@@ -76,6 +77,7 @@ class CalibrationPreflightReport(StrictModel):
     source_registry: dict[str, Any] | None = None
     protected_benchmark_manifest: dict[str, Any] | None = None
     reviewer_roster: dict[str, Any] | None = None
+    reviewer_qualification: dict[str, Any] | None = None
     approval_request_dir: str
     legal_evidence_dir: str
     blockers: list[str] = Field(default_factory=list)
@@ -104,6 +106,8 @@ class CalibrationManifest(StrictModel):
     source_registry_sha256: str
     trust_policy_sha256: str
     reviewer_roster_sha256: str
+    reviewer_qualification_path: str
+    reviewer_qualification_sha256: str
     legal_evidence_sha256: str
     protected_manifest_sha256: str
     authority_database: str
@@ -147,6 +151,7 @@ class CalibrationDecision(StrictModel):
     source_registry_sha256: str
     trust_policy_sha256: str
     reviewer_roster_sha256: str
+    reviewer_qualification_sha256: str
     legal_evidence_sha256: str
     protected_manifest_sha256: str
     authority_evidence_sha256: str
@@ -164,6 +169,7 @@ class CalibrationDecision(StrictModel):
             "source_registry_sha256",
             "trust_policy_sha256",
             "reviewer_roster_sha256",
+            "reviewer_qualification_sha256",
             "legal_evidence_sha256",
             "protected_manifest_sha256",
             "authority_evidence_sha256",
@@ -238,6 +244,39 @@ def _legal_evidence_sha256(path: str | Path) -> str:
         for file in files
     ]
     return stable_hash(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def _validate_reviewer_qualification(
+    report_path: str | Path,
+    reviewer_roster_path: str | Path,
+) -> ReviewerQualificationEvaluationReport:
+    source = Path(report_path).expanduser().resolve(strict=True)
+    report = ReviewerQualificationEvaluationReport.model_validate_json(
+        source.read_text(encoding="utf-8-sig")
+    )
+    roster = load_reviewer_roster(reviewer_roster_path)
+    if report.status != "passed" or report.blockers:
+        raise ValueError("reviewer qualification report did not pass")
+    if report.roster_id != roster.roster_id:
+        raise ValueError("reviewer qualification roster_id does not match the active roster")
+    if report.roster_sha256 != _sha256_file(reviewer_roster_path):
+        raise ValueError("reviewer qualification report is not bound to the active roster")
+    active_reviewers = {
+        identity.reviewer_id
+        for identity in roster.identities
+        if identity.active and "reviewer" in identity.roles
+    }
+    evaluated_reviewers = {item.reviewer_id for item in report.reviewers}
+    if evaluated_reviewers != active_reviewers:
+        raise ValueError("reviewer qualification identities do not match the active reviewers")
+    if any(
+        not item.passed or item.accuracy < report.minimum_accuracy
+        for item in report.reviewers
+    ):
+        raise ValueError("reviewer qualification accuracy threshold was not met")
+    if report.reviewer_agreement_kappa < report.minimum_kappa:
+        raise ValueError("reviewer qualification agreement threshold was not met")
+    return report
 
 
 def _authority_evidence(manifest: CalibrationManifest) -> list[dict[str, Any]]:
@@ -470,6 +509,18 @@ def _validate_current_governance(
     issues.extend(f"reviewer roster invalid: {blocker}" for blocker in roster.readiness_blockers())
     if _sha256_file(reviewer_roster_path) != manifest.reviewer_roster_sha256:
         issues.append("reviewer roster hash changed")
+    try:
+        _validate_reviewer_qualification(
+            manifest.reviewer_qualification_path,
+            reviewer_roster_path,
+        )
+        if (
+            _sha256_file(manifest.reviewer_qualification_path)
+            != manifest.reviewer_qualification_sha256
+        ):
+            issues.append("reviewer qualification report hash changed")
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+        issues.append(f"reviewer qualification invalid: {exc}")
     if _sha256_file(trust_policy_path) != manifest.trust_policy_sha256:
         issues.append("dataset trust policy hash changed")
     validate_protected_benchmark_manifest(protected_config_path, protected_manifest_path)
@@ -524,6 +575,7 @@ def validate_advancement_decision(
         "source_registry_sha256": manifest.source_registry_sha256,
         "trust_policy_sha256": manifest.trust_policy_sha256,
         "reviewer_roster_sha256": manifest.reviewer_roster_sha256,
+        "reviewer_qualification_sha256": manifest.reviewer_qualification_sha256,
         "legal_evidence_sha256": manifest.legal_evidence_sha256,
         "protected_manifest_sha256": manifest.protected_manifest_sha256,
     }
@@ -595,6 +647,7 @@ def preflight_calibration(
     protected_config_path: str | Path,
     protected_manifest_path: str | Path,
     reviewer_roster_path: str | Path,
+    reviewer_qualification_report_path: str | Path | None,
     legal_evidence_dir: str | Path,
     approval_request_dir: str | Path,
 ) -> CalibrationPreflightReport:
@@ -602,6 +655,7 @@ def preflight_calibration(
     source_report: SourceRegistryReport | None = None
     protected: ProtectedBenchmarkManifest | None = None
     reviewer_roster: ReviewerRoster | None = None
+    reviewer_qualification: ReviewerQualificationEvaluationReport | None = None
     registry = SourceRegistry.from_file(sources_path)
     registry.prepare_approval_requests(approval_request_dir)
     try:
@@ -622,11 +676,33 @@ def preflight_calibration(
         blockers.extend(f"reviewer_roster:{issue}" for issue in reviewer_roster.readiness_blockers())
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
         blockers.append(f"reviewer_roster:{exc}")
+    if reviewer_qualification_report_path is None:
+        blockers.append("reviewer_qualification:passed qualification report is required")
+    else:
+        try:
+            reviewer_qualification = _validate_reviewer_qualification(
+                reviewer_qualification_report_path,
+                reviewer_roster_path,
+            )
+        except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+            blockers.append(f"reviewer_qualification:{exc}")
     return CalibrationPreflightReport(
         status="blocked" if blockers else "ready",
         source_registry=source_report.model_dump(mode="json") if source_report else None,
         protected_benchmark_manifest=protected.model_dump(mode="json") if protected else None,
         reviewer_roster=reviewer_roster.model_dump(mode="json") if reviewer_roster else None,
+        reviewer_qualification=(
+            {
+                "status": reviewer_qualification.status,
+                "roster_id": reviewer_qualification.roster_id,
+                "minimum_accuracy": reviewer_qualification.minimum_accuracy,
+                "minimum_kappa": reviewer_qualification.minimum_kappa,
+                "reviewer_agreement_kappa": reviewer_qualification.reviewer_agreement_kappa,
+                "reviewer_count": len(reviewer_qualification.reviewers),
+            }
+            if reviewer_qualification
+            else None
+        ),
         approval_request_dir=str(Path(approval_request_dir).resolve()),
         legal_evidence_dir=str(Path(legal_evidence_dir).resolve()),
         blockers=blockers,
@@ -779,6 +855,7 @@ async def run_calibration(
     protected_config_path: str | Path,
     protected_manifest_path: str | Path,
     reviewer_roster_path: str | Path,
+    reviewer_qualification_report_path: str | Path | None,
     legal_evidence_dir: str | Path,
     trust_policy_path: str | Path,
     work_dir: str | Path,
@@ -833,12 +910,15 @@ async def run_calibration(
         protected_config_path=protected_config_path,
         protected_manifest_path=protected_manifest_path,
         reviewer_roster_path=reviewer_roster_path,
+        reviewer_qualification_report_path=reviewer_qualification_report_path,
         legal_evidence_dir=legal_evidence_dir,
         approval_request_dir=approval_dir,
     )
     _write_json_atomic(root / "calibration_preflight_report.json", preflight)
     if preflight.status != "ready":
         return preflight
+    assert reviewer_qualification_report_path is not None
+    reviewer_qualification_path = Path(reviewer_qualification_report_path).expanduser().resolve(strict=True)
 
     registry = SourceRegistry.from_file(sources_path)
     registry_report = registry.validate(production=True)
@@ -948,6 +1028,8 @@ async def run_calibration(
         source_registry_sha256=_registry_sha256(registry),
         trust_policy_sha256=_sha256_file(trust_policy_path),
         reviewer_roster_sha256=_sha256_file(reviewer_roster_path),
+        reviewer_qualification_path=str(reviewer_qualification_path),
+        reviewer_qualification_sha256=_sha256_file(reviewer_qualification_path),
         legal_evidence_sha256=_legal_evidence_sha256(legal_evidence_dir),
         protected_manifest_sha256=_sha256_file(protected_manifest_file),
         authority_database=str(authority_path),
@@ -1010,6 +1092,20 @@ async def finalize_calibration(
     checks["reviewer_roster_unchanged"] = (
         _sha256_file(reviewer_roster_path) == manifest.reviewer_roster_sha256
     )
+    try:
+        _validate_reviewer_qualification(
+            manifest.reviewer_qualification_path,
+            reviewer_roster_path,
+        )
+        checks["reviewer_qualification_valid"] = True
+        checks["reviewer_qualification_unchanged"] = (
+            _sha256_file(manifest.reviewer_qualification_path)
+            == manifest.reviewer_qualification_sha256
+        )
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+        checks["reviewer_qualification_valid"] = False
+        checks["reviewer_qualification_unchanged"] = False
+        issues.append(f"reviewer qualification is invalid: {exc}")
     try:
         validate_protected_benchmark_manifest(protected_config_path, protected_manifest_path)
         checks["protected_holdout_unchanged"] = (
@@ -1177,6 +1273,7 @@ async def finalize_calibration(
         source_registry_sha256=manifest.source_registry_sha256,
         trust_policy_sha256=manifest.trust_policy_sha256,
         reviewer_roster_sha256=manifest.reviewer_roster_sha256,
+        reviewer_qualification_sha256=manifest.reviewer_qualification_sha256,
         legal_evidence_sha256=manifest.legal_evidence_sha256,
         protected_manifest_sha256=manifest.protected_manifest_sha256,
         authority_evidence_sha256=authority_evidence_sha256,
@@ -1200,6 +1297,11 @@ def _parse_args() -> argparse.Namespace:
         command.add_argument("--protected-config", default="config/protected_benchmarks.json")
         command.add_argument("--protected-manifest", default="data/eval/protected/protected_benchmark_manifest.json")
         command.add_argument("--reviewer-roster", default="config/data_reviewers.json")
+        command.add_argument(
+            "--reviewer-qualification-report",
+            default=None,
+            help="Passed, immutable reviewer qualification evaluation report.",
+        )
         command.add_argument("--legal-evidence-dir", default="governance/source-approvals")
     prepare = subparsers.choices["prepare"]
     prepare.add_argument("--output-dir", default="artifacts/aeitron/calibration-preflight")
@@ -1240,6 +1342,7 @@ async def _main_async(args: argparse.Namespace) -> StrictModel:
             protected_config_path=args.protected_config,
             protected_manifest_path=args.protected_manifest,
             reviewer_roster_path=args.reviewer_roster,
+            reviewer_qualification_report_path=args.reviewer_qualification_report,
             legal_evidence_dir=args.legal_evidence_dir,
             approval_request_dir=output / "legal-approval-requests",
         )
@@ -1252,6 +1355,7 @@ async def _main_async(args: argparse.Namespace) -> StrictModel:
             protected_config_path=args.protected_config,
             protected_manifest_path=args.protected_manifest,
             reviewer_roster_path=args.reviewer_roster,
+            reviewer_qualification_report_path=args.reviewer_qualification_report,
             legal_evidence_dir=args.legal_evidence_dir,
             trust_policy_path=args.trust_policy,
             work_dir=args.work_dir,

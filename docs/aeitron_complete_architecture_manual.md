@@ -3381,7 +3381,9 @@ python -m src.aeitron.learning.calibration_gate run `
   --sources config\data_sources.governed.json `
   --protected-config config\protected_benchmarks.json `
   --protected-manifest data\eval\protected\protected_benchmark_manifest.json `
-  --reviewer-roster config\data_reviewers.json `
+  --reviewer-roster C:\AeitronGovernance\data_reviewers.json `
+  --reviewer-qualification-report C:\AeitronGovernance\qualification-result\reviewer_qualification_report.json `
+  --legal-evidence-dir C:\AeitronGovernance\source-approvals `
   --legal-evidence-dir governance\source-approvals `
   --trust-policy config\dataset_trust_policy.json `
   --work-dir artifacts\aeitron\calibration-200-v2 `
@@ -5051,7 +5053,7 @@ python -m src.aeitron.learning.calibration_gate run `
   --sources config\data_sources.governed.json `
   --protected-config config\protected_benchmarks.json `
   --protected-manifest data\eval\protected\protected_benchmark_manifest.json `
-  --reviewer-roster config\data_reviewers.json `
+  --reviewer-roster C:\AeitronGovernance\data_reviewers.json `
   --trust-policy config\dataset_trust_policy.json `
   --work-dir artifacts\aeitron\calibration-200-v1 `
   --authority-db artifacts\aeitron\dataset-authority.sqlite3
@@ -5110,8 +5112,9 @@ python -m src.aeitron.learning.calibration_gate run `
   --sources config\data_sources.governed.json `
   --protected-config config\protected_benchmarks.json `
   --protected-manifest data\eval\protected\protected_benchmark_manifest.json `
-  --reviewer-roster config\data_reviewers.json `
-  --legal-evidence-dir governance\source-approvals `
+  --reviewer-roster C:\AeitronGovernance\data_reviewers.json `
+  --reviewer-qualification-report C:\AeitronGovernance\qualification-result\reviewer_qualification_report.json `
+  --legal-evidence-dir C:\AeitronGovernance\source-approvals `
   --trust-policy config\dataset_trust_policy.json `
   --work-dir artifacts\aeitron\calibration-5k-v1 `
   --authority-db artifacts\aeitron\dataset-authority.sqlite3
@@ -5141,6 +5144,118 @@ crawl. Legal and human decisions are the remaining external actions.
 Do not reintroduce numbered legacy folders. If a feature is needed, add it to
 the correct final module under `src/aeitron` and update this manual with enough
 detail that the system can be understood without reading all source code.
+
+## Governed Qualification and Activation Pipeline
+
+### Reviewer qualification
+
+`dataset_authority evaluate-reviewer-qualification` is the only qualification
+evaluator. It consumes exactly two independently completed 20-row response
+files and the secure governance directory. It verifies roster membership,
+reviewer assignment, pack/rubric/answer-key/roster hashes, decision vocabulary,
+and rationale length before scoring. It requires two distinct reviewer
+identities, minimum per-reviewer accuracy `0.95`, and Cohen's kappa `0.80`.
+
+The output intentionally excludes answer keys, OIDC subjects, reviewer
+rationales, and row-level correctness. It is immutable: an existing report is
+never overwritten. Real responses remain an external human requirement.
+
+### Legal source binding
+
+`config/data_sources.governed.staging.json` is the deterministic eight-source
+batch. Every row is quarantine until an authorized person binds:
+
+- official license text or publication notice;
+- immutable commit, release, revision, or content snapshot;
+- the license evidence SHA-256;
+- the exact registry-entry SHA-256;
+- authorized legal identity and timezone-aware timestamp;
+- approved use, training scope, and substantive rationale.
+
+Approval requests are local ignored artifacts. Approval occurs sequentially:
+the first approval reads staging; each later approval reads the latest governed
+registry. The source registry protects prior approvals from removal or
+mutation. The repository never fabricates legal decisions or stores private
+legal evidence.
+
+### Dataset advancement
+
+The only governed ladder is:
+
+```text
+qualification passed
+  -> eight approvals replay-verified
+  -> calibration_200 run and human-review finalization
+  -> calibration_5k run and human-review finalization
+  -> production_100k dataset authority
+```
+
+Each stage binds the previous decision, source registry, legal evidence,
+reviewer roster, protected benchmark pack, trust policy, Dataset Authority
+records, and calibration artifacts by SHA-256. Stage/count mismatch, stale
+evidence, altered policy, reviewer conflict, protected contamination, or
+source drift blocks before the next crawl.
+
+The 100k production builder still enforces license/provenance coverage,
+streaming exact/structural/lineage/LSH deduplication, family-aware split
+isolation, source token caps, high-value double review, verified patch
+evidence, and immutable promotion manifests. Raw crawl rows cannot train.
+
+### Tokenizer qualification
+
+The production tokenizer has exactly 64,000 vocabulary entries. The
+real-corpus audit now fails when `vocab_size_actual != vocab_size_requested`;
+it does not pad a small corpus with fake tokens. It also requires all Aeitron
+control tokens and reports code indentation, hexadecimal/address, compile-log,
+and source/shard evidence. The tokenizer hash is bound to the promoted dataset
+and later checkpoint manifests.
+
+### Executable model evaluation
+
+`benchmark_suites --mode executable-model` supports HumanEval and MBPP code
+execution. It loads the selected scratch checkpoint and tokenizer, generates
+multiple candidates with fixed seeds, writes bounded test files, and executes
+them using the hardened Docker sandbox. It reports the unbiased pass@k
+estimator for `k=1,5,10`.
+
+Static benchmark adapters now only validate dataset contracts and are labeled
+`dataset_validation`. They cannot be used as model-quality evidence.
+SWE-Bench-style repository changes and defensive security tasks continue
+through the governed repository scorecard because they require repository
+checkout, patch application, tests, scanners, and verifier evidence rather
+than a single Python execution.
+
+Production readiness verifies the protected benchmark manifest and all
+artifact hashes. It becomes `production_ready` for benchmark evaluation only
+when `AEITRON_EXECUTABLE_BENCHMARK_REPORT` points to a passed executable-model
+report containing measured pass@1 for every active suite.
+
+### Native checkpoint activation
+
+`model_ops.backends promote-checkpoint` verifies every checkpoint file against
+its manifest, requires `model.pt`, hashes the tokenizer, validates a passed
+executable-model report bound to that exact checkpoint, and requires a passed
+50-task scorecard for production promotion. It rejects static reports,
+tampering, insecure remote HTTP endpoints, embedded endpoint credentials,
+query/fragment endpoint ambiguity, and output overwrite.
+
+The command writes an immutable external active-profile artifact. Set
+`AEITRON_ACTIVE_MODEL_PROFILE_PATH` to select it without editing the tracked
+development profile. The native serving process itself must already be healthy
+and load-tested; profile creation is evidence binding, not a claim that an
+external server is online.
+
+### Qdrant project synchronization
+
+`POST /v1/context/vector-sync` synchronizes all indexed repository chunks into
+Qdrant in bounded batches. Point IDs are deterministic, payloads preserve
+project/chunk/path/symbol evidence, and stale project points are removed.
+Remote embedding endpoints require HTTPS, dimensions and finite values are
+validated, and production Qdrant refuses the local hashing fallback.
+
+Qdrant, embedding service, Postgres, Redis, S3/MinIO, GPU execution, and the
+50-task governed repository run remain external operational proofs. The code
+reports those states as blocked or built-not-proven until live evidence exists.
 
 
 

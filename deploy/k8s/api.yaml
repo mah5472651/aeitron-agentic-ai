@@ -58,6 +58,11 @@ spec:
                   key: redis-url
             - name: AEITRON_QDRANT_URL
               value: http://aeitron-qdrant:6333
+            - name: AEITRON_EMBEDDING_URL
+              valueFrom:
+                secretKeyRef:
+                  name: aeitron-secrets
+                  key: embedding-url
             - name: AEITRON_OBJECT_STORE_URI
               value: s3://aeitron-datasets/training-workspace
             - name: AEITRON_OBJECT_STORE_ENDPOINT_URL

@@ -6,8 +6,10 @@ import hashlib
 import math
 import os
 import re
+import uuid
 from collections import Counter
 from typing import Any, Literal, Protocol
+from urllib.parse import urlparse
 
 import httpx
 
@@ -59,10 +61,23 @@ class VectorSearchReport(StrictModel):
     results: list[VectorSearchResult]
 
 
+class VectorSyncReport(StrictModel):
+    project_id: str
+    backend: VectorBackendName
+    collection: str
+    indexed_chunks: int = Field(ge=0)
+    deleted_stale_chunks: int = Field(ge=0)
+    embedding_dimensions: int = Field(ge=1)
+    revision_sha256: str
+
+
 class VectorIndexBackend(Protocol):
     config: VectorBackendConfig
 
     def search(self, *, project_id: str, query: str, top_k: int = 12) -> VectorSearchReport:
+        ...
+
+    def sync_project(self, *, project_id: str, batch_size: int = 64) -> VectorSyncReport:
         ...
 
 
@@ -72,6 +87,9 @@ class EmbeddingProvider(Protocol):
     def embed(self, text: str) -> list[float]:
         ...
 
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        ...
+
 
 class LocalHashingEmbeddingProvider:
     def __init__(self, *, dims: int = 384) -> None:
@@ -79,6 +97,9 @@ class LocalHashingEmbeddingProvider:
 
     def embed(self, text: str) -> list[float]:
         return hashed_embedding(text, dims=self.dims)
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed(text) for text in texts]
 
 
 class HttpEmbeddingProvider:
@@ -92,21 +113,39 @@ class HttpEmbeddingProvider:
         self.endpoint = endpoint.rstrip("/")
         self.model = model
         self.dims = dims
+        parsed = urlparse(self.endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("embedding endpoint must be an absolute HTTP(S) URL")
+        if parsed.username or parsed.password:
+            raise ValueError("embedding endpoint must not contain embedded credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("embedding endpoint must not contain a query string or fragment")
+        if parsed.scheme != "https" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("remote embedding endpoints must use HTTPS")
 
     def embed(self, text: str) -> list[float]:
+        return self.embed_many([text])[0]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        if not texts or len(texts) > 256:
+            raise ValueError("embedding batch size must be between 1 and 256")
+        request_input: str | list[str] = texts[0] if len(texts) == 1 else texts
         response = httpx.post(
             self.endpoint,
-            json={"model": self.model, "input": text},
+            json={"model": self.model, "input": request_input},
             timeout=30.0,
         )
         response.raise_for_status()
         payload = response.json()
-        vector = payload.get("embedding")
-        if vector is None and payload.get("data"):
-            vector = payload["data"][0].get("embedding")
-        if not isinstance(vector, list) or len(vector) != self.dims:
-            raise RuntimeError(f"embedding provider returned invalid vector dimensions; expected {self.dims}")
-        return [float(item) for item in vector]
+        if len(texts) == 1 and isinstance(payload.get("embedding"), list):
+            vectors = [payload["embedding"]]
+        else:
+            data = payload.get("data")
+            if not isinstance(data, list) or len(data) != len(texts):
+                raise RuntimeError("embedding provider returned an invalid batch")
+            ordered = sorted(data, key=lambda item: int(item.get("index", 0)))
+            vectors = [item.get("embedding") for item in ordered]
+        return [_validated_embedding(vector, dims=self.dims) for vector in vectors]
 
 
 def create_embedding_provider(config: VectorBackendConfig, *, allow_local_hashing: bool) -> EmbeddingProvider:
@@ -116,6 +155,15 @@ def create_embedding_provider(config: VectorBackendConfig, *, allow_local_hashin
     if allow_local_hashing:
         return LocalHashingEmbeddingProvider(dims=config.dims)
     raise RuntimeError("production vector backend requires embedding_url/AEITRON_EMBEDDING_URL")
+
+
+def _validated_embedding(value: Any, *, dims: int) -> list[float]:
+    if not isinstance(value, list) or len(value) != dims:
+        raise RuntimeError(f"embedding provider returned invalid vector dimensions; expected {dims}")
+    vector = [float(item) for item in value]
+    if any(not math.isfinite(item) for item in vector):
+        raise RuntimeError("embedding provider returned a non-finite vector")
+    return vector
 
 
 def text_terms(text: str) -> Counter[str]:
@@ -158,8 +206,8 @@ def chunk_search_text(chunk: dict[str, Any]) -> str:
 class LocalVectorIndex:
     """Deterministic local vector index.
 
-    This backend is production-safe as a fallback and for small repositories. It
-    is not a replacement for FAISS/HNSW/Qdrant/pgvector at very large scale.
+    This backend is a deterministic development fallback for small repositories.
+    It is not semantic enough or scalable enough for production retrieval.
     """
 
     def __init__(self, store: LocalStore | None = None, *, dims: int = 384, config: VectorBackendConfig | None = None) -> None:
@@ -195,6 +243,24 @@ class LocalVectorIndex:
             results=sorted(scored, key=lambda item: item.score, reverse=True)[:top_k],
         )
 
+    def sync_project(self, *, project_id: str, batch_size: int = 64) -> VectorSyncReport:
+        if batch_size < 1 or batch_size > 256:
+            raise ValueError("vector sync batch_size must be between 1 and 256")
+        chunks = self.store.list_chunks(project_id)
+        digest = hashlib.sha256()
+        for chunk in chunks:
+            digest.update(str(chunk["id"]).encode("utf-8"))
+            digest.update(hashlib.sha256(chunk_search_text(chunk).encode("utf-8")).digest())
+        return VectorSyncReport(
+            project_id=project_id,
+            backend=self.config.backend,
+            collection="local-exact-scan",
+            indexed_chunks=len(chunks),
+            deleted_stale_chunks=0,
+            embedding_dimensions=self.dims,
+            revision_sha256=digest.hexdigest(),
+        )
+
 
 class FaissVectorIndex(LocalVectorIndex):
     """FAISS adapter contract.
@@ -223,10 +289,12 @@ class HnswVectorIndex(LocalVectorIndex):
 
 class QdrantVectorIndex(LocalVectorIndex):
     def __init__(self, store: LocalStore | None = None, *, config: VectorBackendConfig | None = None) -> None:
-        active = config or VectorBackendConfig(
-            backend="qdrant",
-            qdrant_url=os.environ.get("AEITRON_QDRANT_URL"),
-            embedding_url=os.environ.get("AEITRON_EMBEDDING_URL"),
+        active = config or VectorBackendConfig(backend="qdrant")
+        active = active.model_copy(
+            update={
+                "qdrant_url": active.qdrant_url or os.environ.get("AEITRON_QDRANT_URL"),
+                "embedding_url": active.embedding_url or os.environ.get("AEITRON_EMBEDDING_URL"),
+            }
         )
         if not active.qdrant_url:
             raise RuntimeError("Qdrant backend requested but qdrant_url/AEITRON_QDRANT_URL is not configured")
@@ -240,15 +308,142 @@ class QdrantVectorIndex(LocalVectorIndex):
         self.dims = active.dims
         self.client = QdrantClient(url=active.qdrant_url)
 
+    @staticmethod
+    def _point_id(project_id: str, chunk_id: str) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"aeitron:{project_id}:{chunk_id}"))
+
+    def _ensure_collection(self) -> None:
+        from qdrant_client import models
+
+        try:
+            exists = bool(self.client.collection_exists(self.config.qdrant_collection))
+        except AttributeError:
+            try:
+                self.client.get_collection(self.config.qdrant_collection)
+                exists = True
+            except Exception:
+                exists = False
+        if not exists:
+            self.client.create_collection(
+                collection_name=self.config.qdrant_collection,
+                vectors_config=models.VectorParams(size=self.dims, distance=models.Distance.COSINE),
+            )
+        try:
+            self.client.create_payload_index(
+                collection_name=self.config.qdrant_collection,
+                field_name="project_id",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+                wait=True,
+            )
+        except Exception as exc:
+            if "already exists" not in str(exc).lower():
+                raise RuntimeError(f"Qdrant payload index creation failed: {exc}") from exc
+
+    def sync_project(self, *, project_id: str, batch_size: int = 64) -> VectorSyncReport:
+        from qdrant_client import models
+
+        if batch_size < 1 or batch_size > 256:
+            raise ValueError("Qdrant batch_size must be between 1 and 256")
+        chunks = self.store.list_chunks(project_id)
+        self._ensure_collection()
+        digest = hashlib.sha256()
+        desired_ids: set[str] = set()
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start : start + batch_size]
+            texts = [chunk_search_text(chunk) for chunk in batch]
+            vectors = self.embedding_provider.embed_many(texts)
+            if len(vectors) != len(batch):
+                raise RuntimeError("embedding provider returned the wrong number of vectors")
+            points = []
+            for chunk, text, vector in zip(batch, texts, vectors, strict=True):
+                point_id = self._point_id(project_id, str(chunk["id"]))
+                desired_ids.add(point_id)
+                text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                digest.update(point_id.encode("ascii"))
+                digest.update(bytes.fromhex(text_hash))
+                points.append(
+                    models.PointStruct(
+                        id=point_id,
+                        vector=_validated_embedding(vector, dims=self.dims),
+                        payload={
+                            "project_id": project_id,
+                            "chunk_id": str(chunk["id"]),
+                            "path": str(chunk["path"]),
+                            "start_line": int(chunk["start_line"]),
+                            "end_line": int(chunk["end_line"]),
+                            "symbol_name": chunk.get("symbol_name"),
+                            "content": str(chunk["content"]),
+                            "metadata": dict(chunk.get("metadata") or {}),
+                            "content_sha256": text_hash,
+                        },
+                    )
+                )
+            try:
+                self.client.upsert(
+                    collection_name=self.config.qdrant_collection,
+                    points=points,
+                    wait=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Qdrant upsert failed: {exc}") from exc
+
+        existing_ids: set[str] = set()
+        offset: Any = None
+        project_filter = models.Filter(
+            must=[models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id))]
+        )
+        while True:
+            records, offset = self.client.scroll(
+                collection_name=self.config.qdrant_collection,
+                scroll_filter=project_filter,
+                limit=256,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            existing_ids.update(str(record.id) for record in records)
+            if offset is None:
+                break
+        stale_ids = sorted(existing_ids - desired_ids)
+        if stale_ids:
+            self.client.delete(
+                collection_name=self.config.qdrant_collection,
+                points_selector=models.PointIdsList(points=stale_ids),
+                wait=True,
+            )
+        return VectorSyncReport(
+            project_id=project_id,
+            backend="qdrant",
+            collection=self.config.qdrant_collection,
+            indexed_chunks=len(chunks),
+            deleted_stale_chunks=len(stale_ids),
+            embedding_dimensions=self.dims,
+            revision_sha256=digest.hexdigest(),
+        )
+
     def search(self, *, project_id: str, query: str, top_k: int = 12) -> VectorSearchReport:
         vector = self.embedding_provider.embed(query)
         try:
-            hits = self.client.search(
-                collection_name=self.config.qdrant_collection,
-                query_vector=vector,
-                limit=top_k,
-                query_filter={"must": [{"key": "project_id", "match": {"value": project_id}}]},
+            from qdrant_client import models
+
+            query_filter = models.Filter(
+                must=[models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id))]
             )
+            if hasattr(self.client, "query_points"):
+                response = self.client.query_points(
+                    collection_name=self.config.qdrant_collection,
+                    query=vector,
+                    limit=top_k,
+                    query_filter=query_filter,
+                )
+                hits = response.points
+            else:
+                hits = self.client.search(
+                    collection_name=self.config.qdrant_collection,
+                    query_vector=vector,
+                    limit=top_k,
+                    query_filter=query_filter,
+                )
         except Exception as exc:
             raise RuntimeError(f"Qdrant search failed: {exc}") from exc
         results: list[VectorSearchResult] = []
@@ -271,10 +466,12 @@ class QdrantVectorIndex(LocalVectorIndex):
 
 class PgVectorIndex(LocalVectorIndex):
     def __init__(self, store: LocalStore | None = None, *, config: VectorBackendConfig | None = None) -> None:
-        active = config or VectorBackendConfig(
-            backend="pgvector",
-            postgres_dsn=os.environ.get("AEITRON_DATABASE_URL"),
-            embedding_url=os.environ.get("AEITRON_EMBEDDING_URL"),
+        active = config or VectorBackendConfig(backend="pgvector")
+        active = active.model_copy(
+            update={
+                "postgres_dsn": active.postgres_dsn or os.environ.get("AEITRON_DATABASE_URL"),
+                "embedding_url": active.embedding_url or os.environ.get("AEITRON_EMBEDDING_URL"),
+            }
         )
         if not active.postgres_dsn:
             raise RuntimeError("pgvector backend requested but postgres_dsn/AEITRON_DATABASE_URL is not configured")
@@ -308,8 +505,8 @@ def vector_capabilities() -> list[VectorIndexCapability]:
         )
     ]
     for backend, package, production_notes in [
-        ("faiss", "faiss", ["single-node ANN", "good for large local indexes"]),
-        ("hnsw", "hnswlib", ["fast approximate nearest neighbor", "good for local sidecar indexes"]),
+        ("faiss", "faiss", ["dependency available", "persistent ANN implementation is not complete"]),
+        ("hnsw", "hnswlib", ["dependency available", "persistent ANN implementation is not complete"]),
     ]:
         try:
             __import__(package)
@@ -323,7 +520,7 @@ def vector_capabilities() -> list[VectorIndexCapability]:
                 backend=backend,  # type: ignore[arg-type]
                 available=available,
                 reason=reason,
-                production_grade=available,
+                production_grade=False,
                 notes=production_notes,
             )
         )
@@ -345,8 +542,8 @@ def vector_capabilities() -> list[VectorIndexCapability]:
             reason="AEITRON_DATABASE_URL and AEITRON_EMBEDDING_URL configured"
             if os.environ.get("AEITRON_DATABASE_URL") and os.environ.get("AEITRON_EMBEDDING_URL")
             else "AEITRON_DATABASE_URL or AEITRON_EMBEDDING_URL not configured",
-            production_grade=bool(os.environ.get("AEITRON_DATABASE_URL") and os.environ.get("AEITRON_EMBEDDING_URL")),
-            notes=["Postgres-native vector search", "good when relational metadata and vector search must live together"],
+            production_grade=False,
+            notes=["configuration contract only", "native pgvector persistence/query implementation is not complete"],
         )
     )
     return capabilities

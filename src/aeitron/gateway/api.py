@@ -133,6 +133,13 @@ class VectorSearchRequest(BaseModel):
     dims: int = Field(default=384, ge=64, le=4096)
 
 
+class VectorSyncRequest(BaseModel):
+    project_id: str = Field(min_length=1)
+    backend: str = Field(default="qdrant", pattern="^(local_hashing|qdrant)$")
+    dims: int = Field(default=384, ge=64, le=4096)
+    batch_size: int = Field(default=64, ge=1, le=256)
+
+
 class MemoryRetrieveRequest(BaseModel):
     project_id: str | None = None
     query: str = Field(min_length=1)
@@ -1161,6 +1168,25 @@ async def vector_search(request: VectorSearchRequest) -> dict[str, Any]:
         index = create_vector_index(STORE, VectorBackendConfig(backend=request.backend, dims=request.dims))  # type: ignore[arg-type]
         return index.search(project_id=request.project_id, query=request.query, top_k=request.top_k).model_dump()
     except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/context/vector-sync")
+async def vector_sync(request: VectorSyncRequest, http_request: Request) -> dict[str, Any]:
+    if AUTH_CONFIG.enabled:
+        require_scope(http_request, "context:index")
+    if STORE.get_project(request.project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        index = create_vector_index(
+            STORE,
+            VectorBackendConfig(backend=request.backend, dims=request.dims),  # type: ignore[arg-type]
+        )
+        return index.sync_project(
+            project_id=request.project_id,
+            batch_size=request.batch_size,
+        ).model_dump()
+    except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

@@ -217,6 +217,18 @@ def _scanner_timeout_seconds(scanner: str, default: int) -> int:
     return timeout
 
 
+def _scanner_positive_int(scanner: str, setting: str, default: int, *, minimum: int, maximum: int) -> int:
+    variable = f"AEITRON_{scanner.upper().replace('-', '_')}_{setting.upper()}"
+    raw = os.environ.get(variable, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{variable} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{variable} must be between {minimum} and {maximum}")
+    return value
+
+
 def _run_bandit(root: Path) -> dict[str, Any] | None:
     base_command, missing = _resolve_python_scanner("bandit", "bandit")
     if missing:
@@ -366,6 +378,13 @@ def _run_codeql(root: Path) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_root = Path(tempfile.mkdtemp(prefix="aeitron-codeql-")).resolve()
     database = temporary_root / "database"
+    # Unbounded CodeQL workers can exhaust an 8-16 GiB developer or CI host
+    # before the operating system can report a useful error. These defaults
+    # preserve the full security-extended query suite while bounding resource
+    # use; larger runners can opt in to greater parallelism explicitly.
+    threads = _scanner_positive_int("codeql", "threads", 1, minimum=1, maximum=64)
+    ram_mb = _scanner_positive_int("codeql", "ram_mb", 3072, minimum=1024, maximum=524_288)
+    timeout = _scanner_timeout_seconds("codeql", 3600)
     try:
         create_command = [
             *base_command,
@@ -375,7 +394,8 @@ def _run_codeql(root: Path) -> dict[str, Any]:
             "--language=python",
             "--build-mode=none",
             f"--source-root={source_root}",
-            "--threads=0",
+            f"--threads={threads}",
+            f"--ram={ram_mb}",
         ]
         try:
             created = subprocess.run(  # nosec B603
@@ -385,17 +405,25 @@ def _run_codeql(root: Path) -> dict[str, Any]:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=1800,
+                timeout=timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return {"status": "failed", "phase": "database_create", "reason": "CodeQL database creation exceeded 1800 seconds"}
+            return {
+                "status": "failed",
+                "phase": "database_create",
+                "reason": f"CodeQL database creation exceeded {timeout} seconds",
+                "threads": threads,
+                "ram_mb": ram_mb,
+            }
         if created.returncode != 0:
             return {
                 "status": "failed",
                 "phase": "database_create",
                 "returncode": created.returncode,
                 "ephemeral_database": True,
+                "threads": threads,
+                "ram_mb": ram_mb,
                 "stderr": created.stderr[-4000:],
             }
         command = [
@@ -406,7 +434,8 @@ def _run_codeql(root: Path) -> dict[str, Any]:
             "codeql/python-queries:codeql-suites/python-security-extended.qls",
             "--format=sarif-latest",
             f"--output={output}",
-            "--threads=0",
+            f"--threads={threads}",
+            f"--ram={ram_mb}",
             "--rerun",
         ]
         try:
@@ -417,11 +446,17 @@ def _run_codeql(root: Path) -> dict[str, Any]:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=1800,
+                timeout=timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return {"status": "failed", "phase": "database_analyze", "reason": "CodeQL analysis exceeded 1800 seconds"}
+            return {
+                "status": "failed",
+                "phase": "database_analyze",
+                "reason": f"CodeQL analysis exceeded {timeout} seconds",
+                "threads": threads,
+                "ram_mb": ram_mb,
+            }
         blocking = []
         if completed.returncode == 0 and output.is_file():
             try:
@@ -438,7 +473,15 @@ def _run_codeql(root: Path) -> dict[str, Any]:
             "source_root": str(source_root),
             "query_suite": "python-security-extended.qls",
             "ephemeral_database": True,
+            "threads": threads,
+            "ram_mb": ram_mb,
             "output": str(output),
+            "reason": (
+                ""
+                if completed.returncode == 0
+                else "CodeQL terminated abnormally; inspect stderr and lower AEITRON_CODEQL_THREADS "
+                "or AEITRON_CODEQL_RAM_MB if the host is memory constrained"
+            ),
             "stderr": completed.stderr[-4000:],
         }
     finally:

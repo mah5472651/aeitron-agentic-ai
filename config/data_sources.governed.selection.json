@@ -1,0 +1,50 @@
+{
+  "entries": [
+    {
+      "registry_entry_sha256": "addf0fb8784e90ae666ae3282dbef990d9fbe344ee084c9b9d683fbc76a80a08",
+      "source_id": "docker-production-builds"
+    },
+    {
+      "registry_entry_sha256": "43db0f86ba7d08cc3663f7cbddc0c528b6bccd86fc4114891627a16ef833e885",
+      "source_id": "go-core-secure-coding"
+    },
+    {
+      "registry_entry_sha256": "4669622b8197e298adc70fa94ae4a1b97df302be0baa0650f683c6cb62e62399",
+      "source_id": "kubernetes-production-security"
+    },
+    {
+      "registry_entry_sha256": "85cbaf1bc27239c10f586ab11633eea67d7749fd4d4ecaf4639ac76bd1ae803c",
+      "source_id": "nist-secure-engineering"
+    },
+    {
+      "registry_entry_sha256": "06e6003238f591492b6465ad3e098e8ab1fb248066e2aa8fb4a9ed560e0d40df",
+      "source_id": "owasp-cheat-sheet-series"
+    },
+    {
+      "registry_entry_sha256": "41911d24a5d918c7ded5f2a58a32ea3b94f06951638eb9645501b1ff2e89621b",
+      "source_id": "postgresql-secure-data-layer"
+    },
+    {
+      "registry_entry_sha256": "e292c0e4cb702d3b003bb0a6954cbb5f1b8a16de3b0fd97c57a0ab8b3d9c448c",
+      "source_id": "python-core-secure-coding"
+    },
+    {
+      "registry_entry_sha256": "41eb4049d164c93fcf6405b4d915b9de28c7eaaf6b395c598c369279a475fbf5",
+      "source_id": "rust-core-secure-systems"
+    }
+  ],
+  "input_registry_sha256": "9396f78d5f9a4dc8aec9d9479fe3038eb60c79638f5a684d15a1394635348b64",
+  "schema_version": 1,
+  "selected_registry_sha256": "b25290164ea2482dac04052047ac3f290a73e9dced8b4e68beb8d4ae4a3e2060",
+  "source_count": 8,
+  "source_ids": [
+    "docker-production-builds",
+    "go-core-secure-coding",
+    "kubernetes-production-security",
+    "nist-secure-engineering",
+    "owasp-cheat-sheet-series",
+    "postgresql-secure-data-layer",
+    "python-core-secure-coding",
+    "rust-core-secure-systems"
+  ]
+}

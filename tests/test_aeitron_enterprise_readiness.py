@@ -14,7 +14,13 @@ from src.aeitron.deployment.production_proof import (
     run_production_proof,
 )
 from src.aeitron.evaluation.benchmark_pack import BenchmarkPackConfig, run_benchmark_pack
-from src.aeitron.evaluation.benchmark_suites import BenchmarkSuiteSpec, run_benchmark_suites
+from src.aeitron.evaluation.benchmark_suites import (
+    BenchmarkSuiteSpec,
+    _estimate_pass_at_k,
+    _human_eval_test_files,
+    _mbpp_test_files,
+    run_benchmark_suites,
+)
 from src.aeitron.learning.dataset_validation import DatasetValidationConfig, validate_dataset
 from src.aeitron.learning.source_balancing import balance_clean_jsonl
 from src.aeitron.learning.storage import (
@@ -25,7 +31,7 @@ from src.aeitron.learning.storage import (
     verify_object_store_lifecycle,
 )
 from src.aeitron.production_readiness import run_production_readiness
-from src.aeitron.security.audit import run_security_audit
+from src.aeitron.security.audit import _scanner_positive_int, run_security_audit
 
 
 def write_jsonl(path: Path, rows: list[dict[str, object]]) -> Path:
@@ -277,6 +283,41 @@ class AeitronEnterpriseReadinessTest(unittest.TestCase):
             )
             self.assertEqual(report.status, "passed")
             self.assertEqual(report.aggregate_score, 1.0)
+            self.assertEqual(report.evaluation_mode, "dataset_validation")
+            self.assertTrue(
+                all("not a model capability score" in suite.reason for suite in report.suites)
+            )
+
+    def test_executable_code_benchmark_contract_builds_safe_tests_and_pass_at_k(self) -> None:
+        human_files = _human_eval_test_files(
+            {
+                "prompt": "def add(a, b):\n    \"\"\"Return a plus b.\"\"\"\n",
+                "entry_point": "add",
+                "test": "def check(candidate):\n    assert candidate(2, 3) == 5",
+            },
+            "    return a + b",
+        )
+        self.assertIn("def add", human_files["candidate.py"])
+        self.assertIn("check(candidate)", human_files["runner.py"])
+        mbpp_files = _mbpp_test_files(
+            {"test_list": ["assert reverse('ab') == 'ba'"]},
+            "def reverse(value):\n    return value[::-1]",
+        )
+        self.assertIn("from candidate import *", mbpp_files["runner.py"])
+        self.assertAlmostEqual(_estimate_pass_at_k(10, 3, 1), 0.3)
+        self.assertAlmostEqual(
+            _estimate_pass_at_k(10, 3, 5),
+            1.0 - (21 / 252),
+        )
+        with self.assertRaisesRegex(ValueError, "entry point"):
+            _human_eval_test_files(
+                {
+                    "prompt": "def bad(): pass",
+                    "entry_point": "bad;import os",
+                    "test": "def check(candidate): pass",
+                },
+                "pass",
+            )
 
     def test_benchmark_pack_runs_required_and_optional_local_suites(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -334,6 +375,19 @@ class AeitronEnterpriseReadinessTest(unittest.TestCase):
             bad = run_security_audit(root=root, run_bandit=False, validate_k8s=False, run_semgrep=False, run_codeql=False, run_pip_audit=False)
             self.assertEqual(bad.status, "failed")
             self.assertTrue(any(item.check == "secret_pattern" for item in bad.findings))
+
+    def test_security_scanner_resource_limits_are_validated(self) -> None:
+        with patch.dict("os.environ", {"AEITRON_CODEQL_THREADS": "3"}, clear=False):
+            self.assertEqual(
+                _scanner_positive_int("codeql", "threads", 2, minimum=1, maximum=64),
+                3,
+            )
+        with patch.dict("os.environ", {"AEITRON_CODEQL_THREADS": "0"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "between 1 and 64"):
+                _scanner_positive_int("codeql", "threads", 2, minimum=1, maximum=64)
+        with patch.dict("os.environ", {"AEITRON_CODEQL_RAM_MB": "not-an-integer"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "must be an integer"):
+                _scanner_positive_int("codeql", "ram_mb", 4096, minimum=1024, maximum=524_288)
 
     def test_production_readiness_is_honest_about_missing_external_dependencies(self) -> None:
         cleared = {

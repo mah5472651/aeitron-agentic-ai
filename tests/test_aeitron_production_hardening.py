@@ -3,7 +3,9 @@
 import asyncio
 import json
 import sqlite3
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +20,7 @@ from src.aeitron.identity.auth import AuthConfig, AuthError, validate_token_issu
 from src.aeitron.identity.quota import AsyncLocalQuotaStore, LocalQuotaStore
 from src.aeitron.indexing import ContextBuilder
 from src.aeitron.indexing import LocalVectorIndex, RepositoryIndexer, VectorBackendConfig, create_vector_index, vector_capabilities
+from src.aeitron.indexing.vector_index import QdrantVectorIndex
 from src.aeitron.learning.capacity import CapacityPlanConfig, build_capacity_plan
 from src.aeitron.memory import MemoryIngestRequest, UnifiedMemoryManager
 from src.aeitron.model_ops.backends import MockModelBackend
@@ -318,6 +321,9 @@ class AeitronProductionHardeningTest(unittest.TestCase):
                 selected_search = selected.search(project_id=project["id"], query="login password", top_k=1)
                 self.assertEqual(selected_search.backend, "local_hashing")
                 self.assertEqual(selected_search.dims, 256)
+                sync = selected.sync_project(project_id=project["id"])
+                self.assertEqual(sync.indexed_chunks, store.index_status(project["id"])["chunk_count"])
+                self.assertEqual(sync.backend, "local_hashing")
                 response = PatchService(store).preview_apply_verify(
                     PatchVerifyRequest(
                         project_id=project["id"],
@@ -334,6 +340,94 @@ class AeitronProductionHardeningTest(unittest.TestCase):
                 self.assertEqual(response.verdict, "accept")
                 self.assertTrue(response.rolled_back)
                 self.assertIn("password == 'secret'", (workspace / "auth.py").read_text(encoding="utf-8"))
+
+    def test_qdrant_sync_upserts_chunks_and_removes_stale_points(self) -> None:
+        class Model:
+            def __init__(self, **kwargs: object) -> None:
+                self.__dict__.update(kwargs)
+
+        class FakeClient:
+            def __init__(self, **_kwargs: object) -> None:
+                self.points: list[object] = []
+                self.deleted: list[str] = []
+                self.created = False
+
+            def collection_exists(self, _name: str) -> bool:
+                return False
+
+            def create_collection(self, **_kwargs: object) -> None:
+                self.created = True
+
+            def create_payload_index(self, **_kwargs: object) -> None:
+                return None
+
+            def upsert(self, *, points: list[object], **_kwargs: object) -> None:
+                self.points.extend(points)
+
+            def scroll(self, **_kwargs: object) -> tuple[list[object], None]:
+                return [Model(id="00000000-0000-0000-0000-000000000001")], None
+
+            def delete(self, *, points_selector: object, **_kwargs: object) -> None:
+                self.deleted.extend(points_selector.points)
+
+        fake_client = FakeClient()
+        qdrant_module = types.ModuleType("qdrant_client")
+        models_module = types.ModuleType("qdrant_client.models")
+        models_module.Distance = Model(COSINE="cosine")
+        models_module.PayloadSchemaType = Model(KEYWORD="keyword")
+        for name in (
+            "VectorParams",
+            "PointStruct",
+            "Filter",
+            "FieldCondition",
+            "MatchValue",
+            "PointIdsList",
+        ):
+            setattr(models_module, name, Model)
+        qdrant_module.models = models_module
+        qdrant_module.QdrantClient = lambda **_kwargs: fake_client
+
+        class FakeEmbeddings:
+            dims = 64
+
+            def embed(self, _text: str) -> list[float]:
+                return [0.1] * self.dims
+
+            def embed_many(self, texts: list[str]) -> list[list[float]]:
+                return [[0.1] * self.dims for _ in texts]
+
+        with (
+            tempfile.TemporaryDirectory() as workspace_dir,
+            tempfile.TemporaryDirectory() as db_dir,
+            patch.dict(
+                sys.modules,
+                {
+                    "qdrant_client": qdrant_module,
+                    "qdrant_client.models": models_module,
+                },
+            ),
+        ):
+            workspace = Path(workspace_dir)
+            (workspace / "service.py").write_text("def health():\n    return True\n", encoding="utf-8")
+            with LocalStore(Path(db_dir) / "aeitron.sqlite3") as store:
+                project = store.create_project(name="vector", repo_path=str(workspace))
+                RepositoryIndexer(store).index_project(project_id=project["id"])
+                index = QdrantVectorIndex(
+                    store,
+                    config=VectorBackendConfig(
+                        backend="qdrant",
+                        dims=64,
+                        qdrant_url="http://qdrant.internal:6333",
+                        embedding_url="https://embedding.internal/v1/embeddings",
+                    ),
+                )
+                index.embedding_provider = FakeEmbeddings()
+                report = index.sync_project(project_id=project["id"], batch_size=2)
+                self.assertTrue(fake_client.created)
+                self.assertEqual(report.indexed_chunks, store.index_status(project["id"])["chunk_count"])
+                self.assertEqual(len(fake_client.points), report.indexed_chunks)
+                self.assertEqual(report.deleted_stale_chunks, 1)
+                self.assertEqual(fake_client.deleted, ["00000000-0000-0000-0000-000000000001"])
 
     def test_repository_patch_loop_indexes_context_verifies_and_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:

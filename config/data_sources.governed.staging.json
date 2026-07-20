@@ -1,0 +1,273 @@
+{
+  "sources": [
+    {
+      "allowed_content_types": [
+        "application/json",
+        "application/xml",
+        "text/html",
+        "text/markdown",
+        "text/plain",
+        "text/x-python"
+      ],
+      "allowed_domains": [
+        "docs.docker.com"
+      ],
+      "approval_request_sha256": null,
+      "approval_status": "pending",
+      "approved_use": "foundation",
+      "category": "agentic_coding",
+      "collection_budget": 20000,
+      "immutable_revision": "rolling",
+      "legal_approval_sha256": null,
+      "license": "apache-2.0",
+      "license_evidence_sha256": null,
+      "name": "docker-production-builds",
+      "source_family": "infrastructure-documentation",
+      "source_id": "docker-production-builds",
+      "trust_tier": "quarantine",
+      "urls": [
+        "https://docs.docker.com/build/building/best-practices/",
+        "https://docs.docker.com/engine/security/",
+        "https://docs.docker.com/compose/",
+        "https://docs.docker.com/reference/dockerfile/"
+      ]
+    },
+    {
+      "allowed_content_types": [
+        "application/json",
+        "application/xml",
+        "text/html",
+        "text/markdown",
+        "text/plain",
+        "text/x-python"
+      ],
+      "allowed_domains": [
+        "go.dev"
+      ],
+      "approval_request_sha256": null,
+      "approval_status": "pending",
+      "approved_use": "foundation",
+      "category": "agentic_coding",
+      "collection_budget": 30000,
+      "immutable_revision": "rolling",
+      "legal_approval_sha256": null,
+      "license": "bsd-3-clause",
+      "license_evidence_sha256": null,
+      "name": "go-core-secure-coding",
+      "source_family": "official-language-documentation",
+      "source_id": "go-core-secure-coding",
+      "trust_tier": "quarantine",
+      "urls": [
+        "https://go.dev/doc/",
+        "https://go.dev/doc/effective_go",
+        "https://go.dev/doc/security/",
+        "https://go.dev/doc/tutorial/"
+      ]
+    },
+    {
+      "allowed_content_types": [
+        "application/json",
+        "application/xml",
+        "text/html",
+        "text/markdown",
+        "text/plain",
+        "text/x-python"
+      ],
+      "allowed_domains": [
+        "kubernetes.io"
+      ],
+      "approval_request_sha256": null,
+      "approval_status": "pending",
+      "approved_use": "foundation",
+      "category": "agentic_coding",
+      "collection_budget": 20000,
+      "immutable_revision": "rolling",
+      "legal_approval_sha256": null,
+      "license": "cc-by-4.0",
+      "license_evidence_sha256": null,
+      "name": "kubernetes-production-security",
+      "source_family": "infrastructure-documentation",
+      "source_id": "kubernetes-production-security",
+      "trust_tier": "quarantine",
+      "urls": [
+        "https://kubernetes.io/docs/concepts/security/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/securing-a-cluster/",
+        "https://kubernetes.io/docs/concepts/configuration/secret/",
+        "https://kubernetes.io/docs/concepts/security/pod-security-standards/"
+      ]
+    },
+    {
+      "allowed_content_types": [
+        "application/json",
+        "application/xml",
+        "text/html",
+        "text/markdown",
+        "text/plain",
+        "text/x-python"
+      ],
+      "allowed_domains": [
+        "csrc.nist.gov"
+      ],
+      "approval_request_sha256": null,
+      "approval_status": "pending",
+      "approved_use": "defensive",
+      "category": "defensive_security",
+      "collection_budget": 10000,
+      "immutable_revision": "rolling",
+      "legal_approval_sha256": null,
+      "license": "public-domain",
+      "license_evidence_sha256": null,
+      "name": "nist-secure-engineering",
+      "source_family": "nist",
+      "source_id": "nist-secure-engineering",
+      "trust_tier": "quarantine",
+      "urls": [
+        "https://csrc.nist.gov/Projects/ssdf",
+        "https://csrc.nist.gov/projects/cryptographic-standards-and-guidelines"
+      ]
+    },
+    {
+      "allowed_content_types": [
+        "application/json",
+        "application/xml",
+        "text/html",
+        "text/markdown",
+        "text/plain",
+        "text/x-python"
+      ],
+      "allowed_domains": [
+        "cheatsheetseries.owasp.org"
+      ],
+      "approval_request_sha256": null,
+      "approval_status": "pending",
+      "approved_use": "defensive",
+      "category": "defensive_security",
+      "collection_budget": 20000,
+      "immutable_revision": "rolling",
+      "legal_approval_sha256": null,
+      "license": "cc-by-4.0",
+      "license_evidence_sha256": null,
+      "name": "owasp-cheat-sheet-series",
+      "source_family": "owasp",
+      "source_id": "owasp-cheat-sheet-series",
+      "trust_tier": "quarantine",
+      "urls": [
+        "https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/DOM_based_XSS_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Kubernetes_Security_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html"
+      ]
+    },
+    {
+      "allowed_content_types": [
+        "application/json",
+        "application/xml",
+        "text/html",
+        "text/markdown",
+        "text/plain",
+        "text/x-python"
+      ],
+      "allowed_domains": [
+        "www.postgresql.org"
+      ],
+      "approval_request_sha256": null,
+      "approval_status": "pending",
+      "approved_use": "foundation",
+      "category": "agentic_coding",
+      "collection_budget": 20000,
+      "immutable_revision": "rolling",
+      "legal_approval_sha256": null,
+      "license": "postgresql",
+      "license_evidence_sha256": null,
+      "name": "postgresql-secure-data-layer",
+      "source_family": "infrastructure-documentation",
+      "source_id": "postgresql-secure-data-layer",
+      "trust_tier": "quarantine",
+      "urls": [
+        "https://www.postgresql.org/docs/current/",
+        "https://www.postgresql.org/docs/current/sql-prepare.html",
+        "https://www.postgresql.org/docs/current/libpq.html",
+        "https://www.postgresql.org/docs/current/auth-methods.html"
+      ]
+    },
+    {
+      "allowed_content_types": [
+        "application/json",
+        "application/xml",
+        "text/html",
+        "text/markdown",
+        "text/plain",
+        "text/x-python"
+      ],
+      "allowed_domains": [
+        "docs.python.org"
+      ],
+      "approval_request_sha256": null,
+      "approval_status": "pending",
+      "approved_use": "foundation",
+      "category": "agentic_coding",
+      "collection_budget": 30000,
+      "immutable_revision": "rolling",
+      "legal_approval_sha256": null,
+      "license": "psf-2.0",
+      "license_evidence_sha256": null,
+      "name": "python-core-secure-coding",
+      "source_family": "official-language-documentation",
+      "source_id": "python-core-secure-coding",
+      "trust_tier": "quarantine",
+      "urls": [
+        "https://docs.python.org/3/tutorial/",
+        "https://docs.python.org/3/library/security_warnings.html",
+        "https://docs.python.org/3/library/ast.html",
+        "https://docs.python.org/3/library/asyncio.html",
+        "https://docs.python.org/3/library/subprocess.html",
+        "https://docs.python.org/3/library/unittest.html",
+        "https://docs.python.org/3/library/sqlite3.html",
+        "https://docs.python.org/3/library/typing.html"
+      ]
+    },
+    {
+      "allowed_content_types": [
+        "application/json",
+        "application/xml",
+        "text/html",
+        "text/markdown",
+        "text/plain",
+        "text/x-python"
+      ],
+      "allowed_domains": [
+        "doc.rust-lang.org"
+      ],
+      "approval_request_sha256": null,
+      "approval_status": "pending",
+      "approved_use": "foundation",
+      "category": "agentic_coding",
+      "collection_budget": 30000,
+      "immutable_revision": "rolling",
+      "legal_approval_sha256": null,
+      "license": "apache-2.0",
+      "license_evidence_sha256": null,
+      "name": "rust-core-secure-systems",
+      "source_family": "official-language-documentation",
+      "source_id": "rust-core-secure-systems",
+      "trust_tier": "quarantine",
+      "urls": [
+        "https://doc.rust-lang.org/book/",
+        "https://doc.rust-lang.org/reference/",
+        "https://doc.rust-lang.org/nomicon/",
+        "https://doc.rust-lang.org/cargo/"
+      ]
+    }
+  ]
+}

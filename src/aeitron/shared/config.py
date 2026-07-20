@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def active_profile_path() -> Path:
-    return ROOT / "config" / "active_model_profile.json"
+    override = os.environ.get("AEITRON_ACTIVE_MODEL_PROFILE_PATH")
+    return Path(override).expanduser().resolve() if override else ROOT / "config" / "active_model_profile.json"
 
 
 def load_active_profile() -> dict[str, Any]:
