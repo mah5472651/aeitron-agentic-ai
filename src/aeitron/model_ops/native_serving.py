@@ -9,24 +9,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import Field
 
-from src.aeitron.identity.auth import install_auth
-from src.aeitron.identity.quota import install_quota
+from src.aeitron.identity.auth import AuthConfig, install_auth
+from src.aeitron.identity.quota import QuotaConfig, install_quota
 from src.aeitron.model_ops.checkpoint_compare import GenerationConfig, generate_text
 from src.aeitron.model_ops.foundation import CheckpointManifest, sha256_file
 from src.aeitron.model_ops.tokenizer_pipeline import load_tokenizer
 from src.aeitron.model_ops.torch_decoder import AeitronDecoderLM, ScratchDecoderConfig, load_trusted_checkpoint, require_torch
-from src.aeitron.observability import install_observability
+from src.aeitron.observability import METRICS, install_observability
 from src.aeitron.shared.schemas import StrictModel
 
 try:
@@ -36,13 +37,13 @@ except ImportError:  # pragma: no cover
 
 
 class ChatMessage(StrictModel):
-    role: str
-    content: str
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(min_length=1, max_length=4_194_304)
 
 
 class ChatCompletionRequest(StrictModel):
     model: str = "aeitron-scratch"
-    messages: list[ChatMessage] = Field(min_length=1)
+    messages: list[ChatMessage] = Field(min_length=1, max_length=1_024)
     temperature: float = Field(default=0.0, ge=0.0, le=5.0)
     max_tokens: int = Field(default=256, ge=1, le=4096)
     top_k: int = Field(default=20, ge=0, le=500)
@@ -57,6 +58,14 @@ class NativeServingConfig(StrictModel):
     require_tokenizer_hash_match: bool = True
     auth_enabled: bool = True
     quota_enabled: bool = True
+    required_scope: str = Field(default="model:generate", min_length=1, max_length=128)
+    max_prompt_characters: int = Field(default=131_072, ge=1_024, le=4_194_304)
+    max_messages: int = Field(default=128, ge=1, le=1_024)
+    max_queue_depth: int = Field(default=64, ge=0, le=100_000)
+    max_concurrent_generations: int = Field(default=1, ge=1, le=128)
+    queue_timeout_seconds: float = Field(default=10.0, ge=0.1, le=300.0)
+    generation_timeout_seconds: float = Field(default=120.0, ge=1.0, le=3_600.0)
+    reject_context_truncation: bool = True
 
 
 class NativeServingState:
@@ -86,6 +95,13 @@ class NativeServingState:
         self.model.load_state_dict(payload["model"])
         self.model.eval()
         self.started_at_unix = time.time()
+        self._generation_slots = asyncio.Semaphore(config.max_concurrent_generations)
+        self._state_lock = asyncio.Lock()
+        self._queued = 0
+        self._active = 0
+        self._completed = 0
+        self._failed = 0
+        self._timed_out = 0
 
     def _select_device(self, requested: str) -> "torch.device":
         if requested == "auto":
@@ -95,7 +111,7 @@ class NativeServingState:
         return torch.device(requested)
 
     def health(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "status": "ready",
             "model_name": self.config.model_name,
             "checkpoint_manifest": self.config.checkpoint_manifest,
@@ -108,8 +124,24 @@ class NativeServingState:
             "tokenizer_sha256": sha256_file(self.tokenizer_path),
             "device": str(self.device),
             "uptime_seconds": round(time.time() - self.started_at_unix, 3),
+            "generation_capacity": {
+                "active": self._active,
+                "queued": self._queued,
+                "completed": self._completed,
+                "failed": self._failed,
+                "timed_out": self._timed_out,
+                "max_concurrent": self.config.max_concurrent_generations,
+                "max_queue_depth": self.config.max_queue_depth,
+            },
             "scratch_only": True,
         }
+        if self.device.type == "cuda":
+            payload["cuda_memory"] = {
+                "allocated_bytes": int(torch.cuda.memory_allocated(self.device)),
+                "reserved_bytes": int(torch.cuda.memory_reserved(self.device)),
+                "max_allocated_bytes": int(torch.cuda.max_memory_allocated(self.device)),
+            }
+        return payload
 
     def render_prompt(self, messages: list[ChatMessage]) -> str:
         rendered = []
@@ -124,6 +156,22 @@ class NativeServingState:
     def generate(self, request: ChatCompletionRequest) -> tuple[str, int, float]:
         started = time.perf_counter()
         prompt = self.render_prompt(request.messages)
+        if len(request.messages) > self.config.max_messages:
+            raise HTTPException(status_code=413, detail="message count exceeds serving limit")
+        if len(prompt) > self.config.max_prompt_characters:
+            raise HTTPException(status_code=413, detail="prompt exceeds serving character limit")
+        prompt_tokens = self.tokenizer.encode(prompt).ids
+        if (
+            self.config.reject_context_truncation
+            and len(prompt_tokens) + request.max_tokens > self.model_config.max_sequence_length
+        ):
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "prompt plus requested completion exceeds the model context window; "
+                    "reduce input or max_tokens"
+                ),
+            )
         text, token_count = generate_text(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -132,6 +180,64 @@ class NativeServingState:
             config=GenerationConfig(max_new_tokens=request.max_tokens, temperature=request.temperature, top_k=request.top_k),
         )
         return text, token_count, (time.perf_counter() - started) * 1000
+
+    async def generate_async(self, request: ChatCompletionRequest) -> tuple[str, int, float]:
+        async with self._state_lock:
+            if self._queued >= self.config.max_queue_depth:
+                METRICS.inc("aeitron_serving_rejected_total", reason="queue_full")
+                raise HTTPException(status_code=503, detail="generation queue is full")
+            self._queued += 1
+            METRICS.set_gauge("aeitron_serving_queue_depth", float(self._queued))
+        try:
+            await asyncio.wait_for(
+                self._generation_slots.acquire(),
+                timeout=self.config.queue_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            async with self._state_lock:
+                self._queued = max(0, self._queued - 1)
+                self._failed += 1
+                METRICS.set_gauge("aeitron_serving_queue_depth", float(self._queued))
+            METRICS.inc("aeitron_serving_rejected_total", reason="queue_timeout")
+            raise HTTPException(status_code=503, detail="generation queue wait timed out") from exc
+
+        async with self._state_lock:
+            self._queued = max(0, self._queued - 1)
+            self._active += 1
+            METRICS.set_gauge("aeitron_serving_queue_depth", float(self._queued))
+            METRICS.set_gauge("aeitron_serving_active_generations", float(self._active))
+        work = asyncio.create_task(asyncio.to_thread(self.generate, request))
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(work),
+                timeout=self.config.generation_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            async with self._state_lock:
+                self._timed_out += 1
+            METRICS.inc("aeitron_serving_generation_timeouts_total")
+            asyncio.create_task(self._release_after_completion(work))
+            raise HTTPException(status_code=504, detail="generation timed out") from exc
+        except Exception:
+            await self._release_slot(failed=True)
+            raise
+        await self._release_slot(failed=False)
+        return result
+
+    async def _release_after_completion(self, work: "asyncio.Task[tuple[str, int, float]]") -> None:
+        with contextlib.suppress(Exception):
+            await work
+        await self._release_slot(failed=True)
+
+    async def _release_slot(self, *, failed: bool) -> None:
+        async with self._state_lock:
+            self._active = max(0, self._active - 1)
+            if failed:
+                self._failed += 1
+            else:
+                self._completed += 1
+            METRICS.set_gauge("aeitron_serving_active_generations", float(self._active))
+        self._generation_slots.release()
 
 
 def create_app(config: NativeServingConfig | None = None) -> FastAPI:
@@ -143,6 +249,12 @@ def create_app(config: NativeServingConfig | None = None) -> FastAPI:
         require_tokenizer_hash_match=os.environ.get("AEITRON_REQUIRE_TOKENIZER_HASH_MATCH", "1") == "1",
         auth_enabled=os.environ.get("AEITRON_AUTH_ENABLED", "1") == "1",
         quota_enabled=os.environ.get("AEITRON_QUOTA_ENABLED", "1") == "1",
+        max_prompt_characters=int(os.environ.get("AEITRON_MAX_PROMPT_CHARACTERS", "131072")),
+        max_messages=int(os.environ.get("AEITRON_MAX_MESSAGES", "128")),
+        max_queue_depth=int(os.environ.get("AEITRON_MAX_QUEUE_DEPTH", "64")),
+        max_concurrent_generations=int(os.environ.get("AEITRON_MAX_CONCURRENT_GENERATIONS", "1")),
+        queue_timeout_seconds=float(os.environ.get("AEITRON_QUEUE_TIMEOUT_SECONDS", "10")),
+        generation_timeout_seconds=float(os.environ.get("AEITRON_GENERATION_TIMEOUT_SECONDS", "120")),
     )
     if not active_config.checkpoint_manifest:
         raise ValueError("AEITRON_CHECKPOINT_MANIFEST is required")
@@ -151,9 +263,19 @@ def create_app(config: NativeServingConfig | None = None) -> FastAPI:
     state = NativeServingState(active_config)
     app = FastAPI(title="Aeitron Native Scratch Serving", version="1.0.0")
     if active_config.quota_enabled:
-        install_quota(app)
+        quota_config = QuotaConfig.from_env()
+        if not quota_config.enabled or not quota_config.redis_url:
+            raise RuntimeError(
+                "native production serving requires AEITRON_QUOTA_ENABLED=1 and AEITRON_REDIS_URL"
+            )
+        install_quota(app, quota_config)
     if active_config.auth_enabled:
-        install_auth(app)
+        auth_config = AuthConfig.from_env()
+        if not auth_config.enabled or not auth_config.jwt_secret:
+            raise RuntimeError(
+                "native production serving requires AEITRON_AUTH_ENABLED=1 and AEITRON_JWT_SECRET"
+            )
+        install_auth(app, auth_config)
     install_observability(app)
 
     @app.get("/health/live")
@@ -168,13 +290,21 @@ def create_app(config: NativeServingConfig | None = None) -> FastAPI:
     async def models() -> dict[str, Any]:
         return {"data": [{"id": active_config.model_name, "object": "model", "owned_by": "aeitron"}]}
 
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics() -> str:
+        return METRICS.render_prometheus()
+
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: ChatCompletionRequest) -> Any:
-        if request.model != active_config.model_name:
-            raise HTTPException(status_code=404, detail=f"unknown model: {request.model}")
-        if request.stream:
-            return StreamingResponse(_stream_response(state, request), media_type="text/event-stream")
-        text, token_count, latency_ms = state.generate(request)
+    async def chat_completions(payload: ChatCompletionRequest, request: Request) -> Any:
+        if payload.model != active_config.model_name:
+            raise HTTPException(status_code=404, detail=f"unknown model: {payload.model}")
+        if active_config.auth_enabled:
+            scopes = set(getattr(request.state, "jwt_claims", {}).get("scopes", []))
+            if active_config.required_scope not in scopes and "training:admin" not in scopes:
+                raise HTTPException(status_code=403, detail="missing model generation scope")
+        if payload.stream:
+            return StreamingResponse(_stream_response(state, payload), media_type="text/event-stream")
+        text, token_count, latency_ms = await state.generate_async(payload)
         return {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
@@ -189,7 +319,7 @@ def create_app(config: NativeServingConfig | None = None) -> FastAPI:
 
 
 async def _stream_response(state: NativeServingState, request: ChatCompletionRequest) -> Any:
-    text, token_count, latency_ms = state.generate(request)
+    text, token_count, latency_ms = await state.generate_async(request)
     chunk_id = f"chatcmpl-{uuid.uuid4()}"
     for part in text.split():
         payload = {
@@ -225,6 +355,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no-auth", action="store_true")
     parser.add_argument("--no-quota", action="store_true")
     parser.add_argument("--allow-tokenizer-hash-mismatch", action="store_true")
+    parser.add_argument("--max-prompt-characters", type=int, default=131_072)
+    parser.add_argument("--max-messages", type=int, default=128)
+    parser.add_argument("--max-queue-depth", type=int, default=64)
+    parser.add_argument("--max-concurrent-generations", type=int, default=1)
+    parser.add_argument("--queue-timeout-seconds", type=float, default=10.0)
+    parser.add_argument("--generation-timeout-seconds", type=float, default=120.0)
     return parser.parse_args()
 
 
@@ -241,6 +377,12 @@ def main() -> None:
             require_tokenizer_hash_match=not args.allow_tokenizer_hash_mismatch,
             auth_enabled=not args.no_auth,
             quota_enabled=not args.no_quota,
+            max_prompt_characters=args.max_prompt_characters,
+            max_messages=args.max_messages,
+            max_queue_depth=args.max_queue_depth,
+            max_concurrent_generations=args.max_concurrent_generations,
+            queue_timeout_seconds=args.queue_timeout_seconds,
+            generation_timeout_seconds=args.generation_timeout_seconds,
         )
     )
     uvicorn.run(app, host=args.host, port=args.port)

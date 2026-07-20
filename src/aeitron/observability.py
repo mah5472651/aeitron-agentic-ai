@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from threading import RLock
@@ -56,6 +58,7 @@ class HistogramAggregate:
 @dataclass
 class MetricsRegistry:
     counters: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    gauges: dict[str, float] = field(default_factory=dict)
     histograms: dict[str, HistogramAggregate] = field(default_factory=lambda: defaultdict(HistogramAggregate))
     lock: RLock = field(default_factory=RLock)
 
@@ -69,6 +72,18 @@ class MetricsRegistry:
         with self.lock:
             self.histograms[key].observe(value)
 
+    def set_gauge(self, name: str, value: float, **labels: str) -> None:
+        key = self._key(name, labels)
+        with self.lock:
+            self.gauges[key] = value
+
+    def inc_gauge(self, name: str, value: float = 1.0, **labels: str) -> float:
+        key = self._key(name, labels)
+        with self.lock:
+            updated = max(0.0, self.gauges.get(key, 0.0) + value)
+            self.gauges[key] = updated
+            return updated
+
     def render_prometheus(self) -> str:
         lines = [
             "# HELP aeitron_http_requests_total Total HTTP requests.",
@@ -76,6 +91,14 @@ class MetricsRegistry:
         ]
         with self.lock:
             for key, value in sorted(self.counters.items()):
+                lines.append(f"{key} {value}")
+            lines.extend(
+                [
+                    "# HELP aeitron_http_requests_in_progress Requests currently being processed.",
+                    "# TYPE aeitron_http_requests_in_progress gauge",
+                ]
+            )
+            for key, value in sorted(self.gauges.items()):
                 lines.append(f"{key} {value}")
             lines.extend(
                 [
@@ -95,6 +118,7 @@ class MetricsRegistry:
         with self.lock:
             return {
                 "counters": dict(self.counters),
+                "gauges": dict(self.gauges),
                 "histograms": {
                     key: {"count": value.count, "max": value.maximum if value.count else 0.0}
                     for key, value in self.histograms.items()
@@ -102,9 +126,14 @@ class MetricsRegistry:
             }
 
     def _key(self, name: str, labels: dict[str, str]) -> str:
+        if re.fullmatch(r"[a-zA-Z_:][a-zA-Z0-9_:]*", name) is None:
+            raise ValueError(f"invalid Prometheus metric name: {name!r}")
         if not labels:
             return name
-        label_text = ",".join(f'{key}="{value}"' for key, value in sorted(labels.items()))
+        label_text = ",".join(
+            f'{key}="{self._escape_label(value)}"'
+            for key, value in sorted(labels.items())
+        )
         return f"{name}{{{label_text}}}"
 
     def _with_labels(self, metric_key: str, labels: dict[str, str]) -> str:
@@ -119,6 +148,10 @@ class MetricsRegistry:
         name, labels = metric_key.split("{", 1)
         return f"{name}_count{{{labels}"
 
+    @staticmethod
+    def _escape_label(value: str) -> str:
+        return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
 
 METRICS = MetricsRegistry()
 LOGGER = logging.getLogger("aeitron.gateway")
@@ -128,24 +161,53 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         started = time.perf_counter()
         status_code = 500
+        supplied_request_id = request.headers.get("x-request-id", "")
+        request_id = (
+            supplied_request_id
+            if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", supplied_request_id)
+            else str(uuid.uuid4())
+        )
+        request.state.request_id = request_id
+        route_label = request.url.path
+        METRICS.inc_gauge("aeitron_http_requests_in_progress", 1.0)
         try:
             response = await call_next(request)
             status_code = response.status_code
+            response.headers["X-Request-ID"] = request_id
             return response
         finally:
             duration_ms = (time.perf_counter() - started) * 1000
-            route = request.url.path
+            route_object = request.scope.get("route")
+            route_label = str(getattr(route_object, "path", route_label))
             method = request.method
-            METRICS.inc("aeitron_http_requests_total", method=method, path=route, status=str(status_code))
-            METRICS.observe("aeitron_http_request_duration_ms", duration_ms, method=method, path=route)
+            METRICS.inc_gauge("aeitron_http_requests_in_progress", -1.0)
+            METRICS.inc(
+                "aeitron_http_requests_total",
+                method=method,
+                path=route_label,
+                status=str(status_code),
+            )
+            METRICS.observe(
+                "aeitron_http_request_duration_ms",
+                duration_ms,
+                method=method,
+                path=route_label,
+            )
+            if status_code >= 500:
+                METRICS.inc(
+                    "aeitron_http_server_errors_total",
+                    method=method,
+                    path=route_label,
+                )
             LOGGER.info(
                 "http_request",
                 extra={
                     "method": method,
-                    "path": route,
+                    "path": route_label,
                     "status_code": status_code,
                     "duration_ms": round(duration_ms, 3),
                     "user_id": getattr(request.state, "user_id", ""),
+                    "request_id": request_id,
                 },
             )
 

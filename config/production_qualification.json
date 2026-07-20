@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "evidence_max_age_seconds": 86400,
+  "minimum_security_reviewers": 2,
+  "require_report_signature_in_production": true,
+  "require_operator_notification_proof": true,
+  "load_stages": [
+    {
+      "name": "concurrency-10",
+      "concurrency": 10,
+      "requests": 50,
+      "streaming_requests": 5,
+      "maximum_error_rate": 0.01,
+      "maximum_p95_latency_ms": 30000,
+      "minimum_throughput_rps": 0.1
+    },
+    {
+      "name": "concurrency-100",
+      "concurrency": 100,
+      "requests": 300,
+      "streaming_requests": 20,
+      "maximum_error_rate": 0.01,
+      "maximum_p95_latency_ms": 30000,
+      "minimum_throughput_rps": 0.5
+    },
+    {
+      "name": "concurrency-500",
+      "concurrency": 500,
+      "requests": 1000,
+      "streaming_requests": 50,
+      "maximum_error_rate": 0.01,
+      "maximum_p95_latency_ms": 30000,
+      "minimum_throughput_rps": 1.0
+    },
+    {
+      "name": "concurrency-1000",
+      "concurrency": 1000,
+      "requests": 2000,
+      "streaming_requests": 100,
+      "maximum_error_rate": 0.01,
+      "maximum_p95_latency_ms": 30000,
+      "minimum_throughput_rps": 1.0
+    }
+  ],
+  "required_training_proofs": [
+    "postgres_redis_minio_lifecycle",
+    "ordered_event_stress_1000000",
+    "docker_disaster_recovery_drill",
+    "worker_loss_retry_recovery"
+  ],
+  "required_soak_seconds": [
+    86400,
+    604800
+  ],
+  "required_security_domains": [
+    "authentication_authorization",
+    "ssrf",
+    "path_traversal",
+    "sandbox_escape",
+    "secrets_and_iam",
+    "dependency_supply_chain",
+    "container_kubernetes"
+  ],
+  "required_canary_percentages": [
+    1,
+    10,
+    50,
+    100
+  ],
+  "minimum_internal_canary_users": 1,
+  "maximum_internal_canary_users": 5,
+  "canary_maximum_error_rate": 0.01,
+  "canary_maximum_p95_latency_ms": 30000,
+  "canary_rollback_error_rate": 0.02,
+  "canary_maximum_rollback_seconds": 120
+}

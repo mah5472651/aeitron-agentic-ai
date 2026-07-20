@@ -153,10 +153,22 @@
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
       - prometheus-data:/prometheus
     depends_on:
       api:
         condition: service_healthy
+      alertmanager:
+        condition: service_started
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    profiles: ["monitoring"]
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
   grafana:
     image: grafana/grafana:11.3.1
     profiles: ["monitoring"]
@@ -176,6 +188,7 @@
     command: ["--config=/etc/otel-collector.yaml"]
     ports:
       - "4318:4318"
+      - "127.0.0.1:13133:13133"
     volumes:
       - ./otel-collector.yaml:/etc/otel-collector.yaml:ro
   postgres:
@@ -247,4 +260,5 @@ volumes:
   grafana-data:
   qdrant-data:
   training-runtime:
+  alertmanager-data:
 

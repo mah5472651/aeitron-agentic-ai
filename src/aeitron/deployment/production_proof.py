@@ -52,7 +52,12 @@ class NativeServingLoadReport(StrictModel):
     failed: int
     latency_ms_p50: float
     latency_ms_p95: float
+    latency_ms_p99: float = 0.0
     max_latency_ms: float
+    duration_seconds: float = 0.0
+    throughput_rps: float = 0.0
+    response_bytes: int = Field(default=0, ge=0)
+    status_codes: dict[str, int] = Field(default_factory=dict)
     timeout_count: int
     streaming_requests: int = Field(default=0, ge=0)
     streaming_passed: int = Field(default=0, ge=0)
@@ -578,6 +583,15 @@ async def run_production_proof(config: ProductionProofConfig) -> ProductionProof
     return report
 
 
+def canonical_payload_bytes(payload: Any) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 async def run_native_serving_load_test(
     *,
     endpoint: str,
@@ -596,11 +610,14 @@ async def run_native_serving_load_test(
     timeout_count = 0
     streaming_passed = 0
     content_validation_failures = 0
+    response_bytes = 0
+    status_codes: dict[str, int] = {}
     headers = _auth_headers_value(api_key)
     timeout = httpx.Timeout(timeout_seconds)
+    test_started = time.perf_counter()
 
     async def one(client: httpx.AsyncClient, index: int) -> None:
-        nonlocal timeout_count, streaming_passed, content_validation_failures
+        nonlocal timeout_count, streaming_passed, content_validation_failures, response_bytes
         async with semaphore:
             started = time.perf_counter()
             try:
@@ -625,8 +642,12 @@ async def run_native_serving_load_test(
                         headers=headers,
                         json=request_payload,
                     ) as response:
+                        status_codes[str(response.status_code)] = status_codes.get(
+                            str(response.status_code), 0
+                        ) + 1
                         response.raise_for_status()
                         async for line in response.aiter_lines():
+                            response_bytes += len(line.encode("utf-8", "replace"))
                             if not line.startswith("data: "):
                                 continue
                             data = line[6:]
@@ -651,8 +672,17 @@ async def run_native_serving_load_test(
                         headers=headers,
                         json=request_payload,
                     )
+                    status_codes[str(response.status_code)] = status_codes.get(
+                        str(response.status_code), 0
+                    ) + 1
                     response.raise_for_status()
                     payload = response.json()
+                    raw_content = getattr(response, "content", None)
+                    response_bytes += (
+                        len(raw_content)
+                        if isinstance(raw_content, bytes)
+                        else len(canonical_payload_bytes(payload))
+                    )
                     choices = payload.get("choices") or []
                     content = (
                         choices[0].get("message", {}).get("content")
@@ -673,12 +703,19 @@ async def run_native_serving_load_test(
             except Exception as exc:
                 errors.append(str(exc)[:240])
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    limits = httpx.Limits(
+        max_connections=max(1, concurrency),
+        max_keepalive_connections=max(1, min(concurrency, 256)),
+        keepalive_expiry=30.0,
+    )
+    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
         await asyncio.gather(*(one(client, index) for index in range(requests)))
+    duration_seconds = max(time.perf_counter() - test_started, 1e-9)
     passed = len(latencies)
     sorted_latencies = sorted(latencies)
     p50 = statistics.median(sorted_latencies) if sorted_latencies else 0.0
     p95 = sorted_latencies[min(len(sorted_latencies) - 1, int(len(sorted_latencies) * 0.95))] if sorted_latencies else 0.0
+    p99 = sorted_latencies[min(len(sorted_latencies) - 1, int(len(sorted_latencies) * 0.99))] if sorted_latencies else 0.0
     status = (
         "passed"
         if passed == requests
@@ -696,7 +733,12 @@ async def run_native_serving_load_test(
         failed=requests - passed,
         latency_ms_p50=round(p50, 3),
         latency_ms_p95=round(p95, 3),
+        latency_ms_p99=round(p99, 3),
         max_latency_ms=round(max(sorted_latencies) if sorted_latencies else 0.0, 3),
+        duration_seconds=round(duration_seconds, 6),
+        throughput_rps=round(passed / duration_seconds, 6),
+        response_bytes=response_bytes,
+        status_codes=dict(sorted(status_codes.items())),
         timeout_count=timeout_count,
         streaming_requests=streaming_requests,
         streaming_passed=streaming_passed,

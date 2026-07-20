@@ -5287,5 +5287,140 @@ return valid model-bound content, and benchmark/scorecard/profile hashes must
 match. These checks still require real services and cannot be completed by a
 local unit test.
 
+## Authoritative Production Qualification Control Plane
+
+### Purpose and ownership
+
+Individual smoke, scanner, load, soak, and recovery reports are evidence, not
+independent release decisions. A copied or old report can look valid after its
+dependencies, model, policy, or deployment have changed.
+
+`src/aeitron/deployment/production_qualification.py` is the single final
+production decision authority. It emits ten non-overlapping subsystem results:
+
+1. production proof baseline;
+2. real dependency E2E;
+3. functional hardening;
+4. native model serving;
+5. load and capacity;
+6. failure and chaos;
+7. observability;
+8. soak and recovery;
+9. independent security review;
+10. canary release.
+
+Every result is `passed`, `failed`, `blocked`, or `not_run`. A broken
+measurement is failed. Missing external infrastructure or human evidence is
+blocked. An optional fixed gate that was not requested is not-run.
+
+### Evidence integrity and freshness
+
+The strict contract is `config/production_qualification.json`. Its SHA-256 is
+embedded in every decision. Evidence must be a regular non-symlink file, no
+larger than 128 MiB, inside the policy freshness window, and unchanged after
+binding. Training, security, and canary evidence also carries an internal
+timezone-aware timestamp, so touching an old file cannot make it current.
+
+Reports are stored as:
+
+```text
+artifacts/aeitron/production-qualification/
+  runs/<report-id>/production_qualification_report.json
+  runs/<report-id>/production_qualification_report.json.sha256
+  latest.json
+```
+
+A run directory is create-once and cannot be overwritten. Each report binds
+the previous report digest. `latest.json` is an atomic pointer and its target
+hash is checked before another decision can be written. Production mode
+requires a secret-manager-provided `AEITRON_PROOF_SIGNING_KEY` of at least
+32 bytes and signs the canonical report digest using HMAC-SHA256.
+
+### Functional correctness
+
+`--run-functional-gates` executes only fixed argv commands, never a supplied
+shell string:
+
+```text
+compileall
+full unittest discovery
+release_gate
+```
+
+Stdout and stderr become hash-bound evidence. Property-based tests exercise
+policy ranges and malformed JSON. Focused tests cover stale and tampered
+reports, Unicode, empty and oversized serving requests, queue timeout,
+background-worker cancellation safety, corrupted checkpoints, retries,
+idempotency, and rollback.
+
+### Dependency and failure proof
+
+The live probe applies Postgres migrations, executes the Redis quota Lua
+script, performs object-store write/read/checksum/delete, and performs Qdrant
+create/upsert/query/delete. The isolated Docker recovery proof also checks:
+
+```text
+Postgres dump -> restore -> restart
+Redis AOF save -> restart -> persisted-key read
+MinIO write -> restart -> checksum read -> delete
+Qdrant point upsert -> restart -> vector query -> collection delete
+worker loss -> bounded retry/requeue
+```
+
+The restart drill resolves containers only through its configured Compose
+project and service labels. Its Qdrant endpoint must be loopback, preventing
+the proof runner from restarting a shared or arbitrary remote service.
+
+### Native serving reliability
+
+Native serving rejects empty content, unsupported roles, excess messages,
+oversized prompts, and context-window overflow. Production startup fails if
+auth or Redis quota is requested but not actually configured.
+
+Generation uses bounded queue depth, bounded concurrent slots, queue timeout,
+and execution timeout. If thread-backed generation times out, its slot remains
+held until the worker exits; another model operation cannot overlap the
+still-running task. Readiness exposes queue, active, completed, failed,
+timeout, checkpoint, tokenizer, and CUDA-memory evidence. `/metrics` is exposed
+and every HTTP response receives a validated correlation ID.
+
+### Load, observability, soak, and canary
+
+The default load ladder is 10, 100, 500, and 1,000 concurrent requests. The
+HTTP pool is explicitly sized to stage concurrency instead of silently using
+the client's 100-connection default. Each stage measures p50/p95/p99/max
+latency, throughput, error rate, timeouts, status codes, response bytes, and
+SSE completion. A failed stage stops advancement.
+
+Prometheus loads `deploy/prod/alert-rules.yml`, Alertmanager loads
+`deploy/prod/alertmanager.yml`, and OpenTelemetry exposes health on port 13133.
+Qualification sends a unique informational synthetic alert routed to the
+dedicated null receiver, observes it active, resolves it, and requires it to
+disappear. A separate fresh, hash-bound operator notification report must prove
+that the external channel delivered both the firing and recovery notifications.
+It stores a recipient-reference hash and provider delivery IDs, never a
+destination address or secret.
+
+Soak promotion requires both `infrastructure_soak_86400s` and
+`infrastructure_soak_604800s`. Validation checks measured duration, requested
+duration, successful transactions, freshness, and pass state. Renaming a short
+smoke report cannot satisfy either duration.
+
+Manual security evidence requires two distinct reviewers, no unresolved
+critical/high findings, and passed review of auth, SSRF, path traversal,
+sandbox escape, secrets/IAM, dependency supply chain, and
+container/Kubernetes security. The manual record must bind the scanner report
+generated by the same qualification run.
+
+Canary promotion requires 1-5 real internal users and complete 1%, 10%, 50%,
+and 100% traffic evidence. Every stage must meet latency/error SLOs and contain
+a successful rollback-trigger test. Since users and traffic are external facts,
+missing canary evidence remains blocked.
+
+The complete production command is documented in README under
+**Authoritative Production Qualification**. Building this control plane does
+not retroactively prove the 24-hour run, 7-day run, independent review, or
+real-user canary.
+
 
 

@@ -1,0 +1,1343 @@
+"""Authoritative production qualification control plane for Aeitron.
+
+This module turns measured evidence into one tamper-evident release decision.
+It does not replace live probes, training proofs, scanners, or canary systems;
+it validates and binds their outputs so stale or partial reports cannot be
+mistaken for current production evidence.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import platform
+import re
+import subprocess  # nosec B404 - every subprocess argv is fixed internally
+import sys
+import time
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Literal
+
+import httpx
+from pydantic import Field, field_validator, model_validator
+
+from src.aeitron.deployment.production_proof import (
+    NativeServingLoadReport,
+    ProductionProofConfig,
+    ProductionProofReport,
+    _validated_service_url,
+    run_native_serving_load_test,
+    run_production_proof,
+)
+from src.aeitron.model_ops.foundation import sha256_file
+from src.aeitron.shared.schemas import StrictModel
+
+
+QualificationStatus = Literal["passed", "failed", "blocked", "not_run"]
+HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def canonical_bytes(payload: Any) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+class LoadStagePolicy(StrictModel):
+    name: str = Field(min_length=1, max_length=128)
+    concurrency: int = Field(ge=1, le=10_000)
+    requests: int = Field(ge=1, le=100_000)
+    streaming_requests: int = Field(ge=0, le=10_000)
+    maximum_error_rate: float = Field(ge=0.0, le=1.0)
+    maximum_p95_latency_ms: float = Field(gt=0.0, le=3_600_000.0)
+    minimum_throughput_rps: float = Field(gt=0.0)
+
+    @model_validator(mode="after")
+    def validate_stage(self) -> "LoadStagePolicy":
+        if self.streaming_requests > self.requests:
+            raise ValueError("streaming_requests cannot exceed requests")
+        if self.requests < self.concurrency:
+            raise ValueError("requests must be at least concurrency")
+        return self
+
+
+class QualificationPolicy(StrictModel):
+    schema_version: int = Field(default=1, ge=1)
+    evidence_max_age_seconds: int = Field(ge=60, le=31_536_000)
+    minimum_security_reviewers: int = Field(ge=2, le=20)
+    require_report_signature_in_production: bool = True
+    require_operator_notification_proof: bool = True
+    load_stages: list[LoadStagePolicy] = Field(min_length=1)
+    required_training_proofs: list[str] = Field(min_length=1)
+    required_soak_seconds: list[int] = Field(min_length=2)
+    required_security_domains: list[str] = Field(min_length=1)
+    required_canary_percentages: list[int] = Field(min_length=1)
+    minimum_internal_canary_users: int = Field(ge=1)
+    maximum_internal_canary_users: int = Field(ge=1)
+    canary_maximum_error_rate: float = Field(ge=0.0, le=1.0)
+    canary_maximum_p95_latency_ms: float = Field(gt=0.0)
+    canary_rollback_error_rate: float = Field(gt=0.0, le=1.0)
+    canary_maximum_rollback_seconds: float = Field(gt=0.0, le=3600.0)
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> "QualificationPolicy":
+        if self.minimum_internal_canary_users > self.maximum_internal_canary_users:
+            raise ValueError("minimum_internal_canary_users exceeds maximum")
+        if sorted(self.required_canary_percentages) != self.required_canary_percentages:
+            raise ValueError("required_canary_percentages must be ordered")
+        if len(set(self.required_canary_percentages)) != len(self.required_canary_percentages):
+            raise ValueError("required_canary_percentages contains duplicates")
+        if self.required_canary_percentages[-1] != 100:
+            raise ValueError("canary ladder must end at 100 percent")
+        if self.canary_rollback_error_rate <= self.canary_maximum_error_rate:
+            raise ValueError("rollback error threshold must exceed normal canary error threshold")
+        if len(set(stage.concurrency for stage in self.load_stages)) != len(self.load_stages):
+            raise ValueError("load stage concurrency values must be unique")
+        return self
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "QualificationPolicy":
+        source = Path(path).expanduser().resolve(strict=True)
+        if source.stat().st_size > 1_048_576:
+            raise ValueError("qualification policy exceeds 1 MiB")
+        return cls.model_validate_json(source.read_text(encoding="utf-8-sig"))
+
+
+class EvidenceBinding(StrictModel):
+    evidence_id: str
+    path: str
+    sha256: str
+    size_bytes: int = Field(ge=0)
+    modified_at_unix: float
+    age_seconds: float = Field(ge=0.0)
+
+    @field_validator("sha256")
+    @classmethod
+    def validate_sha256(cls, value: str) -> str:
+        if HEX_SHA256.fullmatch(value) is None:
+            raise ValueError("invalid SHA-256 digest")
+        return value
+
+
+class QualificationCheck(StrictModel):
+    subsystem: str
+    status: QualificationStatus
+    summary: str
+    evidence: list[EvidenceBinding] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    blockers: list[str] = Field(default_factory=list)
+
+
+class LoadStageResult(StrictModel):
+    name: str
+    status: QualificationStatus
+    concurrency: int
+    requests: int
+    error_rate: float = Field(ge=0.0, le=1.0)
+    throughput_rps: float = Field(ge=0.0)
+    latency_ms_p50: float = Field(ge=0.0)
+    latency_ms_p95: float = Field(ge=0.0)
+    latency_ms_p99: float = Field(ge=0.0)
+    maximum_latency_ms: float = Field(ge=0.0)
+    streaming_passed: int = Field(ge=0)
+    blockers: list[str] = Field(default_factory=list)
+
+
+class ProductionQualificationReport(StrictModel):
+    schema_version: int = 1
+    report_id: str
+    status: QualificationStatus
+    mode: Literal["validation", "production"]
+    created_at: str
+    git_commit: str
+    policy_sha256: str
+    previous_report_sha256: str | None = None
+    environment: dict[str, str]
+    checks: list[QualificationCheck]
+    load_stages: list[LoadStageResult] = Field(default_factory=list)
+    report_sha256: str = ""
+    signature_algorithm: str | None = None
+    signature: str | None = None
+
+    @field_validator("policy_sha256", "report_sha256")
+    @classmethod
+    def validate_optional_digest(cls, value: str) -> str:
+        if value and HEX_SHA256.fullmatch(value) is None:
+            raise ValueError("invalid SHA-256 digest")
+        return value
+
+
+class SecurityReviewEvidence(StrictModel):
+    schema_version: int = 1
+    review_id: str = Field(min_length=1, max_length=256)
+    reviewed_at: str
+    reviewers: list[str] = Field(min_length=2)
+    domains: dict[str, Literal["passed", "failed"]]
+    critical_findings: int = Field(ge=0)
+    high_findings: int = Field(ge=0)
+    unresolved_findings: list[str] = Field(default_factory=list)
+    scanner_report_sha256: str
+    decision: Literal["approved", "rejected"]
+
+    @field_validator("scanner_report_sha256")
+    @classmethod
+    def validate_scanner_digest(cls, value: str) -> str:
+        if HEX_SHA256.fullmatch(value) is None:
+            raise ValueError("scanner_report_sha256 must be a SHA-256 digest")
+        return value
+
+    @model_validator(mode="after")
+    def validate_independence(self) -> "SecurityReviewEvidence":
+        normalized = {reviewer.strip().lower() for reviewer in self.reviewers}
+        if len(normalized) != len(self.reviewers):
+            raise ValueError("security reviewers must be distinct")
+        return self
+
+
+class CanaryStageEvidence(StrictModel):
+    percentage: int = Field(ge=1, le=100)
+    requests: int = Field(ge=1)
+    error_rate: float = Field(ge=0.0, le=1.0)
+    p95_latency_ms: float = Field(ge=0.0)
+    rollback_trigger_tested: bool
+    rollback_trigger_error_rate: float = Field(ge=0.0, le=1.0)
+    rollback_succeeded: bool
+    rollback_completed_seconds: float = Field(ge=0.0)
+
+
+class CanaryEvidence(StrictModel):
+    schema_version: int = 1
+    canary_id: str = Field(min_length=1, max_length=256)
+    created_at: str
+    internal_user_count: int = Field(ge=1)
+    stages: list[CanaryStageEvidence] = Field(min_length=1)
+    status: Literal["passed", "failed"]
+
+
+class OperatorNotificationEvidence(StrictModel):
+    schema_version: int = 1
+    proof_id: str = Field(min_length=1, max_length=256)
+    created_at: str
+    provider: str = Field(min_length=1, max_length=128)
+    channel_type: Literal["email", "pager", "slack", "teams", "webhook"]
+    recipient_reference_sha256: str
+    firing_delivery_id: str = Field(min_length=1, max_length=512)
+    recovery_delivery_id: str = Field(min_length=1, max_length=512)
+    firing_delivered_at: str
+    recovery_delivered_at: str
+    firing_delivered: bool
+    recovery_delivered: bool
+    status: Literal["passed", "failed"]
+
+    @field_validator("recipient_reference_sha256")
+    @classmethod
+    def validate_recipient_digest(cls, value: str) -> str:
+        if HEX_SHA256.fullmatch(value) is None:
+            raise ValueError("recipient_reference_sha256 must be a SHA-256 digest")
+        return value
+
+    @model_validator(mode="after")
+    def validate_deliveries(self) -> "OperatorNotificationEvidence":
+        if hmac.compare_digest(self.firing_delivery_id, self.recovery_delivery_id):
+            raise ValueError("firing and recovery delivery IDs must be distinct")
+        return self
+
+
+class ImmutableQualificationStore:
+    def __init__(self, root: str | Path, *, signing_key: str | None) -> None:
+        self.root = Path(root).expanduser().resolve()
+        self.signing_key = signing_key
+
+    def write(self, report: ProductionQualificationReport) -> Path:
+        self.root.mkdir(parents=True, exist_ok=True)
+        previous_digest = self._latest_digest()
+        unsigned = report.model_copy(
+            update={
+                "previous_report_sha256": previous_digest,
+                "report_sha256": "",
+                "signature_algorithm": None,
+                "signature": None,
+            }
+        )
+        digest = hashlib.sha256(canonical_bytes(unsigned.model_dump())).hexdigest()
+        signature = None
+        algorithm = None
+        if self.signing_key:
+            signature = hmac.new(
+                self.signing_key.encode("utf-8"),
+                digest.encode("ascii"),
+                hashlib.sha256,
+            ).hexdigest()
+            algorithm = "HMAC-SHA256"
+        final = unsigned.model_copy(
+            update={
+                "report_sha256": digest,
+                "signature_algorithm": algorithm,
+                "signature": signature,
+            }
+        )
+        run_dir = self.root / "runs" / final.report_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        report_path = run_dir / "production_qualification_report.json"
+        self._write_exclusive(report_path, canonical_bytes(final.model_dump()) + b"\n")
+        self._write_exclusive(
+            report_path.with_suffix(".json.sha256"),
+            f"{sha256_file(report_path)}  {report_path.name}\n".encode("ascii"),
+        )
+        pointer = {
+            "schema_version": 1,
+            "report_id": final.report_id,
+            "report_path": str(report_path),
+            "file_sha256": sha256_file(report_path),
+            "report_sha256": final.report_sha256,
+            "updated_at": utc_now(),
+        }
+        self._write_atomic(self.root / "latest.json", canonical_bytes(pointer) + b"\n")
+        return report_path
+
+    def _latest_digest(self) -> str | None:
+        pointer_path = self.root / "latest.json"
+        if not pointer_path.exists():
+            return None
+        payload = json.loads(pointer_path.read_text(encoding="utf-8-sig"))
+        report_path = Path(str(payload["report_path"])).expanduser().resolve(strict=True)
+        actual = sha256_file(report_path)
+        if not hmac.compare_digest(actual, str(payload["file_sha256"])):
+            raise ValueError("latest qualification report file hash mismatch")
+        report = verify_qualification_report(report_path, signing_key=self.signing_key)
+        if not report.report_sha256:
+            raise ValueError("latest qualification report has no report digest")
+        return report.report_sha256
+
+    @staticmethod
+    def _write_exclusive(path: Path, content: bytes) -> None:
+        with path.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _write_atomic(path: Path, content: bytes) -> None:
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def verify_qualification_report(
+    path: str | Path,
+    *,
+    signing_key: str | None,
+) -> ProductionQualificationReport:
+    source = Path(path).expanduser().resolve(strict=True)
+    report = ProductionQualificationReport.model_validate_json(
+        source.read_text(encoding="utf-8-sig")
+    )
+    unsigned = report.model_copy(
+        update={
+            "report_sha256": "",
+            "signature_algorithm": None,
+            "signature": None,
+        }
+    )
+    expected_digest = hashlib.sha256(canonical_bytes(unsigned.model_dump())).hexdigest()
+    if not hmac.compare_digest(expected_digest, report.report_sha256):
+        raise ValueError("qualification report digest verification failed")
+    if report.signature_algorithm or report.signature:
+        if report.signature_algorithm != "HMAC-SHA256" or not report.signature:
+            raise ValueError("qualification report signature metadata is incomplete")
+        if not signing_key:
+            raise ValueError("qualification report signature cannot be verified without signing key")
+        expected_signature = hmac.new(
+            signing_key.encode("utf-8"),
+            report.report_sha256.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected_signature, report.signature):
+            raise ValueError("qualification report signature verification failed")
+    return report
+
+
+def bind_evidence(
+    path: str | Path,
+    *,
+    evidence_id: str,
+    maximum_age_seconds: int,
+) -> EvidenceBinding:
+    candidate = Path(path).expanduser().absolute()
+    current = candidate
+    while True:
+        if current.exists() and current.is_symlink():
+            raise ValueError(f"{evidence_id} path cannot contain symlinks")
+        if current.parent == current:
+            break
+        current = current.parent
+    source = candidate.resolve(strict=True)
+    if not source.is_file():
+        raise ValueError(f"{evidence_id} must be a regular non-symlink file")
+    stat = source.stat()
+    if stat.st_size > 128 * 1024 * 1024:
+        raise ValueError(f"{evidence_id} exceeds the 128 MiB evidence limit")
+    age = max(0.0, time.time() - stat.st_mtime)
+    if age > maximum_age_seconds:
+        raise ValueError(
+            f"{evidence_id} is stale: age={age:.0f}s, maximum={maximum_age_seconds}s"
+        )
+    return EvidenceBinding(
+        evidence_id=evidence_id,
+        path=str(source),
+        sha256=sha256_file(source),
+        size_bytes=stat.st_size,
+        modified_at_unix=stat.st_mtime,
+        age_seconds=round(age, 3),
+    )
+
+
+def load_json_evidence(binding: EvidenceBinding) -> Any:
+    source = Path(binding.path)
+    if not hmac.compare_digest(sha256_file(source), binding.sha256):
+        raise ValueError(f"{binding.evidence_id} changed after it was bound")
+    return json.loads(source.read_text(encoding="utf-8-sig"))
+
+
+def require_fresh_timestamp(
+    value: str,
+    *,
+    label: str,
+    maximum_age_seconds: int,
+) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} timestamp must include a timezone")
+    age = (datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds()
+    if age < -300:
+        raise ValueError(f"{label} timestamp is more than five minutes in the future")
+    if age > maximum_age_seconds:
+        raise ValueError(
+            f"{label} timestamp is stale: age={age:.0f}s, maximum={maximum_age_seconds}s"
+        )
+    return parsed
+
+
+def _git_commit() -> str:
+    completed = subprocess.run(  # nosec B603 - fixed git argv, no shell
+        ["git", "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    value = completed.stdout.strip().lower()
+    return value if completed.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", value) else "unavailable"
+
+
+def run_fixed_functional_gates(output_dir: Path, *, timeout_seconds: int) -> QualificationCheck:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    commands = [
+        [sys.executable, "-m", "compileall", "-q", "src/aeitron", "tests", "deploy/gpu"],
+        [sys.executable, "-m", "unittest"],
+        [sys.executable, "-m", "src.aeitron.evaluation.release_gate", "--skip-tests"],
+    ]
+    evidence: list[EvidenceBinding] = []
+    failures: list[str] = []
+    command_reports: list[dict[str, Any]] = []
+    for index, argv in enumerate(commands, start=1):
+        started = time.perf_counter()
+        try:
+            completed = subprocess.run(  # nosec B603 - fixed internal argv, no shell
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            stdout_path = output_dir / f"gate-{index}.stdout.log"
+            stderr_path = output_dir / f"gate-{index}.stderr.log"
+            stdout_path.write_text(completed.stdout, encoding="utf-8")
+            stderr_path.write_text(completed.stderr, encoding="utf-8")
+            evidence.extend(
+                [
+                    bind_evidence(
+                        stdout_path,
+                        evidence_id=f"functional-gate-{index}-stdout",
+                        maximum_age_seconds=60,
+                    ),
+                    bind_evidence(
+                        stderr_path,
+                        evidence_id=f"functional-gate-{index}-stderr",
+                        maximum_age_seconds=60,
+                    ),
+                ]
+            )
+            command_reports.append(
+                {
+                    "argv": argv,
+                    "exit_code": completed.returncode,
+                    "duration_seconds": round(time.perf_counter() - started, 3),
+                }
+            )
+            if completed.returncode != 0:
+                failures.append(f"functional gate {index} exited {completed.returncode}")
+        except subprocess.TimeoutExpired:
+            failures.append(f"functional gate {index} exceeded {timeout_seconds}s")
+    return QualificationCheck(
+        subsystem="functional_hardening",
+        status="passed" if not failures else "failed",
+        summary="Fixed compile, full unit/integration suite, and release gate.",
+        evidence=evidence,
+        metrics={"commands": command_reports},
+        blockers=failures,
+    )
+
+
+async def run_load_ladder(
+    *,
+    policy: QualificationPolicy,
+    endpoint: str | None,
+    model: str,
+    api_key: str | None,
+    timeout_seconds: float,
+) -> list[LoadStageResult]:
+    if not endpoint:
+        return [
+            LoadStageResult(
+                name=stage.name,
+                status="blocked",
+                concurrency=stage.concurrency,
+                requests=stage.requests,
+                error_rate=1.0,
+                throughput_rps=0.0,
+                latency_ms_p50=0.0,
+                latency_ms_p95=0.0,
+                latency_ms_p99=0.0,
+                maximum_latency_ms=0.0,
+                streaming_passed=0,
+                blockers=["serving endpoint is not configured"],
+            )
+            for stage in policy.load_stages
+        ]
+    results: list[LoadStageResult] = []
+    for stage in policy.load_stages:
+        started = time.perf_counter()
+        raw: NativeServingLoadReport = await run_native_serving_load_test(
+            endpoint=endpoint,
+            model=model,
+            api_key=api_key,
+            requests=stage.requests,
+            concurrency=stage.concurrency,
+            timeout_seconds=timeout_seconds,
+            streaming_requests=stage.streaming_requests,
+        )
+        duration = max(time.perf_counter() - started, 1e-9)
+        error_rate = raw.failed / max(1, raw.requests)
+        throughput = raw.passed / duration
+        blockers: list[str] = []
+        if error_rate > stage.maximum_error_rate:
+            blockers.append("error rate exceeded stage SLO")
+        if raw.latency_ms_p95 > stage.maximum_p95_latency_ms:
+            blockers.append("p95 latency exceeded stage SLO")
+        if throughput < stage.minimum_throughput_rps:
+            blockers.append("throughput was below stage SLO")
+        if raw.streaming_passed != stage.streaming_requests:
+            blockers.append("not every SSE request completed")
+        results.append(
+            LoadStageResult(
+                name=stage.name,
+                status="passed" if raw.status == "passed" and not blockers else "failed",
+                concurrency=stage.concurrency,
+                requests=stage.requests,
+                error_rate=round(error_rate, 6),
+                throughput_rps=round(throughput, 6),
+                latency_ms_p50=raw.latency_ms_p50,
+                latency_ms_p95=raw.latency_ms_p95,
+                latency_ms_p99=raw.latency_ms_p99,
+                maximum_latency_ms=raw.max_latency_ms,
+                streaming_passed=raw.streaming_passed,
+                blockers=blockers + raw.error_samples[:5],
+            )
+        )
+        if results[-1].status != "passed":
+            break
+    return results
+
+
+def validate_training_proofs(
+    path: str | None,
+    *,
+    policy: QualificationPolicy,
+) -> tuple[QualificationCheck, QualificationCheck]:
+    if not path:
+        blocked = QualificationCheck(
+            subsystem="failure_chaos",
+            status="blocked",
+            summary="No measured training/failure proof report was supplied.",
+            blockers=["--training-proof-report is required"],
+        )
+        soak = QualificationCheck(
+            subsystem="soak_recovery",
+            status="blocked",
+            summary="24-hour and 7-day soak evidence is absent.",
+            blockers=["a current training proof report containing both soak durations is required"],
+        )
+        return blocked, soak
+    try:
+        binding = bind_evidence(
+            path,
+            evidence_id="training-proof-report",
+            maximum_age_seconds=policy.evidence_max_age_seconds,
+        )
+        payload = load_json_evidence(binding)
+        if int(payload.get("schema_version", 0)) != 1:
+            raise ValueError("training proof report schema_version must be 1")
+        require_fresh_timestamp(
+            str(payload.get("generated_at") or ""),
+            label="training proof report",
+            maximum_age_seconds=policy.evidence_max_age_seconds,
+        )
+        rows = payload.get("proofs", [])
+        if not isinstance(rows, list):
+            raise ValueError("training proof report proofs must be a list")
+        statuses = {
+            str(row.get("name")): str(row.get("status"))
+            for row in rows
+            if isinstance(row, dict)
+        }
+        missing_failure = [
+            name
+            for name in policy.required_training_proofs
+            if statuses.get(name) != "passed"
+        ]
+        proof_by_name = {
+            str(row.get("name")): row
+            for row in rows
+            if isinstance(row, dict)
+        }
+        semantic_errors = [
+            error
+            for name in policy.required_training_proofs
+            for error in _validate_training_proof_semantics(
+                name,
+                proof_by_name.get(name),
+            )
+        ]
+        soak_names = [f"infrastructure_soak_{seconds}s" for seconds in policy.required_soak_seconds]
+        missing_soak = [name for name in soak_names if statuses.get(name) != "passed"]
+        for seconds, name in zip(policy.required_soak_seconds, soak_names, strict=True):
+            row = proof_by_name.get(name)
+            if not isinstance(row, dict):
+                continue
+            evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
+            if float(row.get("duration_seconds", 0.0)) < seconds * 0.99:
+                missing_soak.append(f"{name}: measured duration was too short")
+            if int(evidence.get("requested_seconds", 0)) != seconds:
+                missing_soak.append(f"{name}: requested duration evidence mismatch")
+            if int(evidence.get("successful_transactions", 0)) < 1:
+                missing_soak.append(f"{name}: no successful transaction evidence")
+        failure = QualificationCheck(
+            subsystem="failure_chaos",
+            status="passed" if not missing_failure and not semantic_errors else "failed",
+            summary="Controlled dependency restart, worker loss, ordered events, and durable recovery.",
+            evidence=[binding],
+            metrics={"required": policy.required_training_proofs, "statuses": statuses},
+            blockers=[f"required proof did not pass: {name}" for name in missing_failure]
+            + semantic_errors,
+        )
+        soak = QualificationCheck(
+            subsystem="soak_recovery",
+            status="passed" if not missing_soak else "failed",
+            summary="Required continuous infrastructure soak durations.",
+            evidence=[binding],
+            metrics={"required": soak_names},
+            blockers=[f"required soak did not pass: {name}" for name in missing_soak],
+        )
+        return failure, soak
+    except Exception as exc:
+        failed = QualificationCheck(
+            subsystem="failure_chaos",
+            status="failed",
+            summary="Training/failure proof evidence was invalid.",
+            blockers=[str(exc)],
+        )
+        soak = QualificationCheck(
+            subsystem="soak_recovery",
+            status="failed",
+            summary="Soak evidence was invalid.",
+            blockers=[str(exc)],
+        )
+        return failed, soak
+
+
+def _validate_training_proof_semantics(
+    name: str,
+    row: dict[str, Any] | None,
+) -> list[str]:
+    if not isinstance(row, dict) or row.get("status") != "passed":
+        return []
+    evidence = row.get("evidence")
+    if not isinstance(evidence, dict):
+        return [f"{name}: evidence must be an object"]
+    errors: list[str] = []
+    if name == "postgres_redis_minio_lifecycle":
+        if int(evidence.get("redis_event_count", 0)) < 1:
+            errors.append(f"{name}: Redis event round-trip is missing")
+        if evidence.get("duplicate_event_rejected") is not True:
+            errors.append(f"{name}: idempotent duplicate rejection is missing")
+        database = evidence.get("database")
+        if not isinstance(database, dict) or any(
+            int(database.get(key, 0)) < 1
+            for key in ("job_rows", "attempt_rows", "ingress_rows")
+        ):
+            errors.append(f"{name}: durable Postgres lifecycle evidence is incomplete")
+    elif name == "ordered_event_stress_1000000":
+        if (
+            int(evidence.get("event_count", 0)) < 1_000_000
+            or int(evidence.get("final_sequence", 0)) != 1_000_000
+            or int(evidence.get("tail_sequence", 0)) != 1_000_000
+        ):
+            errors.append(f"{name}: one-million ordered event evidence is incomplete")
+    elif name == "docker_disaster_recovery_drill":
+        required = (
+            "postgres_dump_restore",
+            "postgres_restart",
+            "redis_aof_restart",
+            "minio_volume_restart",
+            "qdrant_volume_restart",
+        )
+        if any(evidence.get(key) is not True for key in required):
+            errors.append(f"{name}: one or more dependency recovery checks are absent")
+    elif name == "worker_loss_retry_recovery":
+        if (
+            evidence.get("status_after_loss") != "queued"
+            or evidence.get("retry_failure_class") != "node_loss"
+            or int(evidence.get("attempt_count", 0)) < 1
+        ):
+            errors.append(f"{name}: bounded worker-loss retry evidence is incomplete")
+    return errors
+
+
+def validate_security_review(
+    path: str | None,
+    *,
+    policy: QualificationPolicy,
+    expected_scanner_report_sha256: str | None = None,
+) -> QualificationCheck:
+    if not path:
+        return QualificationCheck(
+            subsystem="independent_security_review",
+            status="blocked",
+            summary="Independent manual security review is not supplied.",
+            blockers=["--manual-security-review is required"],
+        )
+    try:
+        binding = bind_evidence(
+            path,
+            evidence_id="manual-security-review",
+            maximum_age_seconds=policy.evidence_max_age_seconds,
+        )
+        review = SecurityReviewEvidence.model_validate(load_json_evidence(binding))
+        require_fresh_timestamp(
+            review.reviewed_at,
+            label="security review",
+            maximum_age_seconds=policy.evidence_max_age_seconds,
+        )
+        missing_domains = [
+            domain
+            for domain in policy.required_security_domains
+            if review.domains.get(domain) != "passed"
+        ]
+        blockers = [f"security domain did not pass: {domain}" for domain in missing_domains]
+        if len(review.reviewers) < policy.minimum_security_reviewers:
+            blockers.append("independent reviewer count is below policy")
+        if review.critical_findings or review.high_findings or review.unresolved_findings:
+            blockers.append("security review has unresolved critical/high findings")
+        if review.decision != "approved":
+            blockers.append("security review decision is not approved")
+        if (
+            expected_scanner_report_sha256
+            and not hmac.compare_digest(
+                review.scanner_report_sha256,
+                expected_scanner_report_sha256,
+            )
+        ):
+            blockers.append("manual review is not bound to the current automated scanner report")
+        return QualificationCheck(
+            subsystem="independent_security_review",
+            status="passed" if not blockers else "failed",
+            summary="Independent threat-model and manual security review.",
+            evidence=[binding],
+            metrics={
+                "review_id": review.review_id,
+                "reviewer_count": len(review.reviewers),
+                "domains": review.domains,
+                "scanner_report_sha256": review.scanner_report_sha256,
+            },
+            blockers=blockers,
+        )
+    except Exception as exc:
+        return QualificationCheck(
+            subsystem="independent_security_review",
+            status="failed",
+            summary="Manual security review evidence was invalid.",
+            blockers=[str(exc)],
+        )
+
+
+def validate_canary(
+    path: str | None,
+    *,
+    policy: QualificationPolicy,
+) -> QualificationCheck:
+    if not path:
+        return QualificationCheck(
+            subsystem="canary_release",
+            status="blocked",
+            summary="No measured internal-user and staged traffic canary is supplied.",
+            blockers=["--canary-report is required"],
+        )
+    try:
+        binding = bind_evidence(
+            path,
+            evidence_id="canary-report",
+            maximum_age_seconds=policy.evidence_max_age_seconds,
+        )
+        canary = CanaryEvidence.model_validate(load_json_evidence(binding))
+        require_fresh_timestamp(
+            canary.created_at,
+            label="canary",
+            maximum_age_seconds=policy.evidence_max_age_seconds,
+        )
+        by_percentage = {stage.percentage: stage for stage in canary.stages}
+        blockers: list[str] = []
+        if not (
+            policy.minimum_internal_canary_users
+            <= canary.internal_user_count
+            <= policy.maximum_internal_canary_users
+        ):
+            blockers.append("internal canary user count is outside policy")
+        for percentage in policy.required_canary_percentages:
+            stage = by_percentage.get(percentage)
+            if stage is None:
+                blockers.append(f"missing {percentage}% canary stage")
+                continue
+            if stage.error_rate > policy.canary_maximum_error_rate:
+                blockers.append(f"{percentage}% canary error rate exceeded policy")
+            if stage.p95_latency_ms > policy.canary_maximum_p95_latency_ms:
+                blockers.append(f"{percentage}% canary p95 latency exceeded policy")
+            if not stage.rollback_trigger_tested or not stage.rollback_succeeded:
+                blockers.append(f"{percentage}% canary rollback proof is incomplete")
+            if stage.rollback_trigger_error_rate < policy.canary_rollback_error_rate:
+                blockers.append(
+                    f"{percentage}% canary rollback was not triggered at the policy threshold"
+                )
+            if stage.rollback_completed_seconds > policy.canary_maximum_rollback_seconds:
+                blockers.append(f"{percentage}% canary rollback exceeded recovery SLO")
+        if canary.status != "passed":
+            blockers.append("canary report status is not passed")
+        return QualificationCheck(
+            subsystem="canary_release",
+            status="passed" if not blockers else "failed",
+            summary="Internal users and progressive 1/10/50/100 percent traffic canary.",
+            evidence=[binding],
+            metrics={"canary_id": canary.canary_id, "stages": [row.model_dump() for row in canary.stages]},
+            blockers=blockers,
+        )
+    except Exception as exc:
+        return QualificationCheck(
+            subsystem="canary_release",
+            status="failed",
+            summary="Canary evidence was invalid.",
+            blockers=[str(exc)],
+        )
+
+
+async def check_observability(
+    *,
+    metrics_url: str | None,
+    prometheus_url: str | None,
+    grafana_url: str | None,
+    otel_health_url: str | None,
+    alertmanager_url: str | None,
+    operator_notification_report: str | None,
+    policy: QualificationPolicy,
+    allowed_insecure_hosts: list[str],
+) -> QualificationCheck:
+    endpoints = {
+        "metrics": metrics_url,
+        "prometheus": prometheus_url,
+        "grafana": grafana_url,
+        "otel": otel_health_url,
+        "alertmanager": alertmanager_url,
+    }
+    if any(not value for value in endpoints.values()):
+        missing = [name for name, value in endpoints.items() if not value]
+        return QualificationCheck(
+            subsystem="observability",
+            status="blocked",
+            summary="Live logs/metrics/tracing stack is not fully configured.",
+            blockers=[f"missing observability endpoint: {name}" for name in missing],
+        )
+    if policy.require_operator_notification_proof and not operator_notification_report:
+        return QualificationCheck(
+            subsystem="observability",
+            status="blocked",
+            summary="Live observability endpoints are configured, but operator delivery proof is absent.",
+            blockers=["--operator-notification-report is required"],
+        )
+    try:
+        notification_binding: EvidenceBinding | None = None
+        notification: OperatorNotificationEvidence | None = None
+        if operator_notification_report:
+            notification_binding = bind_evidence(
+                operator_notification_report,
+                evidence_id="operator-notification-report",
+                maximum_age_seconds=policy.evidence_max_age_seconds,
+            )
+            notification = OperatorNotificationEvidence.model_validate(
+                load_json_evidence(notification_binding)
+            )
+            require_fresh_timestamp(
+                notification.created_at,
+                label="operator notification proof",
+                maximum_age_seconds=policy.evidence_max_age_seconds,
+            )
+            firing_at = require_fresh_timestamp(
+                notification.firing_delivered_at,
+                label="operator firing notification",
+                maximum_age_seconds=policy.evidence_max_age_seconds,
+            )
+            recovery_at = require_fresh_timestamp(
+                notification.recovery_delivered_at,
+                label="operator recovery notification",
+                maximum_age_seconds=policy.evidence_max_age_seconds,
+            )
+            if recovery_at < firing_at:
+                raise ValueError("operator recovery notification predates firing notification")
+            if (
+                notification.status != "passed"
+                or not notification.firing_delivered
+                or not notification.recovery_delivered
+            ):
+                raise ValueError("operator firing and recovery notifications were not both delivered")
+        validated = {
+            name: _validated_service_url(
+                str(value),
+                label=name,
+                allowed_insecure_hosts=allowed_insecure_hosts,
+            )
+            for name, value in endpoints.items()
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            metric_response, prometheus_response, grafana_response, otel_response, alertmanager_response = await asyncio.gather(
+                client.get(validated["metrics"]),
+                client.get(validated["prometheus"]),
+                client.get(validated["grafana"]),
+                client.get(validated["otel"]),
+                client.get(f"{validated['alertmanager'].rstrip('/')}/-/ready"),
+            )
+            alert_lifecycle = await prove_alert_lifecycle(
+                client,
+                validated["alertmanager"],
+            )
+        for response in (
+            metric_response,
+            prometheus_response,
+            grafana_response,
+            otel_response,
+            alertmanager_response,
+        ):
+            response.raise_for_status()
+        if "aeitron_http_requests_total" not in metric_response.text:
+            raise ValueError("metrics endpoint does not expose Aeitron HTTP metrics")
+        grafana_payload = grafana_response.json()
+        if str(grafana_payload.get("database", "")).lower() != "ok":
+            raise ValueError("Grafana health did not report database=ok")
+        return QualificationCheck(
+            subsystem="observability",
+            status="passed",
+            summary="Live metrics, tracing, alert lifecycle, and operator delivery are proven.",
+            evidence=[notification_binding] if notification_binding else [],
+            metrics={
+                "prometheus_ready": prometheus_response.status_code == 200,
+                "grafana_database": grafana_payload.get("database"),
+                "otel_ready": otel_response.status_code == 200,
+                "alertmanager_ready": alertmanager_response.status_code == 200,
+                "alert_lifecycle": alert_lifecycle,
+                "operator_notification": (
+                    {
+                        "proof_id": notification.proof_id,
+                        "provider": notification.provider,
+                        "channel_type": notification.channel_type,
+                        "firing_delivered": notification.firing_delivered,
+                        "recovery_delivered": notification.recovery_delivered,
+                    }
+                    if notification
+                    else {"required": False}
+                ),
+            },
+        )
+    except Exception as exc:
+        return QualificationCheck(
+            subsystem="observability",
+            status="failed",
+            summary="Live observability proof failed.",
+            blockers=[str(exc)],
+        )
+
+
+async def prove_alert_lifecycle(
+    client: httpx.AsyncClient,
+    endpoint: str,
+) -> dict[str, Any]:
+    proof_id = uuid.uuid4().hex
+    now = datetime.now(UTC)
+    labels = {
+        "alertname": "AeitronQualificationSynthetic",
+        "service": "aeitron-qualification",
+        "severity": "info",
+        "aeitron_qualification_proof": "true",
+        "aeitron_proof_id": proof_id,
+    }
+    firing = [
+        {
+            "labels": labels,
+            "annotations": {
+                "summary": "Synthetic qualification alert; routed to null receiver"
+            },
+            "startsAt": now.isoformat(),
+            "endsAt": datetime.fromtimestamp(now.timestamp() + 300, UTC).isoformat(),
+            "generatorURL": "https://aeitron.invalid/qualification",
+        }
+    ]
+    posted = await client.post(
+        f"{endpoint.rstrip('/')}/api/v2/alerts",
+        json=firing,
+    )
+    posted.raise_for_status()
+
+    async def is_active() -> bool:
+        response = await client.get(
+            f"{endpoint.rstrip('/')}/api/v2/alerts",
+            params={
+                "active": "true",
+                "silenced": "true",
+                "inhibited": "true",
+                "unprocessed": "true",
+            },
+        )
+        response.raise_for_status()
+        return any(
+            isinstance(row, dict)
+            and row.get("labels", {}).get("aeitron_proof_id") == proof_id
+            for row in response.json()
+        )
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and not await is_active():
+        await asyncio.sleep(0.25)
+    if not await is_active():
+        raise RuntimeError("synthetic Alertmanager alert did not enter active state")
+
+    resolved = [
+        {
+            "labels": labels,
+            "annotations": firing[0]["annotations"],
+            "startsAt": firing[0]["startsAt"],
+            "endsAt": datetime.now(UTC).isoformat(),
+            "generatorURL": firing[0]["generatorURL"],
+        }
+    ]
+    posted_resolution = await client.post(
+        f"{endpoint.rstrip('/')}/api/v2/alerts",
+        json=resolved,
+    )
+    posted_resolution.raise_for_status()
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        if not await is_active():
+            return {"proof_id": proof_id, "fired": True, "resolved": True}
+        await asyncio.sleep(0.5)
+    raise RuntimeError("synthetic Alertmanager alert did not resolve")
+
+
+def _map_live_proof(report: ProductionProofReport) -> tuple[QualificationCheck, QualificationCheck]:
+    by_name = {check.name: check for check in report.checks}
+    dependency_names = {
+        "postgres_migrations",
+        "redis_quota",
+        "object_store_lifecycle",
+        "qdrant_round_trip",
+    }
+    serving_names = {"native_serving_health", "benchmark_and_model_evidence"}
+
+    def mapped(subsystem: str, names: set[str], summary: str) -> QualificationCheck:
+        rows = [by_name[name] for name in names if name in by_name]
+        missing = sorted(names - set(by_name))
+        failed = [row for row in rows if row.status == "failed"]
+        blocked = [row for row in rows if row.status in {"skipped", "blocked", "not_run"}]
+        status: QualificationStatus = (
+            "failed"
+            if failed
+            else "blocked"
+            if blocked or missing
+            else "passed"
+        )
+        return QualificationCheck(
+            subsystem=subsystem,
+            status=status,
+            summary=summary,
+            metrics={row.name: row.details for row in rows},
+            blockers=[
+                f"{row.name}: {row.error or row.details.get('reason', row.status)}"
+                for row in failed + blocked
+            ]
+            + [f"missing live proof check: {name}" for name in missing],
+        )
+
+    return (
+        mapped(
+            "real_dependency_e2e",
+            dependency_names,
+            "Live Postgres, Redis, object storage, and Qdrant lifecycle.",
+        ),
+        mapped(
+            "native_model_serving",
+            serving_names,
+            "Authenticated Aeitron scratch checkpoint identity and executable evaluation.",
+        ),
+    )
+
+
+async def run_qualification(args: argparse.Namespace) -> tuple[ProductionQualificationReport, Path]:
+    policy_path = Path(args.policy).expanduser().resolve(strict=True)
+    policy = QualificationPolicy.from_file(policy_path)
+    signing_key = os.environ.get("AEITRON_PROOF_SIGNING_KEY")
+    if args.production and policy.require_report_signature_in_production:
+        if not signing_key or len(signing_key.encode("utf-8")) < 32:
+            raise ValueError(
+                "production qualification requires AEITRON_PROOF_SIGNING_KEY with at least 32 bytes"
+            )
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    live_config = ProductionProofConfig(
+        strict=args.production,
+        output_dir=str(output_dir / "live-proof"),
+        postgres_url=args.postgres_url or os.environ.get("AEITRON_DATABASE_URL"),
+        apply_postgres_migrations=args.apply_postgres_migrations,
+        redis_url=args.redis_url or os.environ.get("AEITRON_REDIS_URL"),
+        object_store_uri=args.object_store_uri or os.environ.get("AEITRON_OBJECT_STORE_URI"),
+        object_store_endpoint_url=(
+            args.object_store_endpoint_url
+            or os.environ.get("AEITRON_OBJECT_STORE_ENDPOINT_URL")
+        ),
+        qdrant_url=args.qdrant_url or os.environ.get("AEITRON_QDRANT_URL"),
+        allowed_insecure_service_hosts=args.allow_insecure_service_host,
+        serving_url=args.serving_url or os.environ.get("AEITRON_SERVING_URL"),
+        serving_api_key=args.serving_api_key or os.environ.get("AEITRON_MODEL_API_KEY"),
+        serving_model=args.serving_model,
+        load_test_requests=max(1, policy.load_stages[0].requests),
+        load_test_concurrency=policy.load_stages[0].concurrency,
+        load_test_timeout_seconds=args.request_timeout_seconds,
+        load_test_streaming_requests=max(1, policy.load_stages[0].streaming_requests),
+        executable_benchmark_report=args.executable_benchmark_report,
+        scorecard_report=args.scorecard_report,
+        active_model_profile=args.active_model_profile,
+        run_security_audit=args.run_security_audit,
+        strict_security_tools=args.strict_security_tools,
+    )
+    live = await run_production_proof(live_config)
+    dependency_check, serving_check = _map_live_proof(live)
+    if args.run_functional_gates:
+        functional = await asyncio.to_thread(
+            run_fixed_functional_gates,
+            output_dir / "functional-gates",
+            timeout_seconds=args.functional_timeout_seconds,
+        )
+    else:
+        functional = QualificationCheck(
+            subsystem="functional_hardening",
+            status="not_run",
+            summary="Fixed functional gates were not requested.",
+            blockers=["use --run-functional-gates"],
+        )
+    load_stages = await run_load_ladder(
+        policy=policy,
+        endpoint=live_config.serving_url,
+        model=live_config.serving_model,
+        api_key=live_config.serving_api_key,
+        timeout_seconds=args.request_timeout_seconds,
+    )
+    load_status: QualificationStatus = (
+        "failed"
+        if any(stage.status == "failed" for stage in load_stages)
+        else "blocked"
+        if any(stage.status == "blocked" for stage in load_stages)
+        else "passed"
+    )
+    load_check = QualificationCheck(
+        subsystem="load_capacity",
+        status=load_status,
+        summary="Progressive 10/100/500/1000 concurrency capacity ladder.",
+        metrics={"stages": [stage.model_dump() for stage in load_stages]},
+        blockers=[item for stage in load_stages for item in stage.blockers],
+    )
+    failure, soak = validate_training_proofs(args.training_proof_report, policy=policy)
+    observability = await check_observability(
+        metrics_url=args.metrics_url,
+        prometheus_url=args.prometheus_url,
+        grafana_url=args.grafana_url,
+        otel_health_url=args.otel_health_url,
+        alertmanager_url=args.alertmanager_url,
+        operator_notification_report=args.operator_notification_report,
+        policy=policy,
+        allowed_insecure_hosts=args.allow_insecure_service_host,
+    )
+    scanner_report_path = (
+        output_dir / "live-proof" / "security-audit" / "security_audit_report.json"
+    )
+    scanner_hash = sha256_file(scanner_report_path) if scanner_report_path.exists() else None
+    security = validate_security_review(
+        args.manual_security_review,
+        policy=policy,
+        expected_scanner_report_sha256=scanner_hash,
+    )
+    live_security = next(
+        (check for check in live.checks if check.name == "security_audit"),
+        None,
+    )
+    if live_security is None or live_security.status != "passed":
+        reason = (
+            "automated security audit did not run"
+            if live_security is None
+            else live_security.error
+            or str(live_security.details.get("reason") or live_security.status)
+        )
+        security.status = "failed" if live_security and live_security.status == "failed" else "blocked"
+        security.blockers.append(f"automated security audit: {reason}")
+    canary = validate_canary(args.canary_report, policy=policy)
+    checks = [
+        QualificationCheck(
+            subsystem="production_proof_baseline",
+            status="passed",
+            summary="Current run uses versioned, hash-chained, tamper-evident evidence.",
+            metrics={"live_proof_status": live.status},
+        ),
+        dependency_check,
+        functional,
+        serving_check,
+        load_check,
+        failure,
+        observability,
+        soak,
+        security,
+        canary,
+    ]
+    status: QualificationStatus = (
+        "failed"
+        if any(check.status == "failed" for check in checks)
+        else "blocked"
+        if any(check.status == "blocked" for check in checks)
+        else "not_run"
+        if any(check.status == "not_run" for check in checks)
+        else "passed"
+    )
+    report = ProductionQualificationReport(
+        report_id=str(uuid.uuid4()),
+        status=status,
+        mode="production" if args.production else "validation",
+        created_at=utc_now(),
+        git_commit=_git_commit(),
+        policy_sha256=sha256_file(policy_path),
+        environment={
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "hostname_sha256": hashlib.sha256(platform.node().encode("utf-8")).hexdigest(),
+        },
+        checks=checks,
+        load_stages=load_stages,
+    )
+    store = ImmutableQualificationStore(output_dir, signing_key=signing_key)
+    path = store.write(report)
+    persisted = ProductionQualificationReport.model_validate_json(
+        path.read_text(encoding="utf-8-sig")
+    )
+    return persisted, path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the authoritative Aeitron production qualification decision."
+    )
+    parser.add_argument("--policy", default="config/production_qualification.json")
+    parser.add_argument("--output-dir", default="artifacts/aeitron/production-qualification")
+    parser.add_argument("--production", action="store_true")
+    parser.add_argument("--postgres-url")
+    parser.add_argument("--apply-postgres-migrations", action="store_true")
+    parser.add_argument("--redis-url")
+    parser.add_argument("--object-store-uri")
+    parser.add_argument("--object-store-endpoint-url")
+    parser.add_argument("--qdrant-url")
+    parser.add_argument("--allow-insecure-service-host", action="append", default=[])
+    parser.add_argument("--serving-url")
+    parser.add_argument("--serving-api-key")
+    parser.add_argument("--serving-model", default="aeitron-scratch")
+    parser.add_argument("--active-model-profile")
+    parser.add_argument("--executable-benchmark-report")
+    parser.add_argument("--scorecard-report")
+    parser.add_argument("--training-proof-report")
+    parser.add_argument("--manual-security-review")
+    parser.add_argument("--canary-report")
+    parser.add_argument("--metrics-url")
+    parser.add_argument("--prometheus-url")
+    parser.add_argument("--grafana-url")
+    parser.add_argument("--otel-health-url")
+    parser.add_argument("--alertmanager-url")
+    parser.add_argument("--operator-notification-report")
+    parser.add_argument("--request-timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--run-functional-gates", action="store_true")
+    parser.add_argument("--functional-timeout-seconds", type=int, default=1800)
+    parser.add_argument("--run-security-audit", action="store_true")
+    parser.add_argument("--strict-security-tools", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    report, path = asyncio.run(run_qualification(parse_args()))
+    print(
+        json.dumps(
+            {
+                "status": report.status,
+                "report_id": report.report_id,
+                "report_path": str(path),
+                "report_sha256": report.report_sha256,
+                "checks": {
+                    check.subsystem: check.status
+                    for check in report.checks
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if report.status != "passed":
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()

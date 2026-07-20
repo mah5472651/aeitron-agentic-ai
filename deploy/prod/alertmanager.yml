@@ -1,0 +1,20 @@
+global:
+  resolve_timeout: 1m
+
+route:
+  receiver: production-operator
+  group_by: [alertname, service]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - receiver: qualification-null
+      matchers:
+        - aeitron_qualification_proof="true"
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 1h
+
+receivers:
+  - name: production-operator
+  - name: qualification-null

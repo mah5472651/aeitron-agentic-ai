@@ -38,7 +38,13 @@ services:
       retries: 60
     volumes: ["proof-minio:/data"]
 
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    ports: ["127.0.0.1:56333:6333"]
+    volumes: ["proof-qdrant:/qdrant/storage"]
+
 volumes:
   proof-postgres:
   proof-redis:
   proof-minio:
+  proof-qdrant:

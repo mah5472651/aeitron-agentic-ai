@@ -347,6 +347,73 @@ The production stack includes Prometheus, Grafana, and optional OpenTelemetry:
 docker compose --env-file deploy\prod\.env.example -f deploy\prod\docker-compose.yml --profile monitoring up
 ```
 
+### Authoritative Production Qualification
+
+`production_proof` performs individual live probes. The final release decision
+is made only by `production_qualification`; old standalone reports are not a
+production-ready declaration.
+
+The qualification runner writes every decision to a new immutable directory,
+hashes the complete report, links it to the previous report digest, and updates
+only a small `latest.json` pointer. Production mode additionally requires a
+32-byte-or-longer `AEITRON_PROOF_SIGNING_KEY` and signs the decision with
+HMAC-SHA256.
+
+Every subsystem has exactly one state: `passed`, `failed`, `blocked`, or
+`not_run`. Missing infrastructure or human evidence is never converted into a
+pass.
+
+```powershell
+$env:AEITRON_PROOF_SIGNING_KEY = "<secret-from-your-secret-manager>"
+
+python -m src.aeitron.deployment.production_qualification `
+  --production `
+  --run-functional-gates `
+  --apply-postgres-migrations `
+  --postgres-url "$env:AEITRON_DATABASE_URL" `
+  --redis-url "$env:AEITRON_REDIS_URL" `
+  --object-store-uri "$env:AEITRON_OBJECT_STORE_URI" `
+  --object-store-endpoint-url "$env:AEITRON_OBJECT_STORE_ENDPOINT_URL" `
+  --qdrant-url "$env:AEITRON_QDRANT_URL" `
+  --serving-url "$env:AEITRON_SERVING_URL" `
+  --serving-api-key "$env:AEITRON_MODEL_API_KEY" `
+  --active-model-profile C:\AeitronGovernance\active-model-profile.json `
+  --executable-benchmark-report artifacts\aeitron\executable-eval\benchmark_suites_report.json `
+  --scorecard-report artifacts\aeitron\agent-scorecard\agent_scorecard.json `
+  --training-proof-report artifacts\aeitron\production-proofs\production_proof_report.json `
+  --manual-security-review C:\AeitronGovernance\manual-security-review.json `
+  --canary-report C:\AeitronGovernance\canary-report.json `
+  --metrics-url https://api.example.com/metrics `
+  --prometheus-url https://prometheus.example.com/-/ready `
+  --grafana-url https://grafana.example.com/api/health `
+  --otel-health-url https://otel.example.com/ `
+  --alertmanager-url https://alertmanager.example.com `
+  --operator-notification-report C:\AeitronGovernance\operator-notification-proof.json `
+  --run-security-audit `
+  --strict-security-tools `
+  --output-dir artifacts\aeitron\production-qualification
+```
+
+The default capacity ladder is 10, 100, 500, then 1,000 concurrent requests.
+Each stage measures normal and SSE responses, p50/p95/p99 latency, throughput,
+error rate, status distribution, and response volume. A failed stage stops
+advancement.
+
+The measured training proof must contain real Postgres/Redis/MinIO lifecycle,
+Qdrant persistence after controlled restart, one million ordered events,
+worker-loss recovery, a 24-hour soak, and a 7-day soak. The proof Docker stack
+is isolated and may restart only its own Compose-labeled containers.
+
+Manual security evidence requires at least two independent reviewers and
+passed decisions for authentication/authorization, SSRF, path traversal,
+sandbox escape, secrets/IAM, dependency supply chain, and
+container/Kubernetes security. Its scanner digest must match the scanner report
+created by the same qualification run.
+
+Canary evidence requires 1-5 internal users followed by measured
+1%, 10%, 50%, and 100% stages. Every stage must remain within error/latency
+policy and contain a successful rollback-trigger test.
+
 ## Colab/Kaggle GPU Smoke
 
 Run a real scratch-decoder forward/backward/checkpoint smoke test:

@@ -1,0 +1,38 @@
+groups:
+  - name: aeitron-production
+    rules:
+      - alert: AeitronApiServerErrors
+        expr: sum(rate(aeitron_http_server_errors_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+          service: aeitron-api
+        annotations:
+          summary: Aeitron API is returning server errors
+
+      - alert: AeitronTrainingWorkerHeartbeatMissing
+        expr: max(aeitron_training_worker_heartbeat_age_seconds) > 30
+        for: 2m
+        labels:
+          severity: critical
+          service: aeitron-training
+        annotations:
+          summary: Aeitron training worker heartbeat is stale
+
+      - alert: AeitronTrainingEventBacklog
+        expr: max(aeitron_training_event_backlog) > 10000
+        for: 5m
+        labels:
+          severity: warning
+          service: aeitron-training
+        annotations:
+          summary: Aeitron training event backlog is excessive
+
+      - alert: AeitronGenerationQueueSaturated
+        expr: max(aeitron_serving_queue_depth) >= 64
+        for: 2m
+        labels:
+          severity: warning
+          service: aeitron-serving
+        annotations:
+          summary: Aeitron native serving queue is saturated

@@ -2,38 +2,37 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess  # nosec B404
 import sys
+from types import SimpleNamespace
 
 from src.aeitron.production_readiness import run_production_readiness
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the Aeitron local release gate.")
+    parser.add_argument(
+        "--skip-tests",
+        action="store_true",
+        help="Reuse a full unittest run already executed by the same parent qualification.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     readiness = run_production_readiness(mode="dev").model_dump()
-    completed = subprocess.run(  # nosec B603
-        [
-            sys.executable,
-            "-m",
-            "unittest",
-            "tests.test_aeitron_mvp_foundation",
-            "tests.test_aeitron_model_foundation",
-            "tests.test_aeitron_data_engine",
-            "tests.test_aeitron_dataset_trust",
-            "tests.test_aeitron_calibration_gate",
-            "tests.test_aeitron_pretraining_pipeline",
-            "tests.test_aeitron_production_hardening",
-            "tests.test_aeitron_scratch_decoder",
-            "tests.test_aeitron_training_control",
-            "tests.test_aeitron_enterprise_readiness",
-            "tests.test_aeitron_training_workspace",
-            "tests.test_aeitron_agent_collaboration",
-            "tests.test_aeitron_agent_execution",
-            "tests.test_aeitron_qualification_campaign",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+    completed = (
+        SimpleNamespace(returncode=0, stdout="tests reused from parent qualification", stderr="")
+        if args.skip_tests
+        else subprocess.run(  # nosec B603
+            [sys.executable, "-m", "unittest"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     )
     print(
         json.dumps(

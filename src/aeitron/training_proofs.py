@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+import httpx
 from pydantic import Field
 
 from src.aeitron.db.migration_runner import apply_migrations
@@ -712,6 +713,7 @@ def docker_disaster_recovery_proof(
     redis_url: str,
     object_store_uri: str,
     object_store_endpoint_url: str,
+    qdrant_url: str,
 ) -> ProofResult:
     started = time.perf_counter()
     started_at = now_iso()
@@ -740,6 +742,17 @@ def docker_disaster_recovery_proof(
         postgres = service_container("postgres")
         redis_container = service_container("redis")
         minio = service_container("minio")
+        qdrant = service_container("qdrant")
+        qdrant_endpoint = urlparse(qdrant_url.rstrip("/"))
+        if (
+            qdrant_endpoint.scheme != "http"
+            or qdrant_endpoint.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or qdrant_endpoint.username
+            or qdrant_endpoint.password
+        ):
+            raise ValueError(
+                "Docker disaster-recovery proof only accepts a loopback Qdrant URL"
+            )
 
         def exec_checked(container: Any, command: list[str]) -> str:
             result = container.exec_run(command)
@@ -810,6 +823,77 @@ def docker_disaster_recovery_proof(
             raise RuntimeError("MinIO object did not recover after restart")
         s3.delete_object(Bucket=bucket, Key=object_key)
 
+        qdrant_collection = f"aeitron_dr_{uuid.uuid4().hex}"
+        qdrant_point = str(uuid.uuid4())
+        qdrant_marker = uuid.uuid4().hex
+        qdrant_recovered = False
+        qdrant_created = False
+        qdrant_cleanup_error = ""
+        try:
+            with httpx.Client(timeout=15.0) as qdrant_client:
+                created = qdrant_client.put(
+                    f"{qdrant_url.rstrip('/')}/collections/{qdrant_collection}",
+                    json={"vectors": {"size": 4, "distance": "Cosine"}},
+                )
+                created.raise_for_status()
+                qdrant_created = True
+                inserted = qdrant_client.put(
+                    f"{qdrant_url.rstrip('/')}/collections/{qdrant_collection}/points",
+                    params={"wait": "true"},
+                    json={
+                        "points": [
+                            {
+                                "id": qdrant_point,
+                                "vector": [1.0, 0.0, 0.0, 0.0],
+                                "payload": {"proof_marker": qdrant_marker},
+                            }
+                        ]
+                    },
+                )
+                inserted.raise_for_status()
+            qdrant.restart(timeout=15)
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                try:
+                    with httpx.Client(timeout=5.0) as qdrant_client:
+                        queried = qdrant_client.post(
+                            f"{qdrant_url.rstrip('/')}/collections/{qdrant_collection}/points/query",
+                            json={
+                                "query": [1.0, 0.0, 0.0, 0.0],
+                                "limit": 1,
+                                "with_payload": True,
+                            },
+                        )
+                        queried.raise_for_status()
+                        points = queried.json().get("result", {}).get("points", [])
+                        qdrant_recovered = bool(
+                            points
+                            and str(points[0].get("id")) == qdrant_point
+                            and points[0].get("payload", {}).get("proof_marker")
+                            == qdrant_marker
+                        )
+                        if qdrant_recovered:
+                            break
+                except Exception:
+                    time.sleep(0.5)
+            if not qdrant_recovered:
+                raise RuntimeError("Qdrant point did not recover after restart")
+        finally:
+            if qdrant_created:
+                try:
+                    with httpx.Client(timeout=10.0) as qdrant_client:
+                        deleted = qdrant_client.delete(
+                            f"{qdrant_url.rstrip('/')}/collections/{qdrant_collection}"
+                        )
+                        if deleted.status_code not in {200, 404}:
+                            qdrant_cleanup_error = (
+                                f"Qdrant cleanup returned HTTP {deleted.status_code}"
+                            )
+                except Exception as exc:
+                    qdrant_cleanup_error = f"Qdrant cleanup failed: {exc}"
+        if qdrant_cleanup_error:
+            raise RuntimeError(qdrant_cleanup_error)
+
         postgres.restart(timeout=15)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
@@ -827,10 +911,12 @@ def docker_disaster_recovery_proof(
             "postgres_restart": True,
             "redis_aof_restart": True,
             "minio_volume_restart": True,
+            "qdrant_volume_restart": True,
             "containers": {
                 "postgres": postgres.name,
                 "redis": redis_container.name,
                 "minio": minio.name,
+                "qdrant": qdrant.name,
             },
         }
         return ProofResult(
@@ -1211,6 +1297,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--redis-url", default=os.environ.get("AEITRON_REDIS_URL", "redis://127.0.0.1:56379/0"))
     parser.add_argument("--object-store-uri", default=os.environ.get("AEITRON_OBJECT_STORE_URI", "s3://aeitron-proof/training-workspace"))
     parser.add_argument("--object-store-endpoint-url", default=os.environ.get("AEITRON_OBJECT_STORE_ENDPOINT_URL", "http://127.0.0.1:59000"))
+    parser.add_argument("--qdrant-url", default=os.environ.get("AEITRON_QDRANT_URL", "http://127.0.0.1:56333"))
     parser.add_argument("--output-dir", default="artifacts/aeitron/production-proofs")
     parser.add_argument("--event-count", type=int, default=0, help="Set to 1000000 for the full ordered-event proof.")
     parser.add_argument("--soak-seconds", type=int, default=0, help="Set to 86400 for the required 24-hour proof.")
@@ -1291,6 +1378,7 @@ async def async_main() -> int:
                 redis_url=args.redis_url,
                 object_store_uri=args.object_store_uri,
                 object_store_endpoint_url=args.object_store_endpoint_url,
+                qdrant_url=args.qdrant_url,
             )
         )
         results.append(

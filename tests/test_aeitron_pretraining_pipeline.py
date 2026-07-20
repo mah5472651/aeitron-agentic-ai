@@ -732,6 +732,8 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
                     device="cpu",
                     auth_enabled=False,
                     quota_enabled=False,
+                    reject_context_truncation=False,
+                    max_prompt_characters=1024,
                 )
             )
             client = TestClient(app)
@@ -759,6 +761,35 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
             self.assertEqual(payload["model"], "aeitron-test")
             self.assertIn("choices", payload)
             self.assertTrue(payload["aeitron"]["scratch_only"])
+            self.assertRegex(response.headers["x-request-id"], r"^[0-9a-f-]{36}$")
+            metrics = client.get("/metrics")
+            self.assertEqual(metrics.status_code, 200)
+            self.assertIn("aeitron_http_requests_total", metrics.text)
+            empty = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "aeitron-test",
+                    "messages": [{"role": "user", "content": ""}],
+                },
+            )
+            self.assertEqual(empty.status_code, 422)
+            invalid_role = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "aeitron-test",
+                    "messages": [{"role": "tool", "content": "not allowed"}],
+                },
+            )
+            self.assertEqual(invalid_role.status_code, 422)
+            huge = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "aeitron-test",
+                    "messages": [{"role": "user", "content": "界" * 2048}],
+                    "max_tokens": 1,
+                },
+            )
+            self.assertEqual(huge.status_code, 413)
 
     def test_hf_export_and_external_runtime_plans_are_real_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
