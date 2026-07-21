@@ -46,7 +46,7 @@ jobs:
       - name: Data platform readiness contract
         run: |
           python -m src.aeitron.learning.production_check \
-            --sources config/data_sources.ultimate.json \
+            --sources config/data_sources.ci.json \
             --frontier-backend postgres \
             --postgres-dsn postgresql://user:pass@postgres:5432/aeitron \
             --object-store-uri s3://aeitron-datasets/pretraining \
@@ -55,7 +55,7 @@ jobs:
             --async-workers 32
           python -m src.aeitron.learning.capacity --target-documents 1000000 --worker-replicas 4 --async-workers-per-replica 16
           python -m src.aeitron.learning.run_plan \
-            --sources config/data_sources.ultimate.json \
+            --sources config/data_sources.ci.json \
             --output-dir artifacts/aeitron/ci-data-run \
             --target-documents 1000 \
             --target-days 1 \

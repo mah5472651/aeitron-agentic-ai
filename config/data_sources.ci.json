@@ -1,0 +1,25 @@
+{
+  "sources": [
+    {
+      "allowed_domains": [
+        "docs.python.org"
+      ],
+      "approval_request_sha256": null,
+      "approval_status": "approved",
+      "approved_use": "foundation",
+      "category": "agentic_coding",
+      "collection_budget": 1000,
+      "immutable_revision": "python-docs-3.14",
+      "legal_approval_sha256": null,
+      "license": "unknown-ok",
+      "license_evidence_sha256": null,
+      "name": "ci-python-docs-smoke",
+      "source_family": "ci-fixture",
+      "source_id": "ci-python-docs-smoke",
+      "trust_tier": "reviewed",
+      "urls": [
+        "https://docs.python.org/3/library/security_warnings.html"
+      ]
+    }
+  ]
+}
