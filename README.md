@@ -1114,9 +1114,19 @@ crawler:
 
 ```powershell
 python -m src.aeitron.learning.calibration_gate prepare `
-  --sources config\data_sources.ultimate.json `
+  --sources config\data_sources.governed.staging.json `
+  --reviewer-roster C:\AeitronGovernance\data_reviewers.json `
+  --reviewer-qualification-report C:\AeitronGovernance\reviewer-qualification-report.json `
+  --legal-evidence-dir C:\AeitronGovernance\source-approvals `
   --output-dir artifacts\aeitron\calibration-preflight
 ```
+
+The eight-source staging registry is the authoritative input for the first
+calibration. The OWASP Cheat Sheet Series entry is declared
+`cc-by-sa-4.0`, matching the official repository's share-alike license; a
+`cc-by-4.0` approval for that source is rejected by the hash-bound contract.
+The qualification report and legal evidence remain external human-governance
+artifacts and must never be fabricated or committed.
 
 For the first balanced foundation calibration, select the exact eight-source
 batch before requesting approvals. Selection is deterministic, hash-bound, and

@@ -672,6 +672,8 @@ class DatasetFingerprintAndManifestTest(unittest.TestCase):
         self.assertEqual(selection_payload, expected_manifest.model_dump(mode="json"))
         self.assertTrue(all(source.approval_status == "pending" for source in staging.sources))
         self.assertTrue(all(source.trust_tier == "quarantine" for source in staging.sources))
+        licenses = {source.source_id: source.license for source in staging.sources}
+        self.assertEqual(licenses["owasp-cheat-sheet-series"], "cc-by-sa-4.0")
 
     def test_registry_write_refuses_approved_source_removal_or_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -17,7 +17,7 @@
       "source_id": "nist-secure-engineering"
     },
     {
-      "registry_entry_sha256": "06e6003238f591492b6465ad3e098e8ab1fb248066e2aa8fb4a9ed560e0d40df",
+      "registry_entry_sha256": "31e614f0eb3f241c1c0f90fada1a88452f07b01f1f17951201be797b96c5c69d",
       "source_id": "owasp-cheat-sheet-series"
     },
     {
@@ -33,9 +33,9 @@
       "source_id": "rust-core-secure-systems"
     }
   ],
-  "input_registry_sha256": "9396f78d5f9a4dc8aec9d9479fe3038eb60c79638f5a684d15a1394635348b64",
+  "input_registry_sha256": "cab834a5e9d028cc51782754408d447d6c44cba66bb03d4abc0a2841ebd90df8",
   "schema_version": 1,
-  "selected_registry_sha256": "b25290164ea2482dac04052047ac3f290a73e9dced8b4e68beb8d4ae4a3e2060",
+  "selected_registry_sha256": "ec3b85958ceaa252c227b874e903a8191cf0dd39820647197d1a82853c7030c6",
   "source_count": 8,
   "source_ids": [
     "docker-production-builds",

@@ -6,7 +6,7 @@
         "cheatsheetseries.owasp.org"
       ],
       "category": "defensive_security",
-      "license": "cc-by-4.0",
+      "license": "cc-by-sa-4.0",
       "name": "owasp-cheat-sheet-series",
       "source_id": "owasp-cheat-sheet-series",
       "source_family": "owasp",

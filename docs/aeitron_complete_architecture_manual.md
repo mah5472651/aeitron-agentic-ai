@@ -4916,6 +4916,13 @@ selected snapshot, selected IDs, and each selected entry hash. The ultimate
 catalog remains unchanged. `sources.pending.json` is local staging evidence,
 not a production registry.
 
+The tracked eight-source staging registry is the authoritative first-batch
+input. Its OWASP Cheat Sheet Series entry uses `cc-by-sa-4.0`, matching the
+official repository license. This is intentionally distinct from Kubernetes
+documentation's `cc-by-4.0` entry. Since every approval binds the complete
+registry entry hash, a stale request that declares the OWASP source as
+`cc-by-4.0` cannot be replayed after this correction.
+
 Each request binds the source ID, complete registry entry SHA-256, source
 family, allowed domains, seed URLs, declared license, and intended use. An
 approval request also contains canonical evidence paths and a deliberately

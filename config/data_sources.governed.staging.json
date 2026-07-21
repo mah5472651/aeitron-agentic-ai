@@ -145,7 +145,7 @@
       "collection_budget": 20000,
       "immutable_revision": "rolling",
       "legal_approval_sha256": null,
-      "license": "cc-by-4.0",
+      "license": "cc-by-sa-4.0",
       "license_evidence_sha256": null,
       "name": "owasp-cheat-sheet-series",
       "source_family": "owasp",

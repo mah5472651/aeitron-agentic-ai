@@ -13,11 +13,12 @@ from src.aeitron.learning.quality import iter_jsonl
 from src.aeitron.shared.schemas import StrictModel
 
 
-PERMISSIVE_LICENSES = {
+DEFAULT_ALLOWED_LICENSES = {
     "apache-2.0",
     "bsd-2-clause",
     "bsd-3-clause",
     "cc-by-4.0",
+    "cc-by-sa-4.0",
     "cc0-1.0",
     "mit",
     "mpl-2.0",
@@ -57,7 +58,7 @@ def decide_license(
     allowed_licenses: set[str] | None = None,
     strict_unknown: bool = True,
 ) -> LicenseDecision:
-    allowed = allowed_licenses or PERMISSIVE_LICENSES
+    allowed = allowed_licenses or DEFAULT_ALLOWED_LICENSES
     normalized = normalize_license(license_name)
     if normalized in allowed:
         return LicenseDecision(accepted=True, license=normalized, reason="approved_license")
@@ -78,7 +79,7 @@ def filter_jsonl_by_license(
     accepted = 0
     rejected = 0
     rejected_by_license: dict[str, int] = {}
-    allowed = allowed_licenses or PERMISSIVE_LICENSES
+    allowed = allowed_licenses or DEFAULT_ALLOWED_LICENSES
     with target.open("w", encoding="utf-8") as handle:
         for path in input_paths:
             for row in iter_jsonl(path):

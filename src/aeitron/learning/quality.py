@@ -112,6 +112,7 @@ class QualityGateConfig(StrictModel):
             "bsd-2-clause",
             "bsd-3-clause",
             "cc-by-4.0",
+            "cc-by-sa-4.0",
             "cc0-1.0",
             "mit",
             "mpl-2.0",
