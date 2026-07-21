@@ -19,6 +19,7 @@ from src.aeitron.shared.integrity import sha256_file
 
 
 SPECIAL_TOKENS = [
+    "<|document_end|>",
     "<|thought_start|>",
     "<|thought_end|>",
     "<|call_graph_root|>",
@@ -46,9 +47,11 @@ class ShardBuildConfig(StrictModel):
     sequence_length: int = Field(default=2048, ge=16)
     validation_fraction: float = Field(default=0.01, ge=0.0, le=0.5)
     seed: int = 1337
+    document_boundary_token: str = "<|document_end|>"
 
 
 class ShardManifest(StrictModel):
+    schema_version: int = Field(default=1, ge=1, le=2)
     dataset_id: str
     tokenizer_path: str
     output_dir: str
@@ -63,6 +66,11 @@ class ShardManifest(StrictModel):
     dataset_manifest_sha256: str = ""
     source_sha256: dict[str, str] = Field(default_factory=dict)
     split_strategy: Literal["random_row", "pre_split_family_safe"] = "random_row"
+    document_boundary_token: str = ""
+    document_boundary_token_id: int | None = Field(default=None, ge=0)
+    train_documents: int = Field(default=0, ge=0)
+    val_documents: int = Field(default=0, ge=0)
+    boundary_token_count: int = Field(default=0, ge=0)
     created_at_unix: float = Field(default_factory=time.time)
 
 
@@ -250,6 +258,12 @@ def build_token_shards(
     active = config or ShardBuildConfig()
     rng = random.Random(active.seed)
     tokenizer = load_tokenizer(tokenizer_path)
+    boundary_token_id = tokenizer.token_to_id(active.document_boundary_token)
+    if boundary_token_id is None:
+        raise ValueError(
+            "tokenizer is missing the configured document boundary token: "
+            f"{active.document_boundary_token}"
+        )
     root = Path(output_dir)
     train_dir = root / "train"
     val_dir = root / "val"
@@ -259,6 +273,7 @@ def build_token_shards(
     train_buffer: list[int] = []
     val_buffer: list[int] = []
     shard_sha256: dict[str, str] = {}
+    train_documents = val_documents = 0
 
     def flush(buffer: list[int], split: str) -> None:
         nonlocal train_tokens, val_tokens
@@ -278,13 +293,19 @@ def build_token_shards(
         buffer.clear()
 
     def encode_into(paths: list[str | Path], *, forced_split: str | None = None) -> None:
+        nonlocal train_documents, val_documents
         for text in iter_texts(paths):
             token_ids = tokenizer.encode(text).ids
-            if len(token_ids) < 2:
+            if not token_ids:
                 continue
+            token_ids.append(boundary_token_id)
             split = forced_split or ("val" if rng.random() < active.validation_fraction else "train")
             buffer = val_buffer if split == "val" else train_buffer
             buffer.extend(token_ids)
+            if split == "val":
+                val_documents += 1
+            else:
+                train_documents += 1
             while len(buffer) >= active.shard_token_count:
                 chunk = buffer[: active.shard_token_count]
                 del buffer[: active.shard_token_count]
@@ -305,6 +326,7 @@ def build_token_shards(
         else None
     )
     manifest = ShardManifest(
+        schema_version=2,
         dataset_id=dataset_id,
         tokenizer_path=str(tokenizer_path),
         output_dir=str(root),
@@ -321,6 +343,11 @@ def build_token_shards(
         ),
         source_sha256=_resolved_hashes(all_sources),
         split_strategy="pre_split_family_safe" if validation_paths else "random_row",
+        document_boundary_token=active.document_boundary_token,
+        document_boundary_token_id=boundary_token_id,
+        train_documents=train_documents,
+        val_documents=val_documents,
+        boundary_token_count=train_documents + val_documents,
     )
     _write_json_atomic(root / "manifest.json", manifest.model_dump(mode="json"))
     return manifest

@@ -47,6 +47,129 @@ from src.aeitron.model_ops.torch_decoder import model_profile
 
 
 class AeitronPretrainingPipelineTest(unittest.TestCase):
+    def test_token_shard_stream_partitions_batches_across_data_parallel_ranks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shard = Path(temp_dir) / "shard.bin"
+            write_uint32_tokens(shard, list(range(64)))
+            rank_zero = list(
+                TokenShardStream(
+                    [str(shard)],
+                    sequence_length=4,
+                    batch_size=1,
+                    shuffle=False,
+                    rank=0,
+                    world_size=2,
+                ).batches()
+            )
+            rank_one = list(
+                TokenShardStream(
+                    [str(shard)],
+                    sequence_length=4,
+                    batch_size=1,
+                    shuffle=False,
+                    rank=1,
+                    world_size=2,
+                ).batches()
+            )
+            rank_zero_starts = {batch[0][0] for batch in rank_zero}
+            rank_one_starts = {batch[0][0] for batch in rank_one}
+            self.assertEqual(len(rank_zero), len(rank_one))
+            self.assertTrue(rank_zero_starts.isdisjoint(rank_one_starts))
+            self.assertEqual(rank_zero_starts | rank_one_starts, set(range(0, 64, 4)))
+            resumed = list(
+                TokenShardStream(
+                    [str(shard)],
+                    sequence_length=4,
+                    batch_size=1,
+                    shuffle=False,
+                    rank=0,
+                    world_size=2,
+                ).batches(start_batch=3)
+            )
+            self.assertEqual(resumed, rank_zero[3:])
+
+    def test_gradient_accumulation_counts_optimizer_steps_and_persists_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            corpus.write_text(
+                json.dumps({"text": "def verify(value): return value is not None " * 100, "license": "mit"}) + "\n",
+                encoding="utf-8",
+            )
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            build_token_shards(
+                input_paths=[corpus],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "shards",
+                config=ShardBuildConfig(shard_token_count=256, sequence_length=16, validation_fraction=0.0),
+            )
+            report = run_pretraining_loop(
+                output_dir=root / "train",
+                manifest=root / "shards" / "manifest.json",
+                device="cpu",
+                steps=2,
+                batch_size=1,
+                sequence_length=16,
+                gradient_accumulation_steps=2,
+                target_tokens=64,
+                dtype="fp32",
+                validate_every=0,
+                checkpoint_every=1,
+                resume=False,
+            )
+            self.assertEqual(report["step_semantics"], "optimizer_update_v2")
+            self.assertEqual(report["optimizer_steps"], 2)
+            self.assertEqual(report["completed_micro_batches_per_rank"], 4)
+            self.assertEqual(report["trained_tokens"], 64)
+            self.assertEqual(len(report["train_losses"]), 2)
+            self.assertEqual(report["dataloader_state"]["completed_micro_batches_per_rank"], 4)
+
+            import torch
+
+            manifest = json.loads(Path(report["checkpoint_manifest"]).read_text(encoding="utf-8"))
+            payload = torch.load(Path(manifest["checkpoint_dir"]) / "model.pt", map_location="cpu")
+            self.assertEqual(payload["training_args"]["step_semantics"], "optimizer_update_v2")
+            self.assertEqual(payload["dataloader_state"]["batch_offset_within_epoch"], 4)
+
+    def test_pretraining_rejects_inconsistent_immutable_token_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            corpus = root / "clean.jsonl"
+            corpus.write_text(
+                json.dumps({"text": "secure code and tests " * 100, "license": "mit"}) + "\n",
+                encoding="utf-8",
+            )
+            tokenizer_path = train_bpe_tokenizer(
+                [corpus],
+                root / "tokenizer.json",
+                TokenizerTrainConfig(vocab_size=1200, min_frequency=1),
+            )
+            build_token_shards(
+                input_paths=[corpus],
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "shards",
+                config=ShardBuildConfig(shard_token_count=128, sequence_length=16, validation_fraction=0.0),
+            )
+            with self.assertRaisesRegex(ValueError, "target_tokens must equal optimizer steps"):
+                run_pretraining_loop(
+                    output_dir=root / "train",
+                    manifest=root / "shards" / "manifest.json",
+                    device="cpu",
+                    steps=2,
+                    batch_size=1,
+                    sequence_length=16,
+                    gradient_accumulation_steps=2,
+                    target_tokens=32,
+                    dtype="fp32",
+                    validate_every=0,
+                    checkpoint_every=0,
+                    resume=False,
+                )
+
     def test_production_tokenizer_requires_hash_bound_family_safe_dataset_splits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -439,6 +562,13 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
             self.assertFalse(report.special_tokens_missing)
             self.assertTrue(Path(report.tokenizer_path).exists())
             self.assertTrue(report.shard_manifest["train_shards"])
+            self.assertEqual(report.shard_manifest["schema_version"], 2)
+            self.assertEqual(report.shard_manifest["document_boundary_token"], "<|document_end|>")
+            self.assertGreaterEqual(report.shard_manifest["boundary_token_count"], 4)
+            self.assertEqual(
+                report.shard_manifest["boundary_token_count"],
+                report.shard_manifest["train_documents"] + report.shard_manifest["val_documents"],
+            )
 
     def test_real_corpus_tokenizer_fails_when_exact_vocab_cannot_be_trained(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1013,7 +1143,7 @@ class AeitronPretrainingPipelineTest(unittest.TestCase):
             val_tokens=0,
             sequence_length=128,
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "document-boundary shard schema v2"):
             validate_production_training_args(
                 production_mode=True,
                 dev_smoke=False,

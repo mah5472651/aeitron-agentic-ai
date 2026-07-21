@@ -23,6 +23,50 @@ from src.aeitron.shared.schemas import StrictModel
 from src.aeitron.shared.integrity import canonical_json_bytes, sha256_file
 
 
+TRAINING_STEP_SEMANTICS = "optimizer_update_v2"
+
+
+class TrainingBatchContract(StrictModel):
+    """Canonical optimizer-step, global-batch, and token-accounting contract."""
+
+    step_semantics: Literal["optimizer_update_v2"] = TRAINING_STEP_SEMANTICS
+    optimizer_steps: int = Field(ge=1)
+    sequence_length: int = Field(ge=1)
+    micro_batch_size: int = Field(ge=1)
+    gradient_accumulation_steps: int = Field(ge=1)
+    data_parallel_size: int = Field(ge=1)
+
+    @property
+    def global_batch_sequences(self) -> int:
+        return self.micro_batch_size * self.gradient_accumulation_steps * self.data_parallel_size
+
+    @property
+    def tokens_per_optimizer_step(self) -> int:
+        return self.sequence_length * self.global_batch_sequences
+
+    @property
+    def target_tokens(self) -> int:
+        return self.optimizer_steps * self.tokens_per_optimizer_step
+
+    @property
+    def completed_micro_batches_per_rank(self) -> int:
+        return self.optimizer_steps * self.gradient_accumulation_steps
+
+    def report(self) -> dict[str, int | str]:
+        return {
+            "step_semantics": self.step_semantics,
+            "optimizer_steps": self.optimizer_steps,
+            "sequence_length": self.sequence_length,
+            "micro_batch_size": self.micro_batch_size,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "data_parallel_size": self.data_parallel_size,
+            "global_batch_sequences": self.global_batch_sequences,
+            "tokens_per_optimizer_step": self.tokens_per_optimizer_step,
+            "target_tokens": self.target_tokens,
+            "completed_micro_batches_per_rank": self.completed_micro_batches_per_rank,
+        }
+
+
 class TokenizerContract(StrictModel):
     tokenizer_type: Literal["bpe", "unigram", "sentencepiece"] = "bpe"
     vocab_size: int = Field(default=128_000, ge=8_000, le=512_000)

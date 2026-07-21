@@ -123,6 +123,8 @@ class TokenShardStream:
         prefetch_batches: int = 0,
         artifact_cache: ArtifactCache | None = None,
         expected_sha256: dict[str, str] | None = None,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         if not shard_paths:
             raise ValueError("at least one shard path is required")
@@ -136,6 +138,12 @@ class TokenShardStream:
         self.prefetch_batches = prefetch_batches
         self.artifact_cache = artifact_cache
         self.expected_sha256 = expected_sha256 or {}
+        if world_size < 1:
+            raise ValueError("world_size must be positive")
+        if rank < 0 or rank >= world_size:
+            raise ValueError("rank must satisfy 0 <= rank < world_size")
+        self.rank = rank
+        self.world_size = world_size
 
     def _materialize_shard(self, path: str) -> Path:
         if self.artifact_cache:
@@ -146,7 +154,7 @@ class TokenShardStream:
             raise ValueError(f"training shard checksum mismatch: {path}")
         return local
 
-    def _batches(self, *, epoch: int = 0) -> Iterator[list[list[int]]]:
+    def _global_batches(self, *, epoch: int = 0) -> Iterator[list[list[int]]]:
         rng = random.Random(self.seed + epoch)
         paths = self.shard_paths.copy()
         if self.shuffle:
@@ -167,9 +175,24 @@ class TokenShardStream:
                     for index in range(0, needed, self.sequence_length)
                 ]
 
-    def batches(self, *, epoch: int = 0) -> Iterator[list[list[int]]]:
+    def _batches(self, *, epoch: int = 0, start_batch: int = 0) -> Iterator[list[list[int]]]:
+        if start_batch < 0:
+            raise ValueError("start_batch must be non-negative")
+        group: list[list[list[int]]] = []
+        local_index = 0
+        for batch in self._global_batches(epoch=epoch):
+            group.append(batch)
+            if len(group) < self.world_size:
+                continue
+            selected = group[self.rank]
+            group.clear()
+            if local_index >= start_batch:
+                yield selected
+            local_index += 1
+
+    def batches(self, *, epoch: int = 0, start_batch: int = 0) -> Iterator[list[list[int]]]:
         if self.prefetch_batches == 0:
-            yield from self._batches(epoch=epoch)
+            yield from self._batches(epoch=epoch, start_batch=start_batch)
             return
 
         sentinel = object()
@@ -187,7 +210,7 @@ class TokenShardStream:
 
         def produce() -> None:
             try:
-                for batch in self._batches(epoch=epoch):
+                for batch in self._batches(epoch=epoch, start_batch=start_batch):
                     if not put(batch):
                         return
             except BaseException as exc:  # propagated to the training thread
@@ -195,7 +218,11 @@ class TokenShardStream:
             finally:
                 put(sentinel)
 
-        worker = threading.Thread(target=produce, name=f"aeitron-shard-prefetch-{epoch}", daemon=True)
+        worker = threading.Thread(
+            target=produce,
+            name=f"aeitron-shard-prefetch-rank-{self.rank}-epoch-{epoch}",
+            daemon=True,
+        )
         worker.start()
         try:
             while True:

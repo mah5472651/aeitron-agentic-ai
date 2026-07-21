@@ -4089,7 +4089,7 @@ is produced.
 
 ### Production Training Policy Contract
 
-`config/training_profiles.json` schema version 2 is the canonical, append-only
+`config/training_profiles.json` schema version 3 is the canonical, append-only
 training policy registry. JSON `defaults` reduce duplication, but
 `TrainingProfileRegistry.from_file()` deep-resolves every profile before
 validation and hashing. The immutable hash therefore covers the complete
@@ -4127,12 +4127,24 @@ warmup/decay behavior, reports current learning rate, validates expected
 runtime versions, prefetches shard batches, and fails if consumed tokens exceed
 the immutable budget.
 
-`steps` is deliberately defined as dataloader micro-batch steps in this
-runtime. `global_batch_sequences = micro_batch * gradient_accumulation *
-world_size`; the immutable token target is calculated from consumed
-micro-batches, sequence length, and world size. Optimizer-update metrics remain
-separate so changing gradient accumulation cannot silently change token
-accounting.
+`steps` is defined as completed optimizer updates on every runtime. The single
+canonical contract is `global_batch_sequences = micro_batch_size *
+gradient_accumulation_steps * data_parallel_size` and `target_tokens =
+optimizer_steps * sequence_length * global_batch_sequences`. Each optimizer
+update consumes exactly `gradient_accumulation_steps` microbatches per
+data-parallel rank. FSDP and DeepSpeed ranks receive deterministic,
+non-overlapping partitions, while distributed validation aggregates loss across
+all ranks. Checkpoints are emitted only at optimizer boundaries and bind the
+exact epoch/batch cursor, data-parallel topology, scheduler, optimizer, and RNG
+state. A checkpoint without the `optimizer_update_v2` contract is rejected by
+the production resume path instead of being interpreted ambiguously.
+
+Token-shard schema v2 adds one `<|document_end|>` token per accepted source
+document and records train/validation document counts plus the boundary token
+ID in the immutable shard manifest. Production training verifies these counts
+and rejects legacy unbounded concatenation. This prevents the causal objective
+from treating the end of one unrelated repository record and the beginning of
+another as a genuine language transition.
 
 ### Gated Qualification Staircase
 
@@ -5799,6 +5811,59 @@ gates, promoted 100K and larger datasets, a real 128K tokenizer, the 1B A/B
 run, multi-node Megatron training, 1M context evaluation, 4T checkpoint
 recovery and converted-serving parity are measured external work and remain
 blocked or not-run until immutable evidence exists.
+
+## First-Principles Convergence Audit
+
+The architecture is directionally sound: a causal decoder learns from governed
+immutable data; retrieval supplies repository evidence; tools execute inside a
+bounded policy; tests and verifiers determine outcomes; and promotion is based
+on measured artifacts rather than model claims. The separation between model,
+data, retrieval, execution and evidence is consistent with first principles.
+
+The codebase is currently **overweight in control-plane breadth** relative to
+model-quality evidence. Governance, scheduling, deployment, RAG, agent roles
+and 4T contracts are more developed than the promoted corpus, trained scratch
+checkpoint, executable benchmark results and scaling curves they are meant to
+support. New orchestration modules should remain frozen until those evidence
+gaps close.
+
+This audit corrected four training-level violations that were not ordinary
+production inconvenience:
+
+1. Backend-dependent meanings of `steps` and token budgets were replaced by
+   the canonical `optimizer_update_v2` batch contract.
+2. Data-parallel ranks now consume deterministic, non-overlapping batches;
+   replicated sample consumption no longer inflates token accounting.
+3. Checkpoint resume now binds and validates the exact dataloader cursor and
+   can occur only at a completed optimizer boundary.
+4. Token shards now preserve document boundaries, and empty distributed
+   validation can no longer produce a synthetic zero loss.
+
+The largest remaining architectural hypotheses are not yet defects, but must
+not be treated as settled truths:
+
+- 128K vocabulary size must beat smaller vocabulary candidates on compression,
+  validation loss and downstream code/security tasks. It is not automatically
+  optimal because the final parameter target is large.
+- 4T total parameters, 128B active parameters and 5M effective context are
+  research targets. Dense/MoE and context scaling evidence must select the
+  architecture before capital is committed.
+- A blanket prohibition on all post-pretraining full-weight instruction and
+  tool-use training conflicts with the goal of a reliable instruction-following
+  coding agent. Scratch initialization and Aeitron-owned weights can be retained
+  while later using governed full-parameter continuation objectives. This
+  requires an explicit owner policy change; the current repository correctly
+  does not bypass the prohibition.
+- A model-quality claim is blocked while the active backend is a mock, protected
+  executable evaluations have not run, and no real checkpoint is serving.
+
+The convergence order is therefore fixed: close governance, build promoted
+data, run tokenizer A/B qualification, prove the T4 trainer, perform 1B
+dense/MoE scaling experiments, activate a native checkpoint, and only then
+deepen infrastructure or scale model size. External approvals, GPUs, live
+services, load, chaos and soak tests are ordinary production realities. Silent
+objective drift, duplicate rank data, ambiguous resume semantics and missing
+document boundaries are fundamental errors and must always block release.
 
 
 

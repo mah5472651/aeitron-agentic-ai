@@ -115,7 +115,7 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
 
     def test_registry_is_immutable_and_has_scale_profiles(self) -> None:
         registry = TrainingProfileRegistry.from_file()
-        self.assertEqual(registry.schema_version, 2)
+        self.assertEqual(registry.schema_version, 3)
         self.assertEqual(registry.latest("defensive-1k").scheduler, "notebook")
         target = registry.latest("aeitron-60b-hybrid")
         self.assertEqual(target.distributed_strategy, "megatron")
@@ -147,11 +147,11 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
     def test_resolved_policy_recomputes_tokens_and_reaches_runtime_command(self) -> None:
         request = self.request(overrides={"steps": 2000})
         spec = self.service.resolve_spec(request)
-        self.assertEqual(spec.schema_version, 2)
+        self.assertEqual(spec.schema_version, 3)
         self.assertEqual(len(spec.model_contract_sha256 or ""), 64)
         self.assertEqual(len(spec.model_parameter_report_sha256 or ""), 64)
         self.assertEqual(spec.model_contract["name"], "aeitron-t4-validation")
-        self.assertEqual(spec.token_budget.target_tokens, 256_000)
+        self.assertEqual(spec.token_budget.target_tokens, 2_048_000)
         command = build_training_command(spec, output_dir="artifacts/aeitron/test")
         self.assertIn("--learning-rate-schedule", command)
         self.assertIn("--checkpoint-every", command)

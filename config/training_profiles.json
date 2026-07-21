@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "defaults": {
     "optimizer": {
       "name": "adamw",
@@ -107,7 +107,7 @@
   "profiles": [
     {
       "profile_id": "defensive-1k",
-      "version": 3,
+      "version": 4,
       "description": "Kaggle/Colab defensive-security scratch pipeline validation.",
       "run_type": "data_pipeline",
       "dev_only": true,
@@ -121,7 +121,7 @@
       "gradient_accumulation_steps": 8,
       "dtype": "fp16",
       "resources": {"nodes": 1, "gpus_per_node": 1, "gpu_memory_gib": 16, "cpu_cores": 4, "memory_gib": 16, "rdma_required": false},
-      "token_budget": {"target_tokens": 128000, "maximum_tokens": 256000, "global_batch_sequences": 8},
+      "token_budget": {"target_tokens": 1024000, "maximum_tokens": 2048000, "global_batch_sequences": 8},
       "learning_rate": {"warmup_steps": 100},
       "immutable_inputs": {"require_promoted_dataset": false, "allowed_uri_schemes": ["s3", "file"]},
       "runtime_limits": {"maximum_wall_time_seconds": 21600},
@@ -132,7 +132,7 @@
     },
     {
       "profile_id": "defensive-10k",
-      "version": 3,
+      "version": 4,
       "description": "Serious single-GPU defensive-security scratch validation on a promoted dataset.",
       "run_type": "data_pipeline",
       "dev_only": false,
@@ -146,7 +146,7 @@
       "gradient_accumulation_steps": 8,
       "dtype": "fp16",
       "resources": {"nodes": 1, "gpus_per_node": 1, "gpu_memory_gib": 16, "cpu_cores": 8, "memory_gib": 32, "rdma_required": false},
-      "token_budget": {"target_tokens": 2560000, "maximum_tokens": 7680000, "global_batch_sequences": 8},
+      "token_budget": {"target_tokens": 20480000, "maximum_tokens": 61440000, "global_batch_sequences": 8},
       "learning_rate": {"warmup_steps": 500},
       "checkpoint": {"interval_steps": 500},
       "evaluation": {"interval_steps": 250},
@@ -158,7 +158,7 @@
     },
     {
       "profile_id": "fundamentals-validation",
-      "version": 3,
+      "version": 4,
       "description": "Coding and language fundamentals scratch-learning validation.",
       "run_type": "data_pipeline",
       "dev_only": true,
@@ -172,7 +172,7 @@
       "gradient_accumulation_steps": 8,
       "dtype": "fp16",
       "resources": {"nodes": 1, "gpus_per_node": 1, "gpu_memory_gib": 16, "cpu_cores": 4, "memory_gib": 16, "rdma_required": false},
-      "token_budget": {"target_tokens": 256000, "maximum_tokens": 1280000, "global_batch_sequences": 8},
+      "token_budget": {"target_tokens": 2048000, "maximum_tokens": 10240000, "global_batch_sequences": 8},
       "learning_rate": {"warmup_steps": 100},
       "immutable_inputs": {"require_promoted_dataset": false, "allowed_uri_schemes": ["s3", "file"]},
       "runtime_limits": {"maximum_wall_time_seconds": 21600},
@@ -183,7 +183,7 @@
     },
     {
       "profile_id": "aeitron-1b-single-node",
-      "version": 3,
+      "version": 4,
       "description": "Single-node 1B scratch pretraining qualification before distributed scaling.",
       "run_type": "pretrain",
       "dev_only": false,
@@ -199,7 +199,7 @@
       "resources": {"nodes": 1, "gpus_per_node": 8, "gpu_memory_gib": 80, "cpu_cores": 64, "memory_gib": 512, "rdma_required": false},
       "optimizer": {"learning_rate": 0.0002},
       "learning_rate": {"warmup_steps": 1000},
-      "token_budget": {"target_tokens": 163840000, "maximum_tokens": 1638400000, "global_batch_sequences": 256},
+      "token_budget": {"target_tokens": 5242880000, "maximum_tokens": 52428800000, "global_batch_sequences": 256},
       "checkpoint": {"interval_steps": 500},
       "evaluation": {"interval_steps": 500, "validation_batches": 32},
       "runtime_limits": {"maximum_wall_time_seconds": 86400},
@@ -211,7 +211,7 @@
     },
     {
       "profile_id": "defensive-staircase-notebook",
-      "version": 2,
+      "version": 3,
       "description": "Gated 1k-10k defensive checkpoint qualification using one immutable promoted dataset.",
       "run_type": "pretrain",
       "dev_only": true,
@@ -225,7 +225,7 @@
       "gradient_accumulation_steps": 8,
       "dtype": "fp16",
       "resources": {"nodes": 1, "gpus_per_node": 1, "gpu_memory_gib": 16, "cpu_cores": 4, "memory_gib": 16, "rdma_required": false},
-      "token_budget": {"target_tokens": 128000, "maximum_tokens": 1280000, "global_batch_sequences": 8},
+      "token_budget": {"target_tokens": 1024000, "maximum_tokens": 10240000, "global_batch_sequences": 8},
       "learning_rate": {"warmup_ratio": 0.05},
       "immutable_inputs": {"allowed_uri_schemes": ["s3", "file"]},
       "runtime_limits": {"maximum_wall_time_seconds": 43200},
@@ -236,7 +236,7 @@
     },
     {
       "profile_id": "defensive-staircase-cluster",
-      "version": 2,
+      "version": 3,
       "description": "Gated 11k-1M defensive checkpoint qualification on a trusted single-GPU scheduler.",
       "run_type": "pretrain",
       "dev_only": false,
@@ -250,7 +250,7 @@
       "gradient_accumulation_steps": 8,
       "dtype": "fp16",
       "resources": {"nodes": 1, "gpus_per_node": 1, "gpu_memory_gib": 16, "cpu_cores": 8, "memory_gib": 32, "rdma_required": false},
-      "token_budget": {"target_tokens": 1408000, "maximum_tokens": 128000000, "global_batch_sequences": 8},
+      "token_budget": {"target_tokens": 11264000, "maximum_tokens": 1024000000, "global_batch_sequences": 8},
       "learning_rate": {"warmup_ratio": 0.05},
       "checkpoint": {"interval_steps": 1000, "keep_last": 5},
       "evaluation": {"interval_steps": 1000, "validation_batches": 32},
@@ -262,7 +262,7 @@
     },
     {
       "profile_id": "aeitron-7b-fsdp",
-      "version": 3,
+      "version": 4,
       "description": "Trusted multi-node 7B scratch pretraining with native PyTorch FSDP.",
       "run_type": "pretrain",
       "dev_only": false,
@@ -277,7 +277,7 @@
       "dtype": "bf16",
       "resources": {"nodes": 2, "gpus_per_node": 8, "gpu_memory_gib": 80, "cpu_cores": 96, "memory_gib": 768, "rdma_required": true},
       "learning_rate": {"warmup_steps": 2000},
-      "token_budget": {"target_tokens": 6553600000, "maximum_tokens": 65536000000, "global_batch_sequences": 256},
+      "token_budget": {"target_tokens": 104857600000, "maximum_tokens": 1048576000000, "global_batch_sequences": 256},
       "checkpoint": {"interval_steps": 1000, "keep_last": 5},
       "evaluation": {"interval_steps": 1000, "validation_batches": 64},
       "runtime_limits": {"maximum_wall_time_seconds": 259200},
@@ -290,7 +290,7 @@
     },
     {
       "profile_id": "aeitron-32b-zero3",
-      "version": 3,
+      "version": 4,
       "description": "Trusted 32B scratch pretraining using DeepSpeed ZeRO-3.",
       "run_type": "pretrain",
       "dev_only": false,
@@ -306,7 +306,7 @@
       "resources": {"nodes": 8, "gpus_per_node": 8, "gpu_memory_gib": 80, "cpu_cores": 96, "memory_gib": 1024, "rdma_required": true},
       "optimizer": {"learning_rate": 0.00015},
       "learning_rate": {"warmup_steps": 5000},
-      "token_budget": {"target_tokens": 262144000000, "maximum_tokens": 524288000000, "global_batch_sequences": 1024},
+      "token_budget": {"target_tokens": 4194304000000, "maximum_tokens": 8388608000000, "global_batch_sequences": 1024},
       "checkpoint": {"interval_steps": 2000, "keep_last": 5},
       "evaluation": {"interval_steps": 2000, "validation_batches": 128},
       "runtime_limits": {"maximum_wall_time_seconds": 604800},
@@ -319,7 +319,7 @@
     },
     {
       "profile_id": "aeitron-60b-hybrid",
-      "version": 3,
+      "version": 4,
       "description": "Target 60B-class trusted-cluster scratch pretraining profile; blocked until real topology proof passes.",
       "run_type": "pretrain",
       "dev_only": false,
@@ -349,7 +349,7 @@
     },
     {
       "profile_id": "aeitron-4t-moe",
-      "version": 1,
+      "version": 2,
       "description": "Final 4T-total, approximately 128B-active MLA/MoE scratch pretraining contract; blocked until all scaling and cluster evidence gates pass.",
       "run_type": "pretrain",
       "dev_only": false,

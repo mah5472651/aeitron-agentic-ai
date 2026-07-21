@@ -978,6 +978,25 @@ single-node jobs, Kubernetes Jobs, Kubeflow PyTorchJobs, and Slurm. Clients can
 select immutable profiles and bounded overrides only; arbitrary shell commands
 are never accepted.
 
+Training profile schema v3 defines `steps` as completed optimizer updates on
+every backend. The canonical token contract is:
+
+```text
+global_batch_sequences = micro_batch_size * gradient_accumulation_steps * data_parallel_size
+target_tokens = optimizer_steps * sequence_length * global_batch_sequences
+```
+
+Data-parallel ranks consume deterministic, non-overlapping batches. Checkpoints
+are written only after a complete optimizer update and bind the optimizer,
+scheduler, RNG state, data-parallel topology, and exact dataloader cursor.
+Pre-v3 profiles and checkpoints without `optimizer_update_v2` cursor evidence
+cannot resume through the production training path.
+
+Token-shard schema v2 appends `<|document_end|>` to every accepted source row.
+Production training rejects legacy shards without verified boundary counts, so
+the causal objective never learns accidental transitions between unrelated
+documents.
+
 ```text
 SDK / CLI / React UI
   -> FastAPI + short-lived JWT

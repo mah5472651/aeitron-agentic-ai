@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import json
 import math
 import os
@@ -16,7 +17,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from src.aeitron.model_ops.data_loader import ArtifactCache, TokenShardStream, count_batches, load_manifest
-from src.aeitron.model_ops.foundation import CheckpointManifest, sha256_file
+from src.aeitron.model_ops.foundation import (
+    TRAINING_STEP_SEMANTICS,
+    CheckpointManifest,
+    TrainingBatchContract,
+    sha256_file,
+)
 from src.aeitron.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer, read_uint32_tokens
 from src.aeitron.model_ops.torch_decoder import (
     DecoderBlock,
@@ -511,6 +517,50 @@ def _json_state(value: Any) -> Any:
     raise TypeError(f"checkpoint state contains unsupported JSON value: {type(value).__name__}")
 
 
+def _validate_checkpoint_training_invariants(
+    trainer_state: dict[str, Any],
+    expected: dict[str, Any] | None,
+) -> None:
+    if expected is None:
+        return
+    saved = trainer_state.get("training_args")
+    if not isinstance(saved, dict):
+        raise ValueError("checkpoint has no immutable training argument contract")
+    mismatched = {
+        key: {"checkpoint": saved.get(key), "expected": value}
+        for key, value in expected.items()
+        if saved.get(key) != value
+    }
+    if mismatched:
+        names = ", ".join(sorted(mismatched))
+        raise ValueError(f"checkpoint training semantics are incompatible: {names}")
+    step = int(trainer_state.get("step", 0))
+    dataloader_state = trainer_state.get("dataloader_state")
+    if not isinstance(dataloader_state, dict):
+        raise ValueError("checkpoint has no deterministic dataloader cursor")
+    accumulation = int(expected["gradient_accumulation_steps"])
+    batches_per_epoch = int(expected["batches_per_rank_per_epoch"])
+    expected_micro_batches = step * accumulation
+    if int(dataloader_state.get("completed_micro_batches_per_rank", -1)) != expected_micro_batches:
+        raise ValueError("checkpoint dataloader cursor does not match optimizer step and accumulation contract")
+    expected_cursor = {
+        "semantics": expected["step_semantics"],
+        "completed_optimizer_steps": step,
+        "epoch": expected_micro_batches // batches_per_epoch,
+        "batch_offset_within_epoch": expected_micro_batches % batches_per_epoch,
+        "batches_per_rank_per_epoch": batches_per_epoch,
+        "world_size": expected["data_parallel_world_size"],
+    }
+    mismatched_cursor = [
+        key for key, value in expected_cursor.items() if dataloader_state.get(key) != value
+    ]
+    if mismatched_cursor:
+        raise ValueError(
+            "checkpoint deterministic dataloader cursor is incompatible: "
+            + ", ".join(sorted(mismatched_cursor))
+        )
+
+
 def _save_dcp_checkpoint(
     *,
     checkpoint_dir: Path,
@@ -563,6 +613,7 @@ def _load_dcp_checkpoint(
     expected_config: ScratchDecoderConfig | None = None,
     expected_dataset_manifest_sha256: str | None = None,
     expected_tokenizer_sha256: str | None = None,
+    expected_training_invariants: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
@@ -578,6 +629,7 @@ def _load_dcp_checkpoint(
     )
     root = checkpoint_path.parent
     trainer_state = json.loads((root / "trainer_state.json").read_text(encoding="utf-8"))
+    _validate_checkpoint_training_invariants(trainer_state, expected_training_invariants)
     if expected_config is not None:
         try:
             saved_config = ScratchDecoderConfig.model_validate(trainer_state.get("config") or {})
@@ -761,6 +813,7 @@ def save_training_checkpoint(
     dataset_manifest_path: str | Path | None = None,
     tokenizer_path: str | Path | None = None,
     environment: dict[str, Any] | None = None,
+    dataloader_state: dict[str, Any] | None = None,
     manifest_filename: str = "checkpoint_manifest.json",
 ) -> Path:
     checkpoint_dir = output_dir / f"checkpoint-step-{step:08d}"
@@ -779,6 +832,7 @@ def save_training_checkpoint(
         "tokenizer_sha256": tokenizer_hash,
         "git_commit": git_commit(),
         "environment": environment or {},
+        "dataloader_state": dataloader_state or {},
         "distributed_world_size": distributed_world_size(),
     }
     is_fsdp = model.__class__.__name__ == "FullyShardedDataParallel"
@@ -864,6 +918,7 @@ def load_checkpoint(
     expected_config: ScratchDecoderConfig | None = None,
     expected_dataset_manifest_sha256: str | None = None,
     expected_tokenizer_sha256: str | None = None,
+    expected_training_invariants: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     if checkpoint_path.is_dir() and (checkpoint_path / ".metadata").is_file():
         return _load_dcp_checkpoint(
@@ -874,6 +929,7 @@ def load_checkpoint(
             expected_config=expected_config,
             expected_dataset_manifest_sha256=expected_dataset_manifest_sha256,
             expected_tokenizer_sha256=expected_tokenizer_sha256,
+            expected_training_invariants=expected_training_invariants,
         )
     if checkpoint_path.is_dir() and (checkpoint_path / "latest").exists() and hasattr(model, "load_checkpoint"):
         loaded_path, client_state = model.load_checkpoint(str(checkpoint_path))
@@ -889,8 +945,10 @@ def load_checkpoint(
         if expected_tokenizer_sha256 is not None:
             if str(client_state.get("tokenizer_sha256") or "") != expected_tokenizer_sha256:
                 raise ValueError("DeepSpeed checkpoint tokenizer hash does not match immutable training input")
+        _validate_checkpoint_training_invariants(client_state, expected_training_invariants)
         return int(client_state.get("step", 0)), int(client_state.get("trained_tokens", 0))
     payload = load_trusted_checkpoint(checkpoint_path, map_location=device)
+    _validate_checkpoint_training_invariants(payload, expected_training_invariants)
     if expected_config is not None:
         try:
             saved_config = ScratchDecoderConfig.model_validate(payload.get("config") or {})
@@ -951,6 +1009,16 @@ def validate_production_training_args(
         failures.append("production mode requires a non-empty validation shard set")
     if active_manifest.split_strategy != "pre_split_family_safe":
         failures.append("production mode requires a pre-split family-safe token corpus")
+    if active_manifest.schema_version < 2:
+        failures.append("production mode requires document-boundary shard schema v2")
+    if (
+        active_manifest.document_boundary_token != "<|document_end|>"
+        or active_manifest.document_boundary_token_id is None
+        or active_manifest.boundary_token_count
+        != active_manifest.train_documents + active_manifest.val_documents
+        or active_manifest.boundary_token_count < 1
+    ):
+        failures.append("production mode requires a verified document boundary token for every source row")
     if not active_manifest.dataset_manifest_path or not active_manifest.dataset_manifest_sha256:
         failures.append("production mode requires a promoted dataset manifest binding")
     else:
@@ -1069,16 +1137,29 @@ def validation_loss(
     model.eval()
     losses: list[float] = []
     use_autocast = device.type == "cuda" and dtype in {"bf16", "fp16"}
-    for index, batch in enumerate(stream.batches(epoch=0)):
-        if index >= max_batches:
-            break
-        input_ids = tensor_batch(batch, device=device)
-        with torch.autocast(device_type=device.type, dtype=autocast_dtype(dtype), enabled=use_autocast):
-            output = model(input_ids, labels=input_ids)
-        if output.loss is not None:
-            losses.append(float(output.loss.detach().cpu()))
-    model.train()
-    return sum(losses) / max(1, len(losses))
+    try:
+        for index, batch in enumerate(stream.batches(epoch=0)):
+            if index >= max_batches:
+                break
+            input_ids = tensor_batch(batch, device=device)
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype(dtype), enabled=use_autocast):
+                output = model(input_ids, labels=input_ids)
+            if output.loss is not None:
+                losses.append(float(output.loss.detach().cpu()))
+    finally:
+        model.train()
+    local_sum = sum(losses)
+    local_count = len(losses)
+    if distributed_is_initialized():
+        aggregate = torch.tensor([local_sum, float(local_count)], dtype=torch.float64, device=device)
+        torch.distributed.all_reduce(aggregate, op=torch.distributed.ReduceOp.SUM)
+        local_sum, local_count = float(aggregate[0].item()), int(aggregate[1].item())
+    if local_count < 1:
+        raise RuntimeError("validation stream produced no complete batches")
+    mean_loss = local_sum / local_count
+    if not math.isfinite(mean_loss):
+        raise FloatingPointError("validation stream produced a non-finite loss")
+    return mean_loss
 
 
 def run_pretraining_loop(
@@ -1218,6 +1299,44 @@ def run_pretraining_loop(
         artifact_cache=artifact_cache,
         expected_sha256=active_manifest.shard_sha256,
     )
+    data_parallel_rank = distributed_rank()
+    data_parallel_world_size = distributed_world_size()
+    available_batches_per_rank = available_batches // data_parallel_world_size
+    if available_batches_per_rank < 1:
+        raise ValueError(
+            "training corpus cannot provide one non-overlapping batch per data-parallel rank: "
+            f"global_batches={available_batches}, world_size={data_parallel_world_size}"
+        )
+    available_validation_batches = 0
+    if active_manifest.val_shards:
+        available_validation_batches = count_batches(
+            active_manifest.val_shards,
+            sequence_length=sequence_length,
+            batch_size=batch_size,
+            artifact_cache=artifact_cache,
+            expected_sha256=active_manifest.shard_sha256,
+        )
+        if validate_every > 0 and available_validation_batches < data_parallel_world_size:
+            raise ValueError(
+                "validation shards cannot provide one non-overlapping batch per data-parallel rank: "
+                f"validation_tokens={active_manifest.val_tokens}, "
+                f"required_tokens={batch_size * sequence_length * data_parallel_world_size}"
+            )
+    batch_contract = TrainingBatchContract(
+        optimizer_steps=steps,
+        sequence_length=sequence_length,
+        micro_batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        data_parallel_size=data_parallel_world_size,
+    )
+    tokens_per_optimizer_step = batch_contract.tokens_per_optimizer_step
+    expected_target_tokens = batch_contract.target_tokens
+    if target_tokens is not None and target_tokens != expected_target_tokens:
+        raise ValueError(
+            "target_tokens must equal optimizer steps * micro batch * sequence length * "
+            "gradient accumulation * data-parallel world size: "
+            f"target_tokens={target_tokens}, expected={expected_target_tokens}"
+        )
     active_progress.emit(
         "training",
         "started",
@@ -1230,6 +1349,9 @@ def run_pretraining_loop(
         train_shards=len(active_manifest.train_shards),
         val_shards=len(active_manifest.val_shards),
         available_batches=available_batches,
+        available_batches_per_rank=available_batches_per_rank,
+        available_validation_batches=available_validation_batches,
+        tokens_per_optimizer_step=tokens_per_optimizer_step,
         vocab_size=config.vocab_size,
         parameter_count=config.parameter_estimate(),
     )
@@ -1242,6 +1364,8 @@ def run_pretraining_loop(
         prefetch_batches=dataloader_prefetch_batches,
         artifact_cache=artifact_cache,
         expected_sha256=active_manifest.shard_sha256,
+        rank=data_parallel_rank,
+        world_size=data_parallel_world_size,
     )
     val_stream = (
         TokenShardStream(
@@ -1253,6 +1377,8 @@ def run_pretraining_loop(
             prefetch_batches=dataloader_prefetch_batches,
             artifact_cache=artifact_cache,
             expected_sha256=active_manifest.shard_sha256,
+            rank=data_parallel_rank,
+            world_size=data_parallel_world_size,
         )
         if active_manifest.val_shards
         else None
@@ -1290,6 +1416,7 @@ def run_pretraining_loop(
         )
     checkpoint_environment = training_environment_report(device=selected, dtype=dtype, distributed_strategy=distributed_strategy)
     checkpoint_args = {
+        "step_semantics": TRAINING_STEP_SEMANTICS,
         "steps": steps,
         "batch_size": batch_size,
         "sequence_length": sequence_length,
@@ -1320,8 +1447,24 @@ def run_pretraining_loop(
         "max_training_loss": max_training_loss,
         "dataloader_prefetch_batches": dataloader_prefetch_batches,
         "dataloader_seed": dataloader_seed,
+        "data_parallel_world_size": data_parallel_world_size,
+        "tokens_per_optimizer_step": tokens_per_optimizer_step,
+        "batches_per_rank_per_epoch": available_batches_per_rank,
         "runtime_versions": runtime_versions,
         "environment": checkpoint_environment,
+    }
+    checkpoint_training_invariants = {
+        name: checkpoint_args[name]
+        for name in (
+            "step_semantics",
+            "batch_size",
+            "sequence_length",
+            "gradient_accumulation_steps",
+            "dataloader_seed",
+            "data_parallel_world_size",
+            "tokens_per_optimizer_step",
+            "batches_per_rank_per_epoch",
+        )
     }
     start_step = 0
     trained_tokens = 0
@@ -1338,6 +1481,7 @@ def run_pretraining_loop(
                 expected_config=config,
                 expected_dataset_manifest_sha256=sha256_file(active_manifest_path) if active_manifest_path else None,
                 expected_tokenizer_sha256=sha256_file(local_tokenizer),
+                expected_training_invariants=checkpoint_training_invariants,
             )
             resume_source = str(checkpoint)
         elif initial_checkpoint_manifest:
@@ -1355,6 +1499,7 @@ def run_pretraining_loop(
                     else sha256_file(active_manifest_path) if active_manifest_path else None
                 ),
                 expected_tokenizer_sha256=sha256_file(local_tokenizer),
+                expected_training_invariants=checkpoint_training_invariants,
             )
             resume_source = str(initial_checkpoint)
     elif initial_checkpoint_manifest:
@@ -1374,7 +1519,44 @@ def run_pretraining_loop(
     use_autocast = selected.type == "cuda" and dtype in {"bf16", "fp16"}
     optimizer.zero_grad(set_to_none=True)
     current_step = start_step
-    epoch = 0
+    expected_resumed_tokens = start_step * tokens_per_optimizer_step
+    if trained_tokens != expected_resumed_tokens:
+        raise ValueError(
+            "checkpoint token cursor is incompatible with optimizer-step semantics: "
+            f"trained_tokens={trained_tokens}, expected={expected_resumed_tokens}"
+        )
+    completed_micro_batches_per_rank = start_step * gradient_accumulation_steps
+    epoch = completed_micro_batches_per_rank // available_batches_per_rank
+    epoch_batch_offset = completed_micro_batches_per_rank % available_batches_per_rank
+    train_iterator = iter(train_stream.batches(epoch=epoch, start_batch=epoch_batch_offset))
+
+    def next_training_batch() -> list[list[int]]:
+        nonlocal epoch, train_iterator
+        try:
+            return next(train_iterator)
+        except StopIteration:
+            epoch += 1
+            train_iterator = iter(train_stream.batches(epoch=epoch))
+            try:
+                return next(train_iterator)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "rank-partitioned training stream produced no batches after preflight validation"
+                ) from exc
+
+    def current_dataloader_state(step: int) -> dict[str, int | str]:
+        completed = step * gradient_accumulation_steps
+        return {
+            "semantics": TRAINING_STEP_SEMANTICS,
+            "completed_optimizer_steps": step,
+            "completed_micro_batches_per_rank": completed,
+            "epoch": completed // available_batches_per_rank,
+            "batch_offset_within_epoch": completed % available_batches_per_rank,
+            "batches_per_rank_per_epoch": available_batches_per_rank,
+            "rank": data_parallel_rank,
+            "world_size": data_parallel_world_size,
+        }
+
     best_val_loss = float("inf")
     best_val_step = 0
     best_checkpoint_manifest: Path | None = None
@@ -1382,122 +1564,115 @@ def run_pretraining_loop(
     early_stopped = False
     early_stop_reason = ""
     while current_step < steps:
-        progressed = False
-        for batch in train_stream.batches(epoch=epoch):
+        optimizer_step_losses: list[float] = []
+        optimizer_step_mtp_losses: list[float] = []
+        for accumulation_index in range(gradient_accumulation_steps):
+            batch = next_training_batch()
             input_ids = tensor_batch(batch, device=selected)
-            with torch.autocast(device_type=selected.type, dtype=autocast_dtype(dtype), enabled=use_autocast):
-                output = model(input_ids, labels=input_ids)
-                if output.loss is None:
-                    raise RuntimeError("loss missing")
-                if not torch.isfinite(output.loss.detach()):
-                    raise FloatingPointError(f"non-finite training loss at step {current_step + 1}: {float(output.loss.detach().cpu())}")
-                if float(output.loss.detach().cpu()) > max_training_loss:
-                    raise FloatingPointError(
-                        f"catastrophic training loss at step {current_step + 1}: "
-                        f"{float(output.loss.detach().cpu())} > {max_training_loss}"
+            synchronize = accumulation_index == gradient_accumulation_steps - 1
+            sync_context = (
+                model.no_sync()
+                if not synchronize
+                and not is_deepspeed_strategy(distributed_strategy)
+                and hasattr(model, "no_sync")
+                else contextlib.nullcontext()
+            )
+            with sync_context:
+                with torch.autocast(device_type=selected.type, dtype=autocast_dtype(dtype), enabled=use_autocast):
+                    output = model(input_ids, labels=input_ids)
+                    if output.loss is None:
+                        raise RuntimeError("loss missing")
+                    observed_loss = float(output.loss.detach().cpu())
+                    if not math.isfinite(observed_loss):
+                        raise FloatingPointError(
+                            f"non-finite training loss at optimizer step {current_step + 1}, "
+                            f"microbatch {accumulation_index + 1}: {observed_loss}"
+                        )
+                    if observed_loss > max_training_loss:
+                        raise FloatingPointError(
+                            f"catastrophic training loss at optimizer step {current_step + 1}: "
+                            f"{observed_loss} > {max_training_loss}"
+                        )
+                    optimizer_step_losses.append(observed_loss)
+                    if output.mtp_loss is not None:
+                        observed_mtp_loss = float(output.mtp_loss.detach().cpu())
+                        optimizer_step_mtp_losses.append(observed_mtp_loss)
+                        mtp_losses.append(observed_mtp_loss)
+                    for router_metric in output.router_metrics:
+                        dropped = int(router_metric.get("dropped_tokens", 0.0))
+                        router_dropped_assignments += dropped
+                        router_load_ratios.append(float(router_metric["p99_to_mean_load"]))
+                    if router_dropped_assignments:
+                        raise RuntimeError("dropless MoE invariant failed: one or more token assignments were dropped")
+                    backward_loss = (
+                        output.loss
+                        if is_deepspeed_strategy(distributed_strategy)
+                        else output.loss / gradient_accumulation_steps
                     )
-                if output.mtp_loss is not None:
-                    mtp_losses.append(float(output.mtp_loss.detach().cpu()))
-                for router_metric in output.router_metrics:
-                    dropped = int(router_metric.get("dropped_tokens", 0.0))
-                    router_dropped_assignments += dropped
-                    router_load_ratios.append(float(router_metric["p99_to_mean_load"]))
-                if router_dropped_assignments:
-                    raise RuntimeError("dropless MoE invariant failed: one or more token assignments were dropped")
-                loss = output.loss if is_deepspeed_strategy(distributed_strategy) else output.loss / gradient_accumulation_steps
-            if is_deepspeed_strategy(distributed_strategy):
-                model.backward(loss)
-            else:
-                loss.backward()
-            progressed = True
+                if is_deepspeed_strategy(distributed_strategy):
+                    model.backward(backward_loss)
+                else:
+                    backward_loss.backward()
             if is_deepspeed_strategy(distributed_strategy):
                 model.step()
-                grad_norm = torch.tensor(0.0)
-            elif (current_step + 1) % gradient_accumulation_steps == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), gradient_clip_norm, error_if_nonfinite=True
-                )
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-            else:
-                grad_norm = torch.tensor(0.0)
-            current_step += 1
-            trained_tokens += batch_size * sequence_length * int(distributed_report.get("world_size", 1))
+            trained_tokens += batch_size * sequence_length * data_parallel_world_size
             if target_tokens is not None and trained_tokens > target_tokens:
                 raise RuntimeError(
                     f"training token accounting exceeded immutable target: {trained_tokens} > {target_tokens}"
                 )
-            train_losses.append(float(output.loss.detach().cpu()))
-            if current_step == 1 or current_step % max(1, progress_every_steps) == 0 or current_step >= steps:
-                active_progress.emit(
-                    "training",
-                    "running",
-                    step=current_step,
-                    requested_steps=steps,
-                    loss=round(train_losses[-1], 6),
-                    grad_norm=round(float(grad_norm.detach().cpu()), 6),
-                    trained_tokens=trained_tokens,
-                    epoch=epoch,
-                    learning_rate=float(optimizer.param_groups[0]["lr"]),
-                    mtp_loss=round(mtp_losses[-1], 6) if mtp_losses else None,
-                    router_p99_to_mean=round(router_load_ratios[-1], 6) if router_load_ratios else None,
-                )
+        if is_deepspeed_strategy(distributed_strategy):
+            grad_norm = torch.tensor(0.0)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), gradient_clip_norm, error_if_nonfinite=True
+            )
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+        current_step += 1
+        train_losses.append(sum(optimizer_step_losses) / len(optimizer_step_losses))
+        if current_step == 1 or current_step % max(1, progress_every_steps) == 0 or current_step >= steps:
+            active_progress.emit(
+                "training",
+                "running",
+                step=current_step,
+                requested_steps=steps,
+                step_semantics=TRAINING_STEP_SEMANTICS,
+                completed_micro_batches_per_rank=current_step * gradient_accumulation_steps,
+                loss=round(train_losses[-1], 6),
+                grad_norm=round(float(grad_norm.detach().cpu()), 6),
+                trained_tokens=trained_tokens,
+                epoch=epoch,
+                learning_rate=float(optimizer.param_groups[0]["lr"]),
+                mtp_loss=(
+                    round(sum(optimizer_step_mtp_losses) / len(optimizer_step_mtp_losses), 6)
+                    if optimizer_step_mtp_losses
+                    else None
+                ),
+                router_p99_to_mean=round(router_load_ratios[-1], 6) if router_load_ratios else None,
+            )
 
-            if val_stream is not None and validate_every > 0 and current_step % validate_every == 0:
-                current_val_loss = validation_loss(
-                    model=model,
-                    stream=val_stream,
-                    device=selected,
-                    max_batches=validation_batches,
-                    dtype=dtype,
-                )
-                val_losses.append({"step": float(current_step), "loss": current_val_loss})
-                active_progress.emit(
-                    "validation",
-                    "complete",
-                    step=current_step,
-                    validation_loss=round(current_val_loss, 6),
-                    best_validation_loss=round(best_val_loss, 6) if best_val_loss != float("inf") else None,
-                )
-                if current_val_loss < best_val_loss - early_stopping_min_delta:
-                    best_val_loss = current_val_loss
-                    best_val_step = current_step
-                    validations_without_improvement = 0
-                    best_checkpoint_manifest = save_training_checkpoint(
-                        output_dir=root,
-                        model=model,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        config=config,
-                        step=current_step,
-                        trained_tokens=trained_tokens,
-                        metrics={"train_loss": train_losses[-1], "val_loss": current_val_loss, "best_val_loss": current_val_loss},
-                        training_args=checkpoint_args,
-                        dataset_manifest_path=active_manifest_path,
-                        tokenizer_path=active_manifest.tokenizer_path,
-                        environment=checkpoint_environment,
-                        manifest_filename="best_checkpoint_manifest.json",
-                    )
-                    active_progress.emit(
-                        "checkpoint",
-                        "best_saved",
-                        step=current_step,
-                        validation_loss=round(current_val_loss, 6),
-                        checkpoint_manifest=str(best_checkpoint_manifest),
-                    )
-                else:
-                    validations_without_improvement += 1
-                    if early_stopping_patience > 0 and validations_without_improvement >= early_stopping_patience:
-                        early_stopped = True
-                        early_stop_reason = (
-                            f"validation loss did not improve by {early_stopping_min_delta} "
-                            f"for {validations_without_improvement} validation checks"
-                        )
-                        active_progress.emit("training", "early_stopping", step=current_step, reason=early_stop_reason)
-                        break
-            if checkpoint_every > 0 and current_step % checkpoint_every == 0:
-                checkpoint_manifest = save_training_checkpoint(
+        if val_stream is not None and validate_every > 0 and current_step % validate_every == 0:
+            current_val_loss = validation_loss(
+                model=model,
+                stream=val_stream,
+                device=selected,
+                max_batches=validation_batches,
+                dtype=dtype,
+            )
+            val_losses.append({"step": float(current_step), "loss": current_val_loss})
+            active_progress.emit(
+                "validation",
+                "complete",
+                step=current_step,
+                validation_loss=round(current_val_loss, 6),
+                best_validation_loss=round(best_val_loss, 6) if best_val_loss != float("inf") else None,
+            )
+            if current_val_loss < best_val_loss - early_stopping_min_delta:
+                best_val_loss = current_val_loss
+                best_val_step = current_step
+                validations_without_improvement = 0
+                best_checkpoint_manifest = save_training_checkpoint(
                     output_dir=root,
                     model=model,
                     optimizer=optimizer,
@@ -1505,31 +1680,63 @@ def run_pretraining_loop(
                     config=config,
                     step=current_step,
                     trained_tokens=trained_tokens,
-                    metrics={"train_loss": train_losses[-1], "val_loss": val_losses[-1]["loss"] if val_losses else -1.0},
+                    metrics={"train_loss": train_losses[-1], "val_loss": current_val_loss, "best_val_loss": current_val_loss},
                     training_args=checkpoint_args,
                     dataset_manifest_path=active_manifest_path,
                     tokenizer_path=active_manifest.tokenizer_path,
                     environment=checkpoint_environment,
+                    dataloader_state=current_dataloader_state(current_step),
+                    manifest_filename="best_checkpoint_manifest.json",
                 )
                 active_progress.emit(
                     "checkpoint",
-                    "saved",
+                    "best_saved",
                     step=current_step,
-                    checkpoint_manifest=str(checkpoint_manifest),
-                    train_loss=round(train_losses[-1], 6),
-                    validation_loss=round(val_losses[-1]["loss"], 6) if val_losses else None,
+                    validation_loss=round(current_val_loss, 6),
+                    checkpoint_manifest=str(best_checkpoint_manifest),
                 )
-            if current_step >= steps:
-                break
+            else:
+                validations_without_improvement += 1
+                if early_stopping_patience > 0 and validations_without_improvement >= early_stopping_patience:
+                    early_stopped = True
+                    early_stop_reason = (
+                        f"validation loss did not improve by {early_stopping_min_delta} "
+                        f"for {validations_without_improvement} validation checks"
+                    )
+                    active_progress.emit("training", "early_stopping", step=current_step, reason=early_stop_reason)
         if early_stopped:
             break
-        if not progressed:
-            raise RuntimeError(
-                "no training batches were produced from shards after preflight validation; "
-                f"available_batches={available_batches}"
+        if checkpoint_every > 0 and current_step % checkpoint_every == 0:
+            checkpoint_manifest = save_training_checkpoint(
+                output_dir=root,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                config=config,
+                step=current_step,
+                trained_tokens=trained_tokens,
+                metrics={"train_loss": train_losses[-1], "val_loss": val_losses[-1]["loss"] if val_losses else -1.0},
+                training_args=checkpoint_args,
+                dataset_manifest_path=active_manifest_path,
+                tokenizer_path=active_manifest.tokenizer_path,
+                environment=checkpoint_environment,
+                dataloader_state=current_dataloader_state(current_step),
             )
-        epoch += 1
+            active_progress.emit(
+                "checkpoint",
+                "saved",
+                step=current_step,
+                checkpoint_manifest=str(checkpoint_manifest),
+                train_loss=round(train_losses[-1], 6),
+                validation_loss=round(val_losses[-1]["loss"], 6) if val_losses else None,
+            )
 
+    expected_completed_tokens = current_step * tokens_per_optimizer_step
+    if trained_tokens != expected_completed_tokens:
+        raise RuntimeError(
+            "optimizer-step token accounting invariant failed: "
+            f"trained_tokens={trained_tokens}, expected={expected_completed_tokens}"
+        )
     final_val_loss = val_losses[-1]["loss"] if val_losses else -1.0
     manifest_path = save_training_checkpoint(
         output_dir=root,
@@ -1544,6 +1751,7 @@ def run_pretraining_loop(
         dataset_manifest_path=active_manifest_path,
         tokenizer_path=active_manifest.tokenizer_path,
         environment=checkpoint_environment,
+        dataloader_state=current_dataloader_state(current_step),
         manifest_filename="checkpoint_manifest.json",
     )
     if best_checkpoint_manifest is None:
@@ -1560,6 +1768,7 @@ def run_pretraining_loop(
             dataset_manifest_path=active_manifest_path,
             tokenizer_path=active_manifest.tokenizer_path,
             environment=checkpoint_environment,
+            dataloader_state=current_dataloader_state(current_step),
             manifest_filename="best_checkpoint_manifest.json",
         )
         best_val_loss = final_val_loss
@@ -1577,6 +1786,7 @@ def run_pretraining_loop(
         expected_config=config,
         expected_dataset_manifest_sha256=sha256_file(active_manifest_path) if active_manifest_path else None,
         expected_tokenizer_sha256=sha256_file(local_tokenizer),
+        expected_training_invariants=checkpoint_training_invariants,
     )
     if reloaded_step != current_step or reloaded_tokens != trained_tokens:
         raise RuntimeError(
@@ -1613,6 +1823,12 @@ def run_pretraining_loop(
         "status": "early_stopped" if early_stopped else "passed",
         "scratch_only": True,
         "steps": current_step,
+        "step_semantics": TRAINING_STEP_SEMANTICS,
+        "optimizer_steps": current_step,
+        "completed_micro_batches_per_rank": current_step * gradient_accumulation_steps,
+        "tokens_per_optimizer_step": tokens_per_optimizer_step,
+        "available_batches_per_rank": available_batches_per_rank,
+        "dataloader_state": current_dataloader_state(current_step),
         "requested_steps": steps,
         "start_step": start_step,
         "resume_source": resume_source,

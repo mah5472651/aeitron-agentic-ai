@@ -38,8 +38,10 @@ from pydantic import Field, field_validator, model_validator
 
 from src.aeitron.learning.storage import ObjectStore, ObjectStoreConfig, S3ObjectStore, create_object_store
 from src.aeitron.model_ops.foundation import (
+    TRAINING_STEP_SEMANTICS,
     ParallelismPlan,
     ScratchDecoderConfig,
+    TrainingBatchContract,
     model_profile as get_model_profile,
 )
 from src.aeitron.model_ops.production_adapters import (
@@ -436,18 +438,22 @@ class TrainingProfile(StrictModel):
             distributed_strategy=self.distributed_strategy,
             parallelism=self.parallelism,
         )
-        calculated_global_batch = self.batch_size * self.gradient_accumulation_steps * data_parallel
-        if self.token_budget.global_batch_sequences != calculated_global_batch:
-            raise ValueError(
-                "global_batch_sequences must equal batch_size * gradient_accumulation_steps * world_size"
-            )
-        minimum_tokens = self.steps * self.sequence_length * (
-            calculated_global_batch
-            if self.distributed_strategy == "megatron"
-            else self.batch_size * data_parallel
+        batch_contract = TrainingBatchContract(
+            optimizer_steps=self.steps,
+            sequence_length=self.sequence_length,
+            micro_batch_size=self.batch_size,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            data_parallel_size=data_parallel,
         )
-        if self.token_budget.target_tokens != minimum_tokens:
-            raise ValueError("target_tokens must equal steps * batch_size * sequence_length * world_size")
+        if self.token_budget.global_batch_sequences != batch_contract.global_batch_sequences:
+            raise ValueError(
+                "global_batch_sequences must equal micro_batch_size * gradient_accumulation_steps * "
+                "data_parallel_size"
+            )
+        if self.token_budget.target_tokens != batch_contract.target_tokens:
+            raise ValueError(
+                "target_tokens must equal optimizer_steps * sequence_length * global_batch_sequences"
+            )
         if self.learning_rate.warmup_steps >= self.steps:
             raise ValueError("warmup_steps must be lower than total steps")
         if self.checkpoint.interval_steps > self.steps or self.evaluation.interval_steps > self.steps:
@@ -635,8 +641,9 @@ class TrainingJobCreateRequest(StrictModel):
 
 
 class TrainingJobSpec(StrictModel):
-    schema_version: int = Field(default=2, ge=1, le=2)
+    schema_version: int = Field(default=3, ge=1, le=3)
     scratch_only: Literal[True] = True
+    step_semantics: Literal["optimizer_update_v2"] = TRAINING_STEP_SEMANTICS
     validation_only: bool = False
     profile_id: str
     profile_version: int
@@ -689,7 +696,7 @@ class TrainingJobSpec(StrictModel):
     def validate_and_hash(self) -> "TrainingJobSpec":
         if self.schema_version >= 2:
             if not self.model_contract or not self.model_contract_sha256 or not self.model_parameter_report_sha256:
-                raise ValueError("schema v2 training jobs require an immutable canonical model contract")
+                raise ValueError("schema v2+ training jobs require an immutable canonical model contract")
             bound_model = ScratchDecoderConfig.model_validate(self.model_contract)
             if not hmac.compare_digest(bound_model.contract_sha256(), self.model_contract_sha256):
                 raise ValueError("training job model contract hash mismatch")
@@ -716,15 +723,16 @@ class TrainingJobSpec(StrictModel):
             distributed_strategy=self.distributed_strategy,
             parallelism=self.parallelism,
         )
-        expected_batch = self.batch_size * self.gradient_accumulation_steps * data_parallel
-        expected_tokens = self.steps * self.sequence_length * (
-            expected_batch
-            if self.distributed_strategy == "megatron"
-            else self.batch_size * data_parallel
+        batch_contract = TrainingBatchContract(
+            optimizer_steps=self.steps,
+            sequence_length=self.sequence_length,
+            micro_batch_size=self.batch_size,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            data_parallel_size=data_parallel,
         )
-        if self.token_budget.global_batch_sequences != expected_batch:
+        if self.token_budget.global_batch_sequences != batch_contract.global_batch_sequences:
             raise ValueError("resolved global batch does not match the job topology")
-        if self.token_budget.target_tokens != expected_tokens:
+        if self.token_budget.target_tokens != batch_contract.target_tokens:
             raise ValueError("resolved token target does not match steps and topology")
         payload = self.model_dump(mode="json", exclude={"spec_hash"})
         calculated = sha256_text(canonical_json(payload))
@@ -3224,14 +3232,15 @@ class TrainingWorkspaceService:
             distributed_strategy=profile.distributed_strategy,
             parallelism=profile.parallelism,
         )
-        global_batch_sequences = (
-            values["batch_size"] * values["gradient_accumulation_steps"] * data_parallel
+        batch_contract = TrainingBatchContract(
+            optimizer_steps=values["steps"],
+            sequence_length=values["sequence_length"],
+            micro_batch_size=values["batch_size"],
+            gradient_accumulation_steps=values["gradient_accumulation_steps"],
+            data_parallel_size=data_parallel,
         )
-        target_tokens = values["steps"] * values["sequence_length"] * (
-            global_batch_sequences
-            if profile.distributed_strategy == "megatron"
-            else values["batch_size"] * data_parallel
-        )
+        global_batch_sequences = batch_contract.global_batch_sequences
+        target_tokens = batch_contract.target_tokens
         token_budget = profile.token_budget.model_copy(
             update={
                 "global_batch_sequences": global_batch_sequences,

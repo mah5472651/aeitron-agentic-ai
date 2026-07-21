@@ -31,6 +31,7 @@ AUTHORITATIVE_MODULES = {
 OWNED_CLASS_NAMES = {
     "model_architecture_contract": {
         "ScratchDecoderConfig",
+        "TrainingBatchContract",
         "TokenizerContract",
         "ParallelismPlan",
     },
