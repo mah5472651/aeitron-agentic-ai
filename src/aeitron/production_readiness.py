@@ -257,6 +257,109 @@ def _check_external_services(mode: str) -> list[ReadinessCheck]:
     return checks
 
 
+def _check_rag_runtime(mode: str) -> ReadinessCheck:
+    required_files = [
+        Path("src/aeitron/indexing/repository_indexer.py"),
+        Path("src/aeitron/indexing/context_builder.py"),
+        Path("src/aeitron/indexing/vector_index.py"),
+        Path("src/aeitron/db/migrations/0008_rag_operations.sql"),
+        Path("config/rag_embedding_training.json"),
+    ]
+    missing = [str(path) for path in required_files if not path.is_file()]
+    proof_path_value = os.environ.get("AEITRON_RAG_PROOF_REPORT", "")
+    evaluation_path_value = os.environ.get("AEITRON_RAG_EVALUATION_REPORT", "")
+    load_path_value = os.environ.get("AEITRON_RAG_LOAD_REPORT", "")
+    proof_evidence: dict[str, Any] = {}
+    proof_passed = False
+    if proof_path_value:
+        try:
+            proof_path = Path(proof_path_value).resolve(strict=True)
+            proof_evidence = json.loads(proof_path.read_text(encoding="utf-8-sig"))
+            checks = {
+                str(item.get("name")): str(item.get("status"))
+                for item in proof_evidence.get("checks", [])
+                if isinstance(item, dict)
+            }
+            proof_passed = all(
+                checks.get(name) == "passed"
+                for name in (
+                    "postgres_migrations",
+                    "redis_quota",
+                    "object_store_lifecycle",
+                    "qdrant_round_trip",
+                    "rag_control_plane_lifecycle",
+                )
+            )
+            if not proof_passed:
+                missing.append("passed real RAG dependency lifecycle checks")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            missing.append(f"valid AEITRON_RAG_PROOF_REPORT: {exc}")
+    elif mode == "production":
+        missing.append("env:AEITRON_RAG_PROOF_REPORT")
+    evaluation_passed = False
+    if evaluation_path_value:
+        try:
+            evaluation = json.loads(Path(evaluation_path_value).resolve(strict=True).read_text(encoding="utf-8-sig"))
+            evaluation_passed = (
+                evaluation.get("status") == "passed"
+                and int(evaluation.get("task_count", 0)) >= 500
+                and float(evaluation.get("hybrid_gain_percentage_points", 0.0)) >= 5.0
+                and int(evaluation.get("stale_revision_results", -1)) == 0
+                and int(evaluation.get("cross_tenant_results", -1)) == 0
+                and bool(evaluation.get("governance_sha256"))
+            )
+            if not evaluation_passed:
+                missing.append("passed governed 500-task RAG evaluation")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            missing.append(f"valid AEITRON_RAG_EVALUATION_REPORT: {exc}")
+    elif mode == "production":
+        missing.append("env:AEITRON_RAG_EVALUATION_REPORT")
+    load_passed = False
+    if load_path_value:
+        try:
+            load_report = json.loads(Path(load_path_value).resolve(strict=True).read_text(encoding="utf-8-sig"))
+            stages = load_report.get("stages", [])
+            load_passed = (
+                load_report.get("status") == "passed"
+                and int(load_report.get("target_chunks", 0)) >= 100_000_000
+                and any(int(item.get("concurrency", 0)) >= 1000 for item in stages if isinstance(item, dict))
+            )
+            if not load_passed:
+                missing.append("passed 100M-chunk/1000-concurrency RAG load report")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            missing.append(f"valid AEITRON_RAG_LOAD_REPORT: {exc}")
+    elif mode == "production":
+        missing.append("env:AEITRON_RAG_LOAD_REPORT")
+    status: ReadinessStatus
+    if missing:
+        status = "blocked_missing_dependency" if mode == "production" else "built_not_cluster_proven"
+    elif proof_passed and evaluation_passed and load_passed:
+        status = "production_ready_requires_external_service"
+    else:
+        status = "built_not_cluster_proven"
+    return ReadinessCheck(
+        subsystem="hybrid_rag_runtime",
+        status=status,
+        summary=(
+            "Durable Postgres dispatch, Redis wake-up, immutable S3 snapshots, Qdrant isolation, "
+            "Tree-sitter graph retrieval, and scratch embedding contracts are implemented."
+        ),
+        required_dependencies=[str(path) for path in required_files]
+        + ["AEITRON_RAG_PROOF_REPORT", "AEITRON_RAG_EVALUATION_REPORT", "AEITRON_RAG_LOAD_REPORT"],
+        missing_dependencies=missing,
+        evidence={
+            "real_dependency_proof": proof_passed,
+            "proof_report": proof_path_value,
+            "governed_evaluation_passed": evaluation_passed,
+            "scale_load_passed": load_passed,
+            "proof_authority": proof_evidence.get("authority"),
+            "governed_500_task_eval_required": True,
+            "100m_chunk_load_proof_required": True,
+        },
+        production_blocker=mode == "production" and bool(missing),
+    )
+
+
 def _check_cli_tools(mode: str) -> list[ReadinessCheck]:
     tools = [
         ("semgrep", "semgrep", "semgrep", "Semgrep static security scan"),
@@ -726,6 +829,7 @@ def run_production_readiness(
         _check_quota(mode),
         _check_model_backend(mode),
         *_check_external_services(mode),
+        _check_rag_runtime(mode),
         *_check_cli_tools(mode),
         *_check_training_stack(mode),
         _check_training_workspace(mode),

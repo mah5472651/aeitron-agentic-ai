@@ -145,6 +145,40 @@
         condition: service_completed_successfully
       migrator:
         condition: service_completed_successfully
+  rag-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    profiles: ["rag"]
+    command:
+      ["python", "-u", "-m", "src.aeitron.indexing.repository_indexer", "worker", "--production", "--poll-seconds", "1"]
+    restart: unless-stopped
+    environment:
+      AEITRON_ENV: "production"
+      AEITRON_DATABASE_URL: "postgresql://aeitron:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/aeitron"
+      AEITRON_REDIS_URL: "redis://redis:6379/0"
+      AEITRON_QDRANT_URL: "http://qdrant:6333"
+      AEITRON_EMBEDDING_URL: "${AEITRON_EMBEDDING_URL:?set AEITRON_EMBEDDING_URL}"
+      AEITRON_EMBEDDING_MANIFEST: "/run/aeitron/embedding_manifest.json"
+      AEITRON_EMBEDDING_DIMS: "768"
+      AEITRON_RAG_OBJECT_STORE_URI: "s3://aeitron-datasets/repository-snapshots"
+      AEITRON_OBJECT_STORE_ENDPOINT_URL: "http://minio:9000"
+      AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER:?set MINIO_ROOT_USER}"
+      AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
+      AWS_EC2_METADATA_DISABLED: "true"
+    volumes:
+      - "${AEITRON_EMBEDDING_MANIFEST_HOST:?set AEITRON_EMBEDDING_MANIFEST_HOST}:/run/aeitron/embedding_manifest.json:ro"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      minio-bootstrap:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
   prometheus:
     image: prom/prometheus:v2.55.1
     profiles: ["monitoring"]
@@ -238,7 +272,7 @@
       retries: 12
   minio-bootstrap:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
-    profiles: ["data", "training"]
+    profiles: ["data", "training", "rag"]
     depends_on:
       - minio
     entrypoint: ["/bin/sh", "-lc"]

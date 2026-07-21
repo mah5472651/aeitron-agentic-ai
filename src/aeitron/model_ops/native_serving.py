@@ -108,6 +108,7 @@ class NativeServingState:
         self._completed = 0
         self._failed = 0
         self._timed_out = 0
+        self._background_releases: set[asyncio.Task[None]] = set()
 
     def health(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -215,7 +216,13 @@ class NativeServingState:
             async with self._state_lock:
                 self._timed_out += 1
             METRICS.inc("aeitron_serving_generation_timeouts_total")
-            asyncio.create_task(self._release_after_completion(work))
+            release_task = asyncio.create_task(self._release_after_completion(work))
+            background_releases = getattr(self, "_background_releases", None)
+            if background_releases is None:
+                background_releases = set()
+                self._background_releases = background_releases
+            background_releases.add(release_task)
+            release_task.add_done_callback(background_releases.discard)
             raise HTTPException(status_code=504, detail="generation timed out") from exc
         except Exception:
             await self._release_slot(failed=True)

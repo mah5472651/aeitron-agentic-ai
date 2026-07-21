@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -14,10 +16,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from src.aeitron.db import LocalStore
+from src.aeitron.db import LocalStore, PostgresRAGStore, PostgresRAGStoreFactory
 from src.aeitron.evaluation.benchmarks import BenchmarkHarness, built_in_security_tasks
 from src.aeitron.identity import AuthError, auth_status, create_jwt, install_auth, install_quota, validate_token_issue_request
 from src.aeitron.indexing import ContextBuilder, RepositoryIndexer, VectorBackendConfig, create_vector_index, vector_capabilities
+from src.aeitron.indexing.repository_indexer import RAGIndexCoordinator
 from src.aeitron.learning.dataset_authority import (
     DatasetAuthorityService,
     PromotionEvidenceCreate,
@@ -62,6 +65,9 @@ QUOTA_CONFIG = install_quota(app)
 AUTH_CONFIG = install_auth(app)
 install_observability(app)
 STORE = LocalStore()
+RAG_STORE_FACTORY: PostgresRAGStoreFactory | None = None
+RAG_STORE_FACTORY_DSN = ""
+RAG_STORE_FACTORY_LOCK = threading.RLock()
 TRAINING_WORKSPACE = TrainingWorkspaceService.from_environment()
 DATASET_AUTHORITY = DatasetAuthorityService.from_environment()
 
@@ -116,6 +122,9 @@ class IndexProjectRequest(BaseModel):
     include_suffixes: list[str] | None = None
     max_file_bytes: int = Field(default=1_000_000, ge=10_000, le=10_000_000)
     max_chunk_lines: int = Field(default=120, ge=20, le=400)
+    max_chunk_tokens: int = Field(default=512, ge=128, le=4096)
+    overlap_tokens: int = Field(default=64, ge=0, le=1024)
+    max_attempts: int = Field(default=3, ge=1, le=20)
 
 
 class ContextBuildRequest(BaseModel):
@@ -212,11 +221,32 @@ def request_organization(request: Request) -> str:
     return organization_id
 
 
+def rag_store(organization_id: str) -> LocalStore | PostgresRAGStore:
+    global RAG_STORE_FACTORY, RAG_STORE_FACTORY_DSN
+    if os.environ.get("AEITRON_ENV", "development").lower() != "production":
+        return STORE
+    dsn = os.environ.get("AEITRON_DATABASE_URL", "")
+    if not dsn:
+        raise RuntimeError("production RAG requires AEITRON_DATABASE_URL")
+    with RAG_STORE_FACTORY_LOCK:
+        if RAG_STORE_FACTORY is None:
+            RAG_STORE_FACTORY = PostgresRAGStoreFactory(
+                dsn,
+                min_pool_size=int(os.environ.get("AEITRON_RAG_DB_POOL_MIN", "1")),
+                max_pool_size=int(os.environ.get("AEITRON_RAG_DB_POOL_MAX", "20")),
+            )
+            RAG_STORE_FACTORY_DSN = dsn
+        elif dsn != RAG_STORE_FACTORY_DSN:
+            raise RuntimeError("AEITRON_DATABASE_URL changed after the shared RAG pool was initialized")
+        return RAG_STORE_FACTORY.for_organization(organization_id)
+
+
 def require_project_access(request: Request, project_id: str, scope: str) -> dict[str, Any]:
     require_scope(request, scope)
-    return STORE.require_project_access(
+    organization_id = request_organization(request)
+    return rag_store(organization_id).require_project_access(
         project_id,
-        request_organization(request),
+        organization_id,
         user_id=request_owner(request) if AUTH_CONFIG.enabled else None,
     )
 
@@ -919,7 +949,8 @@ async def create_project(payload: ProjectCreateRequest, http_request: Request) -
         repo_path = resolve_registered_repo_path(payload.repo_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return STORE.create_project(
+    return await asyncio.to_thread(
+        rag_store(organization_id).create_project,
         name=payload.name,
         repo_path=str(repo_path),
         default_branch=payload.default_branch,
@@ -954,19 +985,123 @@ async def index_project(project_id: str, payload: IndexProjectRequest, http_requ
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project not found") from exc
+    organization_id = request_organization(http_request)
+    active_store = rag_store(organization_id)
     if project["index_status"] == "ready" and not payload.force:
-        return STORE.index_status(project_id)
+        return await asyncio.to_thread(active_store.index_status, project_id)
+    if payload.overlap_tokens >= payload.max_chunk_tokens:
+        raise HTTPException(status_code=400, detail="overlap_tokens must be smaller than max_chunk_tokens")
     suffixes = set(payload.include_suffixes) if payload.include_suffixes else None
     try:
-        report = RepositoryIndexer(STORE).index_project(
+        production = os.environ.get("AEITRON_ENV", "development").lower() == "production"
+        if production:
+            idempotency_key = http_request.headers.get("Idempotency-Key", "")
+            if not idempotency_key:
+                raise ValueError("production index submission requires Idempotency-Key")
+            coordinator = RAGIndexCoordinator(active_store, production_mode=True)
+            try:
+                return await coordinator.submit(
+                    organization_id=organization_id,
+                    project_id=project_id,
+                    idempotency_key=idempotency_key,
+                    max_attempts=payload.max_attempts,
+                    request={
+                        "include_suffixes": sorted(suffixes) if suffixes else None,
+                        "max_file_bytes": payload.max_file_bytes,
+                        "max_chunk_lines": payload.max_chunk_lines,
+                        "max_chunk_tokens": payload.max_chunk_tokens,
+                        "overlap_tokens": payload.overlap_tokens,
+                    },
+                )
+            finally:
+                await coordinator.close()
+        report = await asyncio.to_thread(
+            RepositoryIndexer(active_store).index_project,
             project_id=project_id,
+            organization_id=organization_id,
             include_suffixes=suffixes,
             max_file_bytes=payload.max_file_bytes,
             max_chunk_lines=payload.max_chunk_lines,
+            max_chunk_tokens=payload.max_chunk_tokens,
+            overlap_tokens=payload.overlap_tokens,
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        status = 400 if isinstance(exc, (ValueError, PermissionError)) else 500
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
     return report.model_dump()
+
+
+@app.get("/v1/projects/{project_id}/index/status")
+async def get_project_index_status(project_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        require_project_access(http_request, project_id, "context:read")
+        organization_id = request_organization(http_request)
+        return await asyncio.to_thread(rag_store(organization_id).index_status, project_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
+
+
+@app.get("/v1/projects/{project_id}/index/jobs")
+async def list_project_index_jobs(
+    project_id: str,
+    http_request: Request,
+    limit: int = 100,
+) -> dict[str, Any]:
+    try:
+        require_project_access(http_request, project_id, "context:read")
+        organization_id = request_organization(http_request)
+        jobs = await asyncio.to_thread(
+            rag_store(organization_id).list_index_jobs,
+            organization_id=organization_id,
+            project_id=project_id,
+            limit=limit,
+        )
+        return {"project_id": project_id, "jobs": jobs}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
+
+
+@app.get("/v1/projects/{project_id}/index/jobs/{job_id}")
+async def get_project_index_job(project_id: str, job_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        require_project_access(http_request, project_id, "context:read")
+        organization_id = request_organization(http_request)
+        job = await asyncio.to_thread(
+            rag_store(organization_id).get_index_job,
+            job_id,
+            organization_id=organization_id,
+        )
+        if job is None or str(job["project_id"]) != project_id:
+            raise KeyError("index job not found")
+        return job
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/v1/projects/{project_id}/index/jobs/{job_id}/cancel")
+async def cancel_project_index_job(project_id: str, job_id: str, http_request: Request) -> dict[str, Any]:
+    try:
+        require_project_access(http_request, project_id, "context:index")
+        organization_id = request_organization(http_request)
+        active_store = rag_store(organization_id)
+        job = await asyncio.to_thread(active_store.get_index_job, job_id, organization_id=organization_id)
+        if job is None or str(job["project_id"]) != project_id:
+            raise KeyError("index job not found")
+        return await asyncio.to_thread(
+            active_store.request_index_job_cancel,
+            job_id,
+            organization_id=organization_id,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/v1/agent/runs")
@@ -1145,17 +1280,6 @@ async def list_failure_clusters(project_id: str, request: Request) -> list[dict[
         raise HTTPException(status_code=404, detail="project not found") from exc
 
 
-@app.get("/v1/projects/{project_id}/index/status")
-async def project_index_status(project_id: str, request: Request) -> dict[str, Any]:
-    try:
-        require_project_access(request, project_id, "context:read")
-        return STORE.index_status(project_id)
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="project not found") from exc
-
-
 @app.get("/v1/projects/{project_id}/symbols")
 async def project_symbols(project_id: str, request: Request) -> dict[str, Any]:
     try:
@@ -1164,9 +1288,11 @@ async def project_symbols(project_id: str, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project not found") from exc
+    organization_id = request_organization(request)
+    chunks = await asyncio.to_thread(rag_store(organization_id).list_chunks, project_id)
     symbols: list[dict[str, Any]] = []
     dependencies: dict[str, set[str]] = {}
-    for chunk in STORE.list_chunks(project_id):
+    for chunk in chunks:
         metadata = chunk.get("metadata") or {}
         path = str(chunk.get("path") or "")
         dependency_values = metadata.get("dependencies", [])
@@ -1201,9 +1327,11 @@ async def project_symbols(project_id: str, request: Request) -> dict[str, Any]:
 async def build_context(payload: ContextBuildRequest, http_request: Request) -> dict[str, Any]:
     try:
         require_project_access(http_request, payload.project_id, "context:read")
-        report = ContextBuilder(STORE).build(
+        organization_id = request_organization(http_request)
+        report = await asyncio.to_thread(
+            ContextBuilder(rag_store(organization_id)).build,
             project_id=payload.project_id,
-            organization_id=request_organization(http_request),
+            organization_id=organization_id,
             query=payload.query,
             token_budget=payload.token_budget,
             pinned_files=payload.pinned_files,
@@ -1222,16 +1350,19 @@ async def vector_search(payload: VectorSearchRequest, http_request: Request, res
         project = require_project_access(http_request, payload.project_id, "context:read")
         production = os.environ.get("AEITRON_ENV", "development").lower() == "production"
         config = production_vector_config() if production else VectorBackendConfig(backend=payload.backend, dims=payload.dims)  # type: ignore[arg-type]
-        index = create_vector_index(STORE, config)
+        organization_id = request_organization(http_request)
+        index = create_vector_index(rag_store(organization_id), config)
         response.headers["Deprecation"] = "true"
         response.headers["Sunset"] = "Wed, 31 Dec 2026 23:59:59 GMT"
-        return index.search(
-            organization_id=request_organization(http_request),
+        report = await asyncio.to_thread(
+            index.search,
+            organization_id=organization_id,
             project_id=payload.project_id,
             revision_id=str(project.get("active_index_revision") or ""),
             query=payload.query,
             top_k=payload.top_k,
-        ).model_dump()
+        )
+        return report.model_dump()
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except KeyError as exc:
@@ -1245,16 +1376,19 @@ async def vector_sync(request: VectorSyncRequest, http_request: Request) -> dict
     try:
         project = require_project_access(http_request, request.project_id, "context:index")
         production = os.environ.get("AEITRON_ENV", "development").lower() == "production"
+        organization_id = request_organization(http_request)
         index = create_vector_index(
-            STORE,
+            rag_store(organization_id),
             production_vector_config() if production else VectorBackendConfig(backend=request.backend, dims=request.dims),  # type: ignore[arg-type]
         )
-        return index.sync_project(
-            organization_id=request_organization(http_request),
+        report = await asyncio.to_thread(
+            index.sync_project,
+            organization_id=organization_id,
             project_id=request.project_id,
             revision_id=str(project.get("active_index_revision") or ""),
             batch_size=request.batch_size,
-        ).model_dump()
+        )
+        return report.model_dump()
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except KeyError as exc:
@@ -1276,7 +1410,12 @@ async def ingest_memory(request: MemoryIngestRequest, http_request: Request, pro
             raise PermissionError("authenticated memory ingestion requires a tenant-bound project_id")
         if project_id is not None:
             require_project_access(http_request, project_id, "memory:write")
-        return UnifiedMemoryManager(project_id=project_id, store=STORE).ingest(request).model_dump()
+        organization_id = request_organization(http_request)
+        report = await asyncio.to_thread(
+            UnifiedMemoryManager(project_id=project_id, store=rag_store(organization_id)).ingest,
+            request,
+        )
+        return report.model_dump()
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except KeyError as exc:
@@ -1293,11 +1432,14 @@ async def retrieve_memory(request: MemoryRetrieveRequest, http_request: Request)
             raise PermissionError("authenticated memory retrieval requires a tenant-bound project_id")
         if request.project_id is not None:
             require_project_access(http_request, request.project_id, "memory:read")
-        return UnifiedMemoryManager(project_id=request.project_id, store=STORE).retrieve_report(
+        organization_id = request_organization(http_request)
+        report = await asyncio.to_thread(
+            UnifiedMemoryManager(project_id=request.project_id, store=rag_store(organization_id)).retrieve_report,
             request.query,
             limit=request.limit,
             layers=request.layers or None,  # type: ignore[arg-type]
-        ).model_dump()
+        )
+        return report.model_dump()
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except KeyError as exc:

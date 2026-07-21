@@ -15,7 +15,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from src.aeitron.architecture_integrity import run_architecture_integrity
-from src.aeitron.db import LocalStore
+from src.aeitron.db import LocalStore, PostgresRAGStore
 from src.aeitron.db.migration_runner import expand_psql_includes, load_migrations
 from src.aeitron.evaluation.benchmarks import BenchmarkHarness, built_in_security_tasks
 from src.aeitron.gateway import api as gateway_api
@@ -23,12 +23,18 @@ from src.aeitron.identity.auth import AuthConfig, AuthError, validate_token_issu
 from src.aeitron.identity.quota import AsyncLocalQuotaStore, LocalQuotaStore
 from src.aeitron.indexing import (
     ContextBuilder,
+    EmbeddingPair,
+    EmbeddingTrainingConfig,
+    RAGEvaluationGovernance,
     RAGEvaluationTask,
     ScratchCodeEmbeddingModel,
     ScratchEmbeddingConfig,
+    build_rag_scale_plan,
     save_scratch_embedding_checkpoint,
+    train_scratch_embedding_model,
 )
 from src.aeitron.indexing import LocalVectorIndex, RepositoryIndexer, VectorBackendConfig, create_vector_index, vector_capabilities
+from src.aeitron.indexing.repository_indexer import RAGIndexCoordinator, RedisRAGControl
 from src.aeitron.indexing.vector_index import QdrantVectorIndex, VectorSearchReport, VectorSearchResult
 from src.aeitron.learning.capacity import CapacityPlanConfig, build_capacity_plan
 from src.aeitron.learning.storage import LocalObjectStore
@@ -53,6 +59,52 @@ from src.aeitron.verifier.runtime import VerificationRequest, VerifierRuntime, l
 
 
 class AeitronProductionHardeningTest(unittest.TestCase):
+    def test_postgres_tenant_facades_share_pool_without_closing_it(self) -> None:
+        class SharedPool:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def connection(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        pool = SharedPool()
+        first = PostgresRAGStore.from_shared_pool(pool, organization_id="d7d9fc25-8a27-4133-b420-c0290e0ec074")
+        second = PostgresRAGStore.from_shared_pool(pool, organization_id="6eb798b7-e88b-4d50-81d0-f15a14020cf3")
+        self.assertIs(first._pool, second._pool)
+        first.close()
+        second.close()
+        self.assertFalse(pool.closed)
+        with self.assertRaisesRegex(ValueError, "organization_id must be a UUID"):
+            PostgresRAGStore.from_shared_pool(pool, organization_id="tenant-name")
+
+    def test_redis_worker_wake_uses_consumer_group_and_acknowledges_signal(self) -> None:
+        class FakeRedis:
+            def __init__(self) -> None:
+                self.acked: list[str] = []
+
+            async def xgroup_create(self, *_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("BUSYGROUP Consumer Group name already exists")
+
+            async def xreadgroup(self, *_args: object, **_kwargs: object) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
+                return [("aeitron:rag:index-jobs", [("171-0", {"job_id": "job"})])]
+
+            async def xack(self, _stream: str, _group: str, *message_ids: str) -> None:
+                self.acked.extend(message_ids)
+
+        async def scenario() -> None:
+            control = RedisRAGControl("redis://127.0.0.1:6379/0")
+            fake = FakeRedis()
+            control._client = fake
+            self.assertTrue(await control.wait_for_work("worker-001", timeout_seconds=0.1))
+            self.assertEqual(fake.acked, ["171-0"])
+            with self.assertRaisesRegex(ValueError, "unsafe characters"):
+                await control.wait_for_work("bad worker", timeout_seconds=0.1)
+
+        asyncio.run(scenario())
+
     def test_failed_index_generation_preserves_previous_searchable_revision(self) -> None:
         with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:
             workspace = Path(workspace_dir)
@@ -69,6 +121,22 @@ class AeitronProductionHardeningTest(unittest.TestCase):
                         indexer.index_project(project_id=project["id"])
                 self.assertEqual(store.get_project(project["id"])["active_index_revision"], first.revision_id)
                 self.assertEqual(store.list_chunks(project["id"]), old_chunks)
+                self.assertEqual(store.index_status(project["id"])["status"], "failed")
+
+    def test_production_indexing_rejects_missing_tree_sitter_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:
+            workspace = Path(workspace_dir)
+            (workspace / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+            with LocalStore(Path(db_dir) / "rag.sqlite3") as store:
+                project = store.create_project(name="strict-parser", repo_path=str(workspace))
+                indexer = RepositoryIndexer(store, production_mode=False)
+                indexer.production_mode = True
+                with patch(
+                    "src.aeitron.indexing.repository_indexer.tree_sitter_parser",
+                    side_effect=RuntimeError("tree-sitter-language-pack is unavailable"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "tree-sitter-language-pack is unavailable"):
+                        indexer.index_project(project_id=project["id"])
                 self.assertEqual(store.index_status(project["id"])["status"], "failed")
 
     def test_index_snapshot_is_immutable_and_hash_bound_in_object_storage(self) -> None:
@@ -184,6 +252,92 @@ class AeitronProductionHardeningTest(unittest.TestCase):
         self.assertEqual(report.status, "blocked")
         self.assertIn("500", report.blockers[0])
 
+    def test_rag_scale_plan_requires_real_100m_target_for_production_claim(self) -> None:
+        small = build_rag_scale_plan(target_chunks=1_000_000)
+        production = build_rag_scale_plan(target_chunks=100_000_000)
+        self.assertFalse(small.production_scale_target_met)
+        self.assertTrue(production.production_scale_target_met)
+        self.assertGreaterEqual(production.shard_count, 16)
+        self.assertLessEqual(production.maximum_points_per_shard, 10_000_000)
+
+    def test_rag_job_idempotency_retry_cancellation_and_outbox_are_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:
+            workspace = Path(workspace_dir)
+            (workspace / "main.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+            with LocalStore(Path(db_dir) / "jobs.sqlite3") as store:
+                project = store.create_project(name="jobs", repo_path=str(workspace))
+                first = store.create_index_job(
+                    organization_id="local",
+                    project_id=project["id"],
+                    idempotency_key="index-jobs-0001",
+                    request={"max_chunk_tokens": 512},
+                    max_attempts=2,
+                )
+                duplicate = store.create_index_job(
+                    organization_id="local",
+                    project_id=project["id"],
+                    idempotency_key="index-jobs-0001",
+                    request={"max_chunk_tokens": 512},
+                    max_attempts=2,
+                )
+                self.assertEqual(first["id"], duplicate["id"])
+                claimed = store.claim_index_job(worker_id="worker-test-1")
+                self.assertIsNotNone(claimed)
+                retried = store.fail_index_job(
+                    first["id"],
+                    worker_id="worker-test-1",
+                    error="temporary dependency outage",
+                    retry_delay_seconds=0,
+                )
+                self.assertEqual(retried["status"], "queued")
+                claimed_again = store.claim_index_job(worker_id="worker-test-2")
+                self.assertEqual(claimed_again["attempt"], 2)
+                dead = store.fail_index_job(
+                    first["id"],
+                    worker_id="worker-test-2",
+                    error="dependency outage repeated",
+                    retry_delay_seconds=0,
+                )
+                self.assertEqual(dead["status"], "dead_letter")
+                second = store.create_index_job(
+                    organization_id="local",
+                    project_id=project["id"],
+                    idempotency_key="index-jobs-0002",
+                    request={},
+                    max_attempts=2,
+                )
+                cancelled = store.request_index_job_cancel(second["id"], organization_id="local")
+                self.assertEqual(cancelled["status"], "cancelled")
+
+    def test_tree_sitter_multilingual_chunks_resolve_interprocedural_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:
+            workspace = Path(workspace_dir)
+            (workspace / "lib.rs").write_text(
+                "fn helper(value: i32) -> i32 { value + 1 }\nfn run() -> i32 { helper(4) }\n",
+                encoding="utf-8",
+            )
+            (workspace / "main.go").write_text(
+                "package main\nfunc helperGo(v int) int { return v + 1 }\nfunc runGo() int { return helperGo(4) }\n",
+                encoding="utf-8",
+            )
+            (workspace / "main.js").write_text(
+                "function helperJs(v) { return v + 1; }\nfunction runJs() { return helperJs(4); }\n",
+                encoding="utf-8",
+            )
+            with LocalStore(Path(db_dir) / "trees.sqlite3") as store:
+                project = store.create_project(name="trees", repo_path=str(workspace))
+                report = RepositoryIndexer(store).index_project(project_id=project["id"])
+                chunks = store.list_chunks(project["id"])
+                self.assertEqual(report.status, "ready")
+                parsers = {str(chunk["metadata"].get("parser")) for chunk in chunks}
+                self.assertIn("tree_sitter", parsers)
+                resolved = [
+                    edge
+                    for chunk in chunks
+                    for edge in chunk["metadata"].get("resolved_calls", [])
+                ]
+                self.assertGreaterEqual(len(resolved), 3)
+
     @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "PyTorch not installed")
     def test_scratch_embedding_model_has_finite_loss_and_hash_bound_manifest(self) -> None:
         import torch
@@ -213,6 +367,68 @@ class AeitronProductionHardeningTest(unittest.TestCase):
             self.assertTrue(manifest["scratch_only"])
             self.assertFalse(manifest["borrowed_weights"])
             self.assertEqual(len(manifest["checkpoint_sha256"]), 64)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch") is not None and importlib.util.find_spec("tokenizers") is not None,
+        "PyTorch/tokenizers not installed",
+    )
+    def test_scratch_embedding_trainer_produces_best_hash_bound_checkpoint(self) -> None:
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            vocab = {"<|pad|>": 0, "<|unk|>": 1}
+            for index in range(2, 256):
+                vocab[f"tok{index}"] = index
+            tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="<|unk|>"))
+            tokenizer.pre_tokenizer = Whitespace()
+            tokenizer_path = root / "tokenizer.json"
+            tokenizer.save(str(tokenizer_path))
+            pairs_path = root / "pairs.jsonl"
+            with pairs_path.open("w", encoding="utf-8") as handle:
+                for index in range(40):
+                    pair = EmbeddingPair(
+                        pair_id=hashlib.sha256(f"pair-{index}".encode()).hexdigest(),
+                        query=f"tok{2 + index} tok100",
+                        positive=f"tok{2 + index} tok101",
+                        hard_negatives=[f"tok{120 + (index % 20)} tok102"],
+                        category="task_evidence",
+                        source_revision="revision-1",
+                        lineage_key=f"repository-{index}",
+                    )
+                    handle.write(pair.model_dump_json() + "\n")
+            config = EmbeddingTrainingConfig(
+                model=ScratchEmbeddingConfig(
+                    vocab_size=256,
+                    hidden_size=64,
+                    num_layers=1,
+                    num_attention_heads=4,
+                    projection_dimension=64,
+                    intermediate_size=128,
+                    max_sequence_length=32,
+                    dropout=0.0,
+                ),
+                steps=1,
+                batch_size=2,
+                warmup_steps=0,
+                validation_interval=1,
+                checkpoint_interval=1,
+                validation_fraction=0.25,
+                max_validation_pairs=20,
+                precision="fp32",
+                device="cpu",
+            )
+            report = train_scratch_embedding_model(
+                pairs_path=pairs_path,
+                tokenizer_path=tokenizer_path,
+                output_dir=root / "output",
+                config=config,
+            )
+            self.assertEqual(report.status, "passed", report.model_dump())
+            self.assertEqual(report.best_step, 1)
+            self.assertTrue(Path(report.checkpoint_manifest or "").is_file())
 
     def test_architecture_integrity_passes_repository_and_detects_synthetic_drift(self) -> None:
         current = run_architecture_integrity()
@@ -252,6 +468,13 @@ def repeated(value):
         expanded = expand_psql_includes(migrations[0].sql, base_dir=Path.cwd())
         self.assertIn("CREATE TABLE IF NOT EXISTS projects", expanded)
         self.assertTrue(any(migration.version == "0003_task_retry" for migration in migrations))
+        rag_operations = next(migration for migration in migrations if migration.version == "0008_rag_operations")
+        normalized_sql = " ".join(rag_operations.sql.upper().split())
+        self.assertIn("SECURITY DEFINER", normalized_sql)
+        self.assertIn("SET SEARCH_PATH = PUBLIC, PG_TEMP", normalized_sql)
+        self.assertIn("FOR UPDATE SKIP LOCKED", normalized_sql)
+        self.assertIn("REVOKE ALL ON FUNCTION AEITRON_CLAIM_RAG_INDEX_JOB", normalized_sql)
+        self.assertIn("REVOKE ALL ON FUNCTION AEITRON_CLAIM_RAG_OUTBOX", normalized_sql)
 
     def test_existing_sqlite_db_auto_adds_task_retry_columns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

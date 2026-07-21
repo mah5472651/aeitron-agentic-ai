@@ -260,6 +260,16 @@ def _run_bandit(root: Path) -> dict[str, Any] | None:
         "status": "passed" if not blocking else "failed",
         "issue_count": len(results),
         "blocking_issue_count": len(blocking),
+        "blocking_findings": [
+            {
+                "file": str(item.get("filename") or ""),
+                "line": int(item.get("line_number") or 0),
+                "rule": str(item.get("test_id") or "unknown"),
+                "severity": str(item.get("issue_severity") or "unknown"),
+                "message": str(item.get("issue_text") or "")[:500],
+            }
+            for item in blocking
+        ],
         "metrics": payload.get("metrics", {}),
     }
 
@@ -364,6 +374,16 @@ def _run_semgrep(root: Path) -> dict[str, Any]:
         "issue_count": len(findings),
         "error_count": error_count,
         "warning_count": warning_count,
+        "blocking_findings": [
+            {
+                "file": str(item.get("path") or ""),
+                "line": int((item.get("start") or {}).get("line") or 0),
+                "rule": str(item.get("check_id") or "unknown"),
+                "message": str((item.get("extra") or {}).get("message") or "")[:500],
+            }
+            for item in findings
+            if (item.get("extra") or {}).get("severity") == "ERROR"
+        ],
     }
 
 

@@ -1361,7 +1361,86 @@ python -m src.aeitron.evaluation.benchmark_suites `
 This measures evidence recall, order sensitivity and unsupported claims. A 5M
 effective-context result is not represented as a 5M full-attention claim.
 
-7. Hybrid RAG indexing is revision-bound and idempotent:
+7. Hybrid RAG indexing is revision-bound, tenant-bound, and idempotent.
+
+Production indexing is a durable job, not an in-request filesystem scan:
+
+```text
+Gateway -> Postgres rag_index_jobs -> global claim function -> RAG worker
+       -> immutable S3/MinIO snapshot -> atomic Postgres index revision
+       -> Postgres outbox -> Qdrant vector sync -> delivered/dead-letter
+```
+
+Postgres is the job, revision, chunk-metadata, and outbox authority. The gateway
+uses one bounded process-wide connection pool with immutable request-scoped
+tenant facades, avoiding per-tenant pool explosion and eviction races. Redis only
+wakes workers through an acknowledged consumer group and holds bounded project
+locks; losing Redis cannot lose a job. Workers periodically return to Postgres,
+so a lost wake signal delays work but cannot strand it.
+Migration `0008_rag_operations` adds leases, retries, dead-letter states, and
+two `SECURITY DEFINER` claim functions with fixed search paths, validated worker
+IDs, bounded leases, `SKIP LOCKED`, and public execution revoked. Actual reads
+and writes remain organization-scoped under RLS.
+
+Production routes require tenant scopes and an `Idempotency-Key`:
+
+```text
+POST /v1/projects/{project_id}/index
+GET  /v1/projects/{project_id}/index/status
+GET  /v1/projects/{project_id}/index/jobs
+GET  /v1/projects/{project_id}/index/jobs/{job_id}
+POST /v1/projects/{project_id}/index/jobs/{job_id}/cancel
+POST /v1/context/build
+```
+
+The distributed worker is started explicitly:
+
+```powershell
+python -m src.aeitron.indexing.repository_indexer worker --production
+```
+
+In production, supported non-Python languages require the Tree-sitter runtime;
+missing parsers fail the index instead of silently reducing graph fidelity.
+Python AST plus Tree-sitter for C, C++, Rust, Go, Java, JavaScript, TypeScript,
+and Bash record signatures, imports, calls, mutations, resolved callees,
+ambiguous calls, external dependencies, and reverse caller edges.
+
+The scratch embedding lifecycle is executable and hash-bound:
+
+```powershell
+python -m src.aeitron.indexing.vector_index build-pairs `
+  --sqlite-path data\aeitron.sqlite3 --project-id PROJECT_ID `
+  --output data\rag\embedding-pairs.jsonl --minimum-pairs 500
+
+python -m src.aeitron.indexing.vector_index train `
+  --pairs data\rag\embedding-pairs.jsonl `
+  --tokenizer artifacts\aeitron\tokenizer\tokenizer.json `
+  --config config\rag_embedding_training.json `
+  --output-dir artifacts\aeitron\rag-embedding
+```
+
+This trains `Aeitron-Code-Embed-v1` from random initialization with symmetric
+InfoNCE, in-batch and explicit hard negatives, family-safe validation split,
+mixed precision, gradient accumulation/clipping, warmup/cosine decay, finite
+loss guards, best-checkpoint selection, early stopping, collapse detection,
+retrieval metrics, safe-tensor optimizer state, and strict resume hashes.
+
+The governed evaluation and scale interfaces are:
+
+```powershell
+python -m src.aeitron.indexing.context_builder build-candidates --organization-id ORG_UUID --project-id PROJECT_UUID --output data\eval\rag-candidates.jsonl --target-tasks 500
+python -m src.aeitron.indexing.context_builder evaluate --tasks GOVERNED_TASKS.jsonl --governance GOVERNANCE.json --database-url $env:AEITRON_DATABASE_URL --organization-id ORG_UUID --production --output-dir artifacts\aeitron\rag-eval
+python -m src.aeitron.indexing.context_builder scale-plan --target-chunks 100000000 --output-dir artifacts\aeitron\rag-scale
+python -m src.aeitron.indexing.context_builder load-test --endpoint https://gateway.example.com --organization-id ORG_UUID --project-id PROJECT_UUID --queries GOVERNED_QUERIES.jsonl --target-chunks 100000000 --output-dir artifacts\aeitron\rag-load
+```
+
+Candidate generation never self-approves tasks. Strict evaluation requires at
+least 500 protected, eval-only tasks, distinct reviewer and approver identities,
+zero tenant/stale-revision leakage, and hybrid Recall@20 at least five percentage
+points above lexical retrieval. The load gate ramps 10/100/500/1,000 concurrent
+requests and enforces p95 <= 750 ms, p99 <= 1.5 s, and error rate < 0.5%.
+
+Legacy vector synchronization remains available during compatibility rollout:
 
 ```text
 POST /v1/context/vector-sync
@@ -1382,9 +1461,13 @@ never silently report hybrid success. Index generations commit atomically, so
 a failed rebuild cannot replace the previous searchable revision. Legacy
 `vector-search` and `vector-sync` routes are compatibility endpoints only.
 
-The code path is `built_not_production_proven` until a governed 500-task pack,
-100M-point Qdrant deployment, 1,000-concurrent retrieval load test, isolation
-test, chaos test and soak evidence meet the release thresholds.
+The disposable real-dependency proof has passed Postgres migrations, Redis,
+MinIO checksum lifecycle, Qdrant tenant isolation, durable index idempotency,
+global job dispatch, Tree-sitter persistence, injected vector-outbox failure,
+attempt-two replay, and cleanup. The subsystem remains
+`built_not_production_proven` until an Aeitron scratch embedding checkpoint,
+governed 500-task report, 100M-chunk/1,000-concurrent load report, native model
+serving, chaos, and soak evidence meet the release thresholds.
 
 
 

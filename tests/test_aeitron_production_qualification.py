@@ -792,7 +792,9 @@ class AeitronProductionQualificationTest(unittest.TestCase):
             with self.assertRaises(HTTPException) as second:
                 await state.generate_async(request)
             self.assertEqual(second.exception.status_code, 503)
-            await asyncio.sleep(0.12)
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while state._active and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
             self.assertEqual(state._active, 0)
 
         asyncio.run(scenario())

@@ -217,6 +217,19 @@ class AeitronEnterpriseReadinessTest(unittest.TestCase):
 
             async def post(self, url: str, **kwargs: object) -> FakeResponse:
                 point = state["point"]
+                request = kwargs.get("json")
+                if isinstance(request, dict):
+                    filters = request.get("filter", {}).get("must", [])  # type: ignore[union-attr]
+                    expected_organization = next(
+                        (
+                            item.get("match", {}).get("value")
+                            for item in filters
+                            if item.get("key") == "organization_id"
+                        ),
+                        None,
+                    )
+                    if expected_organization != point["payload"]["organization_id"]:
+                        return FakeResponse({"result": {"points": []}})
                 return FakeResponse({"result": {"points": [point]}})
 
             async def delete(self, url: str, **kwargs: object) -> FakeResponse:

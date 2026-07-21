@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import re
 import statistics
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -23,10 +25,9 @@ import httpx
 from pydantic import Field
 
 from src.aeitron.db.migration_runner import apply_migrations
-from src.aeitron.evaluation.agent_scorecard import AgentScorecardReport
-from src.aeitron.evaluation.benchmark_pack import BenchmarkPackConfig, run_benchmark_pack
-from src.aeitron.evaluation.benchmark_suites import BenchmarkSuitesReport
+from src.aeitron.db import PostgresRAGDispatcher, PostgresRAGStore
 from src.aeitron.identity.quota import RedisQuotaStore
+from src.aeitron.indexing.repository_indexer import RAGIndexCoordinator
 from src.aeitron.learning.storage import ObjectStoreConfig, verify_object_store_lifecycle
 from src.aeitron.security.audit import run_security_audit
 from src.aeitron.shared.config_contracts import load_active_model_contract
@@ -74,6 +75,7 @@ class ProductionProofConfig(StrictModel):
     object_store_uri: str | None = None
     object_store_endpoint_url: str | None = None
     qdrant_url: str | None = None
+    run_rag_control_plane: bool = False
     allowed_insecure_service_hosts: list[str] = Field(default_factory=list)
     serving_url: str | None = None
     serving_api_key: str | None = None
@@ -150,6 +152,7 @@ def config_from_env(args: argparse.Namespace) -> ProductionProofConfig:
         object_store_uri=args.object_store_uri or _env("AEITRON_OBJECT_STORE_URI"),
         object_store_endpoint_url=args.object_store_endpoint_url or _env("AEITRON_OBJECT_STORE_ENDPOINT_URL"),
         qdrant_url=args.qdrant_url or _env("AEITRON_QDRANT_URL"),
+        run_rag_control_plane=args.run_rag_control_plane,
         allowed_insecure_service_hosts=args.allow_insecure_service_host,
         serving_url=args.serving_url or _env("AEITRON_SERVING_URL"),
         serving_api_key=args.serving_api_key or _env("AEITRON_MODEL_API_KEY"),
@@ -229,6 +232,8 @@ async def _check_qdrant(config: ProductionProofConfig) -> ProofCheckResult:
     endpoint = ""
     marker = uuid.uuid4().hex
     point_id = str(uuid.uuid4())
+    organization_id = str(uuid.uuid4())
+    project_id = str(uuid.uuid4())
     cleanup_error = ""
     primary_error = ""
     collection_created = False
@@ -254,7 +259,11 @@ async def _check_qdrant(config: ProductionProofConfig) -> ProofCheckResult:
                         {
                             "id": point_id,
                             "vector": [1.0, 0.0, 0.0, 0.0],
-                            "payload": {"proof_marker": marker},
+                            "payload": {
+                                "proof_marker": marker,
+                                "organization_id": organization_id,
+                                "project_id": project_id,
+                            },
                         }
                     ]
                 },
@@ -266,6 +275,12 @@ async def _check_qdrant(config: ProductionProofConfig) -> ProofCheckResult:
                     "query": [1.0, 0.0, 0.0, 0.0],
                     "limit": 1,
                     "with_payload": True,
+                    "filter": {
+                        "must": [
+                            {"key": "organization_id", "match": {"value": organization_id}},
+                            {"key": "project_id", "match": {"value": project_id}},
+                        ]
+                    },
                 },
             )
             queried.raise_for_status()
@@ -278,6 +293,23 @@ async def _check_qdrant(config: ProductionProofConfig) -> ProofCheckResult:
             )
             if not matched:
                 raise RuntimeError("Qdrant query did not return the inserted proof point")
+            rejected = await client.post(
+                f"{endpoint}/collections/{collection}/points/query",
+                json={
+                    "query": [1.0, 0.0, 0.0, 0.0],
+                    "limit": 1,
+                    "with_payload": True,
+                    "filter": {
+                        "must": [
+                            {"key": "organization_id", "match": {"value": str(uuid.uuid4())}},
+                            {"key": "project_id", "match": {"value": project_id}},
+                        ]
+                    },
+                },
+            )
+            rejected.raise_for_status()
+            if rejected.json().get("result", {}).get("points", []):
+                raise RuntimeError("Qdrant tenant filter returned a cross-tenant point")
     except Exception as exc:
         primary_error = str(exc)
     finally:
@@ -318,8 +350,228 @@ async def _check_qdrant(config: ProductionProofConfig) -> ProofCheckResult:
             "created": True,
             "upsert_verified": True,
             "query_verified": True,
+            "tenant_filter_verified": True,
             "cleanup_verified": True,
         },
+    )
+
+
+async def _check_rag_control_plane(config: ProductionProofConfig) -> ProofCheckResult:
+    started = time.perf_counter()
+    if not config.run_rag_control_plane:
+        return _result(
+            "rag_control_plane_lifecycle",
+            "failed" if config.strict else "skipped",
+            config.strict,
+            started,
+            {"reason": "--run-rag-control-plane was not set"},
+        )
+    missing = [
+        name
+        for name, value in (
+            ("Postgres", config.postgres_url),
+            ("Redis", config.redis_url),
+            ("S3/MinIO", config.object_store_uri),
+        )
+        if not value
+    ]
+    if missing:
+        return _result(
+            "rag_control_plane_lifecycle",
+            "failed",
+            True,
+            started,
+            {"reason": "missing " + ", ".join(missing)},
+        )
+    organization_id = str(uuid.uuid4())
+    store: PostgresRAGStore | None = None
+    dispatcher: PostgresRAGDispatcher | None = None
+    coordinator: RAGIndexCoordinator | None = None
+    cleanup_error = ""
+    primary_error = ""
+    details: dict[str, Any] = {}
+    wake_task: asyncio.Task[bool] | None = None
+    previous_uri = os.environ.get("AEITRON_RAG_OBJECT_STORE_URI")
+    previous_endpoint = os.environ.get("AEITRON_OBJECT_STORE_ENDPOINT_URL")
+    try:
+        assert config.postgres_url and config.redis_url and config.object_store_uri
+        if not config.object_store_uri.startswith("s3://"):
+            raise RuntimeError("RAG control-plane proof requires S3/MinIO snapshot storage")
+        os.environ["AEITRON_RAG_OBJECT_STORE_URI"] = config.object_store_uri.rstrip("/") + "/rag-proof-snapshots"
+        if config.object_store_endpoint_url:
+            os.environ["AEITRON_OBJECT_STORE_ENDPOINT_URL"] = config.object_store_endpoint_url
+        with tempfile.TemporaryDirectory(prefix="aeitron-rag-proof-") as temporary:
+            repository = Path(temporary)
+            (repository / "lib.rs").write_text(
+                "fn helper(v: i32) -> i32 { v + 1 }\nfn run() -> i32 { helper(4) }\n",
+                encoding="utf-8",
+            )
+            store = PostgresRAGStore(config.postgres_url, organization_id=organization_id, max_pool_size=4)
+            store.ensure_organization(organization_id, name="Aeitron RAG lifecycle proof")
+            project = store.create_project(
+                name="rag-lifecycle-proof",
+                repo_path=str(repository),
+                organization_id=organization_id,
+                owner_user_id="production-proof-operator",
+            )
+            coordinator = RAGIndexCoordinator(
+                store,
+                redis_url=config.redis_url,
+                production_mode=True,
+                worker_id=f"rag-proof-{uuid.uuid4().hex[:12]}",
+            )
+            if coordinator.redis is None:
+                raise RuntimeError("RAG proof did not initialize Redis control")
+            await coordinator.redis.healthcheck()
+            wake_task = asyncio.create_task(
+                coordinator.redis.wait_for_work(coordinator.worker_id, timeout_seconds=5.0)
+            )
+            await asyncio.sleep(0.05)
+            idempotency_key = f"rag-proof-{uuid.uuid4().hex}"
+            first = await coordinator.submit(
+                organization_id=organization_id,
+                project_id=str(project["id"]),
+                idempotency_key=idempotency_key,
+            )
+            if not await wake_task:
+                raise RuntimeError("Redis consumer-group wake signal was not delivered")
+            wake_task = None
+            duplicate = await coordinator.submit(
+                organization_id=organization_id,
+                project_id=str(project["id"]),
+                idempotency_key=idempotency_key,
+            )
+            if first["id"] != duplicate["id"]:
+                raise RuntimeError("RAG index idempotency proof failed")
+            dispatcher = PostgresRAGDispatcher(config.postgres_url)
+            claimed = await asyncio.to_thread(
+                dispatcher.claim_index_job,
+                worker_id=coordinator.worker_id,
+                lease_seconds=120,
+            )
+            if claimed is None or claimed["id"] != first["id"]:
+                raise RuntimeError("global RAG dispatcher did not claim the submitted job")
+            completed = await coordinator.execute_claimed_index_job(claimed)
+            if not completed or completed.get("status") != "succeeded":
+                raise RuntimeError(f"RAG index job did not succeed: {completed}")
+            index_status = store.index_status(str(project["id"]))
+            if int(index_status["chunk_count"]) < 2:
+                raise RuntimeError("RAG index did not persist expected Tree-sitter chunks")
+            event = await asyncio.to_thread(
+                dispatcher.claim_outbox,
+                worker_id=coordinator.worker_id,
+                lease_seconds=120,
+            )
+            if event is None:
+                raise RuntimeError("RAG vector-sync outbox event is missing")
+            store.fail_rag_outbox(
+                str(event["id"]),
+                worker_id=coordinator.worker_id,
+                error="injected vector backend outage",
+                retry_delay_seconds=0,
+            )
+            replay_worker = f"rag-replay-{uuid.uuid4().hex[:12]}"
+            replay = store.claim_rag_outbox(worker_id=replay_worker)
+            if replay is None or int(replay["attempt"]) != 2:
+                raise RuntimeError("RAG outbox did not replay after injected outage")
+            store.complete_rag_outbox(str(replay["id"]), worker_id=replay_worker)
+            details = {
+                "organization_id": organization_id,
+                "project_id": str(project["id"]),
+                "job_id": str(completed["id"]),
+                "idempotency_verified": True,
+                "redis_consumer_group_wake_verified": True,
+                "tree_sitter_chunk_count": int(index_status["chunk_count"]),
+                "outbox_retry_attempt": int(replay["attempt"]),
+                "snapshot_storage": "s3_or_minio",
+            }
+    except Exception as exc:
+        primary_error = str(exc)
+    finally:
+        if wake_task is not None and not wake_task.done():
+            wake_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wake_task
+        if previous_uri is None:
+            os.environ.pop("AEITRON_RAG_OBJECT_STORE_URI", None)
+        else:
+            os.environ["AEITRON_RAG_OBJECT_STORE_URI"] = previous_uri
+        if previous_endpoint is None:
+            os.environ.pop("AEITRON_OBJECT_STORE_ENDPOINT_URL", None)
+        else:
+            os.environ["AEITRON_OBJECT_STORE_ENDPOINT_URL"] = previous_endpoint
+        if coordinator is not None:
+            await coordinator.close()
+        if store is not None:
+            store.close()
+        if dispatcher is not None:
+            dispatcher.close()
+        if config.postgres_url:
+            try:
+                import asyncpg
+
+                connection = await asyncpg.connect(config.postgres_url)
+                try:
+                    async with connection.transaction():
+                        await connection.execute(
+                            "SELECT set_config('aeitron.organization_id', $1, true)",
+                            organization_id,
+                        )
+                        await connection.execute(
+                            "UPDATE projects SET active_index_revision=NULL WHERE organization_id=$1::uuid",
+                            organization_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM rag_outbox_events WHERE organization_id=$1::uuid",
+                            organization_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM rag_index_jobs WHERE organization_id=$1::uuid",
+                            organization_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM code_chunks WHERE project_id IN "
+                            "(SELECT id FROM projects WHERE organization_id=$1::uuid)",
+                            organization_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM workspace_files WHERE project_id IN "
+                            "(SELECT id FROM projects WHERE organization_id=$1::uuid)",
+                            organization_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM rag_index_revisions WHERE organization_id=$1::uuid",
+                            organization_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM project_members WHERE organization_id=$1::uuid",
+                            organization_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM projects WHERE organization_id=$1::uuid",
+                            organization_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM organization_members WHERE organization_id=$1::uuid",
+                            organization_id,
+                        )
+                        await connection.execute(
+                            "DELETE FROM organizations WHERE id=$1::uuid",
+                            organization_id,
+                        )
+                finally:
+                    await connection.close()
+            except Exception as exc:
+                cleanup_error = str(exc)
+    if cleanup_error:
+        primary_error = primary_error or f"RAG proof cleanup failed: {cleanup_error}"
+    return _result(
+        "rag_control_plane_lifecycle",
+        "failed" if primary_error else "passed",
+        True,
+        started,
+        {**details, "cleanup_verified": not cleanup_error},
+        error=primary_error,
     )
 
 
@@ -442,6 +694,9 @@ def _check_benchmarks(config: ProductionProofConfig) -> ProofCheckResult:
                 {"reason": "strict proof requires " + ", ".join(missing)},
             )
         try:
+            from src.aeitron.evaluation.agent_scorecard import AgentScorecardReport
+            from src.aeitron.evaluation.benchmark_suites import BenchmarkSuitesReport
+
             assert config.executable_benchmark_report
             assert config.scorecard_report
             assert config.active_model_profile
@@ -527,6 +782,8 @@ def _check_benchmarks(config: ProductionProofConfig) -> ProofCheckResult:
         return _missing("benchmark_pack", config.strict, started, "AEITRON_BENCHMARK_DIR or --benchmark-dir is required")
     root = Path(config.benchmark_dir)
     try:
+        from src.aeitron.evaluation.benchmark_pack import BenchmarkPackConfig, run_benchmark_pack
+
         report = run_benchmark_pack(
             BenchmarkPackConfig(
                 human_eval_path=str(root / "humaneval.jsonl"),
@@ -564,6 +821,7 @@ async def run_production_proof(config: ProductionProofConfig) -> ProductionProof
         await _check_redis_quota(config),
         await _check_object_store(config),
         await _check_qdrant(config),
+        await _check_rag_control_plane(config),
         await _check_serving_health(config),
         await _check_serving_load(config),
         _check_benchmarks(config),
@@ -802,6 +1060,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object-store-uri")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--qdrant-url")
+    parser.add_argument("--run-rag-control-plane", action="store_true")
     parser.add_argument(
         "--allow-insecure-service-host",
         action="append",

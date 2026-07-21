@@ -5337,12 +5337,59 @@ does not delete or replace the previous searchable revision. Postgres migration
 `0007_hybrid_rag.sql` adds organizations, membership, revision/job/outbox
 tables and row-level tenant policies.
 
+Migration `0008_rag_operations.sql` makes that lifecycle distributed and
+recoverable. Index jobs and vector outbox deliveries have bounded attempts,
+availability timestamps, leases, cancellation, terminal dead-letter states and
+claim indexes. Global workers may claim tenant jobs only through fixed-search-
+path `SECURITY DEFINER` functions. Those functions validate worker IDs and
+lease bounds, use `FOR UPDATE SKIP LOCKED`, and revoke execution from `PUBLIC`.
+After a claim, all project, revision, chunk and event operations return to an
+organization-bound `PostgresRAGStore` transaction with RLS context.
+
+`RAGIndexCoordinator` treats Postgres as the source of truth. Redis Streams are
+notification/control acceleration and project-lock ownership only. A worker
+heartbeat extends the Postgres lease; cancellation is checked throughout file
+processing and before atomic revision commit. Retryable failures requeue with
+bounded exponential delay. Exhausted or permanent failures enter the DLQ. The
+outbox uses an independent lease/retry lifecycle, so a Qdrant outage cannot
+roll back or lose a committed metadata revision.
+
+Redis wake signals use the `aeitron-rag-workers` consumer group, are bounded,
+and are acknowledged after consumption. The stream is not the queue authority:
+workers always claim with Postgres `SKIP LOCKED` and periodically poll Postgres
+after the blocking read timeout. Redis outage therefore changes latency, not
+durability. The distributed process uses one bounded Postgres pool for all
+organization-scoped facades instead of opening a pool per claimed job.
+
+The API process owns one bounded shared psycopg pool. Each request receives a
+small immutable organization-bound facade which sets RLS context inside every
+transaction. Creating tenants therefore does not create more pools, and a
+tenant-cache eviction cannot close connections being used by another request.
+
+Production non-Python parsing is fail-closed. Python uses the standard AST;
+C, C++, Rust, Go, Java, JavaScript, TypeScript and Bash use Tree-sitter. Symbol
+chunks carry hierarchy, signature, imports, calls, mutations and parser errors.
+The graph resolver emits resolved callees, ambiguous local candidates, external
+dependencies and reverse caller edges. A supported-language parser dependency
+may fall back to line chunks in development, but production rejects the run.
+
 `Aeitron-Code-Embed-v1` is a random-initialized 12-layer, 768-hidden dual
 encoder contract using the governed 128K tokenizer and symmetric InfoNCE. A
 production embedding service is rejected unless its manifest proves
 `scratch_only=true`, `borrowed_weights=false`, matching dimensions and valid
 tokenizer/checkpoint hashes. The model implementation exists, but no trained
 embedding checkpoint or GPU retrieval-quality proof is claimed yet.
+
+The same implementation now owns pair extraction and training; there is no
+second trainer. It builds positive/negative evidence from function-docstring,
+caller-callee, code-test, task-evidence, error-fix and security-patch relations.
+Training adds explicit hard negatives to in-batch negatives, performs lineage-
+safe train/validation splitting, AdamW warmup/cosine scheduling, gradient
+accumulation and clipping, bf16/fp32 safety, finite-loss checks, validation
+retrieval Recall/MRR and embedding-collapse checks. Best/latest checkpoints use
+safe tensor files and bind tokenizer, pair dataset, config and checkpoint
+digests; resume rejects any drift. `config/rag_embedding_training.json` is the
+production training contract.
 
 Context output includes retrieval mode, degraded reason, candidate counts,
 timings, index revision, embedding version, per-chunk content/evidence hashes
@@ -5351,9 +5398,28 @@ Production evaluation requires at least 500 governed repository tasks and
 enforces Recall@20, nDCG@10, MRR@10, context precision, stale-revision and
 cross-tenant gates.
 
-Qdrant, embedding service, Postgres, Redis, S3/MinIO, GPU execution, and the
-50-task governed repository run remain external operational proofs. The code
-reports those states as blocked or built-not-proven until live evidence exists.
+Evaluation candidate generation is deliberately non-authoritative: generated
+rows are labelled `not_reviewed`. A strict pack must be protected and eval-only,
+bind its task file hash, and have distinct reviewer and approval identities.
+It compares hybrid retrieval with lexical-only retrieval and requires at least
+a five-percentage-point Recall@20 gain. Scale planning computes Qdrant shards,
+replicas, vector/payload capacity, object-storage headroom and worker estimates
+for 100M chunks. The live load harness ramps 10, 100, 500 and 1,000 concurrent
+requests while enforcing tenant-bound evidence IDs, p50/p95/p99, throughput and
+error gates.
+
+An isolated real-service lifecycle has passed against disposable PostgreSQL 16,
+Redis 7, MinIO and Qdrant containers. It applied all eight migrations, verified
+Redis state, S3 checksum round-trip/delete, Qdrant tenant-filter isolation,
+index-job idempotency, global dispatcher claim, two Rust Tree-sitter chunks,
+an injected vector-backend outage, second-attempt outbox replay and dependency-
+ordered cleanup. This is real dependency validation, not the remaining 100M
+scale, trained embedding, long soak or production-cluster proof.
+
+GPU embedding training, a human-governed 500-task pack, the 100M-chunk load
+run, native checkpoint serving and the agent scorecard remain external
+operational proofs. Readiness requires their fresh immutable reports and never
+converts missing evidence into a pass.
 
 `deployment.production_proof` performs operational checks rather than health
 URL checks alone: Postgres migrations must be applied, Qdrant must survive a

@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import argparse
 import hashlib
 import json
 import math
 import os
 import re
+import statistics
 import time
 import uuid
 from collections import Counter
 from html import escape
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
+import httpx
 from pydantic import Field
 
-from src.aeitron.db.local_store import LocalStore
+from src.aeitron.db.local_store import LocalStore, PostgresRAGStore
 from src.aeitron.indexing.repository_indexer import RepositoryIndexer, estimate_tokens
 from src.aeitron.indexing.vector_index import VectorBackendConfig, VectorIndexBackend, create_vector_index
 from src.aeitron.memory.system import UnifiedMemoryManager
@@ -102,6 +107,36 @@ class RAGEvaluationTask(StrictModel):
     category: str = Field(default="repository", min_length=1, max_length=128)
 
 
+class RAGEvaluationGovernance(StrictModel):
+    schema_version: Literal[1] = 1
+    pack_id: str = Field(min_length=8, max_length=256)
+    tasks_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_count: int = Field(ge=500)
+    approved: bool
+    reviewer_ids: list[str] = Field(min_length=2)
+    approved_at: str = Field(min_length=20, max_length=64)
+    protected_holdout: bool = True
+    allowed_use: Literal["evaluation_only"] = "evaluation_only"
+
+    def model_post_init(self, __context: Any) -> None:
+        if len(set(self.reviewer_ids)) != len(self.reviewer_ids):
+            raise ValueError("RAG evaluation governance requires distinct reviewer identities")
+        if not self.approved:
+            raise ValueError("RAG evaluation pack is not approved")
+        if not self.protected_holdout:
+            raise ValueError("RAG evaluation pack must be a protected holdout")
+
+
+class RAGEvaluationCandidateReport(StrictModel):
+    status: Literal["ready_for_review", "blocked"]
+    task_count: int = Field(ge=0)
+    category_counts: dict[str, int]
+    tasks_path: str
+    tasks_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    governance_status: Literal["not_reviewed"] = "not_reviewed"
+    blockers: list[str] = Field(default_factory=list)
+
+
 class RAGEvaluationReport(StrictModel):
     status: Literal["passed", "failed", "blocked"]
     task_count: int
@@ -109,9 +144,46 @@ class RAGEvaluationReport(StrictModel):
     ndcg_at_10: float
     mrr_at_10: float
     context_precision: float
+    lexical_recall_at_20: float = 0.0
+    hybrid_gain_percentage_points: float = 0.0
     degraded_query_count: int
     stale_revision_results: int
     cross_tenant_results: int
+    blockers: list[str] = Field(default_factory=list)
+    category_metrics: dict[str, dict[str, float]] = Field(default_factory=dict)
+    governance_sha256: str = ""
+    report_sha256: str
+
+
+class RAGScalePlan(StrictModel):
+    target_chunks: int = Field(ge=1)
+    shard_count: int = Field(ge=1)
+    maximum_points_per_shard: int = Field(ge=1)
+    replication_factor: int = Field(ge=1)
+    vector_dimensions: int = Field(ge=64)
+    raw_vector_storage_gib: float = Field(ge=0.0)
+    replicated_vector_storage_gib: float = Field(ge=0.0)
+    recommended_index_workers: int = Field(ge=1)
+    production_scale_target_met: bool
+
+
+class RAGLoadStageResult(StrictModel):
+    concurrency: int = Field(ge=1)
+    requests: int = Field(ge=1)
+    passed: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    latency_ms_p50: float = Field(ge=0.0)
+    latency_ms_p95: float = Field(ge=0.0)
+    latency_ms_p99: float = Field(ge=0.0)
+    throughput_rps: float = Field(ge=0.0)
+    error_rate: float = Field(ge=0.0, le=1.0)
+
+
+class RAGLoadReport(StrictModel):
+    status: Literal["passed", "failed", "blocked"]
+    endpoint: str
+    target_chunks: int = Field(ge=0)
+    stages: list[RAGLoadStageResult]
     blockers: list[str] = Field(default_factory=list)
     report_sha256: str
 
@@ -153,6 +225,139 @@ def cosine_sparse(left: Counter[str], right: Counter[str]) -> float:
     if left_norm == 0 or right_norm == 0:
         return 0.0
     return dot / (left_norm * right_norm)
+
+
+def load_governed_rag_evaluation(
+    tasks_path: str | Path,
+    governance_path: str | Path,
+) -> tuple[list[RAGEvaluationTask], RAGEvaluationGovernance, str]:
+    tasks_file = Path(tasks_path).resolve(strict=True)
+    governance_file = Path(governance_path).resolve(strict=True)
+    digest = hashlib.sha256(tasks_file.read_bytes()).hexdigest()
+    governance = RAGEvaluationGovernance.model_validate_json(governance_file.read_text(encoding="utf-8"))
+    if digest != governance.tasks_sha256:
+        raise ValueError("RAG evaluation task pack hash does not match its governance record")
+    tasks: list[RAGEvaluationTask] = []
+    seen: set[str] = set()
+    with tasks_file.open(encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                task = RAGEvaluationTask.model_validate_json(line)
+            except Exception as exc:
+                raise ValueError(f"invalid RAG evaluation task at line {line_number}") from exc
+            if task.task_id in seen:
+                raise ValueError(f"duplicate RAG evaluation task ID: {task.task_id}")
+            seen.add(task.task_id)
+            tasks.append(task)
+    if len(tasks) != governance.task_count:
+        raise ValueError("RAG evaluation task count does not match its governance record")
+    if len(tasks) < 500:
+        raise ValueError("production RAG evaluation requires at least 500 governed tasks")
+    governance_sha256 = hashlib.sha256(governance_file.read_bytes()).hexdigest()
+    return tasks, governance, governance_sha256
+
+
+def build_rag_evaluation_candidates(
+    store: Any,
+    *,
+    project_id: str,
+    organization_id: str,
+    output_path: str | Path,
+    target_tasks: int = 500,
+) -> RAGEvaluationCandidateReport:
+    """Create review candidates from immutable index evidence, never approvals."""
+
+    if target_tasks < 500 or target_tasks > 10_000:
+        raise ValueError("governed RAG evaluation candidate target must be between 500 and 10,000")
+    project = store.require_project_access(project_id, organization_id)
+    revision = str(project.get("active_index_revision") or "")
+    if not revision:
+        raise RuntimeError("RAG evaluation candidates require a committed index revision")
+    chunks = store.list_chunks(project_id)
+    templates = (
+        ("symbol_localization", "Locate the exact repository evidence that defines {symbol} in {path}."),
+        ("dependency_tracing", "Which implementation in {path} establishes the dependencies used by {symbol}?"),
+        ("debugging", "Find the code evidence in {path} that must be inspected when {symbol} fails."),
+        ("defensive_security", "Locate the security-relevant implementation boundary for {symbol} in {path}."),
+        ("patch_localization", "Which exact chunk in {path} should be changed to correct {symbol}?"),
+        ("long_context", "Retrieve the authoritative cross-file evidence for {symbol}, starting from {path}."),
+    )
+    tasks: list[RAGEvaluationTask] = []
+    seen: set[str] = set()
+    for chunk in sorted(chunks, key=lambda item: (str(item["path"]), int(item["start_line"]), str(item["id"]))):
+        symbol = str(chunk.get("symbol_name") or chunk.get("kind") or f"lines {chunk['start_line']}-{chunk['end_line']}")
+        for category, template in templates:
+            query = template.format(symbol=symbol, path=str(chunk["path"]))
+            identity = hashlib.sha256(
+                "\x1f".join([organization_id, project_id, revision, str(chunk["id"]), category, query]).encode("utf-8")
+            ).hexdigest()
+            if identity in seen:
+                continue
+            seen.add(identity)
+            tasks.append(
+                RAGEvaluationTask(
+                    task_id=f"rag-{identity[:24]}",
+                    project_id=project_id,
+                    organization_id=organization_id,
+                    query=query,
+                    relevant_chunk_ids=[str(chunk["id"])],
+                    category=category,
+                )
+            )
+            if len(tasks) >= target_tasks:
+                break
+        if len(tasks) >= target_tasks:
+            break
+    target = Path(output_path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    digest = hashlib.sha256()
+    with temporary.open("wb") as handle:
+        for task in tasks:
+            row = (json.dumps(task.model_dump(mode="json"), sort_keys=True, ensure_ascii=True) + "\n").encode("utf-8")
+            handle.write(row)
+            digest.update(row)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, target)
+    blockers = [] if len(tasks) == target_tasks else [f"index produced only {len(tasks)} of {target_tasks} task candidates"]
+    return RAGEvaluationCandidateReport(
+        status="blocked" if blockers else "ready_for_review",
+        task_count=len(tasks),
+        category_counts=dict(sorted(Counter(task.category for task in tasks).items())),
+        tasks_path=str(target),
+        tasks_sha256=digest.hexdigest(),
+        blockers=blockers,
+    )
+
+
+def build_rag_scale_plan(
+    *,
+    target_chunks: int = 100_000_000,
+    vector_dimensions: int = 768,
+    replication_factor: int = 2,
+    maximum_points_per_shard: int = 10_000_000,
+) -> RAGScalePlan:
+    if target_chunks <= 0 or vector_dimensions < 64 or replication_factor < 1:
+        raise ValueError("invalid RAG scale-plan inputs")
+    if maximum_points_per_shard <= 0 or maximum_points_per_shard > 10_000_000:
+        raise ValueError("maximum points per shard must be between 1 and 10,000,000")
+    shard_count = max(16, math.ceil(target_chunks / maximum_points_per_shard))
+    bytes_per_vector = vector_dimensions * 4
+    raw_gib = target_chunks * bytes_per_vector / (1024**3)
+    return RAGScalePlan(
+        target_chunks=target_chunks,
+        shard_count=shard_count,
+        maximum_points_per_shard=maximum_points_per_shard,
+        replication_factor=replication_factor,
+        vector_dimensions=vector_dimensions,
+        raw_vector_storage_gib=round(raw_gib, 3),
+        replicated_vector_storage_gib=round(raw_gib * replication_factor, 3),
+        recommended_index_workers=max(4, min(256, math.ceil(target_chunks / 2_000_000))),
+        production_scale_target_met=target_chunks >= 100_000_000,
+    )
 
 
 class HybridRAGEngine:
@@ -364,6 +569,7 @@ class HybridRAGEngine:
         terms: Counter[str],
     ) -> list[dict[str, Any]]:
         seeds = lexical[:20] + semantic[:20]
+        seed_ids = {str(item.get("id") or "") for item in seeds}
         seed_symbols = {str(item.get("symbol_name") or "").lower() for item in seeds if item.get("symbol_name")}
         seed_paths = {str(item.get("path") or "").lower() for item in seeds}
         results: list[dict[str, Any]] = []
@@ -375,15 +581,29 @@ class HybridRAGEngine:
                 for value in (metadata.get(key) if isinstance(metadata.get(key), list) else [metadata.get(key)])
                 if value
             }
+            resolved_targets = {
+                str(edge.get("target_chunk_id") or "")
+                for edge in metadata.get("resolved_calls", [])
+                if isinstance(edge, dict) and edge.get("target_chunk_id")
+            }
+            called_by = {
+                str(value)
+                for value in metadata.get("called_by_chunk_ids", [])
+                if value
+            }
             path = str(chunk.get("path") or "").lower()
             symbol = str(chunk.get("symbol_name") or "").lower()
             links = sum(1 for value in dependencies if value in seed_symbols or any(value in seed for seed in seed_paths))
+            resolved_links = len((resolved_targets | called_by).intersection(seed_ids))
             query_links = sum(1 for term in terms if any(term in value for value in dependencies))
-            if not links and not query_links and path not in seed_paths:
+            if not links and not resolved_links and not query_links and path not in seed_paths:
                 continue
             item = dict(chunk)
-            item["score"] = min(1.0, 0.25 * links + 0.15 * query_links + (0.2 if path in seed_paths else 0.0))
-            item["reason"] = "dependency_graph"
+            item["score"] = min(
+                1.0,
+                0.30 * resolved_links + 0.20 * links + 0.15 * query_links + (0.2 if path in seed_paths else 0.0),
+            )
+            item["reason"] = "resolved_call_graph" if resolved_links else "dependency_graph"
             results.append(item)
         return sorted(results, key=lambda item: (-float(item["score"]), str(item["id"])))[: self.context_policy.candidate_limit_per_source]
 
@@ -476,6 +696,8 @@ class HybridRAGEngine:
         tasks: list[RAGEvaluationTask],
         *,
         strict: bool = True,
+        governance: RAGEvaluationGovernance | None = None,
+        governance_sha256: str = "",
     ) -> RAGEvaluationReport:
         if strict and len(tasks) < 500:
             return self._evaluation_report(
@@ -487,10 +709,33 @@ class HybridRAGEngine:
                 leakage=0,
                 blockers=["strict production RAG evaluation requires at least 500 governed tasks"],
             )
+        if strict and governance is None:
+            return self._evaluation_report(
+                status="blocked",
+                task_count=len(tasks),
+                metrics=(0.0, 0.0, 0.0, 0.0),
+                degraded=0,
+                stale=0,
+                leakage=0,
+                blockers=["strict production RAG evaluation requires hash-bound governance evidence"],
+            )
+        if governance is not None and governance.task_count != len(tasks):
+            return self._evaluation_report(
+                status="blocked",
+                task_count=len(tasks),
+                metrics=(0.0, 0.0, 0.0, 0.0),
+                degraded=0,
+                stale=0,
+                leakage=0,
+                blockers=["RAG evaluation governance task count mismatch"],
+                governance_sha256=governance_sha256,
+            )
         recalls: list[float] = []
+        lexical_recalls: list[float] = []
         ndcgs: list[float] = []
         reciprocal_ranks: list[float] = []
         precisions: list[float] = []
+        category_values: dict[str, dict[str, list[float]]] = {}
         degraded = stale = leakage = 0
         for task in tasks:
             report = self.build(
@@ -505,14 +750,37 @@ class HybridRAGEngine:
             retrieved = report.chunks
             top20 = [item.chunk_id for item in retrieved[:20]]
             top10 = [item.chunk_id for item in retrieved[:10]]
-            recalls.append(len(relevant.intersection(top20)) / len(relevant))
+            recall = len(relevant.intersection(top20)) / len(relevant)
+            recalls.append(recall)
+            raw_chunks = self.store.list_chunks(task.project_id)
+            terms = query_terms(task.query)
+            lexical_top20 = [
+                str(item["id"])
+                for item in sorted(
+                    (self.score_chunk(chunk, terms, set()) for chunk in raw_chunks),
+                    key=lambda item: (-float(item["score"]), str(item["id"])),
+                )[:20]
+            ]
+            lexical_recall = len(relevant.intersection(lexical_top20)) / len(relevant)
+            lexical_recalls.append(lexical_recall)
             gains = [1.0 if chunk_id in relevant else 0.0 for chunk_id in top10]
             dcg = sum(gain / math.log2(index + 2) for index, gain in enumerate(gains))
             ideal = sum(1.0 / math.log2(index + 2) for index in range(min(len(relevant), 10)))
-            ndcgs.append(dcg / ideal if ideal else 0.0)
+            ndcg = dcg / ideal if ideal else 0.0
+            ndcgs.append(ndcg)
             first = next((index for index, chunk_id in enumerate(top10, start=1) if chunk_id in relevant), None)
-            reciprocal_ranks.append(1.0 / first if first else 0.0)
-            precisions.append(len(relevant.intersection(top20)) / max(1, len(top20)))
+            reciprocal_rank = 1.0 / first if first else 0.0
+            reciprocal_ranks.append(reciprocal_rank)
+            precision = len(relevant.intersection(top20)) / max(1, len(top20))
+            precisions.append(precision)
+            category = category_values.setdefault(
+                task.category,
+                {"recall_at_20": [], "ndcg_at_10": [], "mrr_at_10": [], "context_precision": []},
+            )
+            category["recall_at_20"].append(recall)
+            category["ndcg_at_10"].append(ndcg)
+            category["mrr_at_10"].append(reciprocal_rank)
+            category["context_precision"].append(precision)
             project = self.store.require_project_access(task.project_id, task.organization_id)
             for item in retrieved:
                 chunk = self.store.get_chunk(item.chunk_id, project_id=task.project_id)
@@ -528,6 +796,8 @@ class HybridRAGEngine:
             sum(values) / max(1, len(values))
             for values in (recalls, ndcgs, reciprocal_ranks, precisions)
         )
+        lexical_recall = sum(lexical_recalls) / max(1, len(lexical_recalls))
+        hybrid_gain = metrics[0] - lexical_recall
         blockers: list[str] = []
         for label, value, threshold in (
             ("Recall@20", metrics[0], 0.90),
@@ -537,6 +807,12 @@ class HybridRAGEngine:
         ):
             if value < threshold:
                 blockers.append(f"{label} {value:.4f} is below {threshold:.2f}")
+        if hybrid_gain < 0.05:
+            blockers.append(
+                f"hybrid Recall@20 gain {hybrid_gain * 100:.2f} percentage points is below 5.00"
+            )
+        if strict and degraded:
+            blockers.append(f"semantic retrieval degraded for {degraded} governed queries")
         if stale:
             blockers.append(f"stale revision results: {stale}")
         if leakage:
@@ -549,6 +825,16 @@ class HybridRAGEngine:
             stale=stale,
             leakage=leakage,
             blockers=blockers,
+            lexical_recall=lexical_recall,
+            hybrid_gain=hybrid_gain,
+            category_metrics={
+                category: {
+                    metric: round(sum(values) / len(values), 6)
+                    for metric, values in metrics_by_name.items()
+                }
+                for category, metrics_by_name in sorted(category_values.items())
+            },
+            governance_sha256=governance_sha256,
         )
 
     @staticmethod
@@ -561,6 +847,10 @@ class HybridRAGEngine:
         stale: int,
         leakage: int,
         blockers: list[str],
+        lexical_recall: float = 0.0,
+        hybrid_gain: float = 0.0,
+        category_metrics: dict[str, dict[str, float]] | None = None,
+        governance_sha256: str = "",
     ) -> RAGEvaluationReport:
         payload = {
             "status": status,
@@ -569,10 +859,14 @@ class HybridRAGEngine:
             "ndcg_at_10": round(metrics[1], 6),
             "mrr_at_10": round(metrics[2], 6),
             "context_precision": round(metrics[3], 6),
+            "lexical_recall_at_20": round(lexical_recall, 6),
+            "hybrid_gain_percentage_points": round(hybrid_gain * 100.0, 6),
             "degraded_query_count": degraded,
             "stale_revision_results": stale,
             "cross_tenant_results": leakage,
             "blockers": blockers,
+            "category_metrics": category_metrics or {},
+            "governance_sha256": governance_sha256,
         }
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         return RAGEvaluationReport(**payload, report_sha256=digest)
@@ -678,4 +972,248 @@ class WorkspaceContextBuilder:
         RepositoryIndexer(store).index_project(project_id=project["id"])
         report = ContextBuilder(store).build(project_id=project["id"], query=query, token_budget=budget)
         return report.model_dump()
+
+
+async def run_rag_load_test(
+    *,
+    endpoint: str,
+    api_token: str,
+    organization_id: str,
+    project_id: str,
+    queries: list[str],
+    target_chunks: int,
+    stages: tuple[tuple[int, int], ...] = ((10, 100), (100, 500), (500, 1000), (1000, 2000)),
+    timeout_seconds: float = 30.0,
+    strict: bool = True,
+) -> RAGLoadReport:
+    """Exercise the live context API without weakening tenant or TLS boundaries."""
+
+    normalized = endpoint.rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("RAG load endpoint must be an absolute HTTP(S) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("RAG load endpoint cannot contain credentials, query parameters, or fragments")
+    if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("remote RAG load endpoints require HTTPS")
+    if not api_token or len(api_token) > 16_384:
+        raise ValueError("a bounded API token is required")
+    if not queries or any(not query.strip() or len(query) > 32_000 for query in queries):
+        raise ValueError("load test requires valid bounded queries")
+    if target_chunks < 0:
+        raise ValueError("target_chunks cannot be negative")
+
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "X-Aeitron-Organization": organization_id,
+        "User-Agent": "Aeitron-RAG-Load-Proof/1",
+    }
+    results: list[RAGLoadStageResult] = []
+    blockers: list[str] = []
+    limits = httpx.Limits(max_connections=max(item[0] for item in stages), max_keepalive_connections=256)
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout_seconds, connect=min(10.0, timeout_seconds)),
+        follow_redirects=False,
+        trust_env=False,
+        headers=headers,
+        limits=limits,
+    ) as client:
+        for concurrency, request_count in stages:
+            if concurrency < 1 or concurrency > 2_000 or request_count < concurrency:
+                raise ValueError("invalid RAG load stage")
+            semaphore = asyncio.Semaphore(concurrency)
+            latencies: list[float] = []
+            passed = failed = 0
+            started = time.perf_counter()
+
+            async def one(index: int) -> bool:
+                async with semaphore:
+                    request_started = time.perf_counter()
+                    try:
+                        response = await client.post(
+                            f"{normalized}/v1/context/build",
+                            json={
+                                "project_id": project_id,
+                                "query": queries[index % len(queries)],
+                                "token_budget": 24_000,
+                                "max_chunks": 24,
+                            },
+                            headers={"X-Request-ID": str(uuid.uuid4())},
+                        )
+                        response.raise_for_status()
+                        if len(response.content) > 16 * 1024 * 1024:
+                            raise RuntimeError("RAG response exceeded 16 MiB")
+                        payload = response.json()
+                        if payload.get("project_id") != project_id:
+                            raise RuntimeError("cross-project response detected")
+                        if not payload.get("context_id") or not payload.get("report_sha256"):
+                            raise RuntimeError("RAG response is missing immutable evidence")
+                        return True
+                    except (httpx.HTTPError, ValueError, RuntimeError):
+                        return False
+                    finally:
+                        latencies.append((time.perf_counter() - request_started) * 1000)
+
+            outcomes = await asyncio.gather(*(one(index) for index in range(request_count)))
+            passed = sum(outcomes)
+            failed = request_count - passed
+            duration = max(1e-9, time.perf_counter() - started)
+            ordered = sorted(latencies)
+
+            def percentile(fraction: float) -> float:
+                position = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * fraction) - 1))
+                return ordered[position]
+
+            stage = RAGLoadStageResult(
+                concurrency=concurrency,
+                requests=request_count,
+                passed=passed,
+                failed=failed,
+                latency_ms_p50=round(statistics.median(ordered), 3),
+                latency_ms_p95=round(percentile(0.95), 3),
+                latency_ms_p99=round(percentile(0.99), 3),
+                throughput_rps=round(request_count / duration, 3),
+                error_rate=round(failed / request_count, 6),
+            )
+            results.append(stage)
+            if stage.error_rate >= 0.005:
+                blockers.append(f"concurrency {concurrency} error rate {stage.error_rate:.4f} is not below 0.005")
+            if stage.latency_ms_p95 > 750.0:
+                blockers.append(f"concurrency {concurrency} p95 {stage.latency_ms_p95:.2f}ms exceeds 750ms")
+            if stage.latency_ms_p99 > 1500.0:
+                blockers.append(f"concurrency {concurrency} p99 {stage.latency_ms_p99:.2f}ms exceeds 1500ms")
+    if strict and target_chunks < 100_000_000:
+        blockers.append("strict scale proof requires an index containing at least 100,000,000 chunks")
+    payload = {
+        "status": "failed" if blockers else "passed",
+        "endpoint": normalized,
+        "target_chunks": target_chunks,
+        "stages": [item.model_dump(mode="json") for item in results],
+        "blockers": blockers,
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return RAGLoadReport(**payload, report_sha256=digest)
+
+
+def _write_rag_report(report: StrictModel, output_dir: str | Path, stem: str) -> Path:
+    root = Path(output_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{stem}.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, target)
+    markdown = [f"# Aeitron {stem.replace('_', ' ').title()}", ""]
+    for key, value in report.model_dump(mode="json").items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            markdown.append(f"- {key}: `{value}`")
+    blockers = getattr(report, "blockers", [])
+    if blockers:
+        markdown.extend(["", "## Blockers", *[f"- {item}" for item in blockers]])
+    (root / f"{stem}.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
+    return target
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate and load-test the authoritative Aeitron Hybrid RAG engine")
+    commands = parser.add_subparsers(dest="command", required=True)
+    evaluate = commands.add_parser("evaluate")
+    evaluate.add_argument("--tasks", required=True)
+    evaluate.add_argument("--governance", required=True)
+    evaluate.add_argument("--output-dir", required=True)
+    evaluate.add_argument("--sqlite-path")
+    evaluate.add_argument("--database-url", default=os.environ.get("AEITRON_DATABASE_URL"))
+    evaluate.add_argument("--organization-id")
+    evaluate.add_argument("--production", action="store_true")
+    candidates = commands.add_parser("build-candidates")
+    candidates.add_argument("--sqlite-path")
+    candidates.add_argument("--database-url", default=os.environ.get("AEITRON_DATABASE_URL"))
+    candidates.add_argument("--organization-id", required=True)
+    candidates.add_argument("--project-id", required=True)
+    candidates.add_argument("--output", required=True)
+    candidates.add_argument("--target-tasks", type=int, default=500)
+    scale = commands.add_parser("scale-plan")
+    scale.add_argument("--target-chunks", type=int, default=100_000_000)
+    scale.add_argument("--dimensions", type=int, default=768)
+    scale.add_argument("--replication-factor", type=int, default=2)
+    scale.add_argument("--output-dir", required=True)
+    load = commands.add_parser("load-test")
+    load.add_argument("--endpoint", required=True)
+    load.add_argument("--organization-id", required=True)
+    load.add_argument("--project-id", required=True)
+    load.add_argument("--queries", required=True, help="JSONL file with a query field")
+    load.add_argument("--target-chunks", type=int, required=True)
+    load.add_argument("--output-dir", required=True)
+    load.add_argument("--validation", action="store_true")
+    args = parser.parse_args()
+    if args.command == "build-candidates":
+        if args.database_url:
+            store: Any = PostgresRAGStore(args.database_url, organization_id=args.organization_id)
+        else:
+            store = LocalStore(args.sqlite_path) if args.sqlite_path else LocalStore()
+        try:
+            report = build_rag_evaluation_candidates(
+                store,
+                project_id=args.project_id,
+                organization_id=args.organization_id,
+                output_path=args.output,
+                target_tasks=args.target_tasks,
+            )
+        finally:
+            store.close()
+        print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
+        raise SystemExit(0 if report.status == "ready_for_review" else 2)
+    if args.command == "scale-plan":
+        report = build_rag_scale_plan(
+            target_chunks=args.target_chunks,
+            vector_dimensions=args.dimensions,
+            replication_factor=args.replication_factor,
+        )
+        _write_rag_report(report, args.output_dir, "rag_scale_plan")
+        print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
+        return
+    if args.command == "load-test":
+        token = os.environ.get("AEITRON_RAG_LOAD_TOKEN", "")
+        query_rows = [json.loads(line) for line in Path(args.queries).resolve(strict=True).read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        queries = [str(row["query"]) for row in query_rows]
+        report = asyncio.run(
+            run_rag_load_test(
+                endpoint=args.endpoint,
+                api_token=token,
+                organization_id=args.organization_id,
+                project_id=args.project_id,
+                queries=queries,
+                target_chunks=args.target_chunks,
+                strict=not args.validation,
+            )
+        )
+        _write_rag_report(report, args.output_dir, "rag_load_report")
+        print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
+        raise SystemExit(0 if report.status == "passed" else 2)
+
+    tasks, governance, governance_sha256 = load_governed_rag_evaluation(args.tasks, args.governance)
+    if args.production:
+        if not args.database_url or not args.organization_id:
+            raise SystemExit("production evaluation requires --database-url and --organization-id")
+        store: Any = PostgresRAGStore(args.database_url, organization_id=args.organization_id)
+    else:
+        store = LocalStore(args.sqlite_path) if args.sqlite_path else LocalStore()
+    try:
+        report = HybridRAGEngine(store, production_mode=args.production).evaluate(
+            tasks,
+            strict=True,
+            governance=governance,
+            governance_sha256=governance_sha256,
+        )
+    finally:
+        store.close()
+    _write_rag_report(report, args.output_dir, "rag_evaluation_report")
+    print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
+    raise SystemExit(0 if report.status == "passed" else 2)
+
+
+if __name__ == "__main__":
+    main()
 

@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
 import os
+import random
 import re
 import threading
 import time
 import uuid
 from collections import Counter
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Iterable, Iterator, Literal, Protocol
 from urllib.parse import urlparse
 
 import httpx
@@ -111,6 +113,33 @@ if nn is not None:
             logits = query @ positive.transpose(0, 1) / self.config.temperature
             labels = torch.arange(logits.shape[0], device=logits.device)
             return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.transpose(0, 1), labels))
+
+        def training_loss(
+            self,
+            query_ids: "torch.Tensor",
+            query_mask: "torch.Tensor",
+            positive_ids: "torch.Tensor",
+            positive_mask: "torch.Tensor",
+            *,
+            hard_negative_ids: "torch.Tensor | None" = None,
+            hard_negative_mask: "torch.Tensor | None" = None,
+        ) -> "torch.Tensor":
+            query = self(query_ids, query_mask)
+            positive = self(positive_ids, positive_mask)
+            candidates = positive
+            if hard_negative_ids is not None:
+                if hard_negative_mask is None or hard_negative_ids.ndim != 3:
+                    raise ValueError("hard negatives require matching [batch, negatives, sequence] tensors")
+                batch, negatives, sequence = hard_negative_ids.shape
+                hard = self(
+                    hard_negative_ids.reshape(batch * negatives, sequence),
+                    hard_negative_mask.reshape(batch * negatives, sequence),
+                )
+                candidates = torch.cat([positive, hard], dim=0)
+            labels = torch.arange(query.shape[0], device=query.device)
+            query_loss = F.cross_entropy(query @ candidates.transpose(0, 1) / self.config.temperature, labels)
+            positive_loss = F.cross_entropy(positive @ query.transpose(0, 1) / self.config.temperature, labels)
+            return 0.5 * (query_loss + positive_loss)
 else:
     class ScratchCodeEmbeddingModel:  # type: ignore[no-redef]
         def __init__(self, _config: ScratchEmbeddingConfig) -> None:
@@ -162,6 +191,792 @@ def save_scratch_embedding_checkpoint(
     manifest_path = target / "embedding_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {**manifest, "manifest_path": str(manifest_path), "checkpoint_path": str(checkpoint)}
+
+
+class EmbeddingPair(StrictModel):
+    pair_id: str = Field(min_length=16, max_length=128)
+    query: str = Field(min_length=1, max_length=200_000)
+    positive: str = Field(min_length=1, max_length=2_000_000)
+    hard_negatives: list[str] = Field(default_factory=list, max_length=8)
+    category: Literal[
+        "function_doc",
+        "symbol_call",
+        "code_test",
+        "error_fix",
+        "task_evidence",
+        "security_patch",
+    ]
+    source_revision: str = Field(min_length=1, max_length=512)
+    lineage_key: str = Field(min_length=1, max_length=1024)
+    verified: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class EmbeddingPairBuildReport(StrictModel):
+    status: Literal["passed", "blocked"]
+    project_id: str
+    index_revision: str
+    pair_count: int
+    categories: dict[str, int]
+    output_path: str
+    output_sha256: str
+    blockers: list[str] = Field(default_factory=list)
+
+
+class EmbeddingTrainingConfig(StrictModel):
+    model: ScratchEmbeddingConfig = Field(default_factory=ScratchEmbeddingConfig)
+    steps: int = Field(default=10_000, ge=1)
+    batch_size: int = Field(default=32, ge=2, le=1024)
+    gradient_accumulation_steps: int = Field(default=1, ge=1, le=1024)
+    learning_rate: float = Field(default=2e-4, gt=0.0, le=1e-2)
+    weight_decay: float = Field(default=0.01, ge=0.0, le=1.0)
+    warmup_steps: int = Field(default=500, ge=0)
+    validation_interval: int = Field(default=250, ge=1)
+    checkpoint_interval: int = Field(default=1000, ge=1)
+    validation_fraction: float = Field(default=0.05, gt=0.0, lt=0.5)
+    max_validation_pairs: int = Field(default=2000, ge=10, le=100_000)
+    hard_negatives_per_query: int = Field(default=1, ge=0, le=8)
+    seed: int = 1337
+    device: str = "auto"
+    precision: Literal["fp32", "fp16", "bf16"] = "bf16"
+    early_stopping_patience: int = Field(default=10, ge=1, le=100)
+    max_gradient_norm: float = Field(default=1.0, gt=0.0, le=100.0)
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.warmup_steps >= self.steps:
+            raise ValueError("warmup_steps must be smaller than steps")
+
+
+class EmbeddingRetrievalMetrics(StrictModel):
+    pair_count: int
+    recall_at_1: float
+    recall_at_5: float
+    recall_at_20: float
+    mrr_at_10: float
+    mean_positive_similarity: float
+    mean_off_diagonal_similarity: float
+    embedding_dimension_std: float
+    collapse_detected: bool
+
+
+class EmbeddingTrainingReport(StrictModel):
+    status: Literal["passed", "failed", "blocked"]
+    steps_completed: int
+    best_step: int
+    best_validation_loss: float | None = None
+    train_loss_last: float | None = None
+    metrics: EmbeddingRetrievalMetrics | None = None
+    tokenizer_sha256: str
+    dataset_sha256: str
+    checkpoint_manifest: str | None = None
+    resumed_from_step: int = 0
+    duration_seconds: float
+    blockers: list[str] = Field(default_factory=list)
+
+
+class EmbeddingCheckpointState(StrictModel):
+    schema_version: Literal[1] = 1
+    step: int = Field(ge=0)
+    best_step: int = Field(ge=0)
+    best_validation_loss: float | None = None
+    stale_validations: int = Field(default=0, ge=0)
+    tokenizer_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    python_random_state: str
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True, ensure_ascii=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _atomic_jsonl(path: Path, rows: Iterable[EmbeddingPair]) -> tuple[int, str]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    digest = hashlib.sha256()
+    count = 0
+    with temporary.open("wb") as handle:
+        for row in rows:
+            payload = (json.dumps(row.model_dump(mode="json"), sort_keys=True, ensure_ascii=True) + "\n").encode("utf-8")
+            handle.write(payload)
+            digest.update(payload)
+            count += 1
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    return count, digest.hexdigest()
+
+
+def build_embedding_pairs(
+    store: LocalStore,
+    *,
+    project_id: str,
+    output_path: str | Path,
+    minimum_pairs: int = 1,
+) -> EmbeddingPairBuildReport:
+    """Build evidence-bound retrieval pairs from a committed repository index."""
+
+    project = store.get_project(project_id)
+    if project is None:
+        raise KeyError(f"unknown project: {project_id}")
+    revision = store.active_index_revision(project_id)
+    if revision is None:
+        raise RuntimeError("embedding pairs require a committed index revision")
+    chunks = store.list_chunks(project_id)
+    by_id = {str(chunk["id"]): chunk for chunk in chunks}
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for chunk in chunks:
+        symbol = str(chunk.get("symbol_name") or "")
+        if symbol:
+            by_symbol.setdefault(symbol.lower(), []).append(chunk)
+    pairs: dict[str, EmbeddingPair] = {}
+
+    def add(query: str, positive: str, category: str, lineage: str, metadata: dict[str, Any]) -> None:
+        if not query.strip() or not positive.strip():
+            return
+        identity = hashlib.sha256(
+            "\x1f".join([str(revision["id"]), category, lineage, query, positive]).encode("utf-8", "surrogatepass")
+        ).hexdigest()
+        candidates = [
+            str(item["content"])
+            for item in chunks
+            if str(item["id"]) != str(metadata.get("chunk_id"))
+            and item.get("language") == metadata.get("language")
+            and str(item.get("path")) != str(metadata.get("path"))
+        ]
+        candidates.sort(key=lambda text: hashlib.sha256((identity + text).encode("utf-8")).hexdigest())
+        pairs[identity] = EmbeddingPair(
+            pair_id=identity,
+            query=query,
+            positive=positive,
+            hard_negatives=candidates[:2],
+            category=category,  # type: ignore[arg-type]
+            source_revision=str(revision["source_revision"]),
+            lineage_key=lineage,
+            verified=True,
+            metadata={**metadata, "index_revision": str(revision["id"])},
+        )
+
+    for chunk in chunks:
+        metadata = dict(chunk.get("metadata") or {})
+        symbol = str(chunk.get("symbol_name") or "")
+        path = str(chunk["path"])
+        lineage = f"{path}:{symbol or chunk['start_line']}"
+        signature = str(metadata.get("signature") or symbol)
+        docstring = str(metadata.get("docstring") or "").strip()
+        if symbol and docstring:
+            add(
+                f"Find the implementation described as: {docstring}",
+                chunk_search_text(chunk),
+                "function_doc",
+                lineage,
+                {"chunk_id": chunk["id"], "path": path, "language": chunk.get("language")},
+            )
+        if symbol:
+            add(
+                f"Locate symbol {signature} in {path}",
+                chunk_search_text(chunk),
+                "task_evidence",
+                lineage,
+                {"chunk_id": chunk["id"], "path": path, "language": chunk.get("language")},
+            )
+        for edge in metadata.get("resolved_calls", []):
+            if not isinstance(edge, dict):
+                continue
+            target = by_id.get(str(edge.get("target_chunk_id") or ""))
+            if target is None:
+                continue
+            add(
+                f"Find the implementation called by {symbol or path}: {edge.get('call')}",
+                chunk_search_text(target),
+                "symbol_call",
+                f"{lineage}->{target['path']}:{target.get('symbol_name')}",
+                {"chunk_id": target["id"], "path": target["path"], "language": target.get("language")},
+            )
+        if "test" in path.lower() or "spec" in path.lower():
+            for called in metadata.get("calls", []):
+                targets = by_symbol.get(str(called).split(".")[-1].lower(), [])
+                if len(targets) == 1:
+                    target = targets[0]
+                    add(
+                        f"Find code covered by test {symbol or path}",
+                        chunk_search_text(target),
+                        "code_test",
+                        f"{path}->{target['path']}:{target.get('symbol_name')}",
+                        {"chunk_id": target["id"], "path": target["path"], "language": target.get("language")},
+                    )
+
+    ordered = [pairs[key] for key in sorted(pairs)]
+    path = Path(output_path).resolve()
+    count, digest = _atomic_jsonl(path, ordered)
+    categories = Counter(pair.category for pair in ordered)
+    blockers = [] if count >= minimum_pairs else [f"pair count {count} is below required {minimum_pairs}"]
+    return EmbeddingPairBuildReport(
+        status="blocked" if blockers else "passed",
+        project_id=project_id,
+        index_revision=str(revision["id"]),
+        pair_count=count,
+        categories=dict(sorted(categories.items())),
+        output_path=str(path),
+        output_sha256=digest,
+        blockers=blockers,
+    )
+
+
+def load_embedding_pairs(path: str | Path) -> tuple[list[EmbeddingPair], str]:
+    source = Path(path).resolve()
+    digest = hashlib.sha256()
+    pairs: list[EmbeddingPair] = []
+    seen: set[str] = set()
+    with source.open("rb") as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            digest.update(raw)
+            if not raw.strip():
+                continue
+            try:
+                pair = EmbeddingPair.model_validate_json(raw)
+            except Exception as exc:
+                raise ValueError(f"invalid embedding pair at line {line_number}") from exc
+            if not pair.verified:
+                raise ValueError(f"unverified embedding pair at line {line_number}")
+            if pair.pair_id in seen:
+                raise ValueError(f"duplicate embedding pair ID at line {line_number}")
+            seen.add(pair.pair_id)
+            pairs.append(pair)
+    if not pairs:
+        raise ValueError("embedding pair dataset is empty")
+    return pairs, digest.hexdigest()
+
+
+def split_embedding_pairs(
+    pairs: list[EmbeddingPair],
+    *,
+    validation_fraction: float,
+) -> tuple[list[EmbeddingPair], list[EmbeddingPair]]:
+    validation: list[EmbeddingPair] = []
+    training: list[EmbeddingPair] = []
+    threshold = int(validation_fraction * 10_000)
+    for pair in pairs:
+        bucket = int(hashlib.sha256(pair.lineage_key.encode("utf-8")).hexdigest()[:8], 16) % 10_000
+        (validation if bucket < threshold else training).append(pair)
+    if not validation and len(training) > 1:
+        validation.append(training.pop())
+    if not training or not validation:
+        raise ValueError("embedding dataset cannot produce non-empty lineage-safe train and validation splits")
+    train_lineages = {pair.lineage_key for pair in training}
+    if train_lineages.intersection(pair.lineage_key for pair in validation):
+        raise RuntimeError("embedding lineage leaked across train and validation")
+    return training, validation
+
+
+def _tokenize_embedding_texts(tokenizer: Any, texts: list[str], *, max_length: int, device: Any) -> tuple[Any, Any]:
+    encoded = [tokenizer.encode(text).ids[:max_length] for text in texts]
+    if not encoded or any(not item for item in encoded):
+        raise ValueError("tokenizer produced an empty embedding sequence")
+    pad_id = tokenizer.token_to_id("<|pad|>")
+    if pad_id is None:
+        pad_id = 0
+    width = max(len(item) for item in encoded)
+    ids = torch.full((len(encoded), width), int(pad_id), dtype=torch.long, device=device)
+    mask = torch.zeros((len(encoded), width), dtype=torch.long, device=device)
+    for row, values in enumerate(encoded):
+        ids[row, : len(values)] = torch.tensor(values, dtype=torch.long, device=device)
+        mask[row, : len(values)] = 1
+    return ids, mask
+
+
+def _save_optimizer_safely(optimizer: Any, output_dir: Path) -> None:
+    try:
+        from safetensors.torch import save_file
+    except ImportError as exc:
+        raise RuntimeError("safetensors is required for optimizer checkpoints") from exc
+    state = optimizer.state_dict()
+    tensors: dict[str, Any] = {}
+    scalars: dict[str, Any] = {}
+    for parameter_id, values in state["state"].items():
+        for name, value in values.items():
+            key = f"state.{parameter_id}.{name}"
+            if torch.is_tensor(value):
+                tensors[key] = value.detach().cpu().contiguous()
+            elif isinstance(value, (bool, int, float, str)) or value is None:
+                scalars[key] = value
+            else:
+                raise TypeError(f"unsupported optimizer state value: {key}")
+    save_file(tensors, str(output_dir / "optimizer.safetensors"), metadata={"format": "aeitron-adamw-v1"})
+    (output_dir / "optimizer.json").write_text(
+        json.dumps({"param_groups": state["param_groups"], "scalars": scalars}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _load_optimizer_safely(optimizer: Any, output_dir: Path) -> None:
+    from safetensors.torch import load_file
+
+    metadata = json.loads((output_dir / "optimizer.json").read_text(encoding="utf-8"))
+    tensors = load_file(str(output_dir / "optimizer.safetensors"), device="cpu")
+    state: dict[int, dict[str, Any]] = {}
+    for key, value in {**metadata.get("scalars", {}), **tensors}.items():
+        _, parameter_id, name = key.split(".", 2)
+        state.setdefault(int(parameter_id), {})[name] = value
+    optimizer.load_state_dict({"state": state, "param_groups": metadata["param_groups"]})
+
+
+def evaluate_embedding_model(
+    model: ScratchCodeEmbeddingModel,
+    tokenizer: Any,
+    pairs: list[EmbeddingPair],
+    *,
+    device: Any,
+    max_pairs: int = 2000,
+) -> EmbeddingRetrievalMetrics:
+    selected = pairs[:max_pairs]
+    model.eval()
+    query_vectors: list[Any] = []
+    positive_vectors: list[Any] = []
+    with torch.no_grad():
+        for start in range(0, len(selected), 64):
+            batch = selected[start : start + 64]
+            query_ids, query_mask = _tokenize_embedding_texts(
+                tokenizer, [item.query for item in batch], max_length=model.config.max_sequence_length, device=device
+            )
+            positive_ids, positive_mask = _tokenize_embedding_texts(
+                tokenizer, [item.positive for item in batch], max_length=model.config.max_sequence_length, device=device
+            )
+            query_vectors.append(model(query_ids, query_mask).cpu())
+            positive_vectors.append(model(positive_ids, positive_mask).cpu())
+    queries = torch.cat(query_vectors)
+    positives = torch.cat(positive_vectors)
+    similarities = queries @ positives.transpose(0, 1)
+    order = similarities.argsort(dim=1, descending=True)
+    ranks = []
+    for index in range(len(selected)):
+        rank = int((order[index] == index).nonzero(as_tuple=False)[0].item()) + 1
+        ranks.append(rank)
+    diagonal = similarities.diag()
+    off_diagonal = similarities[~torch.eye(len(selected), dtype=torch.bool)] if len(selected) > 1 else torch.zeros(1)
+    dimension_std = float(torch.cat([queries, positives]).std(dim=0).mean().item())
+    off_mean = float(off_diagonal.mean().item())
+    collapse = dimension_std < 1e-4 or off_mean > 0.98 or not math.isfinite(dimension_std)
+    return EmbeddingRetrievalMetrics(
+        pair_count=len(selected),
+        recall_at_1=sum(rank <= 1 for rank in ranks) / len(ranks),
+        recall_at_5=sum(rank <= 5 for rank in ranks) / len(ranks),
+        recall_at_20=sum(rank <= 20 for rank in ranks) / len(ranks),
+        mrr_at_10=sum((1.0 / rank) if rank <= 10 else 0.0 for rank in ranks) / len(ranks),
+        mean_positive_similarity=float(diagonal.mean().item()),
+        mean_off_diagonal_similarity=off_mean,
+        embedding_dimension_std=dimension_std,
+        collapse_detected=collapse,
+    )
+
+
+def _nested_tuple(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(_nested_tuple(item) for item in value)
+    return value
+
+
+def _load_embedding_checkpoint(
+    model: ScratchCodeEmbeddingModel,
+    checkpoint_dir: Path,
+    *,
+    tokenizer_sha256: str,
+    dataset_sha256: str,
+) -> EmbeddingCheckpointState:
+    try:
+        from safetensors.torch import load_file
+    except ImportError as exc:
+        raise RuntimeError("safetensors is required for secure checkpoint resume") from exc
+    manifest_path = checkpoint_dir / "embedding_manifest.json"
+    state_path = checkpoint_dir / "training_state.json"
+    weights_path = checkpoint_dir / "embedding_model.safetensors"
+    for path in (manifest_path, state_path, weights_path, checkpoint_dir / "optimizer.json", checkpoint_dir / "optimizer.safetensors"):
+        if not path.is_file():
+            raise FileNotFoundError(f"resume checkpoint is incomplete: {path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    state = EmbeddingCheckpointState.model_validate_json(state_path.read_text(encoding="utf-8"))
+    if manifest.get("tokenizer_sha256") != tokenizer_sha256 or state.tokenizer_sha256 != tokenizer_sha256:
+        raise RuntimeError("resume checkpoint tokenizer hash mismatch")
+    if manifest.get("dataset_manifest_sha256") != dataset_sha256 or state.dataset_sha256 != dataset_sha256:
+        raise RuntimeError("resume checkpoint embedding dataset hash mismatch")
+    actual = hashlib.sha256(weights_path.read_bytes()).hexdigest()
+    if actual != manifest.get("checkpoint_sha256"):
+        raise RuntimeError("resume checkpoint weight checksum mismatch")
+    expected_config = model.config.model_dump(mode="json")
+    if manifest.get("config") != expected_config:
+        raise RuntimeError("resume checkpoint model configuration mismatch")
+    incompatible = model.load_state_dict(load_file(str(weights_path), device="cpu"), strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError("resume checkpoint model state is incompatible")
+    return state
+
+
+def _save_training_checkpoint(
+    model: ScratchCodeEmbeddingModel,
+    optimizer: Any,
+    output_dir: Path,
+    *,
+    state: EmbeddingCheckpointState,
+) -> dict[str, Any]:
+    manifest = save_scratch_embedding_checkpoint(
+        model,
+        output_dir,
+        tokenizer_sha256=state.tokenizer_sha256,
+        dataset_manifest_sha256=state.dataset_sha256,
+    )
+    _save_optimizer_safely(optimizer, output_dir)
+    _atomic_json(output_dir / "training_state.json", state.model_dump(mode="json"))
+    return manifest
+
+
+def _learning_rate(step: int, config: EmbeddingTrainingConfig) -> float:
+    if config.warmup_steps and step <= config.warmup_steps:
+        return config.learning_rate * (step / config.warmup_steps)
+    decay_steps = max(1, config.steps - config.warmup_steps)
+    progress = min(1.0, max(0.0, (step - config.warmup_steps) / decay_steps))
+    return config.learning_rate * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+
+def _validation_loss(
+    model: ScratchCodeEmbeddingModel,
+    tokenizer: Any,
+    pairs: list[EmbeddingPair],
+    *,
+    device: Any,
+    batch_size: int,
+) -> float:
+    model.eval()
+    total = 0.0
+    observations = 0
+    with torch.no_grad():
+        for start in range(0, len(pairs), batch_size):
+            batch = pairs[start : start + batch_size]
+            if len(batch) < 2:
+                continue
+            query_ids, query_mask = _tokenize_embedding_texts(
+                tokenizer, [item.query for item in batch], max_length=model.config.max_sequence_length, device=device
+            )
+            positive_ids, positive_mask = _tokenize_embedding_texts(
+                tokenizer, [item.positive for item in batch], max_length=model.config.max_sequence_length, device=device
+            )
+            loss = model.contrastive_loss(query_ids, query_mask, positive_ids, positive_mask)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("embedding validation produced non-finite loss")
+            total += float(loss.item()) * len(batch)
+            observations += len(batch)
+    if not observations:
+        raise RuntimeError("embedding validation requires at least one batch with two pairs")
+    return total / observations
+
+
+def _training_batch(
+    pairs: list[EmbeddingPair],
+    *,
+    batch_size: int,
+    cursor: int,
+    hard_negatives_per_query: int,
+) -> tuple[list[EmbeddingPair], list[list[str]], int]:
+    selected = [pairs[(cursor + offset) % len(pairs)] for offset in range(batch_size)]
+    negatives: list[list[str]] = []
+    for row, pair in enumerate(selected):
+        values = list(pair.hard_negatives[:hard_negatives_per_query])
+        offset = 1
+        while len(values) < hard_negatives_per_query:
+            candidate = selected[(row + offset) % len(selected)].positive
+            offset += 1
+            if candidate != pair.positive and candidate not in values:
+                values.append(candidate)
+            if offset > len(selected) * 2:
+                raise RuntimeError("training batch cannot construct distinct hard negatives")
+        negatives.append(values)
+    return selected, negatives, (cursor + batch_size) % len(pairs)
+
+
+def train_scratch_embedding_model(
+    *,
+    pairs_path: str | Path,
+    tokenizer_path: str | Path,
+    output_dir: str | Path,
+    config: EmbeddingTrainingConfig,
+    resume_from: str | Path | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> EmbeddingTrainingReport:
+    """Train Aeitron-Code-Embed from random initialization with evidence-bound resume.
+
+    The function intentionally accepts only the Aeitron pair schema and a local
+    tokenizer artifact. It never downloads or initializes borrowed weights.
+    """
+
+    if torch is None:
+        raise RuntimeError("PyTorch is required for scratch embedding training")
+    try:
+        from tokenizers import Tokenizer
+    except ImportError as exc:
+        raise RuntimeError("Hugging Face tokenizers is required for embedding training") from exc
+
+    started = time.monotonic()
+    pairs, dataset_sha256 = load_embedding_pairs(pairs_path)
+    training_pairs, validation_pairs = split_embedding_pairs(
+        pairs,
+        validation_fraction=config.validation_fraction,
+    )
+    validation_pairs = validation_pairs[: config.max_validation_pairs]
+    if len(training_pairs) < config.batch_size:
+        raise ValueError("embedding training set must contain at least one full batch")
+    tokenizer_file = Path(tokenizer_path).resolve(strict=True)
+    tokenizer_sha256 = hashlib.sha256(tokenizer_file.read_bytes()).hexdigest()
+    tokenizer = Tokenizer.from_file(str(tokenizer_file))
+    tokenizer_vocab_size = tokenizer.get_vocab_size(with_added_tokens=True)
+    if tokenizer_vocab_size != config.model.vocab_size:
+        raise ValueError(
+            f"embedding model/tokenizer vocabulary mismatch: {config.model.vocab_size} != {tokenizer_vocab_size}"
+        )
+    if config.device == "auto":
+        device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device_name = config.device
+    device = torch.device(device_name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA embedding training requested but CUDA is unavailable")
+    if config.precision == "fp16" and device.type != "cuda":
+        raise ValueError("fp16 embedding training requires CUDA")
+    if config.precision == "bf16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        raise ValueError("bf16 embedding training requires a bf16-capable CUDA device")
+
+    random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(config.seed)
+    model = ScratchCodeEmbeddingModel(config.model).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=config.weight_decay,
+    )
+    config_sha256 = _canonical_sha256(config.model_dump(mode="json"))
+    step = best_step = stale_validations = 0
+    best_validation_loss: float | None = None
+    resume_step = 0
+    if resume_from is not None:
+        resume_dir = Path(resume_from).resolve(strict=True)
+        state = _load_embedding_checkpoint(
+            model,
+            resume_dir,
+            tokenizer_sha256=tokenizer_sha256,
+            dataset_sha256=dataset_sha256,
+        )
+        if state.config_sha256 != config_sha256:
+            raise RuntimeError("resume checkpoint training configuration mismatch")
+        _load_optimizer_safely(optimizer, resume_dir)
+        random.setstate(_nested_tuple(json.loads(state.python_random_state)))
+        step = resume_step = state.step
+        best_step = state.best_step
+        best_validation_loss = state.best_validation_loss
+        stale_validations = state.stale_validations
+        if step >= config.steps:
+            raise ValueError("resume checkpoint has already reached the requested training steps")
+
+    root = Path(output_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    cursor = (step * config.batch_size * config.gradient_accumulation_steps) % len(training_pairs)
+    shuffled = list(training_pairs)
+    random.Random(config.seed + step).shuffle(shuffled)
+    use_autocast = device.type == "cuda" and config.precision in {"fp16", "bf16"}
+    autocast_dtype = torch.float16 if config.precision == "fp16" else torch.bfloat16
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and config.precision == "fp16")
+    last_loss: float | None = None
+    last_metrics: EmbeddingRetrievalMetrics | None = None
+    stopped_early = False
+
+    while step < config.steps:
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        accumulated = 0.0
+        for _ in range(config.gradient_accumulation_steps):
+            batch, negatives, cursor = _training_batch(
+                shuffled,
+                batch_size=config.batch_size,
+                cursor=cursor,
+                hard_negatives_per_query=config.hard_negatives_per_query,
+            )
+            query_ids, query_mask = _tokenize_embedding_texts(
+                tokenizer, [item.query for item in batch], max_length=config.model.max_sequence_length, device=device
+            )
+            positive_ids, positive_mask = _tokenize_embedding_texts(
+                tokenizer, [item.positive for item in batch], max_length=config.model.max_sequence_length, device=device
+            )
+            hard_ids = hard_mask = None
+            if config.hard_negatives_per_query:
+                flat = [value for row in negatives for value in row]
+                flat_ids, flat_mask = _tokenize_embedding_texts(
+                    tokenizer, flat, max_length=config.model.max_sequence_length, device=device
+                )
+                hard_ids = flat_ids.reshape(config.batch_size, config.hard_negatives_per_query, -1)
+                hard_mask = flat_mask.reshape(config.batch_size, config.hard_negatives_per_query, -1)
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_autocast):
+                loss = model.training_loss(
+                    query_ids,
+                    query_mask,
+                    positive_ids,
+                    positive_mask,
+                    hard_negative_ids=hard_ids,
+                    hard_negative_mask=hard_mask,
+                )
+                scaled_loss = loss / config.gradient_accumulation_steps
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"non-finite embedding loss at optimizer step {step + 1}")
+            scaler.scale(scaled_loss).backward()
+            accumulated += float(loss.detach().item())
+        scaler.unscale_(optimizer)
+        gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_gradient_norm)
+        if not torch.isfinite(gradient_norm):
+            raise FloatingPointError(f"non-finite embedding gradient at optimizer step {step + 1}")
+        scaler.step(optimizer)
+        scaler.update()
+        step += 1
+        lr = _learning_rate(step, config)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        last_loss = accumulated / config.gradient_accumulation_steps
+        event = {
+            "event": "aeitron_embedding_train",
+            "step": step,
+            "max_steps": config.steps,
+            "loss": last_loss,
+            "learning_rate": lr,
+            "gradient_norm": float(gradient_norm),
+            "device": str(device),
+        }
+        if progress is not None:
+            progress(event)
+
+        should_validate = step % config.validation_interval == 0 or step == config.steps
+        if should_validate:
+            validation_loss = _validation_loss(
+                model,
+                tokenizer,
+                validation_pairs,
+                device=device,
+                batch_size=config.batch_size,
+            )
+            last_metrics = evaluate_embedding_model(
+                model,
+                tokenizer,
+                validation_pairs,
+                device=device,
+                max_pairs=config.max_validation_pairs,
+            )
+            improved = best_validation_loss is None or validation_loss < best_validation_loss - 1e-6
+            if improved:
+                best_validation_loss = validation_loss
+                best_step = step
+                stale_validations = 0
+            else:
+                stale_validations += 1
+            if progress is not None:
+                progress(
+                    {
+                        **event,
+                        "event": "aeitron_embedding_validation",
+                        "validation_loss": validation_loss,
+                        "recall_at_20": last_metrics.recall_at_20,
+                        "mrr_at_10": last_metrics.mrr_at_10,
+                        "collapse_detected": last_metrics.collapse_detected,
+                        "improved": improved,
+                    }
+                )
+            state = EmbeddingCheckpointState(
+                step=step,
+                best_step=best_step,
+                best_validation_loss=best_validation_loss,
+                stale_validations=stale_validations,
+                tokenizer_sha256=tokenizer_sha256,
+                dataset_sha256=dataset_sha256,
+                config_sha256=config_sha256,
+                python_random_state=json.dumps(random.getstate(), separators=(",", ":")),
+            )
+            _save_training_checkpoint(model, optimizer, root / "latest", state=state)
+            if improved:
+                _save_training_checkpoint(model, optimizer, root / "best", state=state)
+            if stale_validations >= config.early_stopping_patience:
+                stopped_early = True
+                break
+        elif step % config.checkpoint_interval == 0:
+            state = EmbeddingCheckpointState(
+                step=step,
+                best_step=best_step,
+                best_validation_loss=best_validation_loss,
+                stale_validations=stale_validations,
+                tokenizer_sha256=tokenizer_sha256,
+                dataset_sha256=dataset_sha256,
+                config_sha256=config_sha256,
+                python_random_state=json.dumps(random.getstate(), separators=(",", ":")),
+            )
+            _save_training_checkpoint(model, optimizer, root / "latest", state=state)
+
+    blockers: list[str] = []
+    if best_validation_loss is None:
+        blockers.append("no validation checkpoint was produced")
+    if last_metrics is None:
+        blockers.append("no retrieval evaluation was produced")
+    elif last_metrics.collapse_detected:
+        blockers.append("embedding collapse detector failed")
+    best_manifest = root / "best" / "embedding_manifest.json"
+    if not best_manifest.is_file():
+        blockers.append("best checkpoint manifest is missing")
+    report = EmbeddingTrainingReport(
+        status="failed" if blockers else "passed",
+        steps_completed=step,
+        best_step=best_step,
+        best_validation_loss=best_validation_loss,
+        train_loss_last=last_loss,
+        metrics=last_metrics,
+        tokenizer_sha256=tokenizer_sha256,
+        dataset_sha256=dataset_sha256,
+        checkpoint_manifest=str(best_manifest) if best_manifest.is_file() else None,
+        resumed_from_step=resume_step,
+        duration_seconds=round(time.monotonic() - started, 3),
+        blockers=blockers,
+    )
+    _atomic_json(root / "embedding_training_report.json", report.model_dump(mode="json"))
+    markdown = [
+        "# Aeitron Scratch Embedding Training",
+        "",
+        f"- Status: `{report.status}`",
+        f"- Steps: `{report.steps_completed}`",
+        f"- Best step: `{report.best_step}`",
+        f"- Best validation loss: `{report.best_validation_loss}`",
+        f"- Early stop: `{stopped_early}`",
+        f"- Tokenizer SHA-256: `{report.tokenizer_sha256}`",
+        f"- Dataset SHA-256: `{report.dataset_sha256}`",
+    ]
+    if report.metrics is not None:
+        markdown.extend(
+            [
+                f"- Recall@20: `{report.metrics.recall_at_20:.6f}`",
+                f"- MRR@10: `{report.metrics.mrr_at_10:.6f}`",
+                f"- Collapse detected: `{report.metrics.collapse_detected}`",
+            ]
+        )
+    if report.blockers:
+        markdown.extend(["", "## Blockers", *[f"- {item}" for item in report.blockers]])
+    (root / "embedding_training_report.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
+    return report
 
 
 class VectorBackendConfig(StrictModel):
@@ -903,4 +1718,51 @@ def vector_capabilities() -> list[VectorIndexCapability]:
         )
     )
     return capabilities
+
+
+def _embedding_progress(event: dict[str, Any]) -> None:
+    print(json.dumps(event, sort_keys=True, separators=(",", ":")), flush=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build and train the Aeitron scratch code embedding model")
+    commands = parser.add_subparsers(dest="command", required=True)
+    pairs = commands.add_parser("build-pairs", help="Build verified retrieval pairs from a committed local index")
+    pairs.add_argument("--sqlite-path", required=True)
+    pairs.add_argument("--project-id", required=True)
+    pairs.add_argument("--output", required=True)
+    pairs.add_argument("--minimum-pairs", type=int, default=500)
+    train = commands.add_parser("train", help="Train Aeitron-Code-Embed from random initialization")
+    train.add_argument("--pairs", required=True)
+    train.add_argument("--tokenizer", required=True)
+    train.add_argument("--config", required=True)
+    train.add_argument("--output-dir", required=True)
+    train.add_argument("--resume-from")
+    args = parser.parse_args()
+    if args.command == "build-pairs":
+        with LocalStore(args.sqlite_path) as store:
+            report = build_embedding_pairs(
+                store,
+                project_id=args.project_id,
+                output_path=args.output,
+                minimum_pairs=args.minimum_pairs,
+            )
+        print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
+        raise SystemExit(0 if report.status == "passed" else 2)
+    config_path = Path(args.config).resolve(strict=True)
+    config = EmbeddingTrainingConfig.model_validate_json(config_path.read_text(encoding="utf-8-sig"))
+    report = train_scratch_embedding_model(
+        pairs_path=args.pairs,
+        tokenizer_path=args.tokenizer,
+        output_dir=args.output_dir,
+        config=config,
+        resume_from=args.resume_from,
+        progress=_embedding_progress,
+    )
+    print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
+    raise SystemExit(0 if report.status == "passed" else 2)
+
+
+if __name__ == "__main__":
+    main()
 

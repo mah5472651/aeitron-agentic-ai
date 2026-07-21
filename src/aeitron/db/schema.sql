@@ -191,9 +191,15 @@ CREATE TABLE IF NOT EXISTS rag_index_jobs (
   attempt integer NOT NULL DEFAULT 0,
   max_attempts integer NOT NULL DEFAULT 3,
   cancel_requested boolean NOT NULL DEFAULT false,
+  request_json jsonb NOT NULL DEFAULT '{}',
+  result_json jsonb NOT NULL DEFAULT '{}',
+  lease_owner text,
+  lease_expires_at timestamptz,
+  available_at timestamptz NOT NULL DEFAULT now(),
   error text,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz,
   UNIQUE (organization_id, idempotency_key)
 );
 
@@ -206,6 +212,10 @@ CREATE TABLE IF NOT EXISTS rag_outbox_events (
   payload jsonb NOT NULL,
   status text NOT NULL DEFAULT 'pending',
   attempt integer NOT NULL DEFAULT 0,
+  max_attempts integer NOT NULL DEFAULT 5,
+  lease_owner text,
+  lease_expires_at timestamptz,
+  error text,
   available_at timestamptz NOT NULL DEFAULT now(),
   created_at timestamptz NOT NULL DEFAULT now(),
   delivered_at timestamptz
