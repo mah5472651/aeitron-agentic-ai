@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import hashlib
+import importlib.util
 import json
 import sqlite3
 import sys
@@ -19,10 +21,17 @@ from src.aeitron.evaluation.benchmarks import BenchmarkHarness, built_in_securit
 from src.aeitron.gateway import api as gateway_api
 from src.aeitron.identity.auth import AuthConfig, AuthError, validate_token_issue_request
 from src.aeitron.identity.quota import AsyncLocalQuotaStore, LocalQuotaStore
-from src.aeitron.indexing import ContextBuilder
+from src.aeitron.indexing import (
+    ContextBuilder,
+    RAGEvaluationTask,
+    ScratchCodeEmbeddingModel,
+    ScratchEmbeddingConfig,
+    save_scratch_embedding_checkpoint,
+)
 from src.aeitron.indexing import LocalVectorIndex, RepositoryIndexer, VectorBackendConfig, create_vector_index, vector_capabilities
-from src.aeitron.indexing.vector_index import QdrantVectorIndex
+from src.aeitron.indexing.vector_index import QdrantVectorIndex, VectorSearchReport, VectorSearchResult
 from src.aeitron.learning.capacity import CapacityPlanConfig, build_capacity_plan
+from src.aeitron.learning.storage import LocalObjectStore
 from src.aeitron.memory import MemoryIngestRequest, UnifiedMemoryManager
 from src.aeitron.model_ops.backends import MockModelBackend
 from src.aeitron.patches import PatchVerifyRequest
@@ -44,6 +53,167 @@ from src.aeitron.verifier.runtime import VerificationRequest, VerifierRuntime, l
 
 
 class AeitronProductionHardeningTest(unittest.TestCase):
+    def test_failed_index_generation_preserves_previous_searchable_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:
+            workspace = Path(workspace_dir)
+            source = workspace / "service.py"
+            source.write_text("def stable():\n    return 'v1'\n", encoding="utf-8")
+            with LocalStore(Path(db_dir) / "rag.sqlite3") as store:
+                project = store.create_project(name="revision", repo_path=str(workspace))
+                first = RepositoryIndexer(store).index_project(project_id=project["id"])
+                old_chunks = store.list_chunks(project["id"])
+                source.write_text("def stable():\n    return 'v2'\n", encoding="utf-8")
+                indexer = RepositoryIndexer(store)
+                with patch.object(indexer, "chunk_file", side_effect=RuntimeError("forced build failure")):
+                    with self.assertRaisesRegex(RuntimeError, "forced build failure"):
+                        indexer.index_project(project_id=project["id"])
+                self.assertEqual(store.get_project(project["id"])["active_index_revision"], first.revision_id)
+                self.assertEqual(store.list_chunks(project["id"]), old_chunks)
+                self.assertEqual(store.index_status(project["id"])["status"], "failed")
+
+    def test_index_snapshot_is_immutable_and_hash_bound_in_object_storage(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as workspace_dir,
+            tempfile.TemporaryDirectory() as db_dir,
+            tempfile.TemporaryDirectory() as object_dir,
+        ):
+            workspace = Path(workspace_dir)
+            (workspace / "main.py").write_text("print('snapshot')\n", encoding="utf-8")
+            with LocalStore(Path(db_dir) / "snapshot.sqlite3") as store:
+                project = store.create_project(name="snapshot", repo_path=str(workspace))
+                report = RepositoryIndexer(store, object_store=LocalObjectStore(object_dir)).index_project(
+                    project_id=project["id"]
+                )
+                revision = store.get_index_revision(report.revision_id)
+                binding = revision["manifest"]["source_snapshot_object"]
+                self.assertEqual(binding["snapshot_sha256"], report.source_snapshot_sha256)
+                self.assertEqual(len(binding["sha256"]), 64)
+                self.assertTrue(Path(binding["uri"]).is_file())
+
+    def test_project_access_is_bound_to_organization_and_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:
+            with LocalStore(Path(db_dir) / "tenant.sqlite3") as store:
+                project = store.create_project(
+                    name="tenant",
+                    repo_path=workspace_dir,
+                    organization_id="org-a",
+                    owner_user_id="owner-a",
+                )
+                self.assertEqual(
+                    store.require_project_access(project["id"], "org-a", user_id="owner-a")["id"],
+                    project["id"],
+                )
+                with self.assertRaises(KeyError):
+                    store.require_project_access(project["id"], "org-b")
+                with self.assertRaises(PermissionError):
+                    store.require_project_access(project["id"], "org-a", user_id="stranger")
+                store.insert_memory_entry(
+                    project_id=None,
+                    kind="project:project_fact",
+                    content={"secret": "local-only"},
+                )
+                self.assertEqual(store.list_memory_entries(project["id"]), [])
+
+    def test_hybrid_context_fuses_semantic_evidence_and_reports_outage(self) -> None:
+        class FakeVectorIndex:
+            config = VectorBackendConfig(backend="qdrant", dims=64, embedding_model="Aeitron-Code-Embed-v1")
+
+            def __init__(self, chunk_id: str) -> None:
+                self.chunk_id = chunk_id
+
+            def search(self, **kwargs: object) -> VectorSearchReport:
+                return VectorSearchReport(
+                    organization_id=str(kwargs["organization_id"]),
+                    project_id=str(kwargs["project_id"]),
+                    revision_id=str(kwargs["revision_id"]),
+                    query=str(kwargs["query"]),
+                    backend="qdrant",
+                    dims=64,
+                    results=[
+                        VectorSearchResult(
+                            chunk_id=self.chunk_id,
+                            path="auth.py",
+                            start_line=1,
+                            end_line=2,
+                            score=0.99,
+                        )
+                    ],
+                )
+
+            def sync_project(self, **_kwargs: object) -> object:
+                raise NotImplementedError
+
+        class FailingVectorIndex(FakeVectorIndex):
+            def search(self, **_kwargs: object) -> VectorSearchReport:
+                raise RuntimeError("qdrant unavailable at https://secret.internal")
+
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as db_dir:
+            workspace = Path(workspace_dir)
+            (workspace / "auth.py").write_text("def authorize(user):\n    return bool(user)\n", encoding="utf-8")
+            with LocalStore(Path(db_dir) / "hybrid.sqlite3") as store:
+                project = store.create_project(name="hybrid", repo_path=str(workspace))
+                RepositoryIndexer(store).index_project(project_id=project["id"])
+                chunk = store.list_chunks(project["id"])[0]
+                report = ContextBuilder(store, vector_index=FakeVectorIndex(chunk["id"])).build(
+                    project_id=project["id"], query="authorization", token_budget=2000
+                )
+                self.assertEqual(report.retrieval_mode, "hybrid")
+                self.assertFalse(report.degraded)
+                self.assertGreater(report.candidate_counts["semantic"], 0)
+                self.assertTrue(report.report_sha256)
+                degraded = ContextBuilder(store, vector_index=FailingVectorIndex(chunk["id"])).build(
+                    project_id=project["id"], query="authorization", token_budget=2000
+                )
+                self.assertTrue(degraded.degraded)
+                self.assertEqual(degraded.retrieval_mode, "degraded_lexical_graph")
+                self.assertNotIn("secret.internal", degraded.degraded_reason or "")
+                self.assertTrue(degraded.chunks)
+
+    def test_rag_production_evaluation_cannot_bypass_500_task_gate(self) -> None:
+        report = ContextBuilder().evaluate(
+            [
+                RAGEvaluationTask(
+                    task_id="one",
+                    project_id="missing",
+                    query="find symbol",
+                    relevant_chunk_ids=["expected"],
+                )
+            ],
+            strict=True,
+        )
+        self.assertEqual(report.status, "blocked")
+        self.assertIn("500", report.blockers[0])
+
+    @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "PyTorch not installed")
+    def test_scratch_embedding_model_has_finite_loss_and_hash_bound_manifest(self) -> None:
+        import torch
+
+        config = ScratchEmbeddingConfig(
+            vocab_size=256,
+            hidden_size=64,
+            num_layers=1,
+            num_attention_heads=4,
+            projection_dimension=64,
+            intermediate_size=128,
+            max_sequence_length=32,
+            dropout=0.0,
+        )
+        model = ScratchCodeEmbeddingModel(config)
+        tokens = torch.randint(0, 256, (2, 16))
+        mask = torch.ones_like(tokens)
+        loss = model.contrastive_loss(tokens, mask, tokens.flip(1), mask)
+        self.assertTrue(torch.isfinite(loss).item())
+        with tempfile.TemporaryDirectory() as output_dir:
+            manifest = save_scratch_embedding_checkpoint(
+                model,
+                output_dir,
+                tokenizer_sha256=hashlib.sha256(b"tokenizer").hexdigest(),
+                dataset_manifest_sha256=hashlib.sha256(b"dataset").hexdigest(),
+            )
+            self.assertTrue(manifest["scratch_only"])
+            self.assertFalse(manifest["borrowed_weights"])
+            self.assertEqual(len(manifest["checkpoint_sha256"]), 64)
+
     def test_architecture_integrity_passes_repository_and_detects_synthetic_drift(self) -> None:
         current = run_architecture_integrity()
         self.assertEqual(current.status, "passed", current.model_dump())
@@ -471,6 +641,10 @@ def repeated(value):
                 self.assertTrue(fake_client.created)
                 self.assertEqual(report.indexed_chunks, store.index_status(project["id"])["chunk_count"])
                 self.assertEqual(len(fake_client.points), report.indexed_chunks)
+                for point in fake_client.points:
+                    self.assertNotIn("content", point.payload)
+                    self.assertEqual(point.payload["organization_id"], "local")
+                    self.assertEqual(point.payload["revision_id"], report.revision_id)
                 self.assertEqual(report.deleted_stale_chunks, 1)
                 self.assertEqual(fake_client.deleted, ["00000000-0000-0000-0000-000000000001"])
 

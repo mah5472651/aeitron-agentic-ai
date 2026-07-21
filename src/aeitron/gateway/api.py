@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.aeitron.db import LocalStore
@@ -68,6 +68,7 @@ DATASET_AUTHORITY = DatasetAuthorityService.from_environment()
 
 class AuthTokenRequest(BaseModel):
     user_id: str = Field(default="local-user", min_length=1)
+    organization_id: str = Field(default="local", min_length=1, max_length=128)
     scopes: list[str] = Field(default_factory=lambda: ["api"])
     ttl_seconds: int = Field(default=3600, ge=60, le=86400)
     issue_key: str | None = Field(default=None, min_length=1)
@@ -184,7 +185,7 @@ def require_scope(request: Request, scope: str) -> None:
     claims = getattr(request.state, "jwt_claims", {}) or {}
     scopes = set(str(item) for item in claims.get("scopes", []) if item)
     namespace = scope.split(":", 1)[0]
-    if namespace in {"training", "data", "tools", "agents"}:
+    if namespace in {"training", "data", "tools", "agents", "context", "memory"}:
         allowed = scope in scopes or f"{namespace}:admin" in scopes
     else:
         allowed = scope in scopes or "api" in scopes
@@ -199,6 +200,38 @@ def request_scopes(request: Request) -> set[str]:
 
 def request_owner(request: Request) -> str:
     return str(getattr(request.state, "user_id", "") or "local-user")
+
+
+def request_organization(request: Request) -> str:
+    if not AUTH_CONFIG.enabled:
+        return "local"
+    claims = getattr(request.state, "jwt_claims", {}) or {}
+    organization_id = str(claims.get("organization_id") or "")
+    if not organization_id or len(organization_id) > 128:
+        raise PermissionError("JWT requires an immutable organization_id claim")
+    return organization_id
+
+
+def require_project_access(request: Request, project_id: str, scope: str) -> dict[str, Any]:
+    require_scope(request, scope)
+    return STORE.require_project_access(
+        project_id,
+        request_organization(request),
+        user_id=request_owner(request) if AUTH_CONFIG.enabled else None,
+    )
+
+
+def production_vector_config() -> VectorBackendConfig:
+    production = os.environ.get("AEITRON_ENV", "development").lower() == "production"
+    return VectorBackendConfig(
+        backend="qdrant",
+        dims=int(os.environ.get("AEITRON_EMBEDDING_DIMS", "768")),
+        qdrant_url=os.environ.get("AEITRON_QDRANT_URL"),
+        embedding_url=os.environ.get("AEITRON_EMBEDDING_URL"),
+        embedding_model=os.environ.get("AEITRON_EMBEDDING_MODEL", "Aeitron-Code-Embed-v1"),
+        embedding_manifest_path=os.environ.get("AEITRON_EMBEDDING_MANIFEST"),
+        production_mode=production,
+    )
 
 
 def _dataset_version_manifest_path(version_id: str) -> Path:
@@ -268,6 +301,7 @@ async def issue_auth_token(request: AuthTokenRequest) -> dict[str, object]:
         audience=AUTH_CONFIG.audience,
         scopes=request.scopes,
         ttl_seconds=request.ttl_seconds,
+        extra_claims={"organization_id": request.organization_id},
     )
     return {
         "token_type": "Bearer",  # nosec B105 - OAuth token type label, not a credential.
@@ -875,24 +909,33 @@ async def model_pretraining_readiness(request: PretrainingRunSpec) -> dict[str, 
 
 
 @app.post("/v1/projects")
-async def create_project(request: ProjectCreateRequest) -> dict[str, Any]:
+async def create_project(payload: ProjectCreateRequest, http_request: Request) -> dict[str, Any]:
     try:
-        repo_path = resolve_registered_repo_path(request.repo_path)
+        require_scope(http_request, "context:index")
+        organization_id = request_organization(http_request)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    try:
+        repo_path = resolve_registered_repo_path(payload.repo_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return STORE.create_project(
-        name=request.name,
+        name=payload.name,
         repo_path=str(repo_path),
-        default_branch=request.default_branch,
+        default_branch=payload.default_branch,
+        organization_id=organization_id,
+        owner_user_id=request_owner(http_request),
     )
 
 
 @app.get("/v1/projects/{project_id}")
-async def get_project(project_id: str) -> dict[str, Any]:
-    project = STORE.get_project(project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return project
+async def get_project(project_id: str, request: Request) -> dict[str, Any]:
+    try:
+        return require_project_access(request, project_id, "context:read")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
 
 
 @app.post("/v1/sessions")
@@ -904,19 +947,22 @@ async def create_session(request: SessionCreateRequest) -> dict[str, Any]:
 
 
 @app.post("/v1/projects/{project_id}/index")
-async def index_project(project_id: str, request: IndexProjectRequest) -> dict[str, Any]:
-    project = STORE.get_project(project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    if project["index_status"] == "ready" and not request.force:
+async def index_project(project_id: str, payload: IndexProjectRequest, http_request: Request) -> dict[str, Any]:
+    try:
+        project = require_project_access(http_request, project_id, "context:index")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
+    if project["index_status"] == "ready" and not payload.force:
         return STORE.index_status(project_id)
-    suffixes = set(request.include_suffixes) if request.include_suffixes else None
+    suffixes = set(payload.include_suffixes) if payload.include_suffixes else None
     try:
         report = RepositoryIndexer(STORE).index_project(
             project_id=project_id,
             include_suffixes=suffixes,
-            max_file_bytes=request.max_file_bytes,
-            max_chunk_lines=request.max_chunk_lines,
+            max_file_bytes=payload.max_file_bytes,
+            max_chunk_lines=payload.max_chunk_lines,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1100,18 +1146,24 @@ async def list_failure_clusters(project_id: str, request: Request) -> list[dict[
 
 
 @app.get("/v1/projects/{project_id}/index/status")
-async def project_index_status(project_id: str) -> dict[str, Any]:
+async def project_index_status(project_id: str, request: Request) -> dict[str, Any]:
     try:
+        require_project_access(request, project_id, "context:read")
         return STORE.index_status(project_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project not found") from exc
 
 
 @app.get("/v1/projects/{project_id}/symbols")
-async def project_symbols(project_id: str) -> dict[str, Any]:
-    project = STORE.get_project(project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
+async def project_symbols(project_id: str, request: Request) -> dict[str, Any]:
+    try:
+        require_project_access(request, project_id, "context:read")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
     symbols: list[dict[str, Any]] = []
     dependencies: dict[str, set[str]] = {}
     for chunk in STORE.list_chunks(project_id):
@@ -1146,46 +1198,67 @@ async def project_symbols(project_id: str) -> dict[str, Any]:
 
 
 @app.post("/v1/context/build")
-async def build_context(request: ContextBuildRequest) -> dict[str, Any]:
+async def build_context(payload: ContextBuildRequest, http_request: Request) -> dict[str, Any]:
     try:
+        require_project_access(http_request, payload.project_id, "context:read")
         report = ContextBuilder(STORE).build(
-            project_id=request.project_id,
-            query=request.query,
-            token_budget=request.token_budget,
-            pinned_files=request.pinned_files,
-            max_chunks=request.max_chunks,
+            project_id=payload.project_id,
+            organization_id=request_organization(http_request),
+            query=payload.query,
+            token_budget=payload.token_budget,
+            pinned_files=payload.pinned_files,
+            max_chunks=payload.max_chunks,
         )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project not found") from exc
     return report.model_dump()
 
 
 @app.post("/v1/context/vector-search")
-async def vector_search(request: VectorSearchRequest) -> dict[str, Any]:
-    if STORE.get_project(request.project_id) is None:
-        raise HTTPException(status_code=404, detail="project not found")
+async def vector_search(payload: VectorSearchRequest, http_request: Request, response: Response) -> dict[str, Any]:
     try:
-        index = create_vector_index(STORE, VectorBackendConfig(backend=request.backend, dims=request.dims))  # type: ignore[arg-type]
-        return index.search(project_id=request.project_id, query=request.query, top_k=request.top_k).model_dump()
+        project = require_project_access(http_request, payload.project_id, "context:read")
+        production = os.environ.get("AEITRON_ENV", "development").lower() == "production"
+        config = production_vector_config() if production else VectorBackendConfig(backend=payload.backend, dims=payload.dims)  # type: ignore[arg-type]
+        index = create_vector_index(STORE, config)
+        response.headers["Deprecation"] = "true"
+        response.headers["Sunset"] = "Wed, 31 Dec 2026 23:59:59 GMT"
+        return index.search(
+            organization_id=request_organization(http_request),
+            project_id=payload.project_id,
+            revision_id=str(project.get("active_index_revision") or ""),
+            query=payload.query,
+            top_k=payload.top_k,
+        ).model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/v1/context/vector-sync")
 async def vector_sync(request: VectorSyncRequest, http_request: Request) -> dict[str, Any]:
-    if AUTH_CONFIG.enabled:
-        require_scope(http_request, "context:index")
-    if STORE.get_project(request.project_id) is None:
-        raise HTTPException(status_code=404, detail="project not found")
     try:
+        project = require_project_access(http_request, request.project_id, "context:index")
+        production = os.environ.get("AEITRON_ENV", "development").lower() == "production"
         index = create_vector_index(
             STORE,
-            VectorBackendConfig(backend=request.backend, dims=request.dims),  # type: ignore[arg-type]
+            production_vector_config() if production else VectorBackendConfig(backend=request.backend, dims=request.dims),  # type: ignore[arg-type]
         )
         return index.sync_project(
+            organization_id=request_organization(http_request),
             project_id=request.project_id,
+            revision_id=str(project.get("active_index_revision") or ""),
             batch_size=request.batch_size,
         ).model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1196,25 +1269,39 @@ async def get_vector_capabilities() -> dict[str, Any]:
 
 
 @app.post("/v1/memory/ingest")
-async def ingest_memory(request: MemoryIngestRequest, project_id: str | None = None) -> dict[str, Any]:
-    if project_id is not None and STORE.get_project(project_id) is None:
-        raise HTTPException(status_code=404, detail="project not found")
+async def ingest_memory(request: MemoryIngestRequest, http_request: Request, project_id: str | None = None) -> dict[str, Any]:
     try:
+        require_scope(http_request, "memory:write")
+        if AUTH_CONFIG.enabled and project_id is None:
+            raise PermissionError("authenticated memory ingestion requires a tenant-bound project_id")
+        if project_id is not None:
+            require_project_access(http_request, project_id, "memory:write")
         return UnifiedMemoryManager(project_id=project_id, store=STORE).ingest(request).model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/v1/memory/retrieve")
-async def retrieve_memory(request: MemoryRetrieveRequest) -> dict[str, Any]:
-    if request.project_id is not None and STORE.get_project(request.project_id) is None:
-        raise HTTPException(status_code=404, detail="project not found")
+async def retrieve_memory(request: MemoryRetrieveRequest, http_request: Request) -> dict[str, Any]:
     try:
+        require_scope(http_request, "memory:read")
+        if AUTH_CONFIG.enabled and request.project_id is None:
+            raise PermissionError("authenticated memory retrieval requires a tenant-bound project_id")
+        if request.project_id is not None:
+            require_project_access(http_request, request.project_id, "memory:read")
         return UnifiedMemoryManager(project_id=request.project_id, store=STORE).retrieve_report(
             request.query,
             limit=request.limit,
             layers=request.layers or None,  # type: ignore[arg-type]
         ).model_dump()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

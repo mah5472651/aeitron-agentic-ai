@@ -23,6 +23,7 @@ from pydantic import Field
 from src.aeitron.evaluation.benchmark_pack import validate_protected_benchmark_manifest
 from src.aeitron.identity.auth import AuthConfig
 from src.aeitron.identity.quota import QuotaConfig
+from src.aeitron.indexing.vector_index import VectorBackendConfig, validate_embedding_manifest
 from src.aeitron.model_ops.backends import active_model_health
 from src.aeitron.model_ops.foundation import model_profile
 from src.aeitron.shared.config import load_active_profile
@@ -201,12 +202,34 @@ def _check_external_services(mode: str) -> list[ReadinessCheck]:
     qdrant_dependencies = {
         "AEITRON_QDRANT_URL": bool(os.environ.get("AEITRON_QDRANT_URL")),
         "AEITRON_EMBEDDING_URL": bool(os.environ.get("AEITRON_EMBEDDING_URL")),
+        "AEITRON_EMBEDDING_MANIFEST": bool(os.environ.get("AEITRON_EMBEDDING_MANIFEST")),
     }
     missing_qdrant = [
         f"env:{name}"
         for name, present in qdrant_dependencies.items()
         if not present
     ]
+    manifest_evidence: dict[str, Any] = {}
+    if not missing_qdrant:
+        try:
+            manifest = validate_embedding_manifest(
+                VectorBackendConfig(
+                    backend="qdrant",
+                    dims=int(os.environ.get("AEITRON_EMBEDDING_DIMS", "768")),
+                    qdrant_url=os.environ.get("AEITRON_QDRANT_URL"),
+                    embedding_url=os.environ.get("AEITRON_EMBEDDING_URL"),
+                    embedding_model=os.environ.get("AEITRON_EMBEDDING_MODEL", "Aeitron-Code-Embed-v1"),
+                    embedding_manifest_path=os.environ.get("AEITRON_EMBEDDING_MANIFEST"),
+                    production_mode=True,
+                )
+            )
+            manifest_evidence = {
+                "scratch_only": manifest.get("scratch_only"),
+                "borrowed_weights": manifest.get("borrowed_weights"),
+                "checkpoint_sha256": manifest.get("checkpoint_sha256"),
+            }
+        except (RuntimeError, ValueError) as exc:
+            missing_qdrant.append(f"embedding_manifest:{exc}")
     checks.append(
         ReadinessCheck(
             subsystem="qdrant",
@@ -225,6 +248,8 @@ def _check_external_services(mode: str) -> list[ReadinessCheck]:
             evidence={
                 "qdrant_url_present": qdrant_dependencies["AEITRON_QDRANT_URL"],
                 "embedding_url_present": qdrant_dependencies["AEITRON_EMBEDDING_URL"],
+                "embedding_manifest_present": qdrant_dependencies["AEITRON_EMBEDDING_MANIFEST"],
+                "embedding_manifest": manifest_evidence,
             },
             production_blocker=mode == "production" and bool(missing_qdrant),
         )

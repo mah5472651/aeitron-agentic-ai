@@ -1,15 +1,42 @@
 ﻿-- Aeitron MVP production Postgres schema.
 -- Local development uses src/aeitron/db/local_store.py with equivalent SQLite tables.
 
+CREATE TABLE IF NOT EXISTS organizations (
+  id uuid PRIMARY KEY,
+  name text NOT NULL,
+  status text NOT NULL DEFAULT 'active',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS organization_members (
+  organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id text NOT NULL,
+  role text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (organization_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS projects (
   id uuid PRIMARY KEY,
+  organization_id uuid NOT NULL REFERENCES organizations(id),
   name text NOT NULL,
   repo_path text NOT NULL,
   default_branch text NOT NULL DEFAULT 'main',
   index_status text NOT NULL DEFAULT 'not_indexed',
+  active_index_revision uuid,
+  index_error text,
   last_indexed_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS project_members (
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id text NOT NULL,
+  role text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (project_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -74,6 +101,7 @@ CREATE TABLE IF NOT EXISTS workspace_files (
   language text,
   content_hash text NOT NULL,
   size_bytes integer NOT NULL,
+  index_revision uuid,
   indexed_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE(project_id, path)
 );
@@ -92,6 +120,7 @@ CREATE TABLE IF NOT EXISTS code_chunks (
   token_count integer NOT NULL,
   content text NOT NULL,
   metadata jsonb NOT NULL DEFAULT '{}',
+  index_revision uuid,
   indexed_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -125,6 +154,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
 
 CREATE TABLE IF NOT EXISTS memory_entries (
   id uuid PRIMARY KEY,
+  organization_id uuid NOT NULL REFERENCES organizations(id),
   project_id uuid REFERENCES projects(id) ON DELETE CASCADE,
   kind text NOT NULL,
   content text NOT NULL,
@@ -136,6 +166,53 @@ CREATE TABLE IF NOT EXISTS memory_entries (
   metadata jsonb NOT NULL DEFAULT '{}',
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS rag_index_revisions (
+  id uuid PRIMARY KEY,
+  organization_id uuid NOT NULL REFERENCES organizations(id),
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  source_revision text NOT NULL,
+  source_snapshot_sha256 text NOT NULL,
+  chunker_version text NOT NULL,
+  status text NOT NULL,
+  manifest jsonb NOT NULL DEFAULT '{}',
+  error text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  committed_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS rag_index_jobs (
+  id uuid PRIMARY KEY,
+  organization_id uuid NOT NULL REFERENCES organizations(id),
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  revision_id uuid REFERENCES rag_index_revisions(id) ON DELETE SET NULL,
+  idempotency_key text NOT NULL,
+  status text NOT NULL,
+  attempt integer NOT NULL DEFAULT 0,
+  max_attempts integer NOT NULL DEFAULT 3,
+  cancel_requested boolean NOT NULL DEFAULT false,
+  error text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (organization_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS rag_outbox_events (
+  id uuid PRIMARY KEY,
+  organization_id uuid NOT NULL REFERENCES organizations(id),
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  revision_id uuid NOT NULL REFERENCES rag_index_revisions(id) ON DELETE CASCADE,
+  kind text NOT NULL,
+  payload jsonb NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  attempt integer NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT now(),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  delivered_at timestamptz
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rag_one_building_revision
+  ON rag_index_revisions(project_id) WHERE status = 'building';
 
 CREATE TABLE IF NOT EXISTS learning_candidates (
   id uuid PRIMARY KEY,

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
+import threading
+import time
 import uuid
 from collections import Counter
+from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
 
@@ -16,11 +20,148 @@ import httpx
 from pydantic import Field
 
 from src.aeitron.db import LocalStore
+from src.aeitron.learning.quality import SECRET_RE
 from src.aeitron.shared.schemas import StrictModel
+
+try:
+    import torch
+    from torch import nn
+    from torch.nn import functional as F
+except ImportError:  # pragma: no cover - dependency readiness handles this path.
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
 
 
 TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,}|0x[0-9A-Fa-f]+|[./\\\w-]+\.[A-Za-z0-9]+")
 VectorBackendName = Literal["local_hashing", "faiss", "hnsw", "qdrant", "pgvector"]
+
+
+class ScratchEmbeddingConfig(StrictModel):
+    model_name: str = "Aeitron-Code-Embed-v1"
+    vocab_size: int = Field(default=128_000, ge=256)
+    hidden_size: int = Field(default=768, ge=64)
+    num_layers: int = Field(default=12, ge=1)
+    num_attention_heads: int = Field(default=12, ge=1)
+    projection_dimension: int = Field(default=768, ge=64)
+    intermediate_size: int = Field(default=3072, ge=128)
+    max_sequence_length: int = Field(default=4096, ge=32)
+    dropout: float = Field(default=0.1, ge=0.0, lt=1.0)
+    temperature: float = Field(default=0.05, gt=0.0, le=1.0)
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.hidden_size % self.num_attention_heads:
+            raise ValueError("hidden_size must be divisible by num_attention_heads")
+
+
+if nn is not None:
+    class ScratchCodeEmbeddingModel(nn.Module):
+        """Aeitron-owned random-initialized dual-encoder backbone."""
+
+        def __init__(self, config: ScratchEmbeddingConfig) -> None:
+            super().__init__()
+            self.config = config
+            self.token_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+            self.position_embeddings = nn.Embedding(config.max_sequence_length, config.hidden_size)
+            layer = nn.TransformerEncoderLayer(
+                d_model=config.hidden_size,
+                nhead=config.num_attention_heads,
+                dim_feedforward=config.intermediate_size,
+                dropout=config.dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(layer, num_layers=config.num_layers)
+            self.output_norm = nn.LayerNorm(config.hidden_size)
+            self.projection = nn.Linear(config.hidden_size, config.projection_dimension, bias=False)
+            self.apply(self._initialize)
+
+        @staticmethod
+        def _initialize(module: nn.Module) -> None:
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        def forward(self, input_ids: "torch.Tensor", attention_mask: "torch.Tensor") -> "torch.Tensor":
+            if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
+                raise ValueError("input_ids and attention_mask must have matching [batch, sequence] shapes")
+            if input_ids.shape[1] > self.config.max_sequence_length:
+                raise ValueError("embedding input exceeds configured maximum sequence length")
+            if input_ids.numel() and (int(input_ids.min()) < 0 or int(input_ids.max()) >= self.config.vocab_size):
+                raise ValueError("embedding input contains an out-of-vocabulary token ID")
+            positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+            hidden = self.token_embeddings(input_ids) + self.position_embeddings(positions)
+            hidden = self.encoder(hidden, src_key_padding_mask=~attention_mask.bool())
+            hidden = self.output_norm(hidden)
+            weights = attention_mask.to(hidden.dtype).unsqueeze(-1)
+            pooled = (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+            return F.normalize(self.projection(pooled).float(), p=2, dim=-1)
+
+        def contrastive_loss(
+            self,
+            query_ids: "torch.Tensor",
+            query_mask: "torch.Tensor",
+            positive_ids: "torch.Tensor",
+            positive_mask: "torch.Tensor",
+        ) -> "torch.Tensor":
+            query = self(query_ids, query_mask)
+            positive = self(positive_ids, positive_mask)
+            logits = query @ positive.transpose(0, 1) / self.config.temperature
+            labels = torch.arange(logits.shape[0], device=logits.device)
+            return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.transpose(0, 1), labels))
+else:
+    class ScratchCodeEmbeddingModel:  # type: ignore[no-redef]
+        def __init__(self, _config: ScratchEmbeddingConfig) -> None:
+            raise RuntimeError("PyTorch is required for the Aeitron scratch embedding model")
+
+
+def save_scratch_embedding_checkpoint(
+    model: ScratchCodeEmbeddingModel,
+    output_dir: str | Path,
+    *,
+    tokenizer_sha256: str,
+    dataset_manifest_sha256: str,
+) -> dict[str, Any]:
+    if torch is None:
+        raise RuntimeError("PyTorch is required to save an embedding checkpoint")
+    try:
+        from safetensors.torch import save_file
+    except ImportError as exc:
+        raise RuntimeError("safetensors is required for secure embedding checkpoint serialization") from exc
+    for name, value in {
+        "tokenizer_sha256": tokenizer_sha256,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+    }.items():
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    target = Path(output_dir).resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    checkpoint = target / "embedding_model.safetensors"
+    temporary = target / ".embedding_model.safetensors.tmp"
+    tensors = {
+        name: value.detach().cpu().contiguous()
+        for name, value in model.state_dict().items()
+    }
+    save_file(tensors, str(temporary), metadata={"format": "aeitron-scratch-embedding-v1"})
+    os.replace(temporary, checkpoint)
+    checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    manifest = {
+        "schema_version": 1,
+        "model_name": model.config.model_name,
+        "scratch_only": True,
+        "borrowed_weights": False,
+        "projection_dimension": model.config.projection_dimension,
+        "tokenizer_sha256": tokenizer_sha256,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "checkpoint_sha256": checkpoint_sha256,
+        "config": model.config.model_dump(),
+        "status": "built_not_gpu_proven",
+    }
+    manifest_path = target / "embedding_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {**manifest, "manifest_path": str(manifest_path), "checkpoint_path": str(checkpoint)}
 
 
 class VectorBackendConfig(StrictModel):
@@ -31,7 +172,12 @@ class VectorBackendConfig(StrictModel):
     postgres_dsn: str | None = None
     hnsw_space: str = "cosine"
     embedding_url: str | None = None
-    embedding_model: str = "aeitron-code-embedding"
+    embedding_model: str = "Aeitron-Code-Embed-v1"
+    embedding_manifest_path: str | None = None
+    production_mode: bool = False
+    qdrant_alias: str = "aeitron-rag-current"
+    qdrant_expected_points: int = Field(default=100_000_000, ge=1)
+    qdrant_replication_factor: int = Field(default=2, ge=1, le=9)
 
 
 class VectorIndexCapability(StrictModel):
@@ -54,7 +200,9 @@ class VectorSearchResult(StrictModel):
 
 
 class VectorSearchReport(StrictModel):
+    organization_id: str = "local"
     project_id: str
+    revision_id: str = ""
     query: str
     backend: VectorBackendName = "local_hashing"
     dims: int = 384
@@ -62,7 +210,9 @@ class VectorSearchReport(StrictModel):
 
 
 class VectorSyncReport(StrictModel):
+    organization_id: str = "local"
     project_id: str
+    revision_id: str = ""
     backend: VectorBackendName
     collection: str
     indexed_chunks: int = Field(ge=0)
@@ -74,10 +224,16 @@ class VectorSyncReport(StrictModel):
 class VectorIndexBackend(Protocol):
     config: VectorBackendConfig
 
-    def search(self, *, project_id: str, query: str, top_k: int = 12) -> VectorSearchReport:
+    def search(
+        self, *, organization_id: str = "local", project_id: str,
+        revision_id: str = "", query: str, top_k: int = 12,
+    ) -> VectorSearchReport:
         ...
 
-    def sync_project(self, *, project_id: str, batch_size: int = 64) -> VectorSyncReport:
+    def sync_project(
+        self, *, organization_id: str = "local", project_id: str,
+        revision_id: str = "", batch_size: int = 64,
+    ) -> VectorSyncReport:
         ...
 
 
@@ -122,6 +278,29 @@ class HttpEmbeddingProvider:
             raise ValueError("embedding endpoint must not contain a query string or fragment")
         if parsed.scheme != "https" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("remote embedding endpoints must use HTTPS")
+        self._lock = threading.Lock()
+        self._failure_count = 0
+        self._circuit_open_until = 0.0
+        headers = {"User-Agent": "Aeitron-RAG/1"}
+        api_key = os.environ.get("AEITRON_EMBEDDING_API_KEY")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        cert: str | tuple[str, str] | None = None
+        client_cert = os.environ.get("AEITRON_EMBEDDING_CLIENT_CERT")
+        client_key = os.environ.get("AEITRON_EMBEDDING_CLIENT_KEY")
+        if bool(client_cert) != bool(client_key):
+            raise ValueError("embedding mTLS requires both client certificate and key")
+        if client_cert and client_key:
+            cert = (client_cert, client_key)
+        self.client = httpx.Client(
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            follow_redirects=False,
+            trust_env=False,
+            verify=os.environ.get("AEITRON_EMBEDDING_CA_BUNDLE", True),
+            cert=cert,
+            headers=headers,
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+        )
 
     def embed(self, text: str) -> list[float]:
         return self.embed_many([text])[0]
@@ -129,14 +308,24 @@ class HttpEmbeddingProvider:
     def embed_many(self, texts: list[str]) -> list[list[float]]:
         if not texts or len(texts) > 256:
             raise ValueError("embedding batch size must be between 1 and 256")
+        if any(not isinstance(text, str) or not text or len(text.encode("utf-8")) > 2_000_000 for text in texts):
+            raise ValueError("embedding inputs must be non-empty strings no larger than 2MB")
+        with self._lock:
+            if time.monotonic() < self._circuit_open_until:
+                raise RuntimeError("embedding provider circuit is open")
         request_input: str | list[str] = texts[0] if len(texts) == 1 else texts
-        response = httpx.post(
-            self.endpoint,
-            json={"model": self.model, "input": request_input},
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response = self.client.post(self.endpoint, json={"model": self.model, "input": request_input})
+            response.raise_for_status()
+            if len(response.content) > 64 * 1024 * 1024:
+                raise RuntimeError("embedding provider response exceeded 64MB")
+            payload = response.json()
+        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+            with self._lock:
+                self._failure_count += 1
+                if self._failure_count >= 3:
+                    self._circuit_open_until = time.monotonic() + 30.0
+            raise RuntimeError(f"embedding provider request failed: {type(exc).__name__}") from exc
         if len(texts) == 1 and isinstance(payload.get("embedding"), list):
             vectors = [payload["embedding"]]
         else:
@@ -145,12 +334,42 @@ class HttpEmbeddingProvider:
                 raise RuntimeError("embedding provider returned an invalid batch")
             ordered = sorted(data, key=lambda item: int(item.get("index", 0)))
             vectors = [item.get("embedding") for item in ordered]
-        return [_validated_embedding(vector, dims=self.dims) for vector in vectors]
+        validated = [_validated_embedding(vector, dims=self.dims) for vector in vectors]
+        with self._lock:
+            self._failure_count = 0
+            self._circuit_open_until = 0.0
+        return validated
+
+
+def validate_embedding_manifest(config: VectorBackendConfig) -> dict[str, Any]:
+    path_value = config.embedding_manifest_path or os.environ.get("AEITRON_EMBEDDING_MANIFEST")
+    if not path_value:
+        if config.production_mode:
+            raise RuntimeError("production embeddings require AEITRON_EMBEDDING_MANIFEST")
+        return {"status": "not_bound", "scratch_only": False}
+    path = os.path.realpath(os.path.expanduser(path_value))
+    try:
+        with open(path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("embedding model manifest is unreadable") from exc
+    if manifest.get("scratch_only") is not True or manifest.get("borrowed_weights") is not False:
+        raise RuntimeError("embedding manifest does not prove Aeitron scratch-only weights")
+    if str(manifest.get("model_name")) != config.embedding_model:
+        raise RuntimeError("embedding manifest model name mismatch")
+    if int(manifest.get("projection_dimension", 0)) != config.dims:
+        raise RuntimeError("embedding manifest dimension mismatch")
+    tokenizer_hash = str(manifest.get("tokenizer_sha256") or "")
+    checkpoint_hash = str(manifest.get("checkpoint_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", tokenizer_hash) or not re.fullmatch(r"[0-9a-f]{64}", checkpoint_hash):
+        raise RuntimeError("embedding manifest requires tokenizer and checkpoint SHA-256 bindings")
+    return manifest
 
 
 def create_embedding_provider(config: VectorBackendConfig, *, allow_local_hashing: bool) -> EmbeddingProvider:
     endpoint = config.embedding_url or os.environ.get("AEITRON_EMBEDDING_URL")
     if endpoint:
+        validate_embedding_manifest(config)
         return HttpEmbeddingProvider(endpoint=endpoint, model=config.embedding_model, dims=config.dims)
     if allow_local_hashing:
         return LocalHashingEmbeddingProvider(dims=config.dims)
@@ -216,7 +435,11 @@ class LocalVectorIndex:
         self.dims = self.config.dims
         self.embedding_provider = create_embedding_provider(self.config, allow_local_hashing=True)
 
-    def search(self, *, project_id: str, query: str, top_k: int = 12) -> VectorSearchReport:
+    def search(
+        self, *, organization_id: str = "local", project_id: str,
+        revision_id: str = "", query: str, top_k: int = 12,
+    ) -> VectorSearchReport:
+        self.store.require_project_access(project_id, organization_id)
         query_vector = self.embedding_provider.embed(query)
         scored: list[VectorSearchResult] = []
         for chunk in self.store.list_chunks(project_id):
@@ -236,14 +459,20 @@ class LocalVectorIndex:
                 )
             )
         return VectorSearchReport(
+            organization_id=organization_id,
             project_id=project_id,
+            revision_id=revision_id,
             query=query,
             backend=self.config.backend,
             dims=self.dims,
             results=sorted(scored, key=lambda item: item.score, reverse=True)[:top_k],
         )
 
-    def sync_project(self, *, project_id: str, batch_size: int = 64) -> VectorSyncReport:
+    def sync_project(
+        self, *, organization_id: str = "local", project_id: str,
+        revision_id: str = "", batch_size: int = 64,
+    ) -> VectorSyncReport:
+        self.store.require_project_access(project_id, organization_id)
         if batch_size < 1 or batch_size > 256:
             raise ValueError("vector sync batch_size must be between 1 and 256")
         chunks = self.store.list_chunks(project_id)
@@ -252,7 +481,9 @@ class LocalVectorIndex:
             digest.update(str(chunk["id"]).encode("utf-8"))
             digest.update(hashlib.sha256(chunk_search_text(chunk).encode("utf-8")).digest())
         return VectorSyncReport(
+            organization_id=organization_id,
             project_id=project_id,
+            revision_id=revision_id,
             backend=self.config.backend,
             collection="local-exact-scan",
             indexed_chunks=len(chunks),
@@ -296,6 +527,9 @@ class QdrantVectorIndex(LocalVectorIndex):
                 "embedding_url": active.embedding_url or os.environ.get("AEITRON_EMBEDDING_URL"),
             }
         )
+        if active.qdrant_collection == "aeitron_code_chunks":
+            version_suffix = hashlib.sha256(active.embedding_model.encode("utf-8")).hexdigest()[:12]
+            active = active.model_copy(update={"qdrant_collection": f"aeitron_code_chunks_{version_suffix}"})
         if not active.qdrant_url:
             raise RuntimeError("Qdrant backend requested but qdrant_url/AEITRON_QDRANT_URL is not configured")
         self.embedding_provider = create_embedding_provider(active, allow_local_hashing=False)
@@ -308,9 +542,41 @@ class QdrantVectorIndex(LocalVectorIndex):
         self.dims = active.dims
         self.client = QdrantClient(url=active.qdrant_url)
 
+    def _promote_alias(self) -> None:
+        if not self.config.production_mode:
+            return
+        if not hasattr(self.client, "update_collection_aliases"):
+            raise RuntimeError("Qdrant client does not support atomic alias promotion")
+        from qdrant_client import models
+
+        operations: list[Any] = []
+        try:
+            aliases = self.client.get_aliases().aliases
+            if any(getattr(item, "alias_name", None) == self.config.qdrant_alias for item in aliases):
+                operations.append(
+                    models.DeleteAliasOperation(
+                        delete_alias=models.DeleteAlias(alias_name=self.config.qdrant_alias)
+                    )
+                )
+        except Exception as exc:
+            raise RuntimeError(f"Qdrant alias discovery failed: {exc}") from exc
+        operations.append(
+            models.CreateAliasOperation(
+                create_alias=models.CreateAlias(
+                    collection_name=self.config.qdrant_collection,
+                    alias_name=self.config.qdrant_alias,
+                )
+            )
+        )
+        try:
+            self.client.update_collection_aliases(change_aliases_operations=operations)
+        except Exception as exc:
+            raise RuntimeError(f"Qdrant alias promotion failed: {exc}") from exc
+
     @staticmethod
-    def _point_id(project_id: str, chunk_id: str) -> str:
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"aeitron:{project_id}:{chunk_id}"))
+    def _point_id(organization_id: str, project_id: str, revision_id: str, chunk_id: str) -> str:
+        del revision_id
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"aeitron:{organization_id}:{project_id}:{chunk_id}"))
 
     def _ensure_collection(self) -> None:
         from qdrant_client import models
@@ -324,57 +590,131 @@ class QdrantVectorIndex(LocalVectorIndex):
             except Exception:
                 exists = False
         if not exists:
+            shard_count = (
+                max(16, min(256, math.ceil(self.config.qdrant_expected_points / 10_000_000)))
+                if self.config.production_mode
+                else 1
+            )
             self.client.create_collection(
                 collection_name=self.config.qdrant_collection,
-                vectors_config=models.VectorParams(size=self.dims, distance=models.Distance.COSINE),
+                vectors_config=models.VectorParams(
+                    size=self.dims,
+                    distance=models.Distance.COSINE,
+                    on_disk=self.config.production_mode,
+                ),
+                shard_number=shard_count,
+                replication_factor=self.config.qdrant_replication_factor if self.config.production_mode else 1,
+                write_consistency_factor=(self.config.qdrant_replication_factor // 2) + 1 if self.config.production_mode else 1,
             )
-        try:
-            self.client.create_payload_index(
-                collection_name=self.config.qdrant_collection,
-                field_name="project_id",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-                wait=True,
-            )
-        except Exception as exc:
-            if "already exists" not in str(exc).lower():
-                raise RuntimeError(f"Qdrant payload index creation failed: {exc}") from exc
+        for field_name in ("organization_id", "project_id", "revision_id", "content_hash"):
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.config.qdrant_collection,
+                    field_name=field_name,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                    wait=True,
+                )
+            except Exception as exc:
+                if "already exists" not in str(exc).lower():
+                    raise RuntimeError(f"Qdrant payload index creation failed for {field_name}: {exc}") from exc
 
-    def sync_project(self, *, project_id: str, batch_size: int = 64) -> VectorSyncReport:
+    @staticmethod
+    def _tenant_filter(models: Any, organization_id: str, project_id: str, revision_id: str) -> Any:
+        must = [
+            models.FieldCondition(key="organization_id", match=models.MatchValue(value=organization_id)),
+            models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id)),
+        ]
+        if revision_id:
+            must.append(models.FieldCondition(key="revision_id", match=models.MatchValue(value=revision_id)))
+        return models.Filter(must=must)
+
+    def sync_project(
+        self, *, organization_id: str = "local", project_id: str,
+        revision_id: str = "", batch_size: int = 64,
+    ) -> VectorSyncReport:
         from qdrant_client import models
 
         if batch_size < 1 or batch_size > 256:
             raise ValueError("Qdrant batch_size must be between 1 and 256")
+        project = self.store.require_project_access(project_id, organization_id)
+        active_revision = str(project.get("active_index_revision") or "")
+        revision_id = revision_id or active_revision
+        if not revision_id or revision_id != active_revision:
+            raise RuntimeError("Qdrant sync requires the active committed index revision")
         chunks = self.store.list_chunks(project_id)
+        if any(str(chunk.get("index_revision") or "") != revision_id for chunk in chunks):
+            raise RuntimeError("local chunks are not consistently bound to the active index revision")
+        sensitive = [
+            str(chunk["id"])
+            for chunk in chunks
+            if SECRET_RE.search(str(chunk.get("content") or ""))
+            or "-----BEGIN PRIVATE KEY-----" in str(chunk.get("content") or "")
+        ]
+        if sensitive:
+            raise RuntimeError(f"secret policy blocked embedding for {len(sensitive)} chunk(s)")
         self._ensure_collection()
         digest = hashlib.sha256()
         desired_ids: set[str] = set()
+        for chunk in chunks:
+            digest.update(str(chunk["id"]).encode("utf-8"))
+            digest.update(str(chunk.get("chunk_hash") or "").encode("ascii"))
+        existing_hashes: dict[str, str] = {}
+        existing_ids: set[str] = set()
+        offset: Any = None
+        project_filter = self._tenant_filter(models, organization_id, project_id, "")
+        while True:
+            records, offset = self.client.scroll(
+                collection_name=self.config.qdrant_collection,
+                scroll_filter=project_filter,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for record in records:
+                point_id = str(record.id)
+                existing_ids.add(point_id)
+                payload = dict(getattr(record, "payload", {}) or {})
+                existing_hashes[point_id] = str(payload.get("content_hash") or "")
+            if offset is None:
+                break
+        reused_ids: list[str] = []
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start : start + batch_size]
-            texts = [chunk_search_text(chunk) for chunk in batch]
+            changed_batch: list[dict[str, Any]] = []
+            for chunk in batch:
+                point_id = self._point_id(organization_id, project_id, revision_id, str(chunk["id"]))
+                desired_ids.add(point_id)
+                if existing_hashes.get(point_id) == str(chunk.get("chunk_hash") or ""):
+                    reused_ids.append(point_id)
+                else:
+                    changed_batch.append(chunk)
+            if not changed_batch:
+                continue
+            texts = [chunk_search_text(chunk) for chunk in changed_batch]
             vectors = self.embedding_provider.embed_many(texts)
-            if len(vectors) != len(batch):
+            if len(vectors) != len(changed_batch):
                 raise RuntimeError("embedding provider returned the wrong number of vectors")
             points = []
-            for chunk, text, vector in zip(batch, texts, vectors, strict=True):
-                point_id = self._point_id(project_id, str(chunk["id"]))
-                desired_ids.add(point_id)
+            for chunk, text, vector in zip(changed_batch, texts, vectors, strict=True):
+                point_id = self._point_id(organization_id, project_id, revision_id, str(chunk["id"]))
                 text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                digest.update(point_id.encode("ascii"))
-                digest.update(bytes.fromhex(text_hash))
                 points.append(
                     models.PointStruct(
                         id=point_id,
                         vector=_validated_embedding(vector, dims=self.dims),
                         payload={
+                            "organization_id": organization_id,
                             "project_id": project_id,
+                            "revision_id": revision_id,
                             "chunk_id": str(chunk["id"]),
                             "path": str(chunk["path"]),
                             "start_line": int(chunk["start_line"]),
                             "end_line": int(chunk["end_line"]),
                             "symbol_name": chunk.get("symbol_name"),
-                            "content": str(chunk["content"]),
-                            "metadata": dict(chunk.get("metadata") or {}),
-                            "content_sha256": text_hash,
+                            "language": str(chunk.get("language") or ""),
+                            "source_kind": "repository",
+                            "content_hash": str(chunk.get("chunk_hash") or text_hash),
                         },
                     )
                 )
@@ -386,24 +726,17 @@ class QdrantVectorIndex(LocalVectorIndex):
                 )
             except Exception as exc:
                 raise RuntimeError(f"Qdrant upsert failed: {exc}") from exc
-
-        existing_ids: set[str] = set()
-        offset: Any = None
-        project_filter = models.Filter(
-            must=[models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id))]
-        )
-        while True:
-            records, offset = self.client.scroll(
-                collection_name=self.config.qdrant_collection,
-                scroll_filter=project_filter,
-                limit=256,
-                offset=offset,
-                with_payload=False,
-                with_vectors=False,
-            )
-            existing_ids.update(str(record.id) for record in records)
-            if offset is None:
-                break
+        if reused_ids:
+            if not hasattr(self.client, "set_payload"):
+                if self.config.production_mode:
+                    raise RuntimeError("Qdrant client cannot update revision payload for reused vectors")
+            else:
+                self.client.set_payload(
+                    collection_name=self.config.qdrant_collection,
+                    payload={"revision_id": revision_id},
+                    points=reused_ids,
+                    wait=True,
+                )
         stale_ids = sorted(existing_ids - desired_ids)
         if stale_ids:
             self.client.delete(
@@ -411,8 +744,11 @@ class QdrantVectorIndex(LocalVectorIndex):
                 points_selector=models.PointIdsList(points=stale_ids),
                 wait=True,
             )
+        self._promote_alias()
         return VectorSyncReport(
+            organization_id=organization_id,
             project_id=project_id,
+            revision_id=revision_id,
             backend="qdrant",
             collection=self.config.qdrant_collection,
             indexed_chunks=len(chunks),
@@ -421,17 +757,25 @@ class QdrantVectorIndex(LocalVectorIndex):
             revision_sha256=digest.hexdigest(),
         )
 
-    def search(self, *, project_id: str, query: str, top_k: int = 12) -> VectorSearchReport:
+    def search(
+        self, *, organization_id: str = "local", project_id: str,
+        revision_id: str = "", query: str, top_k: int = 12,
+    ) -> VectorSearchReport:
+        if top_k < 1 or top_k > 500:
+            raise ValueError("top_k must be between 1 and 500")
+        project = self.store.require_project_access(project_id, organization_id)
+        active_revision = str(project.get("active_index_revision") or "")
+        revision_id = revision_id or active_revision
+        if not revision_id or revision_id != active_revision:
+            raise RuntimeError("Qdrant search requires the active committed index revision")
         vector = self.embedding_provider.embed(query)
         try:
             from qdrant_client import models
 
-            query_filter = models.Filter(
-                must=[models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id))]
-            )
+            query_filter = self._tenant_filter(models, organization_id, project_id, revision_id)
             if hasattr(self.client, "query_points"):
                 response = self.client.query_points(
-                    collection_name=self.config.qdrant_collection,
+                    collection_name=self.config.qdrant_alias if self.config.production_mode else self.config.qdrant_collection,
                     query=vector,
                     limit=top_k,
                     query_filter=query_filter,
@@ -439,7 +783,7 @@ class QdrantVectorIndex(LocalVectorIndex):
                 hits = response.points
             else:
                 hits = self.client.search(
-                    collection_name=self.config.qdrant_collection,
+                    collection_name=self.config.qdrant_alias if self.config.production_mode else self.config.qdrant_collection,
                     query_vector=vector,
                     limit=top_k,
                     query_filter=query_filter,
@@ -449,19 +793,31 @@ class QdrantVectorIndex(LocalVectorIndex):
         results: list[VectorSearchResult] = []
         for hit in hits:
             payload = dict(getattr(hit, "payload", {}) or {})
+            chunk_id = str(payload.get("chunk_id") or getattr(hit, "id", ""))
+            chunk = self.store.get_chunk(chunk_id, project_id=project_id)
+            if chunk is None or str(chunk.get("index_revision") or "") != revision_id:
+                continue
             results.append(
                 VectorSearchResult(
-                    chunk_id=str(payload.get("chunk_id") or getattr(hit, "id", "")),
-                    path=str(payload.get("path") or ""),
-                    start_line=int(payload.get("start_line") or 0),
-                    end_line=int(payload.get("end_line") or 0),
-                    symbol_name=payload.get("symbol_name"),
+                    chunk_id=chunk_id,
+                    path=str(chunk.get("path") or ""),
+                    start_line=int(chunk.get("start_line") or 0),
+                    end_line=int(chunk.get("end_line") or 0),
+                    symbol_name=chunk.get("symbol_name"),
                     score=round(float(getattr(hit, "score", 0.0)), 6),
-                    content=str(payload.get("content") or ""),
-                    metadata=dict(payload.get("metadata") or {}),
+                    content=str(chunk.get("content") or ""),
+                    metadata=dict(chunk.get("metadata") or {}),
                 )
             )
-        return VectorSearchReport(project_id=project_id, query=query, backend="qdrant", dims=self.dims, results=results)
+        return VectorSearchReport(
+            organization_id=organization_id,
+            project_id=project_id,
+            revision_id=revision_id,
+            query=query,
+            backend="qdrant",
+            dims=self.dims,
+            results=results,
+        )
 
 
 class PgVectorIndex(LocalVectorIndex):

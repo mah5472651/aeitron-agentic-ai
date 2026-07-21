@@ -1361,7 +1361,7 @@ python -m src.aeitron.evaluation.benchmark_suites `
 This measures evidence recall, order sensitivity and unsupported claims. A 5M
 effective-context result is not represented as a 5M full-attention claim.
 
-7. Qdrant indexing is explicit and idempotent:
+7. Hybrid RAG indexing is revision-bound and idempotent:
 
 ```text
 POST /v1/context/vector-sync
@@ -1369,8 +1369,22 @@ POST /v1/context/vector-sync
 ```
 
 Production Qdrant requires both `AEITRON_QDRANT_URL` and a real
-`AEITRON_EMBEDDING_URL`. Local hashing is a development fallback and never
-qualifies as production semantic retrieval.
+`AEITRON_EMBEDDING_URL`, plus an `AEITRON_EMBEDDING_MANIFEST` proving an
+Aeitron-owned scratch checkpoint, tokenizer hash, dataset hash, dimensions and
+checkpoint hash. Local hashing is a development fallback and never qualifies
+as production semantic retrieval.
+
+`POST /v1/context/build` is the authoritative retrieval endpoint. It fuses
+lexical/symbol, Qdrant semantic, dependency-graph and verified-memory ranks by
+RRF (`k=60`), applies MMR (`lambda=0.75`), and emits immutable evidence IDs.
+Qdrant or embedding outages return `degraded_lexical_graph` explicitly; they
+never silently report hybrid success. Index generations commit atomically, so
+a failed rebuild cannot replace the previous searchable revision. Legacy
+`vector-search` and `vector-sync` routes are compatibility endpoints only.
+
+The code path is `built_not_production_proven` until a governed 500-task pack,
+100M-point Qdrant deployment, 1,000-concurrent retrieval load test, isolation
+test, chaos test and soak evidence meet the release thresholds.
 
 
 

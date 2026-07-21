@@ -20,12 +20,39 @@ from typing import Any, Iterable
 SQLITE_SCHEMA = """
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS organizations (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS organization_members (
+  organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY(organization_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS project_members (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY(project_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL DEFAULT 'local' REFERENCES organizations(id),
   name TEXT NOT NULL,
   repo_path TEXT NOT NULL,
   default_branch TEXT NOT NULL DEFAULT 'main',
   index_status TEXT NOT NULL DEFAULT 'not_indexed',
+  active_index_revision TEXT,
+  index_error TEXT,
   last_indexed_at REAL,
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
@@ -38,6 +65,7 @@ CREATE TABLE IF NOT EXISTS workspace_files (
   language TEXT,
   content_hash TEXT NOT NULL,
   size_bytes INTEGER NOT NULL,
+  index_revision TEXT,
   indexed_at REAL NOT NULL,
   UNIQUE(project_id, path)
 );
@@ -56,6 +84,7 @@ CREATE TABLE IF NOT EXISTS code_chunks (
   token_count INTEGER NOT NULL,
   content TEXT NOT NULL,
   metadata_json TEXT NOT NULL DEFAULT '{}',
+  index_revision TEXT,
   indexed_at REAL NOT NULL
 );
 
@@ -144,6 +173,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
 
 CREATE TABLE IF NOT EXISTS memory_entries (
   id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL DEFAULT 'local' REFERENCES organizations(id),
   project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
   content TEXT NOT NULL,
@@ -221,6 +251,53 @@ CREATE TABLE IF NOT EXISTS failure_records (
   last_seen_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS rag_index_revisions (
+  id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL REFERENCES organizations(id),
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  source_revision TEXT NOT NULL,
+  source_snapshot_sha256 TEXT NOT NULL,
+  chunker_version TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('building', 'committed', 'failed', 'superseded')),
+  manifest_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT,
+  created_at REAL NOT NULL,
+  committed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS rag_index_jobs (
+  id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL REFERENCES organizations(id),
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  revision_id TEXT REFERENCES rag_index_revisions(id) ON DELETE SET NULL,
+  idempotency_key TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(organization_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS rag_outbox_events (
+  id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL REFERENCES organizations(id),
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  revision_id TEXT NOT NULL REFERENCES rag_index_revisions(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempt INTEGER NOT NULL DEFAULT 0,
+  available_at REAL NOT NULL,
+  created_at REAL NOT NULL,
+  delivered_at REAL
+);
+
+INSERT OR IGNORE INTO organizations(id, name, status, created_at)
+VALUES ('local', 'Local Development Organization', 'active', 0);
+
 CREATE INDEX IF NOT EXISTS idx_workspace_files_project_path ON workspace_files(project_id, path);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_project_path ON code_chunks(project_id, path);
 CREATE INDEX IF NOT EXISTS idx_code_chunks_project_symbol ON code_chunks(project_id, symbol_name);
@@ -231,6 +308,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_run_created ON agent_messages(run_id, cr
 CREATE INDEX IF NOT EXISTS idx_messages_correlation ON agent_messages(correlation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_blackboard_run_kind ON blackboard_entries(run_id, kind);
 CREATE INDEX IF NOT EXISTS idx_failures_cluster ON failure_records(project_id, cluster_key);
+CREATE INDEX IF NOT EXISTS idx_rag_revisions_project ON rag_index_revisions(project_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rag_one_building_revision ON rag_index_revisions(project_id) WHERE status = 'building';
+CREATE INDEX IF NOT EXISTS idx_rag_jobs_status ON rag_index_jobs(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_rag_outbox_pending ON rag_outbox_events(status, available_at);
 """
 
 
@@ -283,6 +364,22 @@ class LocalStore:
             connection.execute("ALTER TABLE tasks ADD COLUMN lease_expires_at REAL")
         if "cancel_requested" not in task_columns:
             connection.execute("ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+        project_columns = {row["name"] for row in connection.execute("PRAGMA table_info(projects)").fetchall()}
+        if "organization_id" not in project_columns:
+            connection.execute("ALTER TABLE projects ADD COLUMN organization_id TEXT NOT NULL DEFAULT 'local'")
+        if "active_index_revision" not in project_columns:
+            connection.execute("ALTER TABLE projects ADD COLUMN active_index_revision TEXT")
+        if "index_error" not in project_columns:
+            connection.execute("ALTER TABLE projects ADD COLUMN index_error TEXT")
+        memory_columns = {row["name"] for row in connection.execute("PRAGMA table_info(memory_entries)").fetchall()}
+        if "organization_id" not in memory_columns:
+            connection.execute("ALTER TABLE memory_entries ADD COLUMN organization_id TEXT NOT NULL DEFAULT 'local'")
+        file_columns = {row["name"] for row in connection.execute("PRAGMA table_info(workspace_files)").fetchall()}
+        if "index_revision" not in file_columns:
+            connection.execute("ALTER TABLE workspace_files ADD COLUMN index_revision TEXT")
+        chunk_columns = {row["name"] for row in connection.execute("PRAGMA table_info(code_chunks)").fetchall()}
+        if "index_revision" not in chunk_columns:
+            connection.execute("ALTER TABLE code_chunks ADD COLUMN index_revision TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -296,17 +393,62 @@ class LocalStore:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
-    def create_project(self, *, name: str, repo_path: str, default_branch: str = "main") -> dict[str, Any]:
-        project_id = new_id()
-        timestamp = now_unix()
+    def ensure_organization(self, organization_id: str, *, name: str | None = None) -> dict[str, Any]:
+        if not organization_id or len(organization_id) > 128:
+            raise ValueError("organization_id must contain 1-128 characters")
         self.connection.execute(
-            """
-            INSERT INTO projects(id, name, repo_path, default_branch, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (project_id, name, str(Path(repo_path).resolve()), default_branch, timestamp, timestamp),
+            "INSERT OR IGNORE INTO organizations(id, name, status, created_at) VALUES (?, ?, 'active', ?)",
+            (organization_id, name or organization_id, now_unix()),
         )
         self.connection.commit()
+        row = self.connection.execute("SELECT * FROM organizations WHERE id = ?", (organization_id,)).fetchone()
+        result = row_to_dict(row)
+        if result is None:
+            raise RuntimeError("organization insert did not round-trip")
+        return result
+
+    def add_organization_member(self, organization_id: str, user_id: str, *, role: str = "member") -> None:
+        if role not in {"owner", "admin", "member", "viewer"}:
+            raise ValueError("unsupported organization role")
+        self.ensure_organization(organization_id)
+        self.connection.execute(
+            """
+            INSERT INTO organization_members(organization_id, user_id, role, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(organization_id, user_id) DO UPDATE SET role = excluded.role
+            """,
+            (organization_id, user_id, role, now_unix()),
+        )
+        self.connection.commit()
+
+    def create_project(
+        self,
+        *,
+        name: str,
+        repo_path: str,
+        default_branch: str = "main",
+        organization_id: str = "local",
+        owner_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        project_id = new_id()
+        timestamp = now_unix()
+        self.ensure_organization(organization_id)
+        if owner_user_id:
+            self.add_organization_member(organization_id, owner_user_id, role="owner")
+        self.connection.execute(
+            """
+            INSERT INTO projects(id, organization_id, name, repo_path, default_branch, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (project_id, organization_id, name, str(Path(repo_path).resolve()), default_branch, timestamp, timestamp),
+        )
+        self.connection.commit()
+        if owner_user_id:
+            self.connection.execute(
+                "INSERT INTO project_members(project_id, organization_id, user_id, role, created_at) VALUES (?, ?, ?, 'owner', ?)",
+                (project_id, organization_id, owner_user_id, timestamp),
+            )
+            self.connection.commit()
         project = self.get_project(project_id)
         if project is None:
             raise RuntimeError("project insert did not round-trip")
@@ -315,6 +457,29 @@ class LocalStore:
     def get_project(self, project_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         return row_to_dict(row)
+
+    def require_project_access(
+        self,
+        project_id: str,
+        organization_id: str,
+        *,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM projects WHERE id = ? AND organization_id = ?",
+            (project_id, organization_id),
+        ).fetchone()
+        project = row_to_dict(row)
+        if project is None:
+            raise KeyError("project not found in organization")
+        if user_id is not None:
+            membership = self.connection.execute(
+                "SELECT 1 FROM project_members WHERE project_id = ? AND organization_id = ? AND user_id = ?",
+                (project_id, organization_id, user_id),
+            ).fetchone()
+            if membership is None:
+                raise PermissionError("user is not a member of this project")
+        return project
 
     def delete_project(self, project_id: str) -> bool:
         cursor = self.connection.execute("DELETE FROM projects WHERE id = ?", (project_id,))
@@ -1112,6 +1277,220 @@ class LocalStore:
         self.connection.execute("DELETE FROM workspace_files WHERE project_id = ?", (project_id,))
         self.connection.commit()
 
+    def begin_index_revision(
+        self,
+        *,
+        project_id: str,
+        source_revision: str,
+        source_snapshot_sha256: str,
+        chunker_version: str,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        if project is None:
+            raise KeyError(f"unknown project: {project_id}")
+        if len(source_snapshot_sha256) != 64:
+            raise ValueError("source_snapshot_sha256 must be a SHA-256 hex digest")
+        revision_id = new_id()
+        timestamp = now_unix()
+        with self._lock:
+            try:
+                self.connection.execute(
+                    """
+                    INSERT INTO rag_index_revisions(
+                      id, organization_id, project_id, source_revision,
+                      source_snapshot_sha256, chunker_version, status,
+                      manifest_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'building', ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        project["organization_id"],
+                        project_id,
+                        source_revision,
+                        source_snapshot_sha256,
+                        chunker_version,
+                        json.dumps(manifest, sort_keys=True),
+                        timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RuntimeError("another index generation is already building for this project") from exc
+            self.connection.execute(
+                "UPDATE projects SET index_status = 'indexing', index_error = NULL, updated_at = ? WHERE id = ?",
+                (timestamp, project_id),
+            )
+            self.connection.commit()
+        revision = self.get_index_revision(revision_id)
+        if revision is None:
+            raise RuntimeError("index revision insert did not round-trip")
+        return revision
+
+    def get_index_revision(self, revision_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM rag_index_revisions WHERE id = ?",
+            (revision_id,),
+        ).fetchone()
+        result = row_to_dict(row)
+        if result is not None:
+            result["manifest"] = json.loads(result.pop("manifest_json") or "{}")
+        return result
+
+    def active_index_revision(self, project_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT r.* FROM rag_index_revisions r
+            JOIN projects p ON p.active_index_revision = r.id
+            WHERE p.id = ? AND r.status = 'committed'
+            """,
+            (project_id,),
+        ).fetchone()
+        result = row_to_dict(row)
+        if result is not None:
+            result["manifest"] = json.loads(result.pop("manifest_json") or "{}")
+        return result
+
+    def fail_index_revision(self, revision_id: str, error: str) -> None:
+        safe_error = error[:4096]
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT project_id, status FROM rag_index_revisions WHERE id = ?",
+                (revision_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown index revision: {revision_id}")
+            if row["status"] != "building":
+                raise RuntimeError("only a building index revision can fail")
+            timestamp = now_unix()
+            self.connection.execute(
+                "UPDATE rag_index_revisions SET status = 'failed', error = ? WHERE id = ?",
+                (safe_error, revision_id),
+            )
+            self.connection.execute(
+                "UPDATE projects SET index_status = 'failed', index_error = ?, updated_at = ? WHERE id = ?",
+                (safe_error, timestamp, row["project_id"]),
+            )
+            self.connection.commit()
+
+    def commit_index_revision(
+        self,
+        *,
+        revision_id: str,
+        files: Iterable[dict[str, Any]],
+        chunks: Iterable[dict[str, Any]],
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        file_rows = list(files)
+        chunk_rows = list(chunks)
+        file_ids = {str(item["id"]) for item in file_rows}
+        if len(file_ids) != len(file_rows):
+            raise ValueError("index revision contains duplicate file IDs")
+        chunk_ids = {str(item["id"]) for item in chunk_rows}
+        if len(chunk_ids) != len(chunk_rows):
+            raise ValueError("index revision contains duplicate chunk IDs")
+        if any(str(item["file_id"]) not in file_ids for item in chunk_rows):
+            raise ValueError("index revision contains a chunk with an unknown file ID")
+
+        with self._lock:
+            self.connection.commit()
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                revision = self.connection.execute(
+                    "SELECT * FROM rag_index_revisions WHERE id = ?",
+                    (revision_id,),
+                ).fetchone()
+                if revision is None:
+                    raise KeyError(f"unknown index revision: {revision_id}")
+                if revision["status"] != "building":
+                    raise RuntimeError("only a building index revision can be committed")
+                project_id = str(revision["project_id"])
+                timestamp = now_unix()
+                self.connection.execute("DELETE FROM code_chunks WHERE project_id = ?", (project_id,))
+                self.connection.execute("DELETE FROM workspace_files WHERE project_id = ?", (project_id,))
+                self.connection.executemany(
+                    """
+                    INSERT INTO workspace_files(
+                      id, project_id, path, language, content_hash, size_bytes,
+                      index_revision, indexed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            item["id"], project_id, item["path"], item.get("language"),
+                            item["content_hash"], item["size_bytes"], revision_id, timestamp,
+                        )
+                        for item in file_rows
+                    ],
+                )
+                self.connection.executemany(
+                    """
+                    INSERT INTO code_chunks(
+                      id, project_id, file_id, path, language, start_line, end_line,
+                      symbol_name, kind, chunk_hash, token_count, content,
+                      metadata_json, index_revision, indexed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            item["id"], project_id, item["file_id"], item["path"], item.get("language"),
+                            item["start_line"], item["end_line"], item.get("symbol_name"), item["kind"],
+                            item["chunk_hash"], item["token_count"], item["content"],
+                            json.dumps(item.get("metadata", {}), sort_keys=True), revision_id, timestamp,
+                        )
+                        for item in chunk_rows
+                    ],
+                )
+                self.connection.execute(
+                    """
+                    UPDATE rag_index_revisions SET status = 'superseded'
+                    WHERE project_id = ? AND status = 'committed' AND id != ?
+                    """,
+                    (project_id, revision_id),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE rag_index_revisions
+                    SET status = 'committed', manifest_json = ?, committed_at = ?, error = NULL
+                    WHERE id = ?
+                    """,
+                    (json.dumps(manifest, sort_keys=True), timestamp, revision_id),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_index_revision = ?, index_status = 'ready', index_error = NULL,
+                        last_indexed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (revision_id, timestamp, timestamp, project_id),
+                )
+                outbox_id = new_id()
+                self.connection.execute(
+                    """
+                    INSERT INTO rag_outbox_events(
+                      id, organization_id, project_id, revision_id, kind,
+                      payload_json, status, available_at, created_at
+                    ) VALUES (?, ?, ?, ?, 'vector_sync_required', ?, 'pending', ?, ?)
+                    """,
+                    (
+                        outbox_id,
+                        revision["organization_id"],
+                        project_id,
+                        revision_id,
+                        json.dumps({"revision_id": revision_id, "manifest": manifest}, sort_keys=True),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        committed = self.get_index_revision(revision_id)
+        if committed is None:
+            raise RuntimeError("committed index revision did not round-trip")
+        return committed
+
     def upsert_workspace_file(
         self,
         *,
@@ -1189,6 +1568,19 @@ class LocalStore:
         ).fetchall()
         return [self._chunk_row(row) for row in rows]
 
+    def get_chunk(self, chunk_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
+        sql = """
+            SELECT c.*, f.content_hash AS file_hash
+            FROM code_chunks c JOIN workspace_files f ON f.id = c.file_id
+            WHERE c.id = ?
+        """
+        params: list[Any] = [chunk_id]
+        if project_id is not None:
+            sql += " AND c.project_id = ?"
+            params.append(project_id)
+        row = self.connection.execute(sql, params).fetchone()
+        return self._chunk_row(row) if row is not None else None
+
     def index_status(self, project_id: str) -> dict[str, Any]:
         project = self.get_project(project_id)
         if project is None:
@@ -1208,6 +1600,8 @@ class LocalStore:
         return {
             "project_id": project_id,
             "status": project["index_status"],
+            "active_index_revision": project.get("active_index_revision"),
+            "index_error": project.get("index_error"),
             "file_count": int(files),
             "chunk_count": int(chunks),
             "symbol_count": int(symbols),
@@ -1233,16 +1627,23 @@ class LocalStore:
     ) -> dict[str, Any]:
         entry_id = new_id()
         timestamp = now_unix()
+        organization_id = "local"
+        if project_id is not None:
+            project = self.get_project(project_id)
+            if project is None:
+                raise KeyError(f"unknown project: {project_id}")
+            organization_id = str(project["organization_id"])
         self.connection.execute(
             """
             INSERT INTO memory_entries(
-              id, project_id, kind, content, source_run_id, relevance,
+              id, organization_id, project_id, kind, content, source_run_id, relevance,
               success_rate, usage_count, metadata_json, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (
                 entry_id,
+                organization_id,
                 project_id,
                 kind,
                 json.dumps(content, sort_keys=True),
@@ -1269,12 +1670,19 @@ class LocalStore:
         return data
 
     def list_memory_entries(self, project_id: str | None = None, *, kinds: list[str] | None = None) -> list[dict[str, Any]]:
-        clauses: list[str] = []
         params: list[Any] = []
         if project_id is not None:
-            clauses.append("(project_id = ? OR project_id IS NULL)")
-            params.append(project_id)
-        query = "SELECT * FROM memory_entries WHERE (project_id = ? OR project_id IS NULL) ORDER BY created_at DESC" if clauses else "SELECT * FROM memory_entries ORDER BY created_at DESC"
+            project = self.get_project(project_id)
+            if project is None:
+                raise KeyError(f"unknown project: {project_id}")
+            query = """
+                SELECT * FROM memory_entries
+                WHERE organization_id = ? AND (project_id = ? OR project_id IS NULL)
+                ORDER BY created_at DESC
+            """
+            params.extend([project["organization_id"], project_id])
+        else:
+            query = "SELECT * FROM memory_entries WHERE organization_id = 'local' ORDER BY created_at DESC"
         rows = self.connection.execute(query, params).fetchall()
         allowed_kinds = set(kinds or [])
         results: list[dict[str, Any]] = []

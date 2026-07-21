@@ -332,12 +332,17 @@ not rely only on raw file text; it needs ranked, structured code context.
 Files:
 
 - `src/aeitron/indexing/context_builder.py`
-- `src/aeitron/context/builder.py`
+- `src/aeitron/indexing/vector_index.py`
+- `src/aeitron/indexing/repository_indexer.py`
 
 Purpose:
 
-Build compact ranked context packs for a user query. It scores chunks by query
-relevance, file pins, symbol metadata, and rough token budget.
+`HybridRAGEngine` in `context_builder.py` is the only retrieval orchestration
+authority. It combines lexical/symbol candidates, Qdrant semantic candidates,
+AST/call/dependency expansion and verified memory. Reciprocal Rank Fusion uses
+`k=60`; MMR uses `lambda=0.75`; the final pack is evidence-bound and token
+budgeted. `ContextBuilder` is only a compatibility name for this same class,
+not a second implementation.
 
 When it runs:
 
@@ -347,7 +352,7 @@ When it runs:
 API:
 
 - `POST /v1/context/build`
-- `POST /v1/context/vector-search`
+- `POST /v1/context/vector-search` (deprecated compatibility route)
 - `GET /v1/context/vector-capabilities`
 
 Vector backend details:
@@ -359,17 +364,18 @@ Vector backend details:
   large local ANN sidecar index is desired.
 - `hnsw`: explicit HNSW adapter contract. Use when `hnswlib` is installed and a
   fast local approximate index is desired.
-- `qdrant`: production distributed vector database contract. Requires
-  `AEITRON_QDRANT_URL` or `qdrant_url`.
+- `qdrant`: the only production semantic backend. It requires server-owned
+  Qdrant/embedding configuration and a hash-bound scratch embedding manifest.
 - `pgvector`: Postgres-native vector search contract. Requires
   `AEITRON_DATABASE_URL` or `postgres_dsn`.
 
-Current production path:
+Backend policy:
 
 - local/dev/smoke: `local_hashing`
-- many projects or large memory: `qdrant`
-- relational + vector in one database: `pgvector`
-- single-node large repo: `faiss` or `hnsw`
+- production: Qdrant only, with mandatory organization/project/revision filters
+- degraded production: explicit lexical plus graph retrieval
+- `pgvector`, FAISS and HNSW are capability contracts and do not qualify as
+  production semantic retrieval in the current release
 
 The API rejects unavailable production backends with explicit configuration or
 dependency errors instead of silently pretending they are active.
@@ -5317,10 +5323,33 @@ external server is online.
 ### Qdrant project synchronization
 
 `POST /v1/context/vector-sync` synchronizes all indexed repository chunks into
-Qdrant in bounded batches. Point IDs are deterministic, payloads preserve
-project/chunk/path/symbol evidence, and stale project points are removed.
-Remote embedding endpoints require HTTPS, dimensions and finite values are
-validated, and production Qdrant refuses the local hashing fallback.
+Qdrant in bounded batches. Point IDs bind organization, project, active index
+revision and chunk identity. Qdrant payloads contain only minimal filtering and
+location metadata; source content remains in the authoritative metadata store.
+Every query applies organization, project and active-revision filters. Raw
+source is resolved by chunk ID after retrieval, preventing stale vector payload
+content from becoming evidence.
+
+Repository indexing uses a two-phase generation lifecycle. Files and chunks are
+built first, then committed in one transaction together with the active
+revision and vector-sync outbox event. A failed generation records its error but
+does not delete or replace the previous searchable revision. Postgres migration
+`0007_hybrid_rag.sql` adds organizations, membership, revision/job/outbox
+tables and row-level tenant policies.
+
+`Aeitron-Code-Embed-v1` is a random-initialized 12-layer, 768-hidden dual
+encoder contract using the governed 128K tokenizer and symmetric InfoNCE. A
+production embedding service is rejected unless its manifest proves
+`scratch_only=true`, `borrowed_weights=false`, matching dimensions and valid
+tokenizer/checkpoint hashes. The model implementation exists, but no trained
+embedding checkpoint or GPU retrieval-quality proof is claimed yet.
+
+Context output includes retrieval mode, degraded reason, candidate counts,
+timings, index revision, embedding version, per-chunk content/evidence hashes
+and an immutable report hash. Coder, critic and verifier share that report hash.
+Production evaluation requires at least 500 governed repository tasks and
+enforces Recall@20, nDCG@10, MRR@10, context precision, stale-revision and
+cross-tenant gates.
 
 Qdrant, embedding service, Postgres, Redis, S3/MinIO, GPU execution, and the
 50-task governed repository run remain external operational proofs. The code

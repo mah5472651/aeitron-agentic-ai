@@ -269,6 +269,7 @@ class _AttemptState:
         self.baseline_security = baseline_security
         self.plan: PlanningResult | None = None
         self.context_prompt = ""
+        self.context_report: dict[str, Any] = {}
         self.patch: PatchProposal | None = None
         self.original_patch_id: str | None = None
         self.stage_patch_id: str | None = None
@@ -331,11 +332,18 @@ class ProductionRoleWorkers:
             max_chunks=self.state.request.max_context_chunks,
         )
         self.state.context_prompt = report.prompt_context
+        self.state.context_report = report.model_dump(mode="json")
         return {
             "context_id": report.context_id,
+            "context_report_sha256": report.report_sha256,
+            "index_revision": report.index_revision,
+            "retrieval_mode": report.retrieval_mode,
+            "degraded": report.degraded,
+            "degraded_reason": report.degraded_reason,
             "estimated_tokens": report.estimated_tokens,
             "files": report.files,
             "chunk_ids": [chunk.chunk_id for chunk in report.chunks],
+            "evidence_ids": [chunk.evidence_id for chunk in report.chunks],
         }
 
     async def edit(self, _task: dict[str, Any]) -> dict[str, Any]:
@@ -498,6 +506,15 @@ class ProductionRoleWorkers:
 
     async def critic_review(self, _task: dict[str, Any]) -> dict[str, Any]:
         evidence = {
+            "context": {
+                "context_id": self.state.context_report.get("context_id"),
+                "report_sha256": self.state.context_report.get("report_sha256"),
+                "index_revision": self.state.context_report.get("index_revision"),
+                "degraded": self.state.context_report.get("degraded"),
+                "evidence_ids": [
+                    chunk.get("evidence_id") for chunk in self.state.context_report.get("chunks", [])
+                ],
+            },
             "test": self.state.test_evidence,
             "security": self.state.security_evidence,
             "performance": self.state.performance_review,
@@ -526,6 +543,10 @@ class ProductionRoleWorkers:
 
     async def verify(self, _task: dict[str, Any]) -> dict[str, Any]:
         criteria = {
+            "context_evidence_bound": bool(
+                self.state.context_report.get("report_sha256")
+                and self.state.context_report.get("index_revision")
+            ),
             "patch_exists": bool(self.state.original_patch_id and self.state.patch),
             "tests_passed": self.state.test_evidence.get("passed") is True,
             "security_passed": self.state.security_evidence.get("accepted") is True,
