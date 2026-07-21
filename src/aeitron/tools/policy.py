@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess  # nosec B404 - subprocess is wrapped by strict argv policy.
+import sys
 import tempfile
 import time
 import uuid
@@ -156,6 +157,15 @@ class HardenedToolExecutor:
         )
 
     def resolve_executable(self, executable: str, *, root: Path) -> Path:
+        if executable.lower() in {"python", "python.exe", "python3"}:
+            interpreter = Path(sys.executable).resolve()
+            if not interpreter.is_file():
+                raise FileNotFoundError("running Python interpreter is not a regular file")
+            if self.is_inside(interpreter, root):
+                raise ValueError(
+                    f"refusing project-local Python interpreter to prevent executable shadowing: {interpreter}"
+                )
+            return interpreter
         search_path = self.safe_path(root)
         resolved = shutil.which(executable, path=search_path)
         if resolved is None:

@@ -5315,18 +5315,19 @@ independent release decisions. A copied or old report can look valid after its
 dependencies, model, policy, or deployment have changed.
 
 `src/aeitron/deployment/production_qualification.py` is the single final
-production decision authority. It emits ten non-overlapping subsystem results:
+production decision authority. It emits eleven non-overlapping subsystem results:
 
 1. production proof baseline;
 2. real dependency E2E;
 3. functional hardening;
-4. native model serving;
-5. load and capacity;
-6. failure and chaos;
-7. observability;
-8. soak and recovery;
-9. independent security review;
-10. canary release.
+4. governed scratch-training chain;
+5. native model serving;
+6. load and capacity;
+7. failure and chaos;
+8. observability;
+9. soak and recovery;
+10. independent security review;
+11. canary release.
 
 Every result is `passed`, `failed`, `blocked`, or `not_run`. A broken
 measurement is failed. Missing external infrastructure or human evidence is
@@ -5464,10 +5465,18 @@ The final qualifier binds the data/model progression as immutable evidence.
 The 5k decision must contain the supplied 200 decision file hash. The promoted
 100k manifest must contain the supplied 5k decision file hash. The tokenizer
 audit must report exactly 128,000 requested and actual vocabulary entries with
-no missing special tokens or audit failures. T4 qualification reports must be
-scratch-only, complete at least 1,000 and 10,000 measured steps respectively,
-use at least the 512-hidden/8-layer/256-context technical profile, contain
-finite losses, and prove checkpoint reload.
+no missing special tokens or audit failures. It must bind the exact promoted
+dataset-manifest hash, tokenizer bytes, family-safe train/validation sources,
+token shards, tokenizer manifest and token-efficiency report. The qualifier
+re-hashes every bound file and validates license/provenance/review/patch
+coverage, quality percentiles, source caps, split collisions and all dataset
+promotion checks. A controlled scratch overfit report must show at least a 20%
+relative loss drop and checkpoint logit parity. T4 qualification reports must
+be scratch-only, complete at least 1,000 and 10,000 measured steps respectively,
+use at least the 512-hidden/8-layer/256-context/128K-vocabulary technical
+profile, contain finite training and validation losses, bind the qualified
+dataset/tokenizer/shard/Git/checkpoint hashes, and prove state plus fixed-token
+logit parity after checkpoint reload.
 
 Missing legal approval, reviewer qualification, governed dataset decisions,
 GPU reports, native-serving evidence, live dependency proofs, soak reports, or
@@ -5594,11 +5603,20 @@ new tokenizer.
 ```powershell
 python -m src.aeitron.model_ops.tokenizer_pipeline `
   --input data\production\aeitron-foundation-v1\train.jsonl `
+  --validation-input data\production\aeitron-foundation-v1\val.jsonl `
+  --dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
   --output-dir artifacts\aeitron\tokenizer-128k-v1 `
   --dataset-id aeitron-foundation-v1 `
   --vocab-size 128000 `
+  --no-stress-samples `
+  --production-mode `
   --real-corpus-audit
 ```
+
+Production mode never injects the synthetic stress sample into training data.
+The stress corpus is used only for post-training audit. The command emits
+`tokenizer.json`, `tokenizer_manifest.json`, `tokenizer_audit_report.json`,
+`token_efficiency_report.json`, and a hash-bound shard `manifest.json`.
 
 ### Context qualification
 

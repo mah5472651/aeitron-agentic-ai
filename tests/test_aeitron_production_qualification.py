@@ -112,6 +112,7 @@ class AeitronProductionQualificationTest(unittest.TestCase):
             calibration_5k_decision=None,
             production_dataset_manifest=None,
             tokenizer_audit_report=None,
+            overfit_sanity_report=None,
             t4_1k_training_report=None,
             t4_10k_training_report=None,
             maximum_age_seconds=3600,
@@ -165,6 +166,24 @@ class AeitronProductionQualificationTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            artifact_names = {
+                "train",
+                "val",
+                "test",
+                "split_manifest",
+                "promotion_decision",
+                "dedup_report",
+                "contamination_report",
+                "review_report",
+                "verified_patch_report",
+            }
+            dataset_artifacts = {}
+            dataset_artifact_hashes = {}
+            for name in artifact_names:
+                artifact = root / f"dataset-{name}.json"
+                artifact.write_text(json.dumps({"name": name}), encoding="utf-8")
+                dataset_artifacts[name] = str(artifact)
+                dataset_artifact_hashes[name] = sha256_file(artifact)
             dataset = root / "dataset.json"
             dataset.write_text(
                 json.dumps(
@@ -174,23 +193,63 @@ class AeitronProductionQualificationTest(unittest.TestCase):
                         "status": "promoted",
                         "output_dir": str(root),
                         "dev_smoke": False,
-                        "artifacts": {},
+                        "artifacts": dataset_artifacts,
+                        "artifact_sha256": dataset_artifact_hashes,
                         "metrics": {"promoted_records": 100_000},
                         "issues": [],
-                        "reports": {},
+                        "reports": {
+                            "dataset_trust_metrics": {
+                                "license_coverage": 1.0,
+                                "provenance_coverage": 1.0,
+                                "high_value_review_coverage": 1.0,
+                                "verified_patch_evidence_coverage": 1.0,
+                                "average_quality": 0.90,
+                                "p10_quality": 0.80,
+                                "secret_or_pii_hits": 0,
+                                "maximum_source_token_fraction": 0.20,
+                                "maximum_source_family_token_fraction": 0.35,
+                            },
+                            "split_manifest": {"cross_split_group_collisions": 0},
+                        },
                         "advancement_decision_sha256": sha256_file(calibration_5k),
-                        "promotion_decision": {"status": "promoted"},
+                        "promotion_decision": {"status": "promoted", "checks": {"all": True}},
                     }
                 ),
                 encoding="utf-8",
             )
+            tokenizer_model = root / "tokenizer.json"
+            tokenizer_model.write_text('{"model":"test"}', encoding="utf-8")
+            tokenizer_manifest = root / "tokenizer-manifest.json"
+            tokenizer_manifest.write_text('{"status":"passed"}', encoding="utf-8")
+            shard_manifest = root / "shards.json"
+            shard_payload = {
+                "tokenizer_sha256": sha256_file(tokenizer_model),
+                "dataset_manifest_sha256": sha256_file(dataset),
+                "split_strategy": "pre_split_family_safe",
+            }
+            shard_manifest.write_text(json.dumps(shard_payload), encoding="utf-8")
+            efficiency = root / "efficiency.json"
+            efficiency.write_text('{"status":"passed"}', encoding="utf-8")
+            tokenizer_source = root / "tokenizer-source.jsonl"
+            tokenizer_source.write_text('{"text":"secure code"}\n', encoding="utf-8")
             tokenizer = root / "tokenizer-audit.json"
             tokenizer.write_text(
                 json.dumps(
                     {
                         "status": "passed",
-                        "tokenizer_path": "tokenizer.json",
-                        "shard_manifest_path": "shards.json",
+                        "tokenizer_path": str(tokenizer_model),
+                        "tokenizer_sha256": sha256_file(tokenizer_model),
+                        "tokenizer_manifest_path": str(tokenizer_manifest),
+                        "tokenizer_manifest_sha256": sha256_file(tokenizer_manifest),
+                        "shard_manifest_path": str(shard_manifest),
+                        "shard_manifest_sha256": sha256_file(shard_manifest),
+                        "efficiency_report_path": str(efficiency),
+                        "efficiency_report_sha256": sha256_file(efficiency),
+                        "dataset_manifest_path": str(dataset),
+                        "dataset_manifest_sha256": sha256_file(dataset),
+                        "source_sha256": {str(tokenizer_source): sha256_file(tokenizer_source)},
+                        "split_strategy": "pre_split_family_safe",
+                        "family_safe_split": True,
                         "vocab_size_requested": 128_000,
                         "vocab_size_actual": 128_000,
                         "special_tokens_missing": [],
@@ -198,13 +257,33 @@ class AeitronProductionQualificationTest(unittest.TestCase):
                         "sample_token_counts": {},
                         "source_rows": 100_000,
                         "source_chars": 1_000_000,
-                        "shard_manifest": {},
+                        "shard_manifest": shard_payload,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            overfit = root / "overfit-sanity.json"
+            overfit.write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "relative_loss_drop": 0.30,
+                        "required_relative_loss_drop": 0.20,
+                        "training_report": {
+                            "scratch_only": True,
+                            "checkpoint_reload_verified": True,
+                            "checkpoint_reload_logit_parity": True,
+                        },
                     }
                 ),
                 encoding="utf-8",
             )
 
             def write_training(path: Path, steps: int) -> None:
+                checkpoint = root / f"checkpoint-{steps}.json"
+                checkpoint.write_text(json.dumps({"step": steps}), encoding="utf-8")
+                best_checkpoint = root / f"best-checkpoint-{steps}.json"
+                best_checkpoint.write_text(json.dumps({"step": steps, "best": True}), encoding="utf-8")
                 path.write_text(
                     json.dumps(
                         {
@@ -212,12 +291,24 @@ class AeitronProductionQualificationTest(unittest.TestCase):
                             "scratch_only": True,
                             "steps": steps,
                             "checkpoint_reload_verified": True,
+                            "checkpoint_reload_logit_parity": True,
+                            "checkpoint_reload_max_abs_logit_difference": 0.0,
+                            "dataset_manifest_sha256": sha256_file(shard_manifest),
+                            "shard_manifest_sha256": sha256_file(shard_manifest),
+                            "tokenizer_sha256": sha256_file(tokenizer_model),
+                            "git_commit": "a" * 40,
+                            "checkpoint_manifest": str(checkpoint),
+                            "checkpoint_manifest_sha256": sha256_file(checkpoint),
+                            "best_checkpoint_manifest": str(best_checkpoint),
+                            "best_checkpoint_manifest_sha256": sha256_file(best_checkpoint),
                             "model_config": {
                                 "hidden_size": 512,
                                 "num_layers": 8,
                                 "max_sequence_length": 256,
+                                "vocab_size": 128_000,
                             },
                             "train_losses": [7.0, 6.0],
+                            "validation_losses": [{"step": steps, "loss": 6.1}],
                         }
                     ),
                     encoding="utf-8",
@@ -232,12 +323,21 @@ class AeitronProductionQualificationTest(unittest.TestCase):
                 "calibration_5k_decision": str(calibration_5k),
                 "production_dataset_manifest": str(dataset),
                 "tokenizer_audit_report": str(tokenizer),
+                "overfit_sanity_report": str(overfit),
                 "t4_1k_training_report": str(t4_1k),
                 "t4_10k_training_report": str(t4_10k),
                 "maximum_age_seconds": 3600,
             }
             valid = validate_scratch_training_chain(**kwargs)
             self.assertEqual(valid.status, "passed", valid.model_dump())
+            tokenizer_source.write_text('{"text":"tampered tokenizer source"}\n', encoding="utf-8")
+            source_tampered = validate_scratch_training_chain(**kwargs)
+            self.assertEqual(source_tampered.status, "failed")
+            self.assertTrue(
+                any("tokenizer source SHA-256 mismatch" in item for item in source_tampered.blockers),
+                source_tampered.model_dump(),
+            )
+            tokenizer_source.write_text('{"text":"secure code"}\n', encoding="utf-8")
             calibration_200.write_text(calibration_200.read_text(encoding="utf-8") + "\n", encoding="utf-8")
             tampered = validate_scratch_training_chain(**kwargs)
             self.assertEqual(tampered.status, "failed")

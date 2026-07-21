@@ -86,6 +86,13 @@ class QualificationPolicy(StrictModel):
     canary_maximum_p95_latency_ms: float = Field(gt=0.0)
     canary_rollback_error_rate: float = Field(gt=0.0, le=1.0)
     canary_maximum_rollback_seconds: float = Field(gt=0.0, le=3600.0)
+    minimum_promoted_dataset_records: int = Field(default=100_000, ge=100_000)
+    required_tokenizer_vocab_size: int = Field(default=128_000, ge=1_000)
+    require_family_safe_tokenizer_split: bool = True
+    t4_minimum_hidden_size: int = Field(default=512, ge=128)
+    t4_minimum_layers: int = Field(default=8, ge=2)
+    t4_minimum_sequence_length: int = Field(default=256, ge=64)
+    maximum_checkpoint_reload_logit_difference: float = Field(default=0.005, ge=0.0)
 
     @model_validator(mode="after")
     def validate_policy(self) -> "QualificationPolicy":
@@ -681,21 +688,123 @@ def validate_training_proofs(
         return failed, soak
 
 
+def _verify_bound_file(
+    path: str,
+    expected_sha256: str,
+    *,
+    label: str,
+) -> Path:
+    if not path:
+        raise ValueError(f"{label} path is missing")
+    if HEX_SHA256.fullmatch(expected_sha256) is None:
+        raise ValueError(f"{label} SHA-256 is missing or invalid")
+    source = Path(path).expanduser().resolve(strict=True)
+    if not source.is_file():
+        raise ValueError(f"{label} is not a regular file")
+    if sha256_file(source) != expected_sha256:
+        raise ValueError(f"{label} SHA-256 mismatch")
+    return source
+
+
+def _validate_dataset_artifacts(dataset: ProductionDatasetManifest) -> list[str]:
+    blockers: list[str] = []
+    required = {
+        "train",
+        "val",
+        "test",
+        "split_manifest",
+        "promotion_decision",
+        "dedup_report",
+        "contamination_report",
+        "review_report",
+        "verified_patch_report",
+    }
+    for name in sorted(required):
+        path = str(dataset.artifacts.get(name) or "")
+        expected = str(dataset.artifact_sha256.get(name) or "")
+        try:
+            _verify_bound_file(path, expected, label=f"dataset artifact {name}")
+        except Exception as exc:
+            blockers.append(str(exc))
+    reports = dataset.reports if isinstance(dataset.reports, dict) else {}
+    trust = reports.get("dataset_trust_metrics")
+    split = reports.get("split_manifest")
+    if not isinstance(trust, dict):
+        blockers.append("dataset trust metrics are missing")
+    else:
+        required_values = {
+            "license_coverage": 1.0,
+            "provenance_coverage": 1.0,
+            "high_value_review_coverage": 1.0,
+            "verified_patch_evidence_coverage": 1.0,
+        }
+        for name, expected in required_values.items():
+            if float(trust.get(name, -1.0)) != expected:
+                blockers.append(f"dataset trust metric {name} must equal {expected}")
+        if float(trust.get("average_quality", 0.0)) < 0.80:
+            blockers.append("dataset average quality is below 0.80")
+        if float(trust.get("p10_quality", 0.0)) < 0.70:
+            blockers.append("dataset p10 quality is below 0.70")
+        if int(trust.get("secret_or_pii_hits", -1)) != 0:
+            blockers.append("dataset contains secret or disallowed PII findings")
+        if float(trust.get("maximum_source_token_fraction", 1.0)) > 0.20:
+            blockers.append("dataset single-source token share exceeds 20 percent")
+        if float(trust.get("maximum_source_family_token_fraction", 1.0)) > 0.35:
+            blockers.append("dataset source-family token share exceeds 35 percent")
+    if not isinstance(split, dict) or int(split.get("cross_split_group_collisions", -1)) != 0:
+        blockers.append("dataset split is not proven family-safe")
+    promotion = dataset.promotion_decision
+    checks = promotion.get("checks") if isinstance(promotion, dict) else None
+    if not isinstance(checks, dict) or not checks or not all(value is True for value in checks.values()):
+        blockers.append("dataset promotion checks are missing or contain a failure")
+    return blockers
+
+
 def validate_scratch_training_chain(
     *,
     calibration_200_decision: str | None,
     calibration_5k_decision: str | None,
     production_dataset_manifest: str | None,
     tokenizer_audit_report: str | None,
+    overfit_sanity_report: str | None,
     t4_1k_training_report: str | None,
     t4_10k_training_report: str | None,
     maximum_age_seconds: int,
+    policy: QualificationPolicy | None = None,
 ) -> QualificationCheck:
+    active_policy = policy or QualificationPolicy.model_validate(
+        {
+            "evidence_max_age_seconds": maximum_age_seconds,
+            "minimum_security_reviewers": 2,
+            "load_stages": [
+                {
+                    "name": "default",
+                    "concurrency": 1,
+                    "requests": 1,
+                    "streaming_requests": 0,
+                    "maximum_error_rate": 0.0,
+                    "maximum_p95_latency_ms": 30_000,
+                    "minimum_throughput_rps": 0.001,
+                }
+            ],
+            "required_training_proofs": ["required"],
+            "required_soak_seconds": [86_400, 604_800],
+            "required_security_domains": ["required"],
+            "required_canary_percentages": [100],
+            "minimum_internal_canary_users": 1,
+            "maximum_internal_canary_users": 1,
+            "canary_maximum_error_rate": 0.01,
+            "canary_maximum_p95_latency_ms": 30_000,
+            "canary_rollback_error_rate": 0.02,
+            "canary_maximum_rollback_seconds": 120,
+        }
+    )
     paths = {
         "calibration-200-decision": calibration_200_decision,
         "calibration-5k-decision": calibration_5k_decision,
         "production-dataset-manifest": production_dataset_manifest,
         "tokenizer-audit-report": tokenizer_audit_report,
+        "overfit-sanity-report": overfit_sanity_report,
         "t4-1k-training-report": t4_1k_training_report,
         "t4-10k-training-report": t4_10k_training_report,
     }
@@ -731,6 +840,7 @@ def validate_scratch_training_chain(
         tokenizer = TokenizerAuditReport.model_validate(
             load_json_evidence(bindings["tokenizer-audit-report"])
         )
+        overfit = load_json_evidence(bindings["overfit-sanity-report"])
         t4_reports = {
             "t4_1k": load_json_evidence(bindings["t4-1k-training-report"]),
             "t4_10k": load_json_evidence(bindings["t4-10k-training-report"]),
@@ -755,21 +865,80 @@ def validate_scratch_training_chain(
 
         if dataset.status != "promoted" or dataset.dev_smoke:
             blockers.append("production dataset manifest is not a non-smoke promoted version")
-        if int(dataset.metrics.get("promoted_records", 0)) < 100_000:
-            blockers.append("production dataset has fewer than 100,000 promoted records")
+        if int(dataset.metrics.get("promoted_records", 0)) < active_policy.minimum_promoted_dataset_records:
+            blockers.append(
+                "production dataset has fewer than "
+                f"{active_policy.minimum_promoted_dataset_records:,} promoted records"
+            )
         if dataset.advancement_decision_sha256 != bindings["calibration-5k-decision"].sha256:
             blockers.append("production dataset is not hash-bound to the supplied calibration_5k decision")
         if dataset.promotion_decision.get("status") != "promoted":
             blockers.append("dataset promotion decision is not promoted")
+        blockers.extend(_validate_dataset_artifacts(dataset))
 
         if (
             tokenizer.status != "passed"
-            or tokenizer.vocab_size_requested != 128_000
-            or tokenizer.vocab_size_actual != 128_000
+            or tokenizer.vocab_size_requested != active_policy.required_tokenizer_vocab_size
+            or tokenizer.vocab_size_actual != active_policy.required_tokenizer_vocab_size
             or tokenizer.special_tokens_missing
             or tokenizer.audit_failures
         ):
             blockers.append("128k tokenizer qualification did not pass")
+        if tokenizer.dataset_manifest_sha256 != bindings["production-dataset-manifest"].sha256:
+            blockers.append("tokenizer is not hash-bound to the supplied production dataset manifest")
+        if active_policy.require_family_safe_tokenizer_split and (
+            not tokenizer.family_safe_split
+            or tokenizer.split_strategy != "pre_split_family_safe"
+        ):
+            blockers.append("tokenizer corpus split is not family-safe")
+        tokenizer_bound_files = {
+            "tokenizer": (tokenizer.tokenizer_path, tokenizer.tokenizer_sha256),
+            "tokenizer manifest": (
+                tokenizer.tokenizer_manifest_path,
+                tokenizer.tokenizer_manifest_sha256,
+            ),
+            "token shard manifest": (
+                tokenizer.shard_manifest_path,
+                tokenizer.shard_manifest_sha256,
+            ),
+            "token efficiency report": (
+                tokenizer.efficiency_report_path,
+                tokenizer.efficiency_report_sha256,
+            ),
+        }
+        for label, (path, expected) in tokenizer_bound_files.items():
+            try:
+                _verify_bound_file(path, expected, label=label)
+            except Exception as exc:
+                blockers.append(str(exc))
+        for source_path, expected in tokenizer.source_sha256.items():
+            try:
+                _verify_bound_file(source_path, expected, label="tokenizer source")
+            except Exception as exc:
+                blockers.append(str(exc))
+        shard_payload = tokenizer.shard_manifest
+        if str(shard_payload.get("tokenizer_sha256") or "") != tokenizer.tokenizer_sha256:
+            blockers.append("token shard manifest tokenizer hash mismatch")
+        if str(shard_payload.get("dataset_manifest_sha256") or "") != tokenizer.dataset_manifest_sha256:
+            blockers.append("token shard manifest dataset hash mismatch")
+        if str(shard_payload.get("split_strategy") or "") != tokenizer.split_strategy:
+            blockers.append("token shard manifest split strategy mismatch")
+
+        if not isinstance(overfit, dict) or overfit.get("status") != "passed":
+            blockers.append("controlled overfit sanity did not pass")
+        else:
+            relative_drop = float(overfit.get("relative_loss_drop", -1.0))
+            required_drop = float(overfit.get("required_relative_loss_drop", 0.20))
+            if not math.isfinite(relative_drop) or relative_drop < max(0.20, required_drop):
+                blockers.append("controlled overfit loss did not drop by the required amount")
+            overfit_training = overfit.get("training_report")
+            if not isinstance(overfit_training, dict) or overfit_training.get("scratch_only") is not True:
+                blockers.append("controlled overfit report is not bound to a scratch training run")
+            elif (
+                overfit_training.get("checkpoint_reload_verified") is not True
+                or overfit_training.get("checkpoint_reload_logit_parity") is not True
+            ):
+                blockers.append("controlled overfit checkpoint reload parity did not pass")
 
         required_steps = {"t4_1k": 1_000, "t4_10k": 10_000}
         for name, payload in t4_reports.items():
@@ -785,24 +954,69 @@ def validate_scratch_training_chain(
                 blockers.append(f"{name} did not complete {required_steps[name]} measured steps")
             if payload.get("checkpoint_reload_verified") is not True:
                 blockers.append(f"{name} checkpoint reload was not verified")
+            if payload.get("checkpoint_reload_logit_parity") is not True:
+                blockers.append(f"{name} checkpoint reload logit parity was not verified")
+            reload_difference = float(
+                payload.get("checkpoint_reload_max_abs_logit_difference", math.inf)
+            )
             if (
-                int(model.get("hidden_size", 0)) < 512
-                or int(model.get("num_layers", 0)) < 8
-                or int(model.get("max_sequence_length", 0)) < 256
+                not math.isfinite(reload_difference)
+                or reload_difference > active_policy.maximum_checkpoint_reload_logit_difference
+            ):
+                blockers.append(f"{name} checkpoint reload logit difference exceeded policy")
+            if (
+                int(model.get("hidden_size", 0)) < active_policy.t4_minimum_hidden_size
+                or int(model.get("num_layers", 0)) < active_policy.t4_minimum_layers
+                or int(model.get("max_sequence_length", 0)) < active_policy.t4_minimum_sequence_length
             ):
                 blockers.append(f"{name} model is below the T4 technical qualification profile")
+            if int(model.get("vocab_size", 0)) != active_policy.required_tokenizer_vocab_size:
+                blockers.append(f"{name} model vocabulary does not match the qualified tokenizer")
+            if payload.get("dataset_manifest_sha256") != tokenizer.shard_manifest_sha256:
+                blockers.append(f"{name} training dataset does not match the qualified shard manifest")
+            if payload.get("shard_manifest_sha256") != tokenizer.shard_manifest_sha256:
+                blockers.append(f"{name} shard manifest lineage mismatch")
+            if payload.get("tokenizer_sha256") != tokenizer.tokenizer_sha256:
+                blockers.append(f"{name} tokenizer lineage mismatch")
+            git_revision = str(payload.get("git_commit") or "")
+            if re.fullmatch(r"[0-9a-f]{40}", git_revision) is None:
+                blockers.append(f"{name} Git commit binding is missing or invalid")
+            for field in ("checkpoint_manifest", "best_checkpoint_manifest"):
+                digest_field = f"{field}_sha256"
+                try:
+                    _verify_bound_file(
+                        str(payload.get(field) or ""),
+                        str(payload.get(digest_field) or ""),
+                        label=f"{name} {field.replace('_', ' ')}",
+                    )
+                except Exception as exc:
+                    blockers.append(str(exc))
             losses = payload.get("train_losses")
             if not isinstance(losses, list) or not losses or any(
                 not isinstance(value, (int, float)) or not math.isfinite(float(value))
                 for value in losses
             ):
                 blockers.append(f"{name} training loss evidence is missing or non-finite")
+            validation_losses = payload.get("validation_losses")
+            if not isinstance(validation_losses, list) or not validation_losses:
+                blockers.append(f"{name} validation loss evidence is missing")
+            elif any(
+                not isinstance(row, dict)
+                or not isinstance(row.get("loss"), (int, float))
+                or not math.isfinite(float(row["loss"]))
+                for row in validation_losses
+            ):
+                blockers.append(f"{name} validation loss evidence is non-finite")
 
         metrics = {
             "calibration_200": calibration_200.status,
             "calibration_5k": calibration_5k.status,
             "promoted_records": int(dataset.metrics.get("promoted_records", 0)),
+            "dataset_manifest_sha256": bindings["production-dataset-manifest"].sha256,
             "tokenizer_vocab_size": tokenizer.vocab_size_actual,
+            "tokenizer_sha256": tokenizer.tokenizer_sha256,
+            "token_shard_manifest_sha256": tokenizer.shard_manifest_sha256,
+            "overfit_relative_loss_drop": float(overfit.get("relative_loss_drop", -1.0)),
             "t4_1k_steps": int(t4_reports["t4_1k"].get("steps", 0)),
             "t4_10k_steps": int(t4_reports["t4_10k"].get("steps", 0)),
         }
@@ -1337,9 +1551,11 @@ async def run_qualification(args: argparse.Namespace) -> tuple[ProductionQualifi
         calibration_5k_decision=args.calibration_5k_decision,
         production_dataset_manifest=args.production_dataset_manifest,
         tokenizer_audit_report=args.tokenizer_audit_report,
+        overfit_sanity_report=args.overfit_sanity_report,
         t4_1k_training_report=args.t4_1k_training_report,
         t4_10k_training_report=args.t4_10k_training_report,
         maximum_age_seconds=policy.evidence_max_age_seconds,
+        policy=policy,
     )
     observability = await check_observability(
         metrics_url=args.metrics_url,
@@ -1449,6 +1665,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-5k-decision")
     parser.add_argument("--production-dataset-manifest")
     parser.add_argument("--tokenizer-audit-report")
+    parser.add_argument("--overfit-sanity-report")
     parser.add_argument("--t4-1k-training-report")
     parser.add_argument("--t4-10k-training-report")
     parser.add_argument("--manual-security-review")

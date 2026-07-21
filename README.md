@@ -385,6 +385,7 @@ python -m src.aeitron.deployment.production_qualification `
   --calibration-5k-decision artifacts\aeitron\calibration-5k-v1\calibration_decision.json `
   --production-dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
   --tokenizer-audit-report artifacts\aeitron\tokenizer-128k\tokenizer_audit_report.json `
+  --overfit-sanity-report artifacts\aeitron\overfit-sanity\overfit_sanity_report.json `
   --t4-1k-training-report artifacts\aeitron\t4-1k\pretrain_report.json `
   --t4-10k-training-report artifacts\aeitron\t4-10k\pretrain_report.json `
   --manual-security-review C:\AeitronGovernance\manual-security-review.json `

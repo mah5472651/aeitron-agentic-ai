@@ -830,6 +830,30 @@ def save_training_checkpoint(
     return manifest_path
 
 
+def checkpoint_logit_probe(
+    model: "torch.nn.Module",
+    *,
+    config: ScratchDecoderConfig,
+    device: "torch.device",
+) -> "torch.Tensor":
+    """Capture deterministic logits used to prove a checkpoint reload is exact enough."""
+    sequence_length = min(8, config.max_sequence_length)
+    token_ids = torch.arange(sequence_length, dtype=torch.long, device=device).remainder(
+        config.vocab_size
+    )
+    was_training = bool(model.training)
+    model.eval()
+    try:
+        with torch.no_grad():
+            output = model(token_ids.unsqueeze(0), use_cache=False)
+            logits = output.logits.detach().float().cpu().clone()
+    finally:
+        model.train(was_training)
+    if not torch.isfinite(logits).all():
+        raise RuntimeError("checkpoint parity probe produced non-finite logits")
+    return logits
+
+
 def load_checkpoint(
     checkpoint_path: Path,
     *,
@@ -923,6 +947,29 @@ def validate_production_training_args(
         failures.append("production mode requires a tokenizer path in the shard manifest")
     if tokenizer_path and not Path(tokenizer_path).exists():
         failures.append("production mode tokenizer_path does not exist")
+    if not active_manifest.val_shards or active_manifest.val_tokens < active_manifest.sequence_length:
+        failures.append("production mode requires a non-empty validation shard set")
+    if active_manifest.split_strategy != "pre_split_family_safe":
+        failures.append("production mode requires a pre-split family-safe token corpus")
+    if not active_manifest.dataset_manifest_path or not active_manifest.dataset_manifest_sha256:
+        failures.append("production mode requires a promoted dataset manifest binding")
+    else:
+        dataset_manifest = Path(active_manifest.dataset_manifest_path)
+        if not dataset_manifest.is_file() or sha256_file(dataset_manifest) != active_manifest.dataset_manifest_sha256:
+            failures.append("production dataset manifest binding failed integrity verification")
+    tokenizer_source = Path(active_manifest.tokenizer_path)
+    if (
+        not active_manifest.tokenizer_sha256
+        or not tokenizer_source.is_file()
+        or sha256_file(tokenizer_source) != active_manifest.tokenizer_sha256
+    ):
+        failures.append("production tokenizer binding failed integrity verification")
+    if not active_manifest.source_sha256:
+        failures.append("production token shards require immutable source bindings")
+    for source_path, expected_sha256 in active_manifest.source_sha256.items():
+        source = Path(source_path)
+        if not source.is_file() or sha256_file(source) != expected_sha256:
+            failures.append(f"production tokenizer source binding failed: {source_path}")
     if validate_every <= 0 or validate_every > run_steps:
         failures.append("production mode requires validation to run inside the requested step count")
     if checkpoint_every <= 0:
@@ -1136,6 +1183,7 @@ def run_pretraining_loop(
                 validation_fraction=0.1,
             ),
         )
+        active_manifest_path = (root / "generated-shards" / "manifest.json").resolve()
     elif active_manifest_path is not None:
         active_manifest = load_manifest(active_manifest_path)
     else:
@@ -1273,6 +1321,7 @@ def run_pretraining_loop(
         "dataloader_prefetch_batches": dataloader_prefetch_batches,
         "dataloader_seed": dataloader_seed,
         "runtime_versions": runtime_versions,
+        "environment": checkpoint_environment,
     }
     start_step = 0
     trained_tokens = 0
@@ -1515,6 +1564,7 @@ def run_pretraining_loop(
         )
         best_val_loss = final_val_loss
         best_val_step = current_step
+    pre_reload_logits = checkpoint_logit_probe(model, config=config, device=selected)
     reload_source = latest_checkpoint(root)
     if reload_source is None:
         raise RuntimeError("final checkpoint was not discoverable for reload verification")
@@ -1532,6 +1582,20 @@ def run_pretraining_loop(
         raise RuntimeError(
             "checkpoint reload state mismatch: "
             f"step={reloaded_step}/{current_step}, tokens={reloaded_tokens}/{trained_tokens}"
+        )
+    post_reload_logits = checkpoint_logit_probe(model, config=config, device=selected)
+    reload_max_abs_logit_difference = float(
+        torch.max(torch.abs(pre_reload_logits - post_reload_logits)).item()
+    )
+    reload_tolerance = 1e-6 if dtype == "fp32" else 5e-3
+    checkpoint_reload_logit_parity = (
+        math.isfinite(reload_max_abs_logit_difference)
+        and reload_max_abs_logit_difference <= reload_tolerance
+    )
+    if not checkpoint_reload_logit_parity:
+        raise RuntimeError(
+            "checkpoint reload logit parity failed: "
+            f"max_abs_difference={reload_max_abs_logit_difference}, tolerance={reload_tolerance}"
         )
     distributed_barrier()
     checkpoint_publication = None
@@ -1573,6 +1637,16 @@ def run_pretraining_loop(
         "dev_smoke": dev_smoke,
         "max_training_loss": max_training_loss,
         "git_commit": git_commit(),
+        "dataset_manifest_path": str(active_manifest_path or ""),
+        "dataset_manifest_sha256": (
+            sha256_file(active_manifest_path) if active_manifest_path else ""
+        ),
+        "tokenizer_path": str(local_tokenizer),
+        "tokenizer_sha256": sha256_file(local_tokenizer),
+        "shard_manifest_path": str(active_manifest_path or ""),
+        "shard_manifest_sha256": (
+            sha256_file(active_manifest_path) if active_manifest_path else ""
+        ),
         "train_losses": train_losses,
         "mtp_losses": mtp_losses,
         "router_metrics": {
@@ -1593,7 +1667,12 @@ def run_pretraining_loop(
         "target_tokens": target_tokens,
         "runtime_versions": runtime_versions,
         "checkpoint_manifest": str(manifest_path),
+        "checkpoint_manifest_sha256": sha256_file(manifest_path),
+        "best_checkpoint_manifest_sha256": sha256_file(best_checkpoint_manifest),
         "checkpoint_reload_verified": True,
+        "checkpoint_reload_logit_parity": checkpoint_reload_logit_parity,
+        "checkpoint_reload_max_abs_logit_difference": reload_max_abs_logit_difference,
+        "checkpoint_reload_tolerance": reload_tolerance,
         "checkpoint_publication": checkpoint_publication,
         "duration_ms": round((time.perf_counter() - started) * 1000, 3),
     }

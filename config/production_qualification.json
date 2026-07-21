@@ -72,5 +72,12 @@
   "canary_maximum_error_rate": 0.01,
   "canary_maximum_p95_latency_ms": 30000,
   "canary_rollback_error_rate": 0.02,
-  "canary_maximum_rollback_seconds": 120
+  "canary_maximum_rollback_seconds": 120,
+  "minimum_promoted_dataset_records": 100000,
+  "required_tokenizer_vocab_size": 128000,
+  "require_family_safe_tokenizer_split": true,
+  "t4_minimum_hidden_size": 512,
+  "t4_minimum_layers": 8,
+  "t4_minimum_sequence_length": 256,
+  "maximum_checkpoint_reload_logit_difference": 0.005
 }

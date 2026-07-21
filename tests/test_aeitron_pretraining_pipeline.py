@@ -33,6 +33,7 @@ from src.aeitron.model_ops.learning_validation import (
     write_instruction_corpus,
 )
 from src.aeitron.model_ops.tokenizer_pipeline import (
+    _load_production_dataset_binding,
     RealCorpusTokenizerConfig,
     ShardBuildConfig,
     ShardManifest,
@@ -46,6 +47,57 @@ from src.aeitron.model_ops.torch_decoder import model_profile
 
 
 class AeitronPretrainingPipelineTest(unittest.TestCase):
+    def test_production_tokenizer_requires_hash_bound_family_safe_dataset_splits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            train = root / "train.jsonl"
+            val = root / "val.jsonl"
+            split = root / "split.json"
+            promotion = root / "promotion.json"
+            train.write_text('{"text":"secure train"}\n', encoding="utf-8")
+            val.write_text('{"text":"secure validation"}\n', encoding="utf-8")
+            split.write_text('{"cross_split_group_collisions":0}', encoding="utf-8")
+            promotion.write_text('{"status":"promoted"}', encoding="utf-8")
+            artifacts = {
+                "train": str(train),
+                "val": str(val),
+                "split_manifest": str(split),
+                "promotion_decision": str(promotion),
+            }
+            manifest = root / "dataset_version_manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "status": "promoted",
+                        "dev_smoke": False,
+                        "metrics": {"promoted_records": 100_000},
+                        "artifacts": artifacts,
+                        "artifact_sha256": {
+                            name: sha256_file(path) for name, path in artifacts.items()
+                        },
+                        "reports": {
+                            "split_manifest": {"cross_split_group_collisions": 0}
+                        },
+                        "advancement_decision_sha256": "a" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = RealCorpusTokenizerConfig(
+                input_paths=[str(train)],
+                validation_input_paths=[str(val)],
+                output_dir=str(root / "tokenizer"),
+                production_mode=True,
+                include_stress_samples=False,
+                dataset_manifest_path=str(manifest),
+            )
+            digest, payload = _load_production_dataset_binding(config)
+            self.assertEqual(digest, sha256_file(manifest))
+            self.assertEqual(payload["status"], "promoted")
+            train.write_text('{"text":"tampered"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "artifact integrity"):
+                _load_production_dataset_binding(config)
+
     def test_artifact_cache_accepts_absolute_file_and_enforces_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
