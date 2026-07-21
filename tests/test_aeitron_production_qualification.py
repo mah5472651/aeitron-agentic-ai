@@ -390,6 +390,50 @@ class AeitronProductionQualificationTest(unittest.TestCase):
                 valid = validate_scratch_training_chain(**kwargs)
             self.assertEqual(valid.status, "passed", valid.model_dump())
             replay.assert_called_once_with(str(dataset), trust_policy_path=str(root / "trust-policy.json"))
+            tokenizer_promotion = root / "tokenizer-promotion.json"
+            tokenizer_promotion.write_text('{"status":"promoted"}', encoding="utf-8")
+            evidence_policy = build_policy().model_copy(
+                update={
+                    "tokenizer_selection_mode": "evidence_selected",
+                    "required_tokenizer_vocab_size": None,
+                }
+            )
+            experiment_manifest = SimpleNamespace(
+                experiment_id="tokenizer-selection-test",
+                campaign=SimpleNamespace(
+                    experiment_type="tokenizer_selection",
+                    candidate_vocab_sizes=[32_000, 64_000, 128_000],
+                ),
+                bindings={
+                    "dataset_manifest": SimpleNamespace(sha256=sha256_file(dataset))
+                },
+            )
+            with (
+                patch(
+                    "src.aeitron.deployment.production_qualification.validate_dataset_manifest_for_promotion",
+                    return_value=ProductionDatasetManifest.model_validate(dataset_contract),
+                ),
+                patch(
+                    "src.aeitron.deployment.production_qualification.verify_promotion_chain",
+                    return_value=(
+                        SimpleNamespace(
+                            status="promoted",
+                            promoted_candidate="128000",
+                            promotion_sha256="9" * 64,
+                        ),
+                        SimpleNamespace(status="passed"),
+                        SimpleNamespace(status="passed"),
+                        experiment_manifest,
+                    ),
+                ),
+            ):
+                selected = validate_scratch_training_chain(
+                    **kwargs,
+                    tokenizer_selection_promotion=str(tokenizer_promotion),
+                    policy=evidence_policy,
+                )
+            self.assertEqual(selected.status, "passed", selected.model_dump())
+            self.assertEqual(selected.metrics["tokenizer_experiment_id"], "tokenizer-selection-test")
             with patch(
                 "src.aeitron.deployment.production_qualification.validate_dataset_manifest_for_promotion",
                 side_effect=ValueError("stale legal approval evidence"),

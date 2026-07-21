@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "campaigns": [
     {
       "campaign_id": "defensive-staircase-v1",
@@ -37,6 +37,82 @@
         "require_passing_evaluation": true,
         "require_same_dataset_and_tokenizer": true,
         "maximum_validation_regression": 0.03
+      }
+    }
+  ],
+  "scientific_experiments": [
+    {
+      "campaign_id": "tokenizer-selection-v1",
+      "version": 1,
+      "experiment_type": "tokenizer_selection",
+      "description": "Evidence-selected 32K, 64K, and 128K tokenizer comparison on one governed family-safe corpus.",
+      "hypothesis": "The smallest vocabulary within one aggregate point of the best downstream result minimizes model cost without sacrificing code or security quality.",
+      "training_profile_id": "fundamentals-validation",
+      "candidate_vocab_sizes": [32000, 64000, 128000],
+      "tokenizer_seeds": [1337, 2027, 4099],
+      "token_budget": 2048000,
+      "required_evaluation_suites": ["HumanEval", "MBPP", "AeitronDefensiveSecurity", "AeitronRepositoryScorecard"],
+      "gate": {
+        "maximum_tokenizer_noninferiority_gap": 0.01,
+        "require_executable_evaluation": true,
+        "require_checkpoint_reload_parity": true,
+        "require_zero_dropped_tokens": true
+      }
+    },
+    {
+      "campaign_id": "dense-moe-ab-v1",
+      "version": 1,
+      "experiment_type": "architecture_ab",
+      "description": "Iso-active-parameter and iso-training-FLOP dense versus MLA/MoE comparison through a preregistered 1B confirmation.",
+      "hypothesis": "MLA/MoE should advance only if it produces at least two percent relative validation-loss or benchmark improvement without security, foundation, or routing regressions.",
+      "training_profile_id": "aeitron-1b-single-node",
+      "profile_seeds": {
+        "100m": [1337, 2027, 4099],
+        "100m_moe": [1337, 2027, 4099],
+        "300m": [1337, 2027, 4099],
+        "300m_moe": [1337, 2027, 4099],
+        "1b": [7331],
+        "1b_moe": [7331]
+      },
+      "token_budget": 30000000000,
+      "required_evaluation_suites": ["HumanEval", "MBPP", "AeitronDefensiveSecurity", "AeitronRepositoryScorecard"],
+      "gate": {
+        "minimum_relative_validation_improvement": 0.02,
+        "minimum_benchmark_point_improvement": 0.02,
+        "maximum_foundation_regression": 0.0,
+        "maximum_security_regression": 0.0,
+        "maximum_router_p99_to_mean": 1.2,
+        "require_executable_evaluation": true,
+        "require_checkpoint_reload_parity": true,
+        "require_zero_dropped_tokens": true
+      }
+    },
+    {
+      "campaign_id": "dense-scaling-law-v1",
+      "version": 1,
+      "experiment_type": "scaling_law",
+      "description": "Dense scratch-model scaling study used to estimate whether a 7B experiment is scientifically justified.",
+      "hypothesis": "Four distinct parameter and token scales can predict held-out validation loss within five percent before committing to the 7B run.",
+      "training_profile_id": "aeitron-1b-single-node",
+      "profile_seeds": {
+        "50m": [1337, 2027, 4099],
+        "100m": [1337, 2027, 4099],
+        "300m": [1337, 2027],
+        "1b": [7331]
+      },
+      "profile_token_budgets": {
+        "50m": [1000000000, 3000000000, 10000000000],
+        "100m": [1000000000, 3000000000, 10000000000],
+        "300m": [1000000000, 3000000000, 10000000000],
+        "1b": [3000000000, 10000000000, 30000000000]
+      },
+      "token_budget": 30000000000,
+      "required_evaluation_suites": ["HumanEval", "MBPP", "AeitronDefensiveSecurity", "AeitronRepositoryScorecard"],
+      "gate": {
+        "maximum_scaling_holdout_mape": 0.05,
+        "require_executable_evaluation": true,
+        "require_checkpoint_reload_parity": true,
+        "require_zero_dropped_tokens": true
       }
     }
   ]

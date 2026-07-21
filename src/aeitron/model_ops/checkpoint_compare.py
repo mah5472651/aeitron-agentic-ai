@@ -8,7 +8,7 @@ import math
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -137,6 +137,8 @@ class CheckpointComparisonReport(StrictModel):
     regressed_tasks: list[str]
     unchanged_tasks: list[str]
     recommendation: str
+    evaluation_authority: Literal["diagnostic_keyword"] = "diagnostic_keyword"
+    promotion_eligible: Literal[False] = False
     created_at_unix: float = Field(default_factory=time.time)
 
     def write(self, output_dir: str | Path) -> Path:

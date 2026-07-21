@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "evidence_max_age_seconds": 86400,
   "minimum_security_reviewers": 2,
   "require_report_signature_in_production": true,
@@ -74,7 +74,8 @@
   "canary_rollback_error_rate": 0.02,
   "canary_maximum_rollback_seconds": 120,
   "minimum_promoted_dataset_records": 100000,
-  "required_tokenizer_vocab_size": 128000,
+  "tokenizer_selection_mode": "evidence_selected",
+  "required_tokenizer_vocab_size": null,
   "require_family_safe_tokenizer_split": true,
   "t4_minimum_hidden_size": 512,
   "t4_minimum_layers": 8,

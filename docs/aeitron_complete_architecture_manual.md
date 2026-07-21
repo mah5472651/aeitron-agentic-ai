@@ -20,8 +20,11 @@ under `src/aeitron`.
 
 This roadmap is the default rule for future Aeitron work:
 
-- Scratch-only model development. Aeitron must not add external foundation-model
-  fine-tuning, SFT, DPO, GRPO, LoRA, QLoRA, or RLHF paths.
+- Scratch-origin model development. Aeitron must not import external model
+  weights, adapt third-party checkpoints, or add LoRA/QLoRA/adapter paths.
+  After the 1B foundation proof passes, Aeitron-owned weights may enter a
+  separately governed full-parameter instruction, tool-use, or execution-
+  grounded continuation stage with executable regression gates.
 - Production-grade implementation only. New code must use explicit validation,
   fail-fast dependency checks, secure defaults, durable artifacts, and real
   tests. It must not claim readiness without evidence.
@@ -65,9 +68,10 @@ architecture. It has:
 - Postgres/Redis/MinIO/Kubernetes deployment assets
 - data quality, contamination, review, and benchmark feedback loops
 
-Aeitron is scratch-only. Borrowed-model training and borrowed-model quality
+Aeitron is scratch-origin. Borrowed-model training and borrowed-model quality
 baselines are not part of the architecture. The `mock` backend exists only as a
-plumbing test double.
+plumbing test double. A future full-parameter continuation stage may update
+qualified Aeitron-owned weights, but cannot use borrowed weights or adapters.
 
 ## Architecture Map
 
@@ -2251,16 +2255,15 @@ Files:
 - `src/aeitron/learning/ablation_runner.py`
 - `src/aeitron/model_ops/pretrain_loop.py`
 - `src/aeitron/model_ops/tokenizer_pipeline.py`
-- `src/aeitron/model_ops/sharding.py`
 
 Purpose:
 
 This layer controls checkpoint promotion, data composition, tokenizer/shard
-preparation, and scratch pretraining. Aeitron does not include any post-training
-adaptation path. Every model weight update must come from the scratch
-pretraining stack using Aeitron-owned checkpoints and governed datasets. This
-keeps the architecture simple, auditable, and consistent with the no-borrowed-
-model policy.
+preparation, scratch pretraining, and scientific model selection. Every model
+originates from random Aeitron initialization. A separately governed future
+stage may continue training Aeitron-owned weights with full-parameter
+instruction, tool-use, or execution-grounded objectives only after the 1B
+foundation gate. Borrowed checkpoints and adapter training remain prohibited.
 
 Checkpoint eval loop:
 
@@ -2313,12 +2316,15 @@ python -m src.aeitron.learning.mixer `
   --tokenizer-path artifacts\\aeitron\tokenizer\tokenizer.json
 ```
 
-Ablation runner:
+Ablation and scientific experiment authority:
 
-The ablation runner executes every configured mix experiment against the same
-clean corpus and writes `ablation_report.json` plus a Markdown summary. It is
-used to compare whether a general-heavy, domain-heavy, or domain-extreme corpus
-produces better downstream checkpoint eval results.
+Legacy invocation prepares each configured data mix and writes
+`ablation_report.json` with status `prepared_not_evaluated`. That report cannot
+promote a tokenizer, architecture, or checkpoint. The same module owns the
+authoritative `plan -> run/resume -> inspect/compare -> decide -> promote`
+scientific state machine. It binds governed data/splits, optimizer and
+evaluation policy, model contracts, seeds, token/FLOP budgets, Git/container
+identity, checkpoints, tokenizer audits, and executable evaluations.
 
 Command:
 
@@ -2329,17 +2335,49 @@ python -m src.aeitron.learning.ablation_runner `
   --output-dir artifacts\\aeitron\mix-ablation
 ```
 
+Controlled tokenizer selection starts with:
+
+```powershell
+python -m src.aeitron.learning.ablation_runner plan `
+  --campaign tokenizer-selection-v1 `
+  --dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
+  --split-manifest data\production\aeitron-foundation-v1\split_manifest.json `
+  --optimizer-policy config\training_profiles.json `
+  --evaluation-manifest data\eval\protected\protected_benchmark_manifest.json `
+  --tokenizer-manifest 32000=artifacts\aeitron\tokenizers\32k\tokenizer_manifest.json `
+  --tokenizer-manifest 64000=artifacts\aeitron\tokenizers\64k\tokenizer_manifest.json `
+  --tokenizer-manifest 128000=artifacts\aeitron\tokenizers\128k\tokenizer_manifest.json `
+  --container-digest "aeitron-training@sha256:<64-hex-digest>" `
+  --output-dir artifacts\aeitron\experiments\tokenizer-selection-v1
+```
+
+Each planned arm must be executed through the existing trainer/workspace and
+write one hash-bound arm-evidence JSON object. Missing arms remain `blocked`;
+the authority never invents a score. Tokenizer manifests bind the actual
+tokenizer and shard hashes to the same family-safe dataset. Tokenizer selection
+compares 32K, 64K, and 128K and promotes the smallest vocabulary within one
+downstream aggregate point of the best result. A larger vocabulary outside that
+boundary must also have non-overlapping downstream confidence evidence.
+
+Architecture and scaling campaigns pass one
+`--tokenizer-manifest selected=<path>` argument. Model parameter accounting is
+then regenerated for the evidence-selected vocabulary. Scaling campaigns use
+crossed token budgets at each model size, additive parameter/data power-law
+fitting, leave-one-shape-out error, bootstrap confidence intervals, predicted
+7B/32B FLOPs, and compute-optimal parameter/token estimates. A decision locks
+the experiment permanently; changed evidence requires a new preregistered run.
+
 Scratch-only training rule:
 
 1. Raw crawl rows never train directly.
 2. Only promoted rows from the data gate enter tokenizer training, sharding, or
    scratch pretraining.
-3. Instruction-like, repair-like, and safety-related examples are treated as
-   ordinary pretraining/curriculum text unless a future architecture decision
-   explicitly reopens a separate post-training stage.
-4. There is no adapter-based, pairwise post-training, or external-checkpoint
-   tuning path in Aeitron.
-5. Checkpoints are promoted only through validation loss, benchmark gates,
+3. Before the 1B proof, instruction-like, repair-like, and safety-related
+   examples are ordinary causal-pretraining curriculum text.
+4. After the 1B proof, only a separately governed Aeitron-owned full-parameter
+   continuation stage may introduce instruction/tool/execution objectives.
+5. There is no adapter-based or external-checkpoint tuning path in Aeitron.
+6. Checkpoints are promoted only through validation loss, benchmark gates,
    security gates, and regression comparison.
 
 Scratch pretraining command:
@@ -4814,7 +4852,8 @@ operational gates, not completed proofs:
 4. a corrected 200-record calibration and then a 5,000-record calibration pass;
 5. the one-million-fingerprint scale report passes;
 6. the first 100,000-record version reaches `promoted`;
-7. the 128,000-token tokenizer is trained only from that promoted version;
+7. 32K, 64K, and 128K tokenizer candidates are trained only from that promoted
+   version and the scientific authority selects the production vocabulary;
 8. T4 1k/10k qualification runs bind the promoted manifest and tokenizer;
 9. only a checkpoint that passes evaluation and reload parity becomes the
    native active backend.
@@ -4955,7 +4994,7 @@ The bundle status is always `awaiting_human_legal_approval` and
 `approval.json` can authorize a source.
 
 The final production authority has a `--scratch-chain-only` mode for the full
-200 -> 5K -> 100K -> 128K tokenizer -> overfit -> T4 1K -> T4 10K ladder. It
+200 -> 5K -> 100K -> evidence-selected tokenizer -> overfit -> T4 1K -> T4 10K ladder. It
 persists a canonical SHA-256 report, names the first missing stage, verifies
 freshness and every bound file, and replays the production dataset through the
 Dataset Authority. This replay recursively verifies both calibration decisions
@@ -5278,12 +5317,15 @@ evidence, and immutable promotion manifests. Raw crawl rows cannot train.
 
 ### Tokenizer qualification
 
-The production tokenizer has exactly 128,000 vocabulary entries. The
-real-corpus audit now fails when `vocab_size_actual != vocab_size_requested`;
-it does not pad a small corpus with fake tokens. It also requires all Aeitron
-control tokens and reports code indentation, hexadecimal/address, compile-log,
-and source/shard evidence. The tokenizer hash is bound to the promoted dataset
-and later checkpoint manifests.
+Production tokenizer size is evidence-selected from exactly 32K, 64K, and
+128K candidates. Every individual audit fails when its actual vocabulary does
+not equal its requested vocabulary; no candidate is padded with fake tokens.
+All candidates require Aeitron control tokens and report code indentation,
+hexadecimal/address, compile-log, language, patch, source, and shard evidence.
+The experiment promotes the smallest candidate within one downstream aggregate
+point of the best measured result. Production qualification replays the full
+promotion chain and requires the selected vocabulary, tokenizer audit, model
+vocabulary, dataset hash, and shard hash to match.
 
 ### Executable model evaluation
 
@@ -5386,7 +5428,7 @@ dependencies and reverse caller edges. A supported-language parser dependency
 may fall back to line chunks in development, but production rejects the run.
 
 `Aeitron-Code-Embed-v1` is a random-initialized 12-layer, 768-hidden dual
-encoder contract using the governed 128K tokenizer and symmetric InfoNCE. A
+encoder contract using the governed evidence-selected tokenizer and symmetric InfoNCE. A
 production embedding service is rejected unless its manifest proves
 `scratch_only=true`, `borrowed_weights=false`, matching dimensions and valid
 tokenizer/checkpoint hashes. The model implementation exists, but no trained
@@ -5588,6 +5630,7 @@ cross-cutting concern:
 | Versioned configuration contracts | `shared.config_contracts` |
 | Independent two-reviewer predicate | `learning.training_data_gate` |
 | Hardened host tool schemas and policy | `tools.policy` |
+| Scientific experiment and model-selection decision | `learning.ablation_runner` |
 | Final production release decision | `deployment.production_qualification` |
 
 Compatibility facades may preserve old imports, but they do not reimplement
@@ -5599,17 +5642,18 @@ report to pass in addition to tests.
 The final qualifier binds the data/model progression as immutable evidence.
 The 5k decision must contain the supplied 200 decision file hash. The promoted
 100k manifest must contain the supplied 5k decision file hash. The tokenizer
-audit must report exactly 128,000 requested and actual vocabulary entries with
-no missing special tokens or audit failures. It must bind the exact promoted
+audit must match the 32K/64K/128K scientific promotion winner in both requested
+and actual vocabulary, with no missing special tokens or audit failures. It
+must bind the complete experiment decision chain and exact promoted
 dataset-manifest hash, tokenizer bytes, family-safe train/validation sources,
 token shards, tokenizer manifest and token-efficiency report. The qualifier
 re-hashes every bound file and validates license/provenance/review/patch
 coverage, quality percentiles, source caps, split collisions and all dataset
 promotion checks. A controlled scratch overfit report must show at least a 20%
 relative loss drop and checkpoint logit parity. T4 qualification reports must
-be scratch-only, complete at least 1,000 and 10,000 measured steps respectively,
-use at least the 512-hidden/8-layer/256-context/128K-vocabulary technical
-profile, contain finite training and validation losses, bind the qualified
+be scratch-origin, complete at least 1,000 and 10,000 measured steps respectively,
+use at least the 512-hidden/8-layer/256-context technical profile with the
+selected vocabulary, contain finite training and validation losses, bind the qualified
 dataset/tokenizer/shard/Git/checkpoint hashes, and prove state plus fixed-token
 logit parity after checkpoint reload.
 
@@ -5623,7 +5667,7 @@ facts to `passed`.
 ### One architecture authority
 
 `src/aeitron/model_ops/foundation.py` is the only owner of model shapes,
-tokenizer size, parameter accounting, context curriculum and distributed
+candidate vocabulary contracts, parameter accounting, context curriculum and distributed
 topology contracts. `torch_decoder.py` imports that contract and remains the
 numerical reference runtime. The architecture-integrity release gate rejects a
 second `ScratchDecoderConfig`, `TokenizerContract`, or `ParallelismPlan`
@@ -5642,7 +5686,7 @@ remaining 92 MoE layers
 top-4 routed experts per token
 expert intermediate size 3,392
 one training-only MTP layer
-128,000-token vocabulary
+128,000-token research-target vocabulary; production size remains evidence-selected
 1,000,000 native-context contract
 5,000,000 effective hierarchical-context contract
 ```
@@ -5693,10 +5737,11 @@ limit. The reference MLA cache is storage-compressed, but it expands latent KV
 for the current attention computation. It is a numerical/parity authority, not
 a claim of a fused production MLA kernel.
 
-The `1b` dense and `1b_moe` profiles are an iso-active-compute A/B gate. The MoE
-profile has approximately 5.44B total and 1.31B active parameters; it must beat
-the dense run under the same governed tokens and active compute before sparse
-scaling advances.
+The `100m`/`100m_moe`, `300m`/`300m_moe`, and `1b`/`1b_moe` profiles are
+iso-active-compute A/B gates. Their active-parameter deltas are below one
+percent; the corrected 1B pair differs by roughly 0.02%. MoE must beat dense
+under the same governed tokens, optimizer, evaluation, and training FLOPs
+before sparse scaling advances.
 
 ### Distributed topology
 
@@ -5728,12 +5773,14 @@ GPU topology, NCCL/RDMA health and distributed checkpoint proof are present.
 
 ### Tokenizer migration
 
-All new production tokenizer and real-data pipeline defaults are 128,000.
-Production qualification requires exactly 128,000 requested and actual entries,
-all control tokens and no audit failures. Old 64k tokenizers and dense-v1
-checkpoints remain readable for historical validation, but they cannot resume
-an architecture-v2 run. Every token shard must be rebuilt and hash-bound to the
-new tokenizer.
+The 128K value remains a research candidate, not an automatic production
+choice. The scientific authority compares 32K, 64K, and 128K on one governed,
+family-safe corpus with fixed seeds and equal evidence. Production
+qualification requires the promoted candidate's requested and actual entries,
+all control tokens, no audit failures, and the complete experiment promotion
+chain. Historical tokenizers and dense-v1 checkpoints remain readable for
+validation, but cannot resume an incompatible architecture run. Every token
+shard must be rebuilt and hash-bound when the selected tokenizer changes.
 
 ```powershell
 python -m src.aeitron.model_ops.tokenizer_pipeline `
@@ -5800,14 +5847,14 @@ benchmark files fail rather than becoming synthetic passes.
 | Dropless Top-4 MoE | `code_complete_reference` | No-drop routing invariant, selected sigmoid normalization, gradients and load diagnostics are tested on small profiles. |
 | MTP objective | `code_complete_reference` | A real dense prediction transformer and weighted next-next-token loss are forward/backward tested. |
 | Megatron TP/PP/DP/CP/EP adapter | `built_not_cluster_proven` | Canonical argv and topology are validated; a pinned real checkout and multi-node run are still required. |
-| 1B dense/MoE profiles | `built_not_gpu_proven` | Active-compute delta is approximately 2.25%; no governed iso-token GPU A/B result exists yet. |
-| 128K tokenizer contract | `blocked_missing_artifact` | Trainer and strict qualification gates exist; the real governed 128K tokenizer has not been produced. |
+| 50M/100M/300M/1B scientific profiles | `built_not_gpu_proven` | Canonical iso-active contracts and immutable campaigns exist; no governed GPU A/B evidence exists yet. |
+| Evidence-selected tokenizer | `blocked_missing_artifact` | 32K/64K/128K contracts, statistical selection, and qualification replay exist; real governed arm runs have not completed. |
 | 1M native context | `built_not_cluster_proven` | Shape/curriculum contracts exist; no 1M distributed benchmark run exists. |
 | 5M effective context | `built_not_quality_proven` | Hierarchical retrieval contract exists; end-to-end effective-context quality is not measured yet. |
 | RULER/HELMET/RepoQA-style adapters | `code_complete_local_adapter` | Governed local-format scoring exists; these are not substitutes for official full benchmark runs. |
 
 Therefore the 4T system is not production-ready today. Legal/reviewer data
-gates, promoted 100K and larger datasets, a real 128K tokenizer, the 1B A/B
+gates, promoted 100K and larger datasets, a real selected tokenizer, the 1B A/B
 run, multi-node Megatron training, 1M context evaluation, 4T checkpoint
 recovery and converted-serving parity are measured external work and remain
 blocked or not-run until immutable evidence exists.
@@ -5842,18 +5889,16 @@ production inconvenience:
 The largest remaining architectural hypotheses are not yet defects, but must
 not be treated as settled truths:
 
-- 128K vocabulary size must beat smaller vocabulary candidates on compression,
-  validation loss and downstream code/security tasks. It is not automatically
-  optimal because the final parameter target is large.
+- 128K vocabulary must beat 32K and 64K on governed downstream code/security
+  tasks. The smallest candidate within one aggregate point of the best result
+  is selected to avoid unnecessary embedding and output-layer cost.
 - 4T total parameters, 128B active parameters and 5M effective context are
   research targets. Dense/MoE and context scaling evidence must select the
   architecture before capital is committed.
-- A blanket prohibition on all post-pretraining full-weight instruction and
-  tool-use training conflicts with the goal of a reliable instruction-following
-  coding agent. Scratch initialization and Aeitron-owned weights can be retained
-  while later using governed full-parameter continuation objectives. This
-  requires an explicit owner policy change; the current repository correctly
-  does not bypass the prohibition.
+- The former blanket prohibition on all post-pretraining full-weight work has
+  been corrected. External weights and adapters remain prohibited, while a
+  separately governed full-parameter continuation stage for qualified Aeitron-
+  owned weights is permitted only after the 1B foundation proof.
 - A model-quality claim is blocked while the active backend is a mock, protected
   executable evaluations have not run, and no real checkpoint is serving.
 

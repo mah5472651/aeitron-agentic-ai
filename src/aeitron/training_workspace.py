@@ -48,6 +48,7 @@ from src.aeitron.model_ops.production_adapters import (
     megatron_model_arguments,
     resolve_megatron_data_prefix,
 )
+from src.aeitron.shared.config_contracts import ScientificExperimentCampaignContract
 from src.aeitron.shared.schemas import StrictModel
 from src.aeitron.shared.integrity import canonical_json_text as canonical_json, sha256_file as sha256_path
 
@@ -573,6 +574,7 @@ class QualificationCampaign(StrictModel):
 class QualificationCampaignRegistry(StrictModel):
     schema_version: int = Field(ge=1)
     campaigns: list[QualificationCampaign]
+    scientific_experiments: list[ScientificExperimentCampaignContract] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_campaigns(self) -> "QualificationCampaignRegistry":
@@ -581,6 +583,11 @@ class QualificationCampaignRegistry(StrictModel):
             raise ValueError("qualification campaign identifiers and versions must be unique")
         for campaign in self.campaigns:
             campaign.milestones
+        scientific_identities = [
+            (item.campaign_id, item.version) for item in self.scientific_experiments
+        ]
+        if len(scientific_identities) != len(set(scientific_identities)):
+            raise ValueError("scientific campaign identifiers and versions must be unique")
         return self
 
     def latest(self, campaign_id: str) -> QualificationCampaign:
@@ -2116,6 +2123,8 @@ def build_training_command(spec: TrainingJobSpec, *, output_dir: str) -> list[st
             str(spec.dataset_manifest_sha256),
             "--tokenizer-sha256",
             str(spec.tokenizer_sha256),
+            "--optimizer-policy",
+            "config/training_profiles.json",
             "--artifact-cache-dir",
             spec.dataloader.cache_path,
             "--output-dir",

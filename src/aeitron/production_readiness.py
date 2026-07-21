@@ -431,7 +431,7 @@ def _check_training_stack(mode: str) -> list[ReadinessCheck]:
                 "parameter accounting; no cluster training, checkpoint, context, or serving proof exists yet."
             ),
             required_dependencies=[
-                "governed 128K tokenizer",
+                "governed evidence-selected tokenizer",
                 "promoted immutable dataset",
                 "Megatron-Core TP/PP/DP/CP/EP cluster",
                 "distributed checkpoint reload proof",

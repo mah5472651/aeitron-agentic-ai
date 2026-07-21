@@ -478,6 +478,119 @@ class DatasetTrustPolicyContract(StrictModel):
         return self
 
 
+class ScientificExperimentGateContract(StrictModel):
+    """Promotion thresholds shared by every scientific experiment campaign."""
+
+    minimum_relative_validation_improvement: float = Field(default=0.02, ge=0.0, le=1.0)
+    minimum_benchmark_point_improvement: float = Field(default=0.02, ge=0.0, le=1.0)
+    maximum_foundation_regression: float = Field(default=0.0, ge=0.0, le=1.0)
+    maximum_security_regression: float = Field(default=0.0, ge=0.0, le=1.0)
+    maximum_router_p99_to_mean: float = Field(default=1.20, ge=1.0, le=10.0)
+    maximum_tokenizer_noninferiority_gap: float = Field(default=0.01, ge=0.0, le=0.10)
+    maximum_scaling_holdout_mape: float = Field(default=0.05, gt=0.0, le=0.50)
+    require_executable_evaluation: bool = True
+    require_checkpoint_reload_parity: bool = True
+    require_zero_dropped_tokens: bool = True
+
+
+class ScientificExperimentCampaignContract(StrictModel):
+    """Immutable intent for one tokenizer, architecture, or scaling experiment."""
+
+    campaign_id: str = Field(min_length=3, max_length=128, pattern=r"^[a-z0-9][a-z0-9._-]+$")
+    version: int = Field(default=1, ge=1)
+    experiment_type: Literal["tokenizer_selection", "architecture_ab", "scaling_law"]
+    description: str = Field(min_length=20, max_length=2_000)
+    hypothesis: str = Field(min_length=20, max_length=2_000)
+    objective: Literal["causal_language_modeling"] = "causal_language_modeling"
+    training_profile_id: str = Field(min_length=1, max_length=128)
+    candidate_vocab_sizes: list[int] = Field(default_factory=list)
+    profile_seeds: dict[str, list[int]] = Field(default_factory=dict)
+    tokenizer_seeds: list[int] = Field(default_factory=list)
+    token_budget: int = Field(gt=0)
+    profile_token_budgets: dict[str, list[int]] = Field(default_factory=dict)
+    required_evaluation_suites: list[str] = Field(min_length=1)
+    gate: ScientificExperimentGateContract = Field(default_factory=ScientificExperimentGateContract)
+
+    @model_validator(mode="after")
+    def validate_scientific_campaign(self) -> "ScientificExperimentCampaignContract":
+        if self.experiment_type == "tokenizer_selection":
+            if self.candidate_vocab_sizes != [32_000, 64_000, 128_000]:
+                raise ValueError("tokenizer selection must compare exactly 32K, 64K, and 128K")
+            if len(self.tokenizer_seeds) < 3 or len(set(self.tokenizer_seeds)) != len(self.tokenizer_seeds):
+                raise ValueError("tokenizer selection requires at least three unique fixed seeds")
+            if self.profile_seeds:
+                raise ValueError("tokenizer selection cannot define model profile seeds")
+            if self.profile_token_budgets:
+                raise ValueError("tokenizer selection cannot define per-profile token budgets")
+        else:
+            if self.candidate_vocab_sizes or self.tokenizer_seeds:
+                raise ValueError(f"{self.experiment_type} cannot define tokenizer candidates")
+            if not self.profile_seeds:
+                raise ValueError(f"{self.experiment_type} requires model profile seeds")
+            unknown_budget_profiles = set(self.profile_token_budgets) - set(self.profile_seeds)
+            if unknown_budget_profiles:
+                raise ValueError(
+                    "profile token budgets reference unknown profiles: "
+                    f"{sorted(unknown_budget_profiles)}"
+                )
+            if any(
+                not values
+                or any(value <= 0 for value in values)
+                or len(values) != len(set(values))
+                for values in self.profile_token_budgets.values()
+            ):
+                raise ValueError("profile token budgets must be non-empty, positive, and unique")
+            for profile, seeds in self.profile_seeds.items():
+                if not profile or not seeds or len(set(seeds)) != len(seeds):
+                    raise ValueError(f"profile {profile!r} requires unique fixed seeds")
+            if self.experiment_type == "architecture_ab":
+                required = {"100m", "100m_moe", "300m", "300m_moe", "1b", "1b_moe"}
+                if set(self.profile_seeds) != required:
+                    raise ValueError(f"architecture A/B profiles must equal {sorted(required)}")
+                for profile in ("100m", "100m_moe", "300m", "300m_moe"):
+                    if len(self.profile_seeds[profile]) < 3:
+                        raise ValueError(f"architecture A/B profile {profile} requires at least three seeds")
+                for profile in ("1b", "1b_moe"):
+                    if len(self.profile_seeds[profile]) != 1:
+                        raise ValueError(f"confirmatory profile {profile} requires exactly one preregistered seed")
+            if self.experiment_type == "scaling_law":
+                required = {"50m", "100m", "300m", "1b"}
+                if not required.issubset(set(self.profile_seeds)):
+                    raise ValueError(f"scaling-law campaign requires profiles {sorted(required)}")
+                if set(self.profile_token_budgets) != set(self.profile_seeds):
+                    raise ValueError("scaling-law campaign requires a token budget for every profile")
+                if any(len(values) < 2 for values in self.profile_token_budgets.values()):
+                    raise ValueError("scaling-law campaign requires at least two budgets per profile")
+                shared = set.intersection(
+                    *(set(values) for values in self.profile_token_budgets.values())
+                )
+                if len(shared) < 2:
+                    raise ValueError(
+                        "scaling-law campaign requires at least two crossed token budgets across profiles"
+                    )
+        if len(set(self.required_evaluation_suites)) != len(self.required_evaluation_suites):
+            raise ValueError("required evaluation suites must be unique")
+        return self
+
+
+class ScientificExperimentRegistryContract(StrictModel):
+    schema_version: int = Field(ge=1)
+    scientific_experiments: list[ScientificExperimentCampaignContract] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_registry(self) -> "ScientificExperimentRegistryContract":
+        identities = [(item.campaign_id, item.version) for item in self.scientific_experiments]
+        if len(identities) != len(set(identities)):
+            raise ValueError("scientific experiment campaign identifiers and versions must be unique")
+        return self
+
+    def latest(self, campaign_id: str) -> ScientificExperimentCampaignContract:
+        matches = [item for item in self.scientific_experiments if item.campaign_id == campaign_id]
+        if not matches:
+            raise KeyError(f"scientific experiment campaign not found: {campaign_id}")
+        return max(matches, key=lambda item: item.version)
+
+
 def load_mix_ratios_contract(path: str | Path) -> MixRatiosContract:
     return MixRatiosContract.model_validate(_load_json(path))
 
@@ -500,3 +613,13 @@ def load_verifier_policy_contract(path: str | Path) -> VerifierPolicyContract:
 
 def load_dataset_trust_policy(path: str | Path) -> DatasetTrustPolicyContract:
     return DatasetTrustPolicyContract.model_validate(_load_json(path))
+
+
+def load_scientific_experiment_registry(path: str | Path) -> ScientificExperimentRegistryContract:
+    payload = _load_json(path)
+    return ScientificExperimentRegistryContract.model_validate(
+        {
+            "schema_version": payload.get("schema_version", 1),
+            "scientific_experiments": payload.get("scientific_experiments", []),
+        }
+    )

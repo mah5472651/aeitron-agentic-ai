@@ -26,6 +26,7 @@ AUTHORITATIVE_MODULES = {
     "model_architecture_contract": "src.aeitron.model_ops.foundation",
     "independent_review": "src.aeitron.learning.training_data_gate",
     "production_release_decision": "src.aeitron.deployment.production_qualification",
+    "scientific_experiment_decision": "src.aeitron.learning.ablation_runner",
     "tool_execution_policy": "src.aeitron.tools.policy",
 }
 OWNED_CLASS_NAMES = {
@@ -34,6 +35,12 @@ OWNED_CLASS_NAMES = {
         "TrainingBatchContract",
         "TokenizerContract",
         "ParallelismPlan",
+    },
+    "scientific_experiment_decision": {
+        "ExperimentAuthority",
+        "ExperimentManifest",
+        "ExperimentDecision",
+        "PromotionDecision",
     },
 }
 OWNED_FUNCTION_NAMES = {

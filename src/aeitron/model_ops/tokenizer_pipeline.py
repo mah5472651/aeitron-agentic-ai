@@ -440,12 +440,14 @@ def _token_audit_metrics(tokenizer: Any, paths: list[str | Path]) -> dict[str, f
     unknown_id = tokenizer.token_to_id("<unk>")
     total = unknown = single = whitespace = punctuation = 0
     sampled_chars = 0
+    sampled_bytes = 0
     maximum_chars = 5_000_000
     for text in iter_texts(paths):
         if sampled_chars >= maximum_chars:
             break
         sample = text[: maximum_chars - sampled_chars]
         sampled_chars += len(sample)
+        sampled_bytes += len(sample.encode("utf-8"))
         ids = tokenizer.encode(sample).ids
         for token_id in ids:
             decoded = tokenizer.decode([token_id])
@@ -460,6 +462,7 @@ def _token_audit_metrics(tokenizer: Any, paths: list[str | Path]) -> dict[str, f
     denominator = max(1, total)
     return {
         "sampled_characters": sampled_chars,
+        "sampled_bytes": sampled_bytes,
         "sampled_tokens": total,
         "unknown_tokens": unknown,
         "unknown_rate": unknown / denominator,
@@ -467,6 +470,7 @@ def _token_audit_metrics(tokenizer: Any, paths: list[str | Path]) -> dict[str, f
         "whitespace_token_rate": whitespace / denominator,
         "punctuation_token_rate": punctuation / denominator,
         "tokens_per_character": total / max(1, sampled_chars),
+        "tokens_per_byte": total / max(1, sampled_bytes),
     }
 
 

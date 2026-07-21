@@ -18,9 +18,13 @@ instruction files, additional architecture manuals, or numbered phase systems.
   secure defaults, handle failure modes, and expose observable status.
 - Do not add placeholders, fake passes, fabricated evidence, silent fallback,
   or claims that unmeasured behavior is production-ready.
-- Keep model development scratch-only. Do not introduce external foundation
-  model weights, borrowed-model quality baselines, fine-tuning, SFT, DPO, GRPO,
-  LoRA, QLoRA, RLHF, or adapter-training paths.
+- Keep every model scratch-origin. External foundation-model weights, borrowed
+  quality baselines, LoRA, QLoRA, adapters, and modification of third-party
+  checkpoints are prohibited. After the 1B foundation proof passes, Aeitron-
+  owned weights may enter a separately governed full-parameter instruction,
+  tool-use, or execution-grounded continuation stage. That stage must update
+  the complete model, use no external weights, and pass executable regression
+  and production-qualification gates.
 - Cybersecurity functionality is limited to defensive analysis, secure patching,
   governed education, and explicitly authorized isolated labs, CTFs, and
   evaluation environments. Do not add autonomous live-target attack workflows,
@@ -88,6 +92,9 @@ instruction files, additional architecture manuals, or numbered phase systems.
 - Every model size starts from Aeitron scratch initialization. Smaller models
   validate the architecture and scaling assumptions; their weights do not seed
   a larger model.
+- Tokenizer size, dense versus sparse architecture, and scale targets are
+  scientific hypotheses. Only the experiment authority and final production
+  qualification may promote them; configuration defaults are not evidence.
 
 ## Working Method
 

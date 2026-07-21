@@ -21,6 +21,7 @@ from src.aeitron.model_ops.foundation import (
     TRAINING_STEP_SEMANTICS,
     CheckpointManifest,
     TrainingBatchContract,
+    model_profiles,
     sha256_file,
 )
 from src.aeitron.model_ops.tokenizer_pipeline import ShardBuildConfig, ShardManifest, build_token_shards, load_tokenizer, read_uint32_tokens
@@ -1108,7 +1109,7 @@ def build_training_config(
     vocab_size = base.vocab_size
     tokenizer_path = Path(active_manifest.tokenizer_path)
     if tokenizer_path.exists():
-        vocab_size = max(vocab_size, tokenizer_vocab_size(tokenizer_path))
+        vocab_size = max(256, tokenizer_vocab_size(tokenizer_path))
     highest_token_id = max_token_id(
         active_manifest.train_shards + active_manifest.val_shards,
         artifact_cache=artifact_cache,
@@ -1170,6 +1171,7 @@ def run_pretraining_loop(
     tokenizer_path: str | Path | None = None,
     manifest_sha256: str | None = None,
     tokenizer_sha256: str | None = None,
+    optimizer_policy_path: str | Path | None = None,
     artifact_cache_dir: str | Path | None = None,
     object_store_endpoint_url: str | None = None,
     device: str = "auto",
@@ -1244,6 +1246,13 @@ def run_pretraining_loop(
     active_progress = progress or NullProgressReporter()
     if distributed_rank() != 0:
         active_progress = NullProgressReporter()
+    optimizer_policy_source: Path | None = None
+    optimizer_policy_digest = ""
+    if optimizer_policy_path is not None:
+        optimizer_policy_source = Path(optimizer_policy_path).expanduser().resolve(strict=True)
+        if not optimizer_policy_source.is_file() or optimizer_policy_source.stat().st_size < 1:
+            raise ValueError("optimizer policy must be a non-empty regular file")
+        optimizer_policy_digest = sha256_file(optimizer_policy_source)
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     artifact_cache = ArtifactCache(
@@ -1416,6 +1425,9 @@ def run_pretraining_loop(
         )
     checkpoint_environment = training_environment_report(device=selected, dtype=dtype, distributed_strategy=distributed_strategy)
     checkpoint_args = {
+        "objective": "causal_language_modeling",
+        "optimizer_policy_path": str(optimizer_policy_source or ""),
+        "optimizer_policy_sha256": optimizer_policy_digest,
         "step_semantics": TRAINING_STEP_SEMANTICS,
         "steps": steps,
         "batch_size": batch_size,
@@ -1822,6 +1834,7 @@ def run_pretraining_loop(
     report = {
         "status": "early_stopped" if early_stopped else "passed",
         "scratch_only": True,
+        "objective": "causal_language_modeling",
         "steps": current_step,
         "step_semantics": TRAINING_STEP_SEMANTICS,
         "optimizer_steps": current_step,
@@ -1882,6 +1895,9 @@ def run_pretraining_loop(
         "trained_tokens": trained_tokens,
         "target_tokens": target_tokens,
         "runtime_versions": runtime_versions,
+        "training_args": checkpoint_args,
+        "optimizer_policy_path": str(optimizer_policy_source or ""),
+        "optimizer_policy_sha256": optimizer_policy_digest,
         "checkpoint_manifest": str(manifest_path),
         "checkpoint_manifest_sha256": sha256_file(manifest_path),
         "best_checkpoint_manifest_sha256": sha256_file(best_checkpoint_manifest),
@@ -1916,6 +1932,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer-path")
     parser.add_argument("--manifest-sha256")
     parser.add_argument("--tokenizer-sha256")
+    parser.add_argument("--optimizer-policy")
     parser.add_argument("--artifact-cache-dir")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -1943,7 +1960,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--initial-checkpoint-manifest")
     parser.add_argument("--allow-initial-dataset-rebind", action="store_true")
-    parser.add_argument("--model-profile", default="tiny", choices=["tiny", "t4_validation", "1b", "7b", "32b", "62b"])
+    parser.add_argument(
+        "--model-profile",
+        default="tiny",
+        choices=sorted(name for name in model_profiles() if name != "4t_moe"),
+    )
     parser.add_argument("--attention-impl", default="auto", choices=["auto", "sdpa", "eager"])
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--production", action="store_true", help="Enable strict production training validation.")
@@ -2007,6 +2028,7 @@ def main() -> None:
         tokenizer_path=args.tokenizer_path,
         manifest_sha256=args.manifest_sha256,
         tokenizer_sha256=args.tokenizer_sha256,
+        optimizer_policy_path=args.optimizer_policy,
         artifact_cache_dir=args.artifact_cache_dir,
         object_store_endpoint_url=args.object_store_endpoint_url,
         device=args.device,

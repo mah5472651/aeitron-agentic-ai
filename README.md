@@ -10,7 +10,7 @@ architecture has been removed.
 
 Aeitron follows this roadmap for every future change:
 
-- Scratch-only model development. Do not add external foundation-model fine-tuning, SFT, DPO, GRPO, LoRA, QLoRA, or RLHF paths.
+- Scratch-origin model development. External weights and adapter training are prohibited; evidence-gated full-parameter continuation is allowed only for qualified Aeitron-owned weights.
 - Production-grade code only: explicit validation, fail-fast dependency checks, secure defaults, no placeholder success paths, and no fake readiness claims.
 - Coding-agent performance first: repository indexing, context packing, TaskGraph execution, patch generation, verification, and benchmark feedback get priority over impressive but unused abstractions.
 - Cybersecurity scope stays governed: approved sources, defensive analysis, authorized labs/CTFs/eval material, security patch generation, and verification. No autonomous live-target attack workflow.
@@ -267,11 +267,13 @@ Invoke-RestMethod http://127.0.0.1:8090/v1/model/foundation/status
 
 ## Training Control Plane
 
-Aeitron is scratch-training only. The control plane supports checkpoint eval,
-token-level data mixing, tokenizer/shard preparation, and pretraining gates.
-It does not include post-training adaptation or external foundation-model
-training paths. Protected benchmarks stay eval/holdout and are not mixed into
-training.
+Aeitron starts every model from random initialization and never imports external
+weights. The control plane supports checkpoint evaluation, token-level data
+mixing, tokenizer/shard preparation, and pretraining gates. After the 1B
+foundation proof, Aeitron-owned weights may enter a separately governed
+full-parameter instruction/tool continuation stage. Adapter training and
+third-party checkpoint adaptation remain prohibited. Protected benchmarks stay
+evaluation-only and are never mixed into training.
 
 ```powershell
 python -m src.aeitron.learning.mixer --inputs data\training\clean.jsonl --config config\mix_ratios.json --experiment baseline_70_15_15 --output-dir artifacts\\aeitron\mix-baseline
@@ -284,6 +286,44 @@ Reports:
 - `eval_report.json` and `eval_report.md`
 - `mix_manifest.json`
 - `ablation_report.json`
+
+### Scientific Experiment Authority
+
+The legacy `ablation_report.json` only prepares data mixes. It cannot promote a
+tokenizer, architecture, or checkpoint. Controlled scientific decisions use
+the authoritative experiment state machine:
+
+```powershell
+python -m src.aeitron.learning.ablation_runner plan `
+  --campaign tokenizer-selection-v1 `
+  --dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
+  --split-manifest data\production\aeitron-foundation-v1\split_manifest.json `
+  --optimizer-policy config\training_profiles.json `
+  --evaluation-manifest data\eval\protected\protected_benchmark_manifest.json `
+  --tokenizer-manifest 32000=artifacts\aeitron\tokenizers\32k\tokenizer_manifest.json `
+  --tokenizer-manifest 64000=artifacts\aeitron\tokenizers\64k\tokenizer_manifest.json `
+  --tokenizer-manifest 128000=artifacts\aeitron\tokenizers\128k\tokenizer_manifest.json `
+  --container-digest "aeitron-training@sha256:<64-hex-digest>" `
+  --output-dir artifacts\aeitron\experiments\tokenizer-selection-v1
+
+python -m src.aeitron.learning.ablation_runner run `
+  --experiment-dir artifacts\aeitron\experiments\tokenizer-selection-v1 `
+  --evidence-dir artifacts\aeitron\experiments\tokenizer-selection-v1\arm-evidence
+
+python -m src.aeitron.learning.ablation_runner decide `
+  --experiment-dir artifacts\aeitron\experiments\tokenizer-selection-v1
+
+python -m src.aeitron.learning.ablation_runner promote `
+  --experiment-dir artifacts\aeitron\experiments\tokenizer-selection-v1
+```
+
+Each tokenizer manifest must bind passed family-safe shards and the exact
+governed dataset hash. Each arm report binds those tokenizer bytes plus the
+same governed data, split, optimizer, evaluation manifest, objective, token
+budget, model contract, training report, checkpoint, diagnostic generation
+audit, and executable benchmark evidence. Missing GPU runs remain `blocked`.
+Architecture and scaling campaigns use one `selected=PATH` tokenizer binding;
+their model parameter/FLOP contracts are recalculated for that vocabulary.
 
 ## Production Hardening Gates
 
@@ -384,7 +424,8 @@ python -m src.aeitron.deployment.production_qualification `
   --calibration-200-decision artifacts\aeitron\calibration-200-v1\calibration_decision.json `
   --calibration-5k-decision artifacts\aeitron\calibration-5k-v1\calibration_decision.json `
   --production-dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
-  --tokenizer-audit-report artifacts\aeitron\tokenizer-128k\tokenizer_audit_report.json `
+  --tokenizer-selection-promotion artifacts\aeitron\experiments\tokenizer-selection-v1\promotion_decision.json `
+  --tokenizer-audit-report artifacts\aeitron\tokenizer-selected\tokenizer_audit_report.json `
   --overfit-sanity-report artifacts\aeitron\overfit-sanity\overfit_sanity_report.json `
   --t4-1k-training-report artifacts\aeitron\t4-1k\pretrain_report.json `
   --t4-10k-training-report artifacts\aeitron\t4-10k\pretrain_report.json `
@@ -414,7 +455,7 @@ The qualification runner is the only component allowed to issue a
 passed governed 200
 -> passed governed 5k, bound to the 200 decision hash
 -> promoted non-smoke 100k dataset, bound to the 5k decision hash
--> passed exactly-128k tokenizer audit
+-> passed evidence-selected 32K/64K/128K tokenizer experiment and matching audit
 -> measured T4 1k and 10k scratch runs with checkpoint reload proof
 -> active native checkpoint, executable benchmarks, and repository scorecard
 ```
@@ -1170,7 +1211,8 @@ python -m src.aeitron.deployment.production_qualification `
   --calibration-200-decision artifacts\aeitron\calibration-200\calibration_decision.json `
   --calibration-5k-decision artifacts\aeitron\calibration-5k\calibration_decision.json `
   --production-dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
-  --tokenizer-audit-report artifacts\aeitron\tokenizer-128k\tokenizer_audit_report.json `
+  --tokenizer-selection-promotion artifacts\aeitron\experiments\tokenizer-selection-v1\promotion_decision.json `
+  --tokenizer-audit-report artifacts\aeitron\tokenizer-selected\tokenizer_audit_report.json `
   --overfit-sanity-report artifacts\aeitron\t4-overfit\overfit_sanity_report.json `
   --t4-1k-training-report artifacts\aeitron\t4-1k\training_report.json `
   --t4-10k-training-report artifacts\aeitron\t4-10k\training_report.json `
@@ -1282,20 +1324,23 @@ or hash-mismatched evidence.
 the exactly 100,000-row production dataset. Custom counts are dev-only and
 cannot authorize advancement.
 
-4. Train the production tokenizer only from the promoted dataset:
+4. Train all three tokenizer candidates only from the promoted dataset, run
+   equal-evidence T4 arms, then promote the measured winner:
 
 ```powershell
 python -m src.aeitron.model_ops.tokenizer_pipeline `
   --input data\production\aeitron-foundation-v1\train.jsonl `
-  --output-dir artifacts\aeitron\tokenizer-128k-v1 `
+  --output-dir artifacts\aeitron\tokenizer-candidate `
   --dataset-id aeitron-foundation-v1 `
   --vocab-size 128000 `
   --real-corpus-audit
 ```
 
-The audit now fails unless the actual vocabulary is exactly 128,000 and every
-required control token is present. A small corpus that cannot supply enough
-valid BPE merges is rejected instead of being called a 128k tokenizer.
+Repeat with `--vocab-size 32000`, `64000`, and `128000`. Each audit fails unless
+its actual vocabulary equals its requested size and every control token is
+present. The experiment authority selects the smallest candidate within one
+downstream aggregate point of the best result; a small corpus cannot be padded
+with fabricated tokens.
 
 5. Run executable HumanEval/MBPP evaluation against a scratch checkpoint:
 

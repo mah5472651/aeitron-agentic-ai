@@ -38,6 +38,7 @@ from src.aeitron.deployment.production_proof import (
     run_production_proof,
 )
 from src.aeitron.learning.calibration_gate import CalibrationDecision, CalibrationPreflightReport
+from src.aeitron.learning.ablation_runner import verify_promotion_chain
 from src.aeitron.learning.production_dataset import (
     ProductionDatasetManifest,
     validate_dataset_manifest_for_promotion,
@@ -91,7 +92,8 @@ class QualificationPolicy(StrictModel):
     canary_rollback_error_rate: float = Field(gt=0.0, le=1.0)
     canary_maximum_rollback_seconds: float = Field(gt=0.0, le=3600.0)
     minimum_promoted_dataset_records: int = Field(default=100_000, ge=100_000)
-    required_tokenizer_vocab_size: int = Field(default=128_000, ge=1_000)
+    tokenizer_selection_mode: Literal["fixed", "evidence_selected"] = "fixed"
+    required_tokenizer_vocab_size: int | None = Field(default=128_000, ge=1_000)
     require_family_safe_tokenizer_split: bool = True
     t4_minimum_hidden_size: int = Field(default=512, ge=128)
     t4_minimum_layers: int = Field(default=8, ge=2)
@@ -112,6 +114,10 @@ class QualificationPolicy(StrictModel):
             raise ValueError("rollback error threshold must exceed normal canary error threshold")
         if len(set(stage.concurrency for stage in self.load_stages)) != len(self.load_stages):
             raise ValueError("load stage concurrency values must be unique")
+        if self.tokenizer_selection_mode == "fixed" and self.required_tokenizer_vocab_size is None:
+            raise ValueError("fixed tokenizer selection requires required_tokenizer_vocab_size")
+        if self.tokenizer_selection_mode == "evidence_selected" and self.required_tokenizer_vocab_size is not None:
+            raise ValueError("evidence-selected tokenizer policy cannot hard-code a vocabulary size")
         return self
 
     @classmethod
@@ -787,6 +793,7 @@ def validate_scratch_training_chain(
     calibration_200_decision: str | None,
     calibration_5k_decision: str | None,
     production_dataset_manifest: str | None,
+    tokenizer_selection_promotion: str | None = None,
     tokenizer_audit_report: str | None,
     overfit_sanity_report: str | None,
     t4_1k_training_report: str | None,
@@ -830,6 +837,8 @@ def validate_scratch_training_chain(
         "t4-1k-training-report": t4_1k_training_report,
         "t4-10k-training-report": t4_10k_training_report,
     }
+    if active_policy.tokenizer_selection_mode == "evidence_selected":
+        paths["tokenizer-selection-promotion"] = tokenizer_selection_promotion
     if calibration_200_decision is None and calibration_preflight_report:
         try:
             preflight_binding = bind_evidence(
@@ -957,14 +966,40 @@ def validate_scratch_training_chain(
             blockers.append("dataset promotion decision is not promoted")
         blockers.extend(_validate_dataset_artifacts(dataset))
 
+        selected_vocab_size = active_policy.required_tokenizer_vocab_size
+        if active_policy.tokenizer_selection_mode == "evidence_selected":
+            try:
+                promotion, decision, comparison, experiment_manifest = verify_promotion_chain(
+                    bindings["tokenizer-selection-promotion"].path
+                )
+                if (
+                    promotion.status != "promoted"
+                    or decision.status != "passed"
+                    or comparison.status != "passed"
+                    or experiment_manifest.campaign.experiment_type != "tokenizer_selection"
+                ):
+                    raise ValueError("tokenizer scientific promotion chain did not pass")
+                selected_vocab_size = int(str(promotion.promoted_candidate))
+                if selected_vocab_size not in experiment_manifest.campaign.candidate_vocab_sizes:
+                    raise ValueError("promoted tokenizer is not a planned candidate")
+                if (
+                    experiment_manifest.bindings["dataset_manifest"].sha256
+                    != bindings["production-dataset-manifest"].sha256
+                ):
+                    raise ValueError("tokenizer experiment is not bound to the production dataset")
+                metrics["tokenizer_experiment_id"] = experiment_manifest.experiment_id
+                metrics["tokenizer_promotion_sha256"] = promotion.promotion_sha256
+            except Exception as exc:
+                blockers.append(f"tokenizer evidence-selection verification failed: {exc}")
         if (
             tokenizer.status != "passed"
-            or tokenizer.vocab_size_requested != active_policy.required_tokenizer_vocab_size
-            or tokenizer.vocab_size_actual != active_policy.required_tokenizer_vocab_size
+            or selected_vocab_size is None
+            or tokenizer.vocab_size_requested != selected_vocab_size
+            or tokenizer.vocab_size_actual != selected_vocab_size
             or tokenizer.special_tokens_missing
             or tokenizer.audit_failures
         ):
-            blockers.append("128k tokenizer qualification did not pass")
+            blockers.append("evidence-selected tokenizer qualification did not pass")
         if tokenizer.dataset_manifest_sha256 != bindings["production-dataset-manifest"].sha256:
             blockers.append("tokenizer is not hash-bound to the supplied production dataset manifest")
         if active_policy.require_family_safe_tokenizer_split and (
@@ -1051,7 +1086,7 @@ def validate_scratch_training_chain(
                 or int(model.get("max_sequence_length", 0)) < active_policy.t4_minimum_sequence_length
             ):
                 blockers.append(f"{name} model is below the T4 technical qualification profile")
-            if int(model.get("vocab_size", 0)) != active_policy.required_tokenizer_vocab_size:
+            if selected_vocab_size is None or int(model.get("vocab_size", 0)) != selected_vocab_size:
                 blockers.append(f"{name} model vocabulary does not match the qualified tokenizer")
             if payload.get("dataset_manifest_sha256") != tokenizer.shard_manifest_sha256:
                 blockers.append(f"{name} training dataset does not match the qualified shard manifest")
@@ -1089,7 +1124,7 @@ def validate_scratch_training_chain(
             ):
                 blockers.append(f"{name} validation loss evidence is non-finite")
 
-        metrics = {
+        metrics.update({
             "calibration_200": calibration_200.status,
             "calibration_5k": calibration_5k.status,
             "promoted_records": int(dataset.metrics.get("promoted_records", 0)),
@@ -1100,7 +1135,7 @@ def validate_scratch_training_chain(
             "overfit_relative_loss_drop": float(overfit.get("relative_loss_drop", -1.0)),
             "t4_1k_steps": int(t4_reports["t4_1k"].get("steps", 0)),
             "t4_10k_steps": int(t4_reports["t4_10k"].get("steps", 0)),
-        }
+        })
     except Exception as exc:
         blockers.append(str(exc))
 
@@ -1681,6 +1716,7 @@ async def run_qualification(args: argparse.Namespace) -> tuple[ProductionQualifi
         calibration_200_decision=args.calibration_200_decision,
         calibration_5k_decision=args.calibration_5k_decision,
         production_dataset_manifest=args.production_dataset_manifest,
+        tokenizer_selection_promotion=args.tokenizer_selection_promotion,
         tokenizer_audit_report=args.tokenizer_audit_report,
         overfit_sanity_report=args.overfit_sanity_report,
         t4_1k_training_report=args.t4_1k_training_report,
@@ -1796,6 +1832,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-200-decision")
     parser.add_argument("--calibration-5k-decision")
     parser.add_argument("--production-dataset-manifest")
+    parser.add_argument("--tokenizer-selection-promotion")
     parser.add_argument("--tokenizer-audit-report")
     parser.add_argument("--overfit-sanity-report")
     parser.add_argument("--t4-1k-training-report")
@@ -1830,6 +1867,7 @@ def main() -> None:
             calibration_200_decision=args.calibration_200_decision,
             calibration_5k_decision=args.calibration_5k_decision,
             production_dataset_manifest=args.production_dataset_manifest,
+            tokenizer_selection_promotion=args.tokenizer_selection_promotion,
             tokenizer_audit_report=args.tokenizer_audit_report,
             overfit_sanity_report=args.overfit_sanity_report,
             t4_1k_training_report=args.t4_1k_training_report,
