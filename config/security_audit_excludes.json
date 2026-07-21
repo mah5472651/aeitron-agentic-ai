@@ -24,17 +24,6 @@
         "fixture_only_command_injection_strings",
         "fixture_only_path_traversal_strings"
       ]
-    },
-    {
-      "path": "tools/codeql/python/tools/imp.py",
-      "reason": "Vendored CodeQL compatibility helper; scanned by upstream CodeQL distribution governance, not Aeitron runtime code.",
-      "risk_category": "vendored_external_tool",
-      "owner": "security-tooling",
-      "expires": null,
-      "allow_executable_sinks": true,
-      "approved_executable_sinks": [
-        "vendored_external_tool_codeql_distribution"
-      ]
     }
   ]
 }
