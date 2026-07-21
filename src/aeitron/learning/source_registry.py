@@ -5,12 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess  # nosec B404 - fixed git argv, validated public HTTPS repository
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
-from urllib.parse import urlparse
+from typing import Any, Literal
+from urllib.parse import quote, urlparse
 
+import httpx
 from pydantic import Field, field_validator, model_validator
 
 from src.aeitron.learning.web_ingest import SourceSpec, allowed_url, load_sources
@@ -101,6 +106,140 @@ class SourceApprovalRequestArtifact(StrictModel):
     warning: str
 
 
+class SourceEvidenceOrigin(StrictModel):
+    source_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{1,127}$")
+    origin_kind: Literal["git_repository", "web_snapshot"]
+    expected_license: str = Field(min_length=2, max_length=80)
+    repository_url: str | None = None
+    git_ref: str | None = Field(default=None, min_length=1, max_length=160)
+    license_path: str | None = Field(default=None, min_length=1, max_length=512)
+    license_url: str | None = Field(default=None, min_length=1, max_length=2048)
+
+    @model_validator(mode="after")
+    def validate_origin(self) -> "SourceEvidenceOrigin":
+        if self.origin_kind == "git_repository":
+            if not self.repository_url or not self.git_ref or not self.license_path:
+                raise ValueError("git evidence origin requires repository_url, git_ref, and license_path")
+            parsed = urlparse(self.repository_url)
+            if parsed.scheme != "https" or parsed.hostname != "github.com":
+                raise ValueError("git evidence repository must be an official HTTPS GitHub URL")
+            if parsed.query or parsed.fragment or parsed.username or parsed.password:
+                raise ValueError("git evidence repository URL cannot contain credentials, query, or fragment")
+            if re.fullmatch(r"/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?", parsed.path) is None:
+                raise ValueError("git evidence repository URL must contain exactly owner/repository")
+            relative = Path(self.license_path)
+            if relative.is_absolute() or ".." in relative.parts or "\x00" in self.license_path:
+                raise ValueError("git evidence license_path must be a safe relative path")
+            if self.license_url is not None:
+                raise ValueError("git evidence origin cannot also define license_url")
+        else:
+            if not self.license_url:
+                raise ValueError("web evidence origin requires license_url")
+            parsed = urlparse(self.license_url)
+            if parsed.scheme != "https" or parsed.hostname not in {"www.nist.gov"}:
+                raise ValueError("web evidence URL must use an explicitly governed HTTPS host")
+            if parsed.query or parsed.fragment or parsed.username or parsed.password:
+                raise ValueError("web evidence URL cannot contain credentials, query, or fragment")
+            if any(value is not None for value in (self.repository_url, self.git_ref, self.license_path)):
+                raise ValueError("web evidence origin cannot define git fields")
+        return self
+
+
+class SourceEvidenceOriginRegistry(StrictModel):
+    schema_version: Literal[1] = 1
+    sources: list[SourceEvidenceOrigin] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_unique_sources(self) -> "SourceEvidenceOriginRegistry":
+        source_ids = [source.source_id for source in self.sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("source evidence origin registry contains duplicate source IDs")
+        return self
+
+
+class SourceEvidenceCandidate(StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["awaiting_human_legal_approval"] = "awaiting_human_legal_approval"
+    source_id: str
+    origin_kind: Literal["git_repository", "web_snapshot"]
+    registry_entry_sha256: str
+    expected_license: str
+    requested_revision: str
+    resolved_immutable_revision: str
+    license_source_url: str
+    license_evidence_path: str
+    license_evidence_sha256: str
+    license_evidence_bytes: int = Field(ge=1, le=1_048_576)
+    response_metadata: dict[str, str] = Field(default_factory=dict)
+    materialized_at_unix: float
+    warning: str
+
+    @field_validator("registry_entry_sha256", "license_evidence_sha256")
+    @classmethod
+    def validate_candidate_hash(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
+            raise ValueError("source evidence candidate hashes must be SHA-256 hex")
+        return normalized
+
+
+class SourceEvidenceCandidateEntry(StrictModel):
+    source_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{1,127}$")
+    candidate_path: str
+    candidate_sha256: str
+    license_path: str
+    license_sha256: str
+    approval_template_path: str
+    approval_template_sha256: str
+
+    @field_validator("candidate_sha256", "license_sha256", "approval_template_sha256")
+    @classmethod
+    def validate_entry_hash(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
+            raise ValueError("evidence candidate entry hashes must be SHA-256 hex")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_relative_paths(self) -> "SourceEvidenceCandidateEntry":
+        for value in (self.candidate_path, self.license_path, self.approval_template_path):
+            relative = Path(value)
+            if relative.is_absolute() or ".." in relative.parts or "\x00" in value:
+                raise ValueError("evidence candidate manifest paths must be safe and relative")
+            if not relative.parts or relative.parts[0] != self.source_id:
+                raise ValueError("evidence candidate manifest path does not belong to its source")
+        return self
+
+
+class SourceEvidenceCandidateBundleReport(StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["awaiting_human_legal_approval"] = "awaiting_human_legal_approval"
+    source_count: int = Field(ge=1)
+    source_registry_sha256: str
+    origin_registry_sha256: str
+    output_dir: str
+    candidates: list[SourceEvidenceCandidateEntry]
+    created_at_unix: float
+    production_collection_authorized: Literal[False] = False
+
+    @field_validator("source_registry_sha256", "origin_registry_sha256")
+    @classmethod
+    def validate_bundle_hash(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
+            raise ValueError("evidence candidate bundle hashes must be SHA-256 hex")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_candidate_set(self) -> "SourceEvidenceCandidateBundleReport":
+        source_ids = [entry.source_id for entry in self.candidates]
+        if self.source_count != len(source_ids) or len(source_ids) != len(set(source_ids)):
+            raise ValueError("evidence candidate bundle count or source uniqueness is invalid")
+        if source_ids != sorted(source_ids):
+            raise ValueError("evidence candidate bundle sources must be deterministically sorted")
+        return self
+
+
 class SourceSelectionEntry(StrictModel):
     source_id: str
     registry_entry_sha256: str
@@ -153,6 +292,111 @@ def source_registry_snapshot_sha256(sources: list[SourceSpec]) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def load_evidence_origin_registry(path: str | Path) -> SourceEvidenceOriginRegistry:
+    source = Path(path).expanduser().resolve(strict=True)
+    if not source.is_file() or source.stat().st_size > 1_048_576:
+        raise ValueError("source evidence origin registry must be a regular file no larger than 1 MiB")
+    return SourceEvidenceOriginRegistry.model_validate_json(source.read_text(encoding="utf-8-sig"))
+
+
+def _resolve_public_git_revision(repository_url: str, revision: str, *, timeout_seconds: float = 30.0) -> str:
+    git = shutil.which("git")
+    if not git:
+        raise RuntimeError("git executable is required to resolve governed evidence revisions")
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE"}
+    }
+    environment.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_ASKPASS": "",
+        }
+    )
+    completed = subprocess.run(  # nosec B603 - validated URL and fixed argv without shell
+        [git, "-c", "credential.helper=", "ls-remote", "--exit-code", repository_url, revision],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_seconds,
+        env=environment,
+        shell=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()[:500]
+        raise RuntimeError(f"failed to resolve governed repository revision: {detail or completed.returncode}")
+    revisions = {
+        line.split()[0].lower()
+        for line in completed.stdout.splitlines()
+        if line.strip() and len(line.split()) >= 2
+    }
+    if len(revisions) != 1:
+        raise RuntimeError("governed repository revision did not resolve to exactly one commit")
+    resolved = next(iter(revisions))
+    if re.fullmatch(r"[0-9a-f]{40}", resolved) is None:
+        raise RuntimeError("governed repository revision is not a full SHA-1 commit")
+    return resolved
+
+
+def _fetch_governed_evidence_url(
+    url: str,
+    *,
+    maximum_bytes: int = 1_048_576,
+    timeout_seconds: float = 30.0,
+) -> tuple[bytes, dict[str, str]]:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in {"raw.githubusercontent.com", "www.nist.gov"}:
+        raise ValueError("governed evidence fetch attempted an unapproved host")
+    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise ValueError("governed evidence URL cannot contain credentials, query, or fragment")
+    headers = {
+        "Accept": "text/plain,text/html;q=0.9",
+        "User-Agent": "Aeitron-Governance-Evidence/1.0",
+    }
+    with httpx.Client(
+        follow_redirects=False,
+        timeout=httpx.Timeout(timeout_seconds),
+        trust_env=False,
+        headers=headers,
+    ) as client:
+        with client.stream("GET", url) as response:
+            if response.status_code != 200:
+                raise RuntimeError(f"governed evidence fetch returned HTTP {response.status_code}")
+            content_length = response.headers.get("content-length")
+            if content_length and int(content_length) > maximum_bytes:
+                raise ValueError("governed evidence response exceeds the maximum size")
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > maximum_bytes:
+                    raise ValueError("governed evidence response exceeds the maximum size")
+                chunks.append(chunk)
+            payload = b"".join(chunks)
+            if not payload or b"\x00" in payload:
+                raise ValueError("governed evidence response is empty or binary")
+            metadata = {
+                key: value[:512]
+                for key in ("content-type", "etag", "last-modified")
+                if (value := response.headers.get(key))
+            }
+    return payload, metadata
+
+
+def _raw_github_url(repository_url: str, revision: str, relative_path: str) -> str:
+    parsed = urlparse(repository_url)
+    segments = parsed.path.removesuffix(".git").strip("/").split("/")
+    if len(segments) != 2:
+        raise ValueError("governed GitHub repository URL must contain owner/repository")
+    owner, repository = (quote(segment, safe="._-") for segment in segments)
+    safe_path = "/".join(quote(part, safe="._-") for part in Path(relative_path).parts)
+    return f"https://raw.githubusercontent.com/{owner}/{repository}/{revision}/{safe_path}"
 
 
 class SourceRegistry:
@@ -488,6 +732,151 @@ class SourceRegistry:
         )
         return written
 
+    def materialize_evidence_candidates(
+        self,
+        *,
+        origin_registry_path: str | Path,
+        output_dir: str | Path,
+    ) -> SourceEvidenceCandidateBundleReport:
+        """Fetch immutable official evidence without granting legal approval.
+
+        The output deliberately contains ``approval.template.json`` rather than
+        ``approval.json``. Only an authorized human can turn reviewed evidence
+        into the latter file through the existing approval contract.
+        """
+
+        origins = load_evidence_origin_registry(origin_registry_path)
+        source_by_id = {source.source_id: source for source in self.sources}
+        origin_by_id = {origin.source_id: origin for origin in origins.sources}
+        if None in source_by_id:
+            raise ValueError("every governed source requires a source_id before evidence materialization")
+        source_ids = set(source_by_id)
+        origin_ids = set(origin_by_id)
+        if source_ids != origin_ids:
+            missing = sorted(source_ids - origin_ids)
+            unexpected = sorted(origin_ids - source_ids)
+            raise ValueError(
+                "evidence origin registry must exactly match governed sources; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+
+        target = Path(output_dir).expanduser().resolve()
+        if target.exists():
+            raise FileExistsError(f"refusing to overwrite governed evidence candidate directory: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
+        candidate_entries: list[SourceEvidenceCandidateEntry] = []
+        try:
+            for source_id in sorted(source_ids):
+                source = source_by_id[source_id]
+                assert source is not None
+                origin = origin_by_id[source_id]
+                if origin.expected_license.lower() != source.license.lower():
+                    raise ValueError(
+                        f"{source_id}: evidence origin license {origin.expected_license!r} "
+                        f"does not match registry license {source.license!r}"
+                    )
+
+                if origin.origin_kind == "git_repository":
+                    assert origin.repository_url is not None
+                    assert origin.git_ref is not None
+                    assert origin.license_path is not None
+                    resolved_revision = _resolve_public_git_revision(origin.repository_url, origin.git_ref)
+                    evidence_url = _raw_github_url(
+                        origin.repository_url,
+                        resolved_revision,
+                        origin.license_path,
+                    )
+                    requested_revision = origin.git_ref
+                else:
+                    assert origin.license_url is not None
+                    evidence_url = origin.license_url
+                    requested_revision = "content-addressed-web-snapshot"
+                    resolved_revision = ""
+
+                evidence, response_metadata = _fetch_governed_evidence_url(evidence_url)
+                evidence_sha256 = hashlib.sha256(evidence).hexdigest()
+                if origin.origin_kind == "web_snapshot":
+                    resolved_revision = f"sha256:{evidence_sha256}"
+
+                final_source_dir = target / source_id
+                temporary_source_dir = temporary / source_id
+                temporary_source_dir.mkdir(parents=True, exist_ok=False)
+                license_path = temporary_source_dir / "license.txt"
+                license_path.write_bytes(evidence)
+                candidate = SourceEvidenceCandidate(
+                    source_id=source_id,
+                    origin_kind=origin.origin_kind,
+                    registry_entry_sha256=source_registry_entry_sha256(source),
+                    expected_license=origin.expected_license,
+                    requested_revision=requested_revision,
+                    resolved_immutable_revision=resolved_revision,
+                    license_source_url=evidence_url,
+                    license_evidence_path=str(final_source_dir / "license.txt"),
+                    license_evidence_sha256=evidence_sha256,
+                    license_evidence_bytes=len(evidence),
+                    response_metadata=response_metadata,
+                    materialized_at_unix=time.time(),
+                    warning=(
+                        "Evidence candidate only. An authorized human must inspect source scope, third-party "
+                        "content, attribution/share-alike obligations, and intended training use before approval."
+                    ),
+                )
+                candidate_path = temporary_source_dir / "candidate.json"
+                self._atomic_write_json(candidate_path, candidate.model_dump(mode="json"))
+                approval_template = {
+                    "schema_version": 1,
+                    "approval_id": None,
+                    "decision": "pending_human_review",
+                    "source_id": source_id,
+                    "registry_entry_sha256": candidate.registry_entry_sha256,
+                    "immutable_revision": resolved_revision,
+                    "license": source.license,
+                    "license_evidence_sha256": evidence_sha256,
+                    "approved_use": source.approved_use,
+                    "approved_by": None,
+                    "approved_at": None,
+                    "scope": "evaluation_only" if source.approved_use == "evaluation_only" else "training_collection",
+                    "rationale": None,
+                }
+                template_path = temporary_source_dir / "approval.template.json"
+                self._atomic_write_json(template_path, approval_template)
+                candidate_entries.append(
+                    SourceEvidenceCandidateEntry(
+                        source_id=source_id,
+                        candidate_path=f"{source_id}/candidate.json",
+                        candidate_sha256=sha256_file(candidate_path),
+                        license_path=f"{source_id}/license.txt",
+                        license_sha256=evidence_sha256,
+                        approval_template_path=f"{source_id}/approval.template.json",
+                        approval_template_sha256=sha256_file(template_path),
+                    )
+                )
+
+            origin_payload = json.dumps(
+                origins.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            report = SourceEvidenceCandidateBundleReport(
+                source_count=len(candidate_entries),
+                source_registry_sha256=source_registry_snapshot_sha256(self.sources),
+                origin_registry_sha256=hashlib.sha256(origin_payload).hexdigest(),
+                output_dir=str(target),
+                candidates=candidate_entries,
+                created_at_unix=time.time(),
+            )
+            self._atomic_write_json(
+                temporary / "evidence-candidate-manifest.json",
+                report.model_dump(mode="json"),
+            )
+            os.replace(temporary, target)
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        return report
+
     @staticmethod
     def write_selection_manifest(manifest: SourceSelectionManifest, path: str | Path) -> Path:
         target = Path(path).resolve()
@@ -551,6 +940,8 @@ def main() -> None:
     parser.add_argument("--legal-approval")
     parser.add_argument("--trust-tier", choices=["reviewed", "trusted"], default="reviewed")
     parser.add_argument("--prepare-approval-dir")
+    parser.add_argument("--evidence-origins")
+    parser.add_argument("--materialize-evidence-candidates")
     parser.add_argument(
         "--select-source",
         action="append",
@@ -577,6 +968,16 @@ def main() -> None:
         )
     if args.prepare_approval_dir:
         registry.prepare_approval_requests(args.prepare_approval_dir)
+    candidate_bundle: SourceEvidenceCandidateBundleReport | None = None
+    if args.materialize_evidence_candidates:
+        if not args.evidence_origins:
+            parser.error("--materialize-evidence-candidates requires --evidence-origins")
+        candidate_bundle = registry.materialize_evidence_candidates(
+            origin_registry_path=args.evidence_origins,
+            output_dir=args.materialize_evidence_candidates,
+        )
+    elif args.evidence_origins:
+        parser.error("--evidence-origins requires --materialize-evidence-candidates")
     if args.approve_source:
         required = {
             "--immutable-revision": args.immutable_revision,
@@ -603,7 +1004,10 @@ def main() -> None:
             parser.error("approval evidence verification failed: " + "; ".join(evidence_blockers))
     if args.output:
         registry.write(args.output)
-    print(json.dumps(report.model_dump(), indent=2, sort_keys=True))
+    payload: dict[str, Any] = report.model_dump(mode="json")
+    if candidate_bundle is not None:
+        payload["evidence_candidates"] = candidate_bundle.model_dump(mode="json")
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

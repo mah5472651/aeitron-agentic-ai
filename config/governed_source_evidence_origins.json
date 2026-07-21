@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "expected_license": "apache-2.0",
+      "git_ref": "HEAD",
+      "license_path": "LICENSE",
+      "origin_kind": "git_repository",
+      "repository_url": "https://github.com/docker/docs.git",
+      "source_id": "docker-production-builds"
+    },
+    {
+      "expected_license": "bsd-3-clause",
+      "git_ref": "HEAD",
+      "license_path": "LICENSE",
+      "origin_kind": "git_repository",
+      "repository_url": "https://github.com/golang/go.git",
+      "source_id": "go-core-secure-coding"
+    },
+    {
+      "expected_license": "cc-by-4.0",
+      "git_ref": "HEAD",
+      "license_path": "LICENSE",
+      "origin_kind": "git_repository",
+      "repository_url": "https://github.com/kubernetes/website.git",
+      "source_id": "kubernetes-production-security"
+    },
+    {
+      "expected_license": "public-domain",
+      "license_url": "https://www.nist.gov/open/copyright-fair-use-and-licensing-statements-srd-data-software-and-technical-series-publications",
+      "origin_kind": "web_snapshot",
+      "source_id": "nist-secure-engineering"
+    },
+    {
+      "expected_license": "cc-by-sa-4.0",
+      "git_ref": "HEAD",
+      "license_path": "LICENSE.md",
+      "origin_kind": "git_repository",
+      "repository_url": "https://github.com/OWASP/CheatSheetSeries.git",
+      "source_id": "owasp-cheat-sheet-series"
+    },
+    {
+      "expected_license": "postgresql",
+      "git_ref": "HEAD",
+      "license_path": "COPYRIGHT",
+      "origin_kind": "git_repository",
+      "repository_url": "https://github.com/postgres/postgres.git",
+      "source_id": "postgresql-secure-data-layer"
+    },
+    {
+      "expected_license": "psf-2.0",
+      "git_ref": "HEAD",
+      "license_path": "LICENSE",
+      "origin_kind": "git_repository",
+      "repository_url": "https://github.com/python/cpython.git",
+      "source_id": "python-core-secure-coding"
+    },
+    {
+      "expected_license": "apache-2.0",
+      "git_ref": "HEAD",
+      "license_path": "LICENSE-APACHE",
+      "origin_kind": "git_repository",
+      "repository_url": "https://github.com/rust-lang/rust.git",
+      "source_id": "rust-core-secure-systems"
+    }
+  ]
+}

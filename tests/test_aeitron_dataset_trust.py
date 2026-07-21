@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from starlette.requests import Request
 
@@ -48,7 +49,12 @@ from src.aeitron.learning.production_dataset import (
     split_train_val_test,
     validate_dataset_manifest_for_promotion,
 )
-from src.aeitron.learning.source_registry import SourceRegistry, source_registry_entry_sha256
+from src.aeitron.learning.source_registry import (
+    SourceEvidenceOrigin,
+    SourceRegistry,
+    load_evidence_origin_registry,
+    source_registry_entry_sha256,
+)
 from src.aeitron.learning.source_reputation import build_source_reputation_report
 from src.aeitron.learning.training_data_gate import TrainingDataGateConfig, score_row
 from src.aeitron.learning.web_ingest import SourceSpec
@@ -674,6 +680,99 @@ class DatasetFingerprintAndManifestTest(unittest.TestCase):
         self.assertTrue(all(source.trust_tier == "quarantine" for source in staging.sources))
         licenses = {source.source_id: source.license for source in staging.sources}
         self.assertEqual(licenses["owasp-cheat-sheet-series"], "cc-by-sa-4.0")
+        evidence_origins = load_evidence_origin_registry(
+            root / "config" / "governed_source_evidence_origins.json"
+        )
+        self.assertEqual(
+            {source.source_id for source in evidence_origins.sources},
+            {source.source_id for source in staging.sources},
+        )
+        self.assertEqual(
+            {source.source_id: source.expected_license for source in evidence_origins.sources},
+            licenses,
+        )
+
+    def test_evidence_candidate_materialization_is_atomic_and_never_approves(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = SourceSpec(
+                name="official-docs",
+                source_id="official-docs",
+                source_family="official-docs",
+                urls=["https://docs.example.com/security"],
+                allowed_domains=["docs.example.com"],
+                license="apache-2.0",
+            )
+            origins = root / "origins.json"
+            origins.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "sources": [
+                            {
+                                "source_id": "official-docs",
+                                "origin_kind": "git_repository",
+                                "expected_license": "apache-2.0",
+                                "repository_url": "https://github.com/example/docs.git",
+                                "git_ref": "HEAD",
+                                "license_path": "LICENSE",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = root / "evidence"
+            with (
+                patch(
+                    "src.aeitron.learning.source_registry._resolve_public_git_revision",
+                    return_value="a" * 40,
+                ),
+                patch(
+                    "src.aeitron.learning.source_registry._fetch_governed_evidence_url",
+                    return_value=(b"Apache License 2.0\n", {"content-type": "text/plain"}),
+                ),
+            ):
+                report = SourceRegistry([source]).materialize_evidence_candidates(
+                    origin_registry_path=origins,
+                    output_dir=output,
+                )
+            self.assertFalse(report.production_collection_authorized)
+            self.assertEqual(report.status, "awaiting_human_legal_approval")
+            self.assertTrue((output / "evidence-candidate-manifest.json").is_file())
+            self.assertTrue((output / "official-docs" / "license.txt").is_file())
+            self.assertTrue((output / "official-docs" / "candidate.json").is_file())
+            template = json.loads(
+                (output / "official-docs" / "approval.template.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(template["decision"], "pending_human_review")
+            self.assertEqual(template["immutable_revision"], "a" * 40)
+            self.assertFalse((output / "official-docs" / "approval.json").exists())
+            with self.assertRaisesRegex(FileExistsError, "refusing to overwrite"):
+                SourceRegistry([source]).materialize_evidence_candidates(
+                    origin_registry_path=origins,
+                    output_dir=output,
+                )
+
+    def test_evidence_origin_rejects_ssrf_and_path_escape(self) -> None:
+        with self.assertRaisesRegex(ValueError, "official HTTPS GitHub"):
+            SourceEvidenceOrigin(
+                source_id="unsafe-source",
+                origin_kind="git_repository",
+                expected_license="apache-2.0",
+                repository_url="https://127.0.0.1/repository.git",
+                git_ref="HEAD",
+                license_path="LICENSE",
+            )
+        with self.assertRaisesRegex(ValueError, "safe relative path"):
+            SourceEvidenceOrigin(
+                source_id="unsafe-source",
+                origin_kind="git_repository",
+                expected_license="apache-2.0",
+                repository_url="https://github.com/example/repository.git",
+                git_ref="HEAD",
+                license_path="../LICENSE",
+            )
 
     def test_registry_write_refuses_approved_source_removal_or_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

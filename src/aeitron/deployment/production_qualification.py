@@ -19,6 +19,7 @@ import platform
 import re
 import subprocess  # nosec B404 - every subprocess argv is fixed internally
 import sys
+import tempfile
 import time
 import uuid
 from datetime import UTC, datetime
@@ -36,8 +37,11 @@ from src.aeitron.deployment.production_proof import (
     run_native_serving_load_test,
     run_production_proof,
 )
-from src.aeitron.learning.calibration_gate import CalibrationDecision
-from src.aeitron.learning.production_dataset import ProductionDatasetManifest
+from src.aeitron.learning.calibration_gate import CalibrationDecision, CalibrationPreflightReport
+from src.aeitron.learning.production_dataset import (
+    ProductionDatasetManifest,
+    validate_dataset_manifest_for_promotion,
+)
 from src.aeitron.model_ops.tokenizer_pipeline import TokenizerAuditReport
 from src.aeitron.shared.integrity import canonical_json_bytes, sha256_file
 from src.aeitron.shared.schemas import StrictModel
@@ -141,6 +145,23 @@ class QualificationCheck(StrictModel):
     evidence: list[EvidenceBinding] = Field(default_factory=list)
     metrics: dict[str, Any] = Field(default_factory=dict)
     blockers: list[str] = Field(default_factory=list)
+
+
+class ScratchAdvancementReport(StrictModel):
+    schema_version: Literal[1] = 1
+    authority: Literal["scratch_training_advancement"] = "scratch_training_advancement"
+    report_id: str
+    created_at: str
+    git_commit: str
+    check: QualificationCheck
+    report_sha256: str = ""
+
+    @field_validator("report_sha256")
+    @classmethod
+    def validate_report_sha256(cls, value: str) -> str:
+        if value and HEX_SHA256.fullmatch(value) is None:
+            raise ValueError("scratch advancement report digest must be SHA-256")
+        return value
 
 
 class LoadStageResult(StrictModel):
@@ -762,6 +783,7 @@ def _validate_dataset_artifacts(dataset: ProductionDatasetManifest) -> list[str]
 
 def validate_scratch_training_chain(
     *,
+    calibration_preflight_report: str | None = None,
     calibration_200_decision: str | None,
     calibration_5k_decision: str | None,
     production_dataset_manifest: str | None,
@@ -808,12 +830,46 @@ def validate_scratch_training_chain(
         "t4-1k-training-report": t4_1k_training_report,
         "t4-10k-training-report": t4_10k_training_report,
     }
+    if calibration_200_decision is None and calibration_preflight_report:
+        try:
+            preflight_binding = bind_evidence(
+                calibration_preflight_report,
+                evidence_id="calibration-preflight-report",
+                maximum_age_seconds=maximum_age_seconds,
+            )
+            preflight = CalibrationPreflightReport.model_validate(
+                load_json_evidence(preflight_binding)
+            )
+            if preflight.status != "ready":
+                if any(item.startswith("reviewer_qualification:") for item in preflight.blockers):
+                    next_stage = "reviewer-qualification-report"
+                elif any(item.startswith("source_legal_approval:") for item in preflight.blockers):
+                    next_stage = "source-legal-approvals"
+                else:
+                    next_stage = "governance-preflight"
+                return QualificationCheck(
+                    subsystem="scratch_training_chain",
+                    status="blocked",
+                    summary="Reviewer/legal governance must pass before calibration collection.",
+                    evidence=[preflight_binding],
+                    metrics={"next_required_stage": next_stage},
+                    blockers=list(preflight.blockers),
+                )
+        except Exception as exc:
+            return QualificationCheck(
+                subsystem="scratch_training_chain",
+                status="failed",
+                summary="Calibration preflight evidence is invalid or stale.",
+                metrics={"next_required_stage": "governance-preflight"},
+                blockers=[str(exc)],
+            )
     missing = [name for name, path in paths.items() if not path]
     if missing:
         return QualificationCheck(
             subsystem="scratch_training_chain",
             status="blocked",
             summary="Governed 200 -> 5k -> 100k -> tokenizer -> T4 qualification chain is incomplete.",
+            metrics={"next_required_stage": missing[0]},
             blockers=[f"missing evidence: {name}" for name in missing],
         )
 
@@ -837,6 +893,31 @@ def validate_scratch_training_chain(
         dataset = ProductionDatasetManifest.model_validate(
             load_json_evidence(bindings["production-dataset-manifest"])
         )
+        active_trust_policy = dataset.governance_paths.get("trust_policy_path")
+        if not active_trust_policy:
+            blockers.append("production dataset manifest is missing its active trust-policy binding")
+        else:
+            try:
+                replayed_dataset = validate_dataset_manifest_for_promotion(
+                    bindings["production-dataset-manifest"].path,
+                    trust_policy_path=active_trust_policy,
+                )
+                replay_identity = (
+                    replayed_dataset.dataset_id,
+                    replayed_dataset.version_id,
+                    replayed_dataset.status,
+                    replayed_dataset.advancement_decision_sha256,
+                )
+                parsed_identity = (
+                    dataset.dataset_id,
+                    dataset.version_id,
+                    dataset.status,
+                    dataset.advancement_decision_sha256,
+                )
+                if replay_identity != parsed_identity:
+                    blockers.append("production dataset authority replay returned a different manifest identity")
+            except Exception as exc:
+                blockers.append(f"production dataset authority replay failed: {exc}")
         tokenizer = TokenizerAuditReport.model_validate(
             load_json_evidence(bindings["tokenizer-audit-report"])
         )
@@ -1031,6 +1112,56 @@ def validate_scratch_training_chain(
         metrics=metrics,
         blockers=blockers,
     )
+
+
+def write_scratch_advancement_report(
+    check: QualificationCheck,
+    *,
+    output_dir: str | Path,
+) -> tuple[ScratchAdvancementReport, Path]:
+    root = Path(output_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    report_id = f"scratch-advancement-{uuid.uuid4()}"
+    unsigned = ScratchAdvancementReport(
+        report_id=report_id,
+        created_at=utc_now(),
+        git_commit=_git_commit(),
+        check=check,
+    )
+    digest = hashlib.sha256(canonical_json_bytes(unsigned.model_dump(mode="json"))).hexdigest()
+    report = unsigned.model_copy(update={"report_sha256": digest})
+    target = root / f"{report_id}.json"
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=root,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(canonical_json_bytes(report.model_dump(mode="json")) + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, target)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return report, target
+
+
+def verify_scratch_advancement_report(path: str | Path) -> ScratchAdvancementReport:
+    source = Path(path).expanduser().resolve(strict=True)
+    if not source.is_file() or source.stat().st_size > 10_000_000:
+        raise ValueError("scratch advancement report must be a regular file no larger than 10 MiB")
+    report = ScratchAdvancementReport.model_validate_json(source.read_text(encoding="utf-8-sig"))
+    unsigned = report.model_copy(update={"report_sha256": ""})
+    expected = hashlib.sha256(canonical_json_bytes(unsigned.model_dump(mode="json"))).hexdigest()
+    if not hmac.compare_digest(report.report_sha256, expected):
+        raise ValueError("scratch advancement report digest verification failed")
+    return report
 
 
 def _validate_training_proof_semantics(
@@ -1661,6 +1792,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--executable-benchmark-report")
     parser.add_argument("--scorecard-report")
     parser.add_argument("--training-proof-report")
+    parser.add_argument("--calibration-preflight-report")
     parser.add_argument("--calibration-200-decision")
     parser.add_argument("--calibration-5k-decision")
     parser.add_argument("--production-dataset-manifest")
@@ -1681,11 +1813,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--functional-timeout-seconds", type=int, default=1800)
     parser.add_argument("--run-security-audit", action="store_true")
     parser.add_argument("--strict-security-tools", action="store_true")
+    parser.add_argument(
+        "--scratch-chain-only",
+        action="store_true",
+        help="Validate and persist only the governed 200 -> 5k -> 100k -> tokenizer -> T4 evidence ladder.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    report, path = asyncio.run(run_qualification(parse_args()))
+    args = parse_args()
+    if args.scratch_chain_only:
+        policy = QualificationPolicy.from_file(args.policy)
+        check = validate_scratch_training_chain(
+            calibration_preflight_report=args.calibration_preflight_report,
+            calibration_200_decision=args.calibration_200_decision,
+            calibration_5k_decision=args.calibration_5k_decision,
+            production_dataset_manifest=args.production_dataset_manifest,
+            tokenizer_audit_report=args.tokenizer_audit_report,
+            overfit_sanity_report=args.overfit_sanity_report,
+            t4_1k_training_report=args.t4_1k_training_report,
+            t4_10k_training_report=args.t4_10k_training_report,
+            maximum_age_seconds=policy.evidence_max_age_seconds,
+            policy=policy,
+        )
+        advancement, path = write_scratch_advancement_report(check, output_dir=args.output_dir)
+        print(
+            json.dumps(
+                {
+                    "status": advancement.check.status,
+                    "report_id": advancement.report_id,
+                    "report_path": str(path),
+                    "report_sha256": advancement.report_sha256,
+                    "next_required_stage": advancement.check.metrics.get("next_required_stage"),
+                    "blockers": advancement.check.blockers,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        if advancement.check.status != "passed":
+            raise SystemExit(1)
+        return
+
+    report, path = asyncio.run(run_qualification(args))
     print(
         json.dumps(
             {

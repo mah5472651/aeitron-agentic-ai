@@ -4923,6 +4923,27 @@ documentation's `cc-by-4.0` entry. Since every approval binds the complete
 registry entry hash, a stale request that declares the OWASP source as
 `cc-by-4.0` cannot be replayed after this correction.
 
+The source registry also owns official evidence-candidate materialization. The
+versioned `config/governed_source_evidence_origins.json` contains exactly the
+same eight source IDs and their expected licenses. Seven origins resolve an
+official public Git repository ref to one full commit and fetch the license
+from `raw.githubusercontent.com`; NIST uses its exact official licensing page
+and a content-addressed SHA-256 revision. Redirects, credentials, query strings,
+unapproved hosts, path traversal, binary responses, responses over 1 MiB, and
+partial output are rejected. The operation writes `license.txt`,
+`candidate.json`, `approval.template.json`, and a bundle manifest atomically.
+The bundle status is always `awaiting_human_legal_approval` and
+`production_collection_authorized=false`; only the separately validated human
+`approval.json` can authorize a source.
+
+The final production authority has a `--scratch-chain-only` mode for the full
+200 -> 5K -> 100K -> 128K tokenizer -> overfit -> T4 1K -> T4 10K ladder. It
+persists a canonical SHA-256 report, names the first missing stage, verifies
+freshness and every bound file, and replays the production dataset through the
+Dataset Authority. This replay recursively verifies both calibration decisions
+and the current reviewer roster, qualification result, legal evidence, trust
+policy, source registry, protected benchmark pack, and promoted artifacts.
+
 Each request binds the source ID, complete registry entry SHA-256, source
 family, allowed domains, seed URLs, declared license, and intended use. An
 approval request also contains canonical evidence paths and a deliberately

@@ -1128,6 +1128,40 @@ calibration. The OWASP Cheat Sheet Series entry is declared
 The qualification report and legal evidence remain external human-governance
 artifacts and must never be fabricated or committed.
 
+Materialize official, immutable legal-evidence candidates before the human
+decision. This resolves public Git origins to full commits, content-addresses
+the NIST policy snapshot, enforces HTTPS host/path/size limits, and writes only
+`approval.template.json`; it never creates an authorizing `approval.json`:
+
+```powershell
+python -m src.aeitron.learning.source_registry `
+  --sources config\data_sources.governed.staging.json `
+  --evidence-origins config\governed_source_evidence_origins.json `
+  --materialize-evidence-candidates C:\AeitronGovernance\source-evidence-candidates-v1
+```
+
+After reviewer qualification, legal approval, calibration, dataset promotion,
+tokenizer qualification, and T4 runs, validate the complete immutable scratch
+advancement chain with one command:
+
+```powershell
+python -m src.aeitron.deployment.production_qualification `
+  --scratch-chain-only `
+  --calibration-preflight-report artifacts\aeitron\calibration-preflight\calibration_preflight_report.json `
+  --calibration-200-decision artifacts\aeitron\calibration-200\calibration_decision.json `
+  --calibration-5k-decision artifacts\aeitron\calibration-5k\calibration_decision.json `
+  --production-dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
+  --tokenizer-audit-report artifacts\aeitron\tokenizer-128k\tokenizer_audit_report.json `
+  --overfit-sanity-report artifacts\aeitron\t4-overfit\overfit_sanity_report.json `
+  --t4-1k-training-report artifacts\aeitron\t4-1k\training_report.json `
+  --t4-10k-training-report artifacts\aeitron\t4-10k\training_report.json `
+  --output-dir artifacts\aeitron\scratch-advancement
+```
+
+Missing evidence produces a hash-bound blocked report with the first exact next
+stage. A promoted dataset is replayed through the Dataset Authority, including
+current reviewer, legal, protected-benchmark, and calibration bindings.
+
 For the first balanced foundation calibration, select the exact eight-source
 batch before requesting approvals. Selection is deterministic, hash-bound, and
 does not modify the ultimate catalog:

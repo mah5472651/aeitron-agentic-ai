@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import HTTPException
 from hypothesis import given, settings, strategies as st
@@ -29,9 +30,12 @@ from src.aeitron.deployment.production_qualification import (
     validate_scratch_training_chain,
     validate_security_review,
     validate_training_proofs,
+    verify_scratch_advancement_report,
+    write_scratch_advancement_report,
     utc_now,
 )
 from src.aeitron.model_ops.foundation import sha256_file
+from src.aeitron.learning.production_dataset import ProductionDatasetManifest
 from src.aeitron.model_ops.native_serving import (
     ChatCompletionRequest,
     NativeServingState,
@@ -106,6 +110,55 @@ def build_report(report_id: str) -> ProductionQualificationReport:
 
 
 class AeitronProductionQualificationTest(unittest.TestCase):
+    def test_scratch_advancement_report_is_hash_bound_and_names_next_stage(self) -> None:
+        check = validate_scratch_training_chain(
+            calibration_200_decision=None,
+            calibration_5k_decision=None,
+            production_dataset_manifest=None,
+            tokenizer_audit_report=None,
+            overfit_sanity_report=None,
+            t4_1k_training_report=None,
+            t4_10k_training_report=None,
+            maximum_age_seconds=3600,
+        )
+        self.assertEqual(check.metrics["next_required_stage"], "calibration-200-decision")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            preflight_path = Path(temp_dir) / "calibration-preflight.json"
+            preflight_path.write_text(
+                json.dumps(
+                    {
+                        "status": "blocked",
+                        "approval_request_dir": "approval-requests",
+                        "legal_evidence_dir": "source-approvals",
+                        "blockers": [
+                            "reviewer_qualification:passed qualification report is required",
+                            "source_legal_approval:official-docs requires human approval",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            governed = validate_scratch_training_chain(
+                calibration_preflight_report=str(preflight_path),
+                calibration_200_decision=None,
+                calibration_5k_decision=None,
+                production_dataset_manifest=None,
+                tokenizer_audit_report=None,
+                overfit_sanity_report=None,
+                t4_1k_training_report=None,
+                t4_10k_training_report=None,
+                maximum_age_seconds=3600,
+            )
+            self.assertEqual(governed.metrics["next_required_stage"], "reviewer-qualification-report")
+            report, path = write_scratch_advancement_report(check, output_dir=temp_dir)
+            verified = verify_scratch_advancement_report(path)
+            self.assertEqual(verified.report_sha256, report.report_sha256)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["check"]["status"] = "passed"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "digest verification failed"):
+                verify_scratch_advancement_report(path)
+
     def test_scratch_training_chain_blocks_missing_and_rejects_tampering(self) -> None:
         missing = validate_scratch_training_chain(
             calibration_200_decision=None,
@@ -211,6 +264,7 @@ class AeitronProductionQualificationTest(unittest.TestCase):
                             },
                             "split_manifest": {"cross_split_group_collisions": 0},
                         },
+                        "governance_paths": {"trust_policy_path": str(root / "trust-policy.json")},
                         "advancement_decision_sha256": sha256_file(calibration_5k),
                         "promotion_decision": {"status": "promoted", "checks": {"all": True}},
                     }
@@ -328,10 +382,30 @@ class AeitronProductionQualificationTest(unittest.TestCase):
                 "t4_10k_training_report": str(t4_10k),
                 "maximum_age_seconds": 3600,
             }
-            valid = validate_scratch_training_chain(**kwargs)
+            dataset_contract = json.loads(dataset.read_text(encoding="utf-8"))
+            with patch(
+                "src.aeitron.deployment.production_qualification.validate_dataset_manifest_for_promotion",
+                return_value=ProductionDatasetManifest.model_validate(dataset_contract),
+            ) as replay:
+                valid = validate_scratch_training_chain(**kwargs)
             self.assertEqual(valid.status, "passed", valid.model_dump())
+            replay.assert_called_once_with(str(dataset), trust_policy_path=str(root / "trust-policy.json"))
+            with patch(
+                "src.aeitron.deployment.production_qualification.validate_dataset_manifest_for_promotion",
+                side_effect=ValueError("stale legal approval evidence"),
+            ):
+                stale_governance = validate_scratch_training_chain(**kwargs)
+            self.assertEqual(stale_governance.status, "failed")
+            self.assertTrue(
+                any("authority replay failed" in item for item in stale_governance.blockers),
+                stale_governance.model_dump(),
+            )
             tokenizer_source.write_text('{"text":"tampered tokenizer source"}\n', encoding="utf-8")
-            source_tampered = validate_scratch_training_chain(**kwargs)
+            with patch(
+                "src.aeitron.deployment.production_qualification.validate_dataset_manifest_for_promotion",
+                return_value=ProductionDatasetManifest.model_validate(dataset_contract),
+            ):
+                source_tampered = validate_scratch_training_chain(**kwargs)
             self.assertEqual(source_tampered.status, "failed")
             self.assertTrue(
                 any("tokenizer source SHA-256 mismatch" in item for item in source_tampered.blockers),
@@ -339,7 +413,11 @@ class AeitronProductionQualificationTest(unittest.TestCase):
             )
             tokenizer_source.write_text('{"text":"secure code"}\n', encoding="utf-8")
             calibration_200.write_text(calibration_200.read_text(encoding="utf-8") + "\n", encoding="utf-8")
-            tampered = validate_scratch_training_chain(**kwargs)
+            with patch(
+                "src.aeitron.deployment.production_qualification.validate_dataset_manifest_for_promotion",
+                return_value=ProductionDatasetManifest.model_validate(dataset_contract),
+            ):
+                tampered = validate_scratch_training_chain(**kwargs)
             self.assertEqual(tampered.status, "failed")
             self.assertTrue(any("hash-bound" in item for item in tampered.blockers))
 
