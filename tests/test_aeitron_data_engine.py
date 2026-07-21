@@ -831,6 +831,20 @@ class AeitronDataEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.status, "block")
         self.assertIn("source_registry", {item.name for item in report.checks if item.status == "fail"})
 
+    def test_ci_source_registry_passes_distributed_readiness_contract(self) -> None:
+        report = run_readiness_check(
+            DataPlatformReadinessConfig(
+                sources_path="config/data_sources.ci.json",
+                frontier_backend="postgres",
+                postgres_dsn="postgresql://user:pass@postgres:5432/aeitron",
+                object_store_uri="s3://aeitron-datasets/pretraining",
+                production_mode=True,
+                worker_replicas=4,
+                async_workers=32,
+            )
+        )
+        self.assertEqual(report.status, "pass")
+
     def test_quality_inspector_and_run_plan_prepare_first_serious_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
