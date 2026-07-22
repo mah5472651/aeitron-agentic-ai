@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import hmac
 import json
 import math
 import os
+import random
 import shutil
 import subprocess  # nosec B404
 import sys
@@ -1172,6 +1174,8 @@ def run_pretraining_loop(
     manifest_sha256: str | None = None,
     tokenizer_sha256: str | None = None,
     optimizer_policy_path: str | Path | None = None,
+    model_progression_decision_path: str | Path | None = None,
+    model_progression_decision_sha256: str | None = None,
     artifact_cache_dir: str | Path | None = None,
     object_store_endpoint_url: str | None = None,
     device: str = "auto",
@@ -1211,6 +1215,7 @@ def run_pretraining_loop(
     max_training_loss: float = 10_000.0,
     dataloader_prefetch_batches: int = 4,
     dataloader_seed: int = 1337,
+    model_seed: int = 1337,
     expected_python_version: str | None = None,
     expected_pytorch_version: str | None = None,
     expected_cuda_version: str | None = None,
@@ -1253,6 +1258,21 @@ def run_pretraining_loop(
         if not optimizer_policy_source.is_file() or optimizer_policy_source.stat().st_size < 1:
             raise ValueError("optimizer policy must be a non-empty regular file")
         optimizer_policy_digest = sha256_file(optimizer_policy_source)
+    if bool(model_progression_decision_path) != bool(model_progression_decision_sha256):
+        raise ValueError("model progression decision path and SHA-256 must be supplied together")
+    progression_source: Path | None = None
+    progression_digest = ""
+    progression = None
+    if model_progression_decision_path is not None:
+        progression_source = Path(model_progression_decision_path).expanduser().resolve(strict=True)
+        progression_digest = sha256_file(progression_source)
+        if not hmac.compare_digest(progression_digest, str(model_progression_decision_sha256)):
+            raise ValueError("model progression decision SHA-256 mismatch")
+        from src.aeitron.learning.ablation_runner import verify_model_progression_decision
+
+        progression = verify_model_progression_decision(progression_source)
+        if progression.status != "authorized" or progression.target_model_profile != model_profile_name:
+            raise ValueError("model progression decision does not authorize this model profile")
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     artifact_cache = ArtifactCache(
@@ -1301,6 +1321,11 @@ def run_pretraining_loop(
         gradient_checkpointing=gradient_checkpointing,
         artifact_cache=artifact_cache,
     )
+    if progression is not None and not hmac.compare_digest(
+        config.contract_sha256(),
+        str(progression.target_model_contract_sha256 or ""),
+    ):
+        raise ValueError("runtime model contract differs from the authorized progression target")
     available_batches = validate_training_shards(
         train_shards=active_manifest.train_shards,
         sequence_length=sequence_length,
@@ -1364,6 +1389,13 @@ def run_pretraining_loop(
         vocab_size=config.vocab_size,
         parameter_count=config.parameter_estimate(),
     )
+    if not 0 <= model_seed <= 2**31 - 1:
+        raise ValueError("model_seed must be between 0 and 2**31-1")
+    random.seed(model_seed)
+    torch.manual_seed(model_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(model_seed)
+
     train_stream = TokenShardStream(
         active_manifest.train_shards,
         sequence_length=sequence_length,
@@ -1393,7 +1425,16 @@ def run_pretraining_loop(
         else None
     )
 
+    # Every rank must initialize identical parameters before distributed
+    # wrapping. Runtime stochastic operations receive a rank-specific stream
+    # only after initialization, while checkpoint resume restores exact RNG
+    # state from the selected checkpoint.
     model = AeitronDecoderLM(config).to(selected)
+    runtime_seed = model_seed + distributed_rank() * 1_000_003
+    random.seed(runtime_seed)
+    torch.manual_seed(runtime_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(runtime_seed)
     if config.gradient_checkpointing:
         model.enable_gradient_checkpointing()
     if not is_deepspeed_strategy(distributed_strategy):
@@ -1428,6 +1469,8 @@ def run_pretraining_loop(
         "objective": "causal_language_modeling",
         "optimizer_policy_path": str(optimizer_policy_source or ""),
         "optimizer_policy_sha256": optimizer_policy_digest,
+        "model_progression_decision_path": str(progression_source or ""),
+        "model_progression_decision_sha256": progression_digest,
         "step_semantics": TRAINING_STEP_SEMANTICS,
         "steps": steps,
         "batch_size": batch_size,
@@ -1459,6 +1502,9 @@ def run_pretraining_loop(
         "max_training_loss": max_training_loss,
         "dataloader_prefetch_batches": dataloader_prefetch_batches,
         "dataloader_seed": dataloader_seed,
+        "model_seed": model_seed,
+        "runtime_seed": runtime_seed,
+        "distributed_rank": distributed_rank(),
         "data_parallel_world_size": data_parallel_world_size,
         "tokens_per_optimizer_step": tokens_per_optimizer_step,
         "batches_per_rank_per_epoch": available_batches_per_rank,
@@ -1473,6 +1519,9 @@ def run_pretraining_loop(
             "sequence_length",
             "gradient_accumulation_steps",
             "dataloader_seed",
+            "model_seed",
+            "runtime_seed",
+            "distributed_rank",
             "data_parallel_world_size",
             "tokens_per_optimizer_step",
             "batches_per_rank_per_epoch",
@@ -1898,6 +1947,8 @@ def run_pretraining_loop(
         "training_args": checkpoint_args,
         "optimizer_policy_path": str(optimizer_policy_source or ""),
         "optimizer_policy_sha256": optimizer_policy_digest,
+        "model_progression_decision_path": str(progression_source or ""),
+        "model_progression_decision_sha256": progression_digest,
         "checkpoint_manifest": str(manifest_path),
         "checkpoint_manifest_sha256": sha256_file(manifest_path),
         "best_checkpoint_manifest_sha256": sha256_file(best_checkpoint_manifest),
@@ -1933,6 +1984,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest-sha256")
     parser.add_argument("--tokenizer-sha256")
     parser.add_argument("--optimizer-policy")
+    parser.add_argument("--model-progression-decision")
+    parser.add_argument("--model-progression-decision-sha256")
     parser.add_argument("--artifact-cache-dir")
     parser.add_argument("--object-store-endpoint-url")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -1972,6 +2025,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-training-loss", type=float, default=10_000.0)
     parser.add_argument("--dataloader-prefetch-batches", type=int, default=4)
     parser.add_argument("--dataloader-seed", type=int, default=1337)
+    parser.add_argument("--model-seed", type=int, default=1337)
     parser.add_argument("--expected-python-version")
     parser.add_argument("--expected-pytorch-version")
     parser.add_argument("--expected-cuda-version")
@@ -2029,6 +2083,8 @@ def main() -> None:
         manifest_sha256=args.manifest_sha256,
         tokenizer_sha256=args.tokenizer_sha256,
         optimizer_policy_path=args.optimizer_policy,
+        model_progression_decision_path=args.model_progression_decision,
+        model_progression_decision_sha256=args.model_progression_decision_sha256,
         artifact_cache_dir=args.artifact_cache_dir,
         object_store_endpoint_url=args.object_store_endpoint_url,
         device=args.device,
@@ -2066,6 +2122,7 @@ def main() -> None:
         max_training_loss=args.max_training_loss,
         dataloader_prefetch_batches=args.dataloader_prefetch_batches,
         dataloader_seed=args.dataloader_seed,
+        model_seed=args.model_seed,
         expected_python_version=args.expected_python_version,
         expected_pytorch_version=args.expected_pytorch_version,
         expected_cuda_version=args.expected_cuda_version,

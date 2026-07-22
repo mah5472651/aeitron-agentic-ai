@@ -145,6 +145,55 @@ class BoundArtifact(StrictModel):
             raise ValueError(f"bound artifact hash changed: {self.name}")
 
 
+def _bind_evaluation_inputs(
+    evaluation_manifest: str | Path,
+    *,
+    required_suites: Sequence[str],
+) -> dict[str, BoundArtifact]:
+    """Bind every file that can influence a scientific evaluation result."""
+
+    payload = _json_object(evaluation_manifest)
+    policy = payload.get("executable_evaluation")
+    if not isinstance(policy, dict):
+        raise ValueError("evaluation manifest requires an executable_evaluation object")
+    bindings: dict[str, BoundArtifact] = {}
+    for name in ("protected_config", "protected_manifest"):
+        raw_path = policy.get(name)
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError(f"evaluation manifest is missing {name}")
+        artifact = BoundArtifact.bind(name, raw_path)
+        declared = policy.get(f"{name}_sha256")
+        if declared is not None and not hmac.compare_digest(str(declared), artifact.sha256):
+            raise ValueError(f"evaluation manifest {name} hash mismatch")
+        bindings[name] = artifact
+
+    raw_suites = policy.get("suites")
+    if not isinstance(raw_suites, list) or not raw_suites:
+        raise ValueError("evaluation manifest requires non-empty executable suites")
+    seen: set[str] = set()
+    for row in raw_suites:
+        if not isinstance(row, dict):
+            raise ValueError("evaluation suite entries must be objects")
+        name = str(row.get("name") or "").strip()
+        path = row.get("path")
+        if not name or name in seen:
+            raise ValueError("evaluation suite names must be non-empty and unique")
+        if row.get("required") is not True:
+            raise ValueError(f"scientific evaluation suite must be required: {name}")
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(f"evaluation suite path is missing: {name}")
+        artifact = BoundArtifact.bind(name, path)
+        declared = row.get("sha256")
+        if declared is not None and not hmac.compare_digest(str(declared), artifact.sha256):
+            raise ValueError(f"evaluation suite hash mismatch: {name}")
+        bindings[f"suite:{name}"] = artifact
+        seen.add(name)
+    missing = sorted(set(required_suites) - seen)
+    if missing:
+        raise ValueError(f"evaluation manifest is missing required campaign suites: {missing}")
+    return bindings
+
+
 class ExperimentArmPlan(StrictModel):
     arm_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{2,160}$")
     seed: int = Field(ge=0)
@@ -153,6 +202,7 @@ class ExperimentArmPlan(StrictModel):
     model_contract_sha256: str
     total_parameters: int = Field(gt=0)
     active_parameters: int = Field(gt=0)
+    canonical_training_flops: float = Field(gt=0.0)
     vocab_size: int = Field(gt=0)
     token_budget: int = Field(gt=0)
     training_profile_id: str
@@ -175,11 +225,75 @@ class ExperimentArmPlan(StrictModel):
             raise ValueError("experiment arm parameter accounting mismatch")
         if contract.vocab_size != self.vocab_size:
             raise ValueError("experiment arm vocabulary does not match model contract")
+        expected_flops = float(6 * self.active_parameters * self.token_budget)
+        if not math.isclose(self.canonical_training_flops, expected_flops, rel_tol=1e-12):
+            raise ValueError("experiment arm canonical training FLOPs mismatch")
+        return self
+
+
+class ScientificArmExecutionRequest(StrictModel):
+    schema_version: Literal[1] = 1
+    experiment_id: str
+    arm_id: str
+    status: Literal["not_run"] = "not_run"
+    scheduler: Literal["notebook", "kubernetes", "kubernetes_pytorch", "slurm"]
+    distributed_strategy: str
+    training_profile_id: str
+    model_profile: str
+    model_contract_sha256: str
+    total_parameters: int = Field(gt=0)
+    active_parameters: int = Field(gt=0)
+    canonical_training_flops: float = Field(gt=0.0)
+    model_seed: int = Field(ge=0, le=2**31 - 1)
+    dataloader_seed: int = Field(ge=0, le=2**31 - 1)
+    world_size: int = Field(ge=1)
+    optimizer_steps: int = Field(ge=1)
+    token_budget: int = Field(ge=1)
+    tokens_per_optimizer_step: int = Field(ge=1)
+    sequence_length: int = Field(ge=1)
+    batch_size: int = Field(ge=1)
+    gradient_accumulation_steps: int = Field(ge=1)
+    dtype: str
+    tokenizer_manifest_path: str
+    tokenizer_manifest_sha256: str
+    shard_manifest_path: str
+    shard_manifest_sha256: str
+    dataset_manifest_path: str
+    dataset_manifest_sha256: str
+    split_manifest_path: str
+    split_manifest_sha256: str
+    optimizer_policy_path: str
+    optimizer_policy_sha256: str
+    evaluation_manifest_path: str
+    evaluation_manifest_sha256: str
+    container_digest: str
+    required_evaluation_suites: list[str]
+
+    @model_validator(mode="after")
+    def validate_execution_shape(self) -> "ScientificArmExecutionRequest":
+        if self.optimizer_steps * self.tokens_per_optimizer_step != self.token_budget:
+            raise ValueError("scientific arm token budget is not exactly executable")
+        expected_flops = float(6 * self.active_parameters * self.token_budget)
+        if not math.isclose(self.canonical_training_flops, expected_flops, rel_tol=1e-12):
+            raise ValueError("scientific execution request FLOPs do not match its active compute")
+        for value in (
+            self.tokenizer_manifest_sha256,
+            self.shard_manifest_sha256,
+            self.dataset_manifest_sha256,
+            self.split_manifest_sha256,
+            self.model_contract_sha256,
+            self.optimizer_policy_sha256,
+            self.evaluation_manifest_sha256,
+        ):
+            if HEX_SHA256.fullmatch(value) is None:
+                raise ValueError("scientific execution request contains an invalid SHA-256")
+        if SAFE_CONTAINER_DIGEST.fullmatch(self.container_digest) is None:
+            raise ValueError("scientific execution request requires a pinned container digest")
         return self
 
 
 class ExperimentManifest(StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     authority: Literal["aeitron_scientific_experiment"] = "aeitron_scientific_experiment"
     experiment_id: str
     campaign: ScientificExperimentCampaignContract
@@ -188,6 +302,7 @@ class ExperimentManifest(StrictModel):
     container_digest: str
     objective: Literal["causal_language_modeling"]
     bindings: dict[str, BoundArtifact]
+    evaluation_inputs: dict[str, BoundArtifact]
     tokenizers: dict[str, BoundArtifact]
     arms: list[ExperimentArmPlan] = Field(min_length=1)
     environment: dict[str, str]
@@ -228,6 +343,11 @@ class ExperimentManifest(StrictModel):
                 "experiment tokenizer bindings do not match the campaign: "
                 f"expected={sorted(expected_tokenizer_keys)} actual={sorted(self.tokenizers)}"
             )
+        required_evaluation_keys = {f"suite:{name}" for name in self.campaign.required_evaluation_suites}
+        if not {"protected_config", "protected_manifest", *required_evaluation_keys}.issubset(
+            self.evaluation_inputs
+        ):
+            raise ValueError("experiment evaluation inputs are incomplete")
         return self
 
     def sealed(self) -> "ExperimentManifest":
@@ -238,6 +358,8 @@ class ExperimentManifest(StrictModel):
         if not self.manifest_sha256 or not hmac.compare_digest(expected, self.manifest_sha256):
             raise ValueError("experiment manifest has been modified")
         for artifact in self.bindings.values():
+            artifact.verify()
+        for artifact in self.evaluation_inputs.values():
             artifact.verify()
         contracts = {
             key: _verified_tokenizer_contract(
@@ -351,7 +473,12 @@ class ArmEvidence(StrictModel):
             raise ValueError("training evidence contains non-finite metrics")
         return self
 
-    def verify_artifacts(self, *, arm: ExperimentArmPlan) -> None:
+    def verify_artifacts(
+        self,
+        *,
+        arm: ExperimentArmPlan,
+        evaluation_inputs: dict[str, BoundArtifact],
+    ) -> None:
         self.training_report.verify()
         self.evaluation_report.verify()
         self.generation_audit.verify()
@@ -377,6 +504,11 @@ class ArmEvidence(StrictModel):
             raise ValueError("training report is missing immutable training arguments")
         if training_args.get("step_semantics") != "optimizer_update_v2":
             raise ValueError("training report does not use optimizer-step semantics")
+        if int(training_args.get("model_seed", -1)) != arm.seed:
+            raise ValueError("training report model seed does not match the preregistered arm seed")
+        expected_runtime_seed = arm.seed + int(training_args.get("distributed_rank", 0)) * 1_000_003
+        if int(training_args.get("runtime_seed", -1)) != expected_runtime_seed:
+            raise ValueError("training report runtime seed is not derived from the preregistered arm seed")
         if int(training_args.get("target_tokens", -1)) != self.trained_tokens:
             raise ValueError("training arguments do not bind the preregistered token budget")
         if int(training.get("trained_tokens", -1)) != self.trained_tokens:
@@ -414,6 +546,32 @@ class ArmEvidence(StrictModel):
             raise ValueError("router load summary differs from training evidence")
         if evaluation.get("status") != "passed" or evaluation.get("evaluation_mode") != "executable_model":
             raise ValueError("bound evaluation is not a passed executable-model report")
+        if not hmac.compare_digest(
+            str(evaluation.get("evaluation_manifest_sha256") or ""),
+            self.evaluation_manifest_sha256,
+        ):
+            raise ValueError("executable evaluation is not bound to the experiment evaluation manifest")
+        if not hmac.compare_digest(
+            str(evaluation.get("checkpoint_manifest_sha256") or ""),
+            self.checkpoint_manifest.sha256,
+        ):
+            raise ValueError("executable evaluation checkpoint hash differs from the selected checkpoint")
+        if not hmac.compare_digest(
+            str(evaluation.get("tokenizer_sha256") or ""),
+            self.tokenizer_sha256,
+        ):
+            raise ValueError("executable evaluation tokenizer hash differs from the selected tokenizer")
+        reported_suite_hashes = evaluation.get("suite_artifact_sha256")
+        if not isinstance(reported_suite_hashes, dict):
+            raise ValueError("executable evaluation is missing suite artifact hashes")
+        expected_suite_hashes = {
+            key.removeprefix("suite:"): artifact.sha256
+            for key, artifact in evaluation_inputs.items()
+            if key.startswith("suite:")
+        }
+        for name, expected_hash in expected_suite_hashes.items():
+            if not hmac.compare_digest(str(reported_suite_hashes.get(name) or ""), expected_hash):
+                raise ValueError(f"executable evaluation suite hash mismatch: {name}")
         if not math.isclose(
             float(evaluation.get("aggregate_score", math.nan)),
             self.executable_benchmark_score,
@@ -542,7 +700,15 @@ class StatisticalComparisonReport(StrictModel):
     scaling_law: ScalingLawReport | None = None
     selected_candidate: str | None = None
     blockers: list[str] = Field(default_factory=list)
+    arm_reports_sha256: str = ""
     report_sha256: str = ""
+
+    @field_validator("arm_reports_sha256")
+    @classmethod
+    def validate_arm_reports_digest(cls, value: str) -> str:
+        if value and HEX_SHA256.fullmatch(value) is None:
+            raise ValueError("arm report digest is invalid")
+        return value
 
     def sealed(self) -> "StatisticalComparisonReport":
         return self.model_copy(update={"report_sha256": _digest_model(self, omitted={"report_sha256"})})
@@ -581,6 +747,75 @@ class PromotionDecision(StrictModel):
         return self.model_copy(update={"promotion_sha256": _digest_model(self, omitted={"promotion_sha256"})})
 
 
+class ModelProgressionDecision(StrictModel):
+    """Composite scientific authorization for the next scratch-model scale.
+
+    This is not a deployment or production promotion. It proves that the
+    tokenizer, architecture, and scaling decisions all passed on one immutable
+    evidence lineage. Production qualification remains the final authority.
+    """
+
+    schema_version: Literal[2] = 2
+    authority: Literal["aeitron_model_progression"] = "aeitron_model_progression"
+    status: Literal["authorized", "blocked"]
+    target_scale: Literal["7b"] = "7b"
+    selected_tokenizer_vocab_size: int | None = Field(default=None, gt=0)
+    selected_architecture: str | None = None
+    target_model_profile: str | None = None
+    target_model_contract_sha256: str | None = None
+    tokenizer_promotion_sha256: str
+    architecture_promotion_sha256: str
+    scaling_promotion_sha256: str
+    dataset_manifest_sha256: str
+    split_manifest_sha256: str
+    evaluation_manifest_sha256: str
+    selected_tokenizer_manifest_sha256: str | None = None
+    blockers: list[str] = Field(default_factory=list)
+    production_qualification_required: Literal[True] = True
+    created_at_unix: float = Field(default_factory=time.time)
+    decision_sha256: str = ""
+
+    @field_validator(
+        "tokenizer_promotion_sha256",
+        "architecture_promotion_sha256",
+        "scaling_promotion_sha256",
+        "dataset_manifest_sha256",
+        "split_manifest_sha256",
+        "evaluation_manifest_sha256",
+    )
+    @classmethod
+    def validate_progression_digest(cls, value: str) -> str:
+        if HEX_SHA256.fullmatch(value) is None:
+            raise ValueError("model progression contains an invalid SHA-256")
+        return value
+
+    @field_validator("selected_tokenizer_manifest_sha256", "target_model_contract_sha256")
+    @classmethod
+    def validate_optional_progression_digest(cls, value: str | None) -> str | None:
+        if value is not None and HEX_SHA256.fullmatch(value) is None:
+            raise ValueError("selected tokenizer manifest SHA-256 is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def validate_progression(self) -> "ModelProgressionDecision":
+        if self.status == "authorized":
+            if self.blockers:
+                raise ValueError("authorized model progression cannot contain blockers")
+            if self.selected_tokenizer_vocab_size is None or not self.selected_architecture:
+                raise ValueError("authorized model progression requires tokenizer and architecture choices")
+            if self.selected_tokenizer_manifest_sha256 is None:
+                raise ValueError("authorized model progression requires the selected tokenizer manifest hash")
+            if self.target_model_contract_sha256 is None:
+                raise ValueError("authorized model progression requires the exact target model contract hash")
+            expected_profile = "7b_moe" if self.selected_architecture == "1b_moe" else "7b"
+            if self.target_model_profile != expected_profile:
+                raise ValueError("7B target profile does not match the selected 1B architecture")
+        return self
+
+    def sealed(self) -> "ModelProgressionDecision":
+        return self.model_copy(update={"decision_sha256": _digest_model(self, omitted={"decision_sha256"})})
+
+
 class AblationReport(StrictModel):
     """Legacy mix preparation report; never a model-promotion decision."""
 
@@ -615,6 +850,7 @@ def _arm_from_profile(
         model_contract_sha256=contract.contract_sha256(),
         total_parameters=int(report["total"]),
         active_parameters=int(report["active"]),
+        canonical_training_flops=float(6 * int(report["active"]) * token_budget),
         vocab_size=contract.vocab_size,
         token_budget=token_budget,
         training_profile_id=training_profile_id,
@@ -683,6 +919,10 @@ def create_experiment_manifest(
         "optimizer_policy": BoundArtifact.bind("optimizer_policy", optimizer_policy),
         "evaluation_manifest": BoundArtifact.bind("evaluation_manifest", evaluation_manifest),
     }
+    evaluation_inputs = _bind_evaluation_inputs(
+        evaluation_manifest,
+        required_suites=campaign.required_evaluation_suites,
+    )
     campaign_sha256 = hashlib.sha256(
         canonical_json_bytes(campaign.model_dump(mode="json"))
     ).hexdigest()
@@ -718,6 +958,9 @@ def create_experiment_manifest(
     identity_payload = {
         "campaign": campaign_sha256,
         "bindings": {name: item.sha256 for name, item in sorted(bindings.items())},
+        "evaluation_inputs": {
+            name: item.sha256 for name, item in sorted(evaluation_inputs.items())
+        },
         "tokenizers": {name: item.sha256 for name, item in sorted(tokenizer_bindings.items())},
         "git_commit": _git_commit(),
         "container_digest": container_digest,
@@ -731,6 +974,7 @@ def create_experiment_manifest(
         container_digest=container_digest,
         objective=campaign.objective,
         bindings=bindings,
+        evaluation_inputs=evaluation_inputs,
         tokenizers=tokenizer_bindings,
         arms=_campaign_arms(campaign, selected_vocab_size=selected_vocab_size),
         environment={
@@ -776,7 +1020,7 @@ def _load_arm_evidence(manifest: ExperimentManifest, evidence_dir: str | Path) -
                 raise ValueError("trained token count differs from the immutable token budget")
             if item.total_parameters != arm.total_parameters or item.active_parameters != arm.active_parameters:
                 raise ValueError("arm parameter evidence differs from canonical accounting")
-            item.verify_artifacts(arm=arm)
+            item.verify_artifacts(arm=arm, evaluation_inputs=manifest.evaluation_inputs)
             expected_bindings = {
                 "dataset_manifest_sha256": manifest.bindings["dataset_manifest"].sha256,
                 "split_manifest_sha256": manifest.bindings["split_manifest"].sha256,
@@ -1450,7 +1694,478 @@ def verify_promotion_chain(promotion_path: str | Path) -> tuple[
     }
     if len(identities) != 1:
         raise ValueError("scientific promotion chain contains mixed experiment identities")
+    arm_reports_path = root / "arm_reports.json"
+    if not comparison.arm_reports_sha256:
+        raise ValueError("scientific comparison is not bound to admitted arm evidence")
+    if not arm_reports_path.is_file() or not hmac.compare_digest(
+        sha256_file(arm_reports_path),
+        comparison.arm_reports_sha256,
+    ):
+        raise ValueError("scientific arm report binding changed")
+    arm_reports = _json_object(arm_reports_path)
+    if arm_reports.get("experiment_id") != manifest.experiment_id:
+        raise ValueError("arm reports belong to a different experiment")
+    raw_bindings = arm_reports.get("evidence")
+    if not isinstance(raw_bindings, dict):
+        raise ValueError("arm reports do not contain evidence bindings")
+    planned = {arm.arm_id: arm for arm in manifest.arms}
+    if set(raw_bindings) != set(planned):
+        raise ValueError("arm report evidence set differs from the preregistered arms")
+    for arm_id, raw_binding in raw_bindings.items():
+        artifact = BoundArtifact.model_validate(raw_binding)
+        artifact.verify()
+        evidence = ArmEvidence.model_validate(_json_object(artifact.path))
+        if evidence.arm_id != arm_id:
+            raise ValueError(f"arm evidence identity mismatch: {arm_id}")
+        evidence.verify_artifacts(
+            arm=planned[arm_id],
+            evaluation_inputs=manifest.evaluation_inputs,
+        )
     return promotion, decision, comparison, manifest
+
+
+def build_model_progression_decision(
+    *,
+    tokenizer_promotion_path: str | Path,
+    architecture_promotion_path: str | Path,
+    scaling_promotion_path: str | Path,
+) -> ModelProgressionDecision:
+    """Authorize a 7B experiment only from three compatible promotion chains."""
+
+    chains = {
+        "tokenizer_selection": verify_promotion_chain(tokenizer_promotion_path),
+        "architecture_ab": verify_promotion_chain(architecture_promotion_path),
+        "scaling_law": verify_promotion_chain(scaling_promotion_path),
+    }
+    blockers: list[str] = []
+    by_type: dict[
+        str,
+        tuple[PromotionDecision, ExperimentDecision, StatisticalComparisonReport, ExperimentManifest],
+    ] = {}
+    for supplied_name, chain in chains.items():
+        actual_name = chain[3].campaign.experiment_type
+        if actual_name != supplied_name:
+            blockers.append(
+                f"{supplied_name} input contains {actual_name} promotion evidence"
+            )
+        if actual_name in by_type:
+            blockers.append(f"duplicate scientific promotion type: {actual_name}")
+        by_type[actual_name] = chain
+        if chain[0].status != "promoted":
+            blockers.append(f"{supplied_name} scientific promotion did not pass")
+
+    tokenizer_chain = by_type.get("tokenizer_selection")
+    architecture_chain = by_type.get("architecture_ab")
+    scaling_chain = by_type.get("scaling_law")
+    if tokenizer_chain is None or architecture_chain is None or scaling_chain is None:
+        raise ValueError("model progression requires tokenizer, architecture, and scaling promotion chains")
+
+    manifests = [tokenizer_chain[3], architecture_chain[3], scaling_chain[3]]
+    for binding_name in ("dataset_manifest", "split_manifest", "evaluation_manifest"):
+        digests = {manifest.bindings[binding_name].sha256 for manifest in manifests}
+        if len(digests) != 1:
+            blockers.append(f"scientific campaigns do not share one {binding_name} lineage")
+
+    tokenizer_candidate = tokenizer_chain[0].promoted_candidate
+    architecture_candidate = architecture_chain[0].promoted_candidate
+    scaling_candidate = scaling_chain[0].promoted_candidate
+    selected_tokenizer_artifact: BoundArtifact | None = None
+    selected_vocab_size: int | None = None
+    if tokenizer_candidate is None or tokenizer_candidate not in tokenizer_chain[3].tokenizers:
+        blockers.append("tokenizer promotion does not identify a bound candidate")
+    else:
+        selected_vocab_size = int(tokenizer_candidate)
+        selected_tokenizer_artifact = tokenizer_chain[3].tokenizers[tokenizer_candidate]
+        for label, manifest in (
+            ("architecture", architecture_chain[3]),
+            ("scaling", scaling_chain[3]),
+        ):
+            selected = manifest.tokenizers.get("selected")
+            if selected is None or not hmac.compare_digest(
+                selected.sha256,
+                selected_tokenizer_artifact.sha256,
+            ):
+                blockers.append(
+                    f"{label} campaign is not bound to the tokenizer selected by the tokenizer campaign"
+                )
+
+    if architecture_candidate not in {"1b", "1b_moe"}:
+        blockers.append("architecture promotion did not select a supported 1B confirmation")
+    if scaling_candidate != "7b":
+        blockers.append("scaling-law promotion did not authorize the 7B experiment")
+    target_profile = (
+        "7b_moe"
+        if architecture_candidate == "1b_moe"
+        else "7b" if architecture_candidate == "1b" else None
+    )
+    target_contract_sha256: str | None = None
+    if target_profile is not None:
+        try:
+            target = model_profile(target_profile)
+            if selected_vocab_size is not None:
+                target = target.model_copy(update={"vocab_size": selected_vocab_size})
+            target.parameter_report()
+            target_contract_sha256 = target.contract_sha256()
+        except Exception as exc:
+            blockers.append(f"target model profile is invalid: {exc}")
+
+    decision = ModelProgressionDecision(
+        status="authorized" if not blockers else "blocked",
+        selected_tokenizer_vocab_size=selected_vocab_size if not blockers else None,
+        selected_architecture=architecture_candidate if not blockers else None,
+        target_model_profile=target_profile if not blockers else None,
+        target_model_contract_sha256=target_contract_sha256 if not blockers else None,
+        tokenizer_promotion_sha256=tokenizer_chain[0].promotion_sha256,
+        architecture_promotion_sha256=architecture_chain[0].promotion_sha256,
+        scaling_promotion_sha256=scaling_chain[0].promotion_sha256,
+        dataset_manifest_sha256=tokenizer_chain[3].bindings["dataset_manifest"].sha256,
+        split_manifest_sha256=tokenizer_chain[3].bindings["split_manifest"].sha256,
+        evaluation_manifest_sha256=tokenizer_chain[3].bindings["evaluation_manifest"].sha256,
+        selected_tokenizer_manifest_sha256=(
+            selected_tokenizer_artifact.sha256 if selected_tokenizer_artifact and not blockers else None
+        ),
+        blockers=sorted(set(blockers)),
+    ).sealed()
+    return decision
+
+
+def verify_model_progression_decision(path: str | Path) -> ModelProgressionDecision:
+    source = Path(path).expanduser().resolve(strict=True)
+    decision = ModelProgressionDecision.model_validate(_json_object(source))
+    expected = _digest_model(decision, omitted={"decision_sha256"})
+    if not decision.decision_sha256 or not hmac.compare_digest(expected, decision.decision_sha256):
+        raise ValueError("model progression decision has been modified")
+    return decision
+
+
+def build_arm_execution_requests(
+    manifest: ExperimentManifest,
+) -> list[ScientificArmExecutionRequest]:
+    """Translate preregistered arms into exact, scheduler-ready workloads."""
+
+    from src.aeitron.training_workspace import TrainingProfileRegistry
+
+    policy_path = Path(manifest.bindings["optimizer_policy"].path)
+    try:
+        registry = TrainingProfileRegistry.from_file(policy_path)
+        profile = registry.latest(manifest.campaign.training_profile_id)
+    except Exception as exc:
+        raise ValueError(
+            "scientific optimizer policy must be a valid training profile registry "
+            f"containing {manifest.campaign.training_profile_id!r}: {exc}"
+        ) from exc
+    world_size = (
+        1
+        if profile.scheduler == "notebook"
+        else profile.resources.nodes * profile.resources.gpus_per_node
+    )
+    tokens_per_step = (
+        profile.sequence_length
+        * profile.batch_size
+        * profile.gradient_accumulation_steps
+        * world_size
+    )
+    requests: list[ScientificArmExecutionRequest] = []
+    for arm in manifest.arms:
+        if arm.token_budget % tokens_per_step:
+            raise ValueError(
+                f"arm {arm.arm_id} token budget {arm.token_budget} is not divisible by "
+                f"the immutable training shape {tokens_per_step} tokens/optimizer-step"
+            )
+        tokenizer = _manifest_tokenizer_contract(manifest, arm)
+        requests.append(
+            ScientificArmExecutionRequest(
+                experiment_id=manifest.experiment_id,
+                arm_id=arm.arm_id,
+                scheduler=profile.scheduler,
+                distributed_strategy=profile.distributed_strategy,
+                training_profile_id=arm.training_profile_id,
+                model_profile=arm.model_profile,
+                model_contract_sha256=arm.model_contract_sha256,
+                total_parameters=arm.total_parameters,
+                active_parameters=arm.active_parameters,
+                canonical_training_flops=arm.canonical_training_flops,
+                model_seed=arm.seed,
+                dataloader_seed=arm.seed,
+                world_size=world_size,
+                optimizer_steps=arm.token_budget // tokens_per_step,
+                token_budget=arm.token_budget,
+                tokens_per_optimizer_step=tokens_per_step,
+                sequence_length=profile.sequence_length,
+                batch_size=profile.batch_size,
+                gradient_accumulation_steps=profile.gradient_accumulation_steps,
+                dtype=profile.dtype,
+                tokenizer_manifest_path=manifest.tokenizers[
+                    str(arm.vocab_size)
+                    if manifest.campaign.experiment_type == "tokenizer_selection"
+                    else "selected"
+                ].path,
+                tokenizer_manifest_sha256=manifest.tokenizers[
+                    str(arm.vocab_size)
+                    if manifest.campaign.experiment_type == "tokenizer_selection"
+                    else "selected"
+                ].sha256,
+                shard_manifest_path=tokenizer.shard_manifest_path,
+                shard_manifest_sha256=tokenizer.shard_manifest_sha256,
+                dataset_manifest_path=manifest.bindings["dataset_manifest"].path,
+                dataset_manifest_sha256=manifest.bindings["dataset_manifest"].sha256,
+                split_manifest_path=manifest.bindings["split_manifest"].path,
+                split_manifest_sha256=manifest.bindings["split_manifest"].sha256,
+                optimizer_policy_path=manifest.bindings["optimizer_policy"].path,
+                optimizer_policy_sha256=manifest.bindings["optimizer_policy"].sha256,
+                evaluation_manifest_path=manifest.bindings["evaluation_manifest"].path,
+                evaluation_manifest_sha256=manifest.bindings["evaluation_manifest"].sha256,
+                container_digest=manifest.container_digest,
+                required_evaluation_suites=arm.required_evaluation_suites,
+            )
+        )
+    return requests
+
+
+def admit_arm_evidence_from_reports(
+    *,
+    experiment_dir: str | Path,
+    arm_id: str,
+    training_report_path: str | Path,
+    evaluation_report_path: str | Path,
+    generation_audit_path: str | Path,
+    tokenizer_audit_path: str | Path,
+    output_dir: str | Path | None = None,
+) -> ArmEvidence:
+    """Derive immutable arm evidence from reports owned by existing authorities."""
+
+    manifest = _load_manifest(experiment_dir)
+    arms = {arm.arm_id: arm for arm in manifest.arms}
+    arm = arms.get(arm_id)
+    if arm is None:
+        raise ValueError(f"arm is not present in the immutable experiment plan: {arm_id}")
+    training_artifact = BoundArtifact.bind("training", training_report_path)
+    evaluation_artifact = BoundArtifact.bind("evaluation", evaluation_report_path)
+    generation_artifact = BoundArtifact.bind("generation_audit", generation_audit_path)
+    tokenizer_artifact = BoundArtifact.bind("tokenizer_audit", tokenizer_audit_path)
+    training = _json_object(training_artifact.path)
+    evaluation = _json_object(evaluation_artifact.path)
+    generation = _json_object(generation_artifact.path)
+    tokenizer = _json_object(tokenizer_artifact.path)
+
+    checkpoint_path = str(
+        training.get("best_checkpoint_manifest") or training.get("checkpoint_manifest") or ""
+    )
+    if not checkpoint_path:
+        raise ValueError("training report does not identify its selected checkpoint manifest")
+    checkpoint_artifact = BoundArtifact.bind("checkpoint", checkpoint_path)
+    suites = evaluation.get("suites")
+    if not isinstance(suites, list):
+        raise ValueError("evaluation report does not contain suite results")
+    foundation_kinds = {"human_eval_style", "mbpp_style", "swe_bench_style", "repoqa_style"}
+    security_kinds = {"cyberseceval_style", "custom_security"}
+    foundation_scores = [
+        float(row["score"])
+        for row in suites
+        if isinstance(row, dict) and row.get("kind") in foundation_kinds and row.get("status") == "passed"
+    ]
+    security_scores = [
+        float(row["score"])
+        for row in suites
+        if isinstance(row, dict) and row.get("kind") in security_kinds and row.get("status") == "passed"
+    ]
+    if not foundation_scores or not security_scores:
+        raise ValueError("evaluation report requires passed foundation and security suites")
+    token_statistics = tokenizer.get("token_statistics")
+    if not isinstance(token_statistics, dict):
+        raise ValueError("tokenizer audit is missing token statistics")
+    router = training.get("router_metrics")
+    if not isinstance(router, dict):
+        router = {}
+    raw_router_ratio = router.get("maximum_p99_to_mean_load")
+    router_ratio = (
+        float(raw_router_ratio)
+        if raw_router_ratio is not None and float(raw_router_ratio) >= 1.0
+        else None
+    )
+    candidate = generation.get("candidate")
+    if not isinstance(candidate, dict):
+        raise ValueError("generation audit is missing candidate results")
+    tokenizer_contract = _manifest_tokenizer_contract(manifest, arm)
+    evidence = ArmEvidence(
+        arm_id=arm.arm_id,
+        status="passed",
+        seed=arm.seed,
+        objective=manifest.objective,
+        dataset_manifest_sha256=manifest.bindings["dataset_manifest"].sha256,
+        split_manifest_sha256=manifest.bindings["split_manifest"].sha256,
+        optimizer_policy_sha256=manifest.bindings["optimizer_policy"].sha256,
+        evaluation_manifest_sha256=manifest.bindings["evaluation_manifest"].sha256,
+        model_contract_sha256=arm.model_contract_sha256,
+        tokenizer_sha256=tokenizer_contract.tokenizer_sha256,
+        tokenizer_vocab_size=arm.vocab_size,
+        trained_tokens=int(training.get("trained_tokens", -1)),
+        training_flops=arm.canonical_training_flops,
+        total_parameters=arm.total_parameters,
+        active_parameters=arm.active_parameters,
+        validation_loss=float(training.get("best_validation_loss", math.inf)),
+        executable_benchmark_score=float(evaluation.get("aggregate_score", math.nan)),
+        foundation_score=statistics.fmean(foundation_scores),
+        security_score=statistics.fmean(security_scores),
+        tokens_per_byte=float(token_statistics.get("tokens_per_byte", math.nan)),
+        checkpoint_reload_parity=(
+            training.get("checkpoint_reload_verified") is True
+            and training.get("checkpoint_reload_logit_parity") is True
+        ),
+        generation_collapsed=int(candidate.get("collapsed_count", -1)) > 0,
+        dropped_tokens=int(router.get("dropped_assignments", 0)),
+        router_p99_to_mean=router_ratio,
+        evaluation_authority=PROMOTION_EVALUATION_AUTHORITY,
+        training_report=training_artifact,
+        evaluation_report=evaluation_artifact,
+        generation_audit=generation_artifact,
+        checkpoint_manifest=checkpoint_artifact,
+        tokenizer_audit=tokenizer_artifact,
+    )
+    evidence.verify_artifacts(arm=arm, evaluation_inputs=manifest.evaluation_inputs)
+    destination = Path(output_dir or (Path(experiment_dir) / "arm-evidence")).expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    _exclusive_json(destination / f"{arm.arm_id}.json", evidence.model_dump(mode="json"))
+    return evidence
+
+
+def assemble_scientific_evaluation_report(
+    *,
+    experiment_dir: str | Path,
+    code_benchmark_report_path: str | Path,
+    repository_scorecard_report_path: str | Path,
+    output_path: str | Path,
+) -> Path:
+    """Combine executable code and repository evidence without re-scoring either."""
+
+    manifest = _load_manifest(experiment_dir)
+    code_artifact = BoundArtifact.bind("code_benchmark_report", code_benchmark_report_path)
+    scorecard_artifact = BoundArtifact.bind(
+        "repository_scorecard_report",
+        repository_scorecard_report_path,
+    )
+    code = _json_object(code_artifact.path)
+    scorecard = _json_object(scorecard_artifact.path)
+    if code.get("status") != "passed" or code.get("evaluation_mode") != "executable_model":
+        raise ValueError("code benchmark report is not passed executable-model evidence")
+    if not hmac.compare_digest(
+        str(code.get("evaluation_manifest_sha256") or ""),
+        manifest.bindings["evaluation_manifest"].sha256,
+    ):
+        raise ValueError("code benchmark report uses a different evaluation manifest")
+    checkpoint_sha256 = str(code.get("checkpoint_manifest_sha256") or "")
+    tokenizer_sha256 = str(code.get("tokenizer_sha256") or "")
+    if HEX_SHA256.fullmatch(checkpoint_sha256) is None or HEX_SHA256.fullmatch(tokenizer_sha256) is None:
+        raise ValueError("code benchmark report lacks checkpoint or tokenizer identity")
+    if scorecard.get("status") != "passed" or scorecard.get("policy_mode") != "strict":
+        raise ValueError("repository scorecard is not a passed strict run")
+    if int(scorecard.get("task_count", 0)) < 50:
+        raise ValueError("repository scorecard contains fewer than 50 governed tasks")
+    model_evidence = scorecard.get("model_evidence")
+    if not isinstance(model_evidence, dict):
+        raise ValueError("repository scorecard lacks model evidence")
+    if not hmac.compare_digest(
+        str(model_evidence.get("checkpoint_manifest_sha256") or ""),
+        checkpoint_sha256,
+    ):
+        raise ValueError("repository scorecard checkpoint differs from code evaluation")
+    if not hmac.compare_digest(
+        str(model_evidence.get("tokenizer_sha256") or ""),
+        tokenizer_sha256,
+    ):
+        raise ValueError("repository scorecard tokenizer differs from code evaluation")
+
+    expected_suite_hashes = {
+        key.removeprefix("suite:"): artifact.sha256
+        for key, artifact in manifest.evaluation_inputs.items()
+        if key.startswith("suite:")
+    }
+    reported_code_hashes = code.get("suite_artifact_sha256")
+    if not isinstance(reported_code_hashes, dict):
+        raise ValueError("code benchmark report lacks suite hashes")
+    raw_suites = code.get("suites")
+    if not isinstance(raw_suites, list):
+        raise ValueError("code benchmark report lacks suite results")
+    suites = [dict(row) for row in raw_suites if isinstance(row, dict)]
+    code_names = {str(row.get("name") or "") for row in suites}
+    for name in code_names:
+        expected = expected_suite_hashes.get(name)
+        if expected is None or not hmac.compare_digest(
+            str(reported_code_hashes.get(name) or ""),
+            expected,
+        ):
+            raise ValueError(f"code benchmark suite hash differs from the experiment: {name}")
+
+    scorecard_hash = str(scorecard.get("task_suite_sha256") or "")
+    scorecard_suite_rows = {
+        "AeitronDefensiveSecurity": {
+            "name": "AeitronDefensiveSecurity",
+            "kind": "custom_security",
+            "status": "passed",
+            "score": float(scorecard.get("security_detection_fix_score", math.nan)),
+            "total": sum(
+                1
+                for row in scorecard.get("tasks", [])
+                if isinstance(row, dict) and row.get("category") in {"security", "patch"}
+            ),
+            "passed": sum(
+                1
+                for row in scorecard.get("tasks", [])
+                if isinstance(row, dict)
+                and row.get("category") in {"security", "patch"}
+                and row.get("security_passed") is True
+                and row.get("tests_passed") is True
+            ),
+            "reason": "passed strict governed repository security scorecard",
+            "report": {"source_report_sha256": scorecard_artifact.sha256},
+        },
+        "AeitronRepositoryScorecard": {
+            "name": "AeitronRepositoryScorecard",
+            "kind": "swe_bench_style",
+            "status": "passed",
+            "score": float(scorecard.get("average_score", math.nan)),
+            "total": int(scorecard.get("task_count", 0)),
+            "passed": sum(
+                1
+                for row in scorecard.get("tasks", [])
+                if isinstance(row, dict) and row.get("accepted") is True and row.get("tests_passed") is True
+            ),
+            "reason": "passed strict governed repository workflow scorecard",
+            "report": {"source_report_sha256": scorecard_artifact.sha256},
+        },
+    }
+    for name, row in scorecard_suite_rows.items():
+        if name not in manifest.campaign.required_evaluation_suites:
+            continue
+        if not hmac.compare_digest(scorecard_hash, expected_suite_hashes.get(name, "")):
+            raise ValueError(f"repository scorecard task-suite hash differs from the experiment: {name}")
+        suites.append(row)
+
+    suite_names = {str(row.get("name") or "") for row in suites}
+    missing = sorted(set(manifest.campaign.required_evaluation_suites) - suite_names)
+    if missing:
+        raise ValueError(f"assembled evaluation is missing required suites: {missing}")
+    scores = [float(row["score"]) for row in suites if row.get("status") == "passed"]
+    if len(scores) != len(suites) or any(not math.isfinite(score) for score in scores):
+        raise ValueError("assembled evaluation contains failed or non-finite suite evidence")
+    payload = {
+        "schema_version": 2,
+        "status": "passed",
+        "evaluation_mode": "executable_model",
+        "suites": suites,
+        "aggregate_score": round(statistics.fmean(scores), 6),
+        "checkpoint_manifest_sha256": checkpoint_sha256,
+        "tokenizer_sha256": tokenizer_sha256,
+        "evaluation_manifest_sha256": manifest.bindings["evaluation_manifest"].sha256,
+        "suite_artifact_sha256": expected_suite_hashes,
+        "source_reports": {
+            "code_benchmark": code_artifact.model_dump(mode="json"),
+            "repository_scorecard": scorecard_artifact.model_dump(mode="json"),
+        },
+        "created_at_unix": time.time(),
+    }
+    target = Path(output_path).expanduser().resolve()
+    return _exclusive_json(target, payload)
 
 
 class ExperimentAuthority:
@@ -1479,45 +2194,14 @@ class ExperimentAuthority:
             tokenizer_manifests=tokenizer_manifests,
             container_digest=container_digest,
         )
-        _atomic_json(self.root / "experiment_manifest.json", manifest.model_dump(mode="json"))
+        execution_requests = build_arm_execution_requests(manifest)
         requests = {
             "schema_version": 1,
             "experiment_id": manifest.experiment_id,
             "status": "not_run",
-            "arms": [
-                {
-                    "arm_id": arm.arm_id,
-                    "training_profile_id": arm.training_profile_id,
-                    "seed": arm.seed,
-                    "token_budget": arm.token_budget,
-                    "model_profile": arm.model_profile,
-                    "model_contract_sha256": arm.model_contract_sha256,
-                    "model_contract": arm.model_contract,
-                    "dataset_manifest_path": manifest.bindings["dataset_manifest"].path,
-                    "dataset_manifest_sha256": manifest.bindings["dataset_manifest"].sha256,
-                    "split_manifest_path": manifest.bindings["split_manifest"].path,
-                    "split_manifest_sha256": manifest.bindings["split_manifest"].sha256,
-                    "optimizer_policy_path": manifest.bindings["optimizer_policy"].path,
-                    "optimizer_policy_sha256": manifest.bindings["optimizer_policy"].sha256,
-                    "tokenizer_contract": _manifest_tokenizer_contract(manifest, arm).model_dump(
-                        mode="json"
-                    ),
-                    "tokenizer_manifest_path": manifest.tokenizers[
-                        str(arm.vocab_size)
-                        if manifest.campaign.experiment_type == "tokenizer_selection"
-                        else "selected"
-                    ].path,
-                    "tokenizer_manifest_sha256": manifest.tokenizers[
-                        str(arm.vocab_size)
-                        if manifest.campaign.experiment_type == "tokenizer_selection"
-                        else "selected"
-                    ].sha256,
-                    "canonical_training_flops": 6 * arm.active_parameters * arm.token_budget,
-                    "required_evaluation_suites": arm.required_evaluation_suites,
-                }
-                for arm in manifest.arms
-            ],
+            "arms": [request.model_dump(mode="json") for request in execution_requests],
         }
+        _atomic_json(self.root / "experiment_manifest.json", manifest.model_dump(mode="json"))
         _atomic_json(self.root / "arm_execution_requests.json", requests)
         return manifest
 
@@ -1546,7 +2230,7 @@ class ExperimentAuthority:
             ).model_dump(mode="json")
             for item in evidence
         }
-        _atomic_json(
+        arm_reports_path = _atomic_json(
             self.root / "arm_reports.json",
             {
                 "schema_version": 1,
@@ -1557,6 +2241,12 @@ class ExperimentAuthority:
             },
         )
         comparison = compare_experiment(manifest, evidence, blockers)
+        comparison = comparison.model_copy(
+            update={
+                "arm_reports_sha256": sha256_file(arm_reports_path),
+                "report_sha256": "",
+            }
+        ).sealed()
         _atomic_json(self.root / "statistical_comparison.json", comparison.model_dump(mode="json"))
         if comparison.scaling_law is not None:
             _atomic_json(self.root / "scaling_law_report.json", comparison.scaling_law.model_dump(mode="json"))
@@ -1683,6 +2373,24 @@ def _authority_args() -> argparse.Namespace:
         command.add_argument("--experiment-dir", required=True)
         if name in {"run", "resume", "inspect", "compare"}:
             command.add_argument("--evidence-dir")
+    admit = commands.add_parser("admit-arm")
+    admit.add_argument("--experiment-dir", required=True)
+    admit.add_argument("--arm-id", required=True)
+    admit.add_argument("--training-report", required=True)
+    admit.add_argument("--evaluation-report", required=True)
+    admit.add_argument("--generation-audit", required=True)
+    admit.add_argument("--tokenizer-audit", required=True)
+    admit.add_argument("--evidence-dir")
+    assemble = commands.add_parser("assemble-evaluation")
+    assemble.add_argument("--experiment-dir", required=True)
+    assemble.add_argument("--code-benchmark-report", required=True)
+    assemble.add_argument("--repository-scorecard-report", required=True)
+    assemble.add_argument("--output", required=True)
+    progression = commands.add_parser("advance-7b")
+    progression.add_argument("--tokenizer-promotion", required=True)
+    progression.add_argument("--architecture-promotion", required=True)
+    progression.add_argument("--scaling-promotion", required=True)
+    progression.add_argument("--output", required=True)
     return parser.parse_args()
 
 
@@ -1714,6 +2422,36 @@ def _run_authority_cli(args: argparse.Namespace) -> int:
         )
         payload: Any = manifest.model_dump(mode="json")
         code = 0
+    elif args.command == "advance-7b":
+        decision = build_model_progression_decision(
+            tokenizer_promotion_path=args.tokenizer_promotion,
+            architecture_promotion_path=args.architecture_promotion,
+            scaling_promotion_path=args.scaling_promotion,
+        )
+        _exclusive_json(Path(args.output).expanduser().resolve(), decision.model_dump(mode="json"))
+        payload = decision.model_dump(mode="json")
+        code = 0 if decision.status == "authorized" else 2
+    elif args.command == "admit-arm":
+        evidence = admit_arm_evidence_from_reports(
+            experiment_dir=args.experiment_dir,
+            arm_id=args.arm_id,
+            training_report_path=args.training_report,
+            evaluation_report_path=args.evaluation_report,
+            generation_audit_path=args.generation_audit,
+            tokenizer_audit_path=args.tokenizer_audit,
+            output_dir=args.evidence_dir,
+        )
+        payload = evidence.model_dump(mode="json")
+        code = 0
+    elif args.command == "assemble-evaluation":
+        target = assemble_scientific_evaluation_report(
+            experiment_dir=args.experiment_dir,
+            code_benchmark_report_path=args.code_benchmark_report,
+            repository_scorecard_report_path=args.repository_scorecard_report,
+            output_path=args.output,
+        )
+        payload = {"status": "passed", "evaluation_report": str(target)}
+        code = 0
     else:
         authority = ExperimentAuthority(args.experiment_dir)
         if args.command == "inspect":
@@ -1736,7 +2474,18 @@ def _run_authority_cli(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    commands = {"plan", "run", "resume", "inspect", "compare", "decide", "promote"}
+    commands = {
+        "plan",
+        "run",
+        "resume",
+        "inspect",
+        "compare",
+        "decide",
+        "promote",
+        "admit-arm",
+        "assemble-evaluation",
+        "advance-7b",
+    }
     if len(sys.argv) > 1 and sys.argv[1] in commands:
         raise SystemExit(_run_authority_cli(_authority_args()))
     args = _legacy_args()

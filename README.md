@@ -294,17 +294,49 @@ tokenizer, architecture, or checkpoint. Controlled scientific decisions use
 the authoritative experiment state machine:
 
 ```powershell
+python -m src.aeitron.evaluation.qualification_campaign plan `
+  --config config\defensive_checkpoint_qualification.json `
+  --output-dir artifacts\aeitron\qualification-plan
+
 python -m src.aeitron.learning.ablation_runner plan `
   --campaign tokenizer-selection-v1 `
   --dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
   --split-manifest data\production\aeitron-foundation-v1\split_manifest.json `
   --optimizer-policy config\training_profiles.json `
-  --evaluation-manifest data\eval\protected\protected_benchmark_manifest.json `
+  --evaluation-manifest artifacts\aeitron\qualification-plan\qualification_campaign_plan.json `
   --tokenizer-manifest 32000=artifacts\aeitron\tokenizers\32k\tokenizer_manifest.json `
   --tokenizer-manifest 64000=artifacts\aeitron\tokenizers\64k\tokenizer_manifest.json `
   --tokenizer-manifest 128000=artifacts\aeitron\tokenizers\128k\tokenizer_manifest.json `
   --container-digest "aeitron-training@sha256:<64-hex-digest>" `
   --output-dir artifacts\aeitron\experiments\tokenizer-selection-v1
+
+python -m src.aeitron.evaluation.benchmark_suites `
+  --mode executable-model `
+  --suite HumanEval human_eval_style data\eval\protected\human_eval.jsonl `
+  --suite MBPP mbpp_style data\eval\protected\mbpp.jsonl `
+  --checkpoint-manifest ARM_CHECKPOINT.json `
+  --tokenizer-path ARM_TOKENIZER.json `
+  --evaluation-manifest artifacts\aeitron\qualification-plan\qualification_campaign_plan.json `
+  --output-dir ARM_EVAL_DIR
+
+python -m src.aeitron.evaluation.agent_scorecard `
+  --tasks data\eval\protected\aeitron_repository_scorecard.jsonl `
+  --output-dir ARM_SCORECARD_DIR `
+  --policy-mode strict
+
+python -m src.aeitron.learning.ablation_runner assemble-evaluation `
+  --experiment-dir artifacts\aeitron\experiments\tokenizer-selection-v1 `
+  --code-benchmark-report ARM_EVAL_DIR\benchmark_suites_report.json `
+  --repository-scorecard-report ARM_SCORECARD_DIR\agent_scorecard.json `
+  --output ARM_EVAL_DIR\scientific_evaluation_report.json
+
+python -m src.aeitron.learning.ablation_runner admit-arm `
+  --experiment-dir artifacts\aeitron\experiments\tokenizer-selection-v1 `
+  --arm-id ARM_ID `
+  --training-report ARM_TRAINING_REPORT.json `
+  --evaluation-report ARM_EVAL_DIR\scientific_evaluation_report.json `
+  --generation-audit ARM_GENERATION_AUDIT.json `
+  --tokenizer-audit ARM_TOKENIZER_AUDIT.json
 
 python -m src.aeitron.learning.ablation_runner run `
   --experiment-dir artifacts\aeitron\experiments\tokenizer-selection-v1 `
@@ -321,9 +353,29 @@ Each tokenizer manifest must bind passed family-safe shards and the exact
 governed dataset hash. Each arm report binds those tokenizer bytes plus the
 same governed data, split, optimizer, evaluation manifest, objective, token
 budget, model contract, training report, checkpoint, diagnostic generation
-audit, and executable benchmark evidence. Missing GPU runs remain `blocked`.
+audit, and executable benchmark evidence. `arm_execution_requests.json` is the
+scheduler-ready immutable workload contract; metrics are derived by
+`admit-arm`, never entered by hand. The evaluation manifest binds the protected
+configuration, protected manifest, and every suite file; changing any one of
+them invalidates the experiment. Missing GPU runs remain `blocked`.
 Architecture and scaling campaigns use one `selected=PATH` tokenizer binding;
 their model parameter/FLOP contracts are recalculated for that vocabulary.
+
+Tokenizer, dense/MoE, and scaling promotions are combined only after all three
+chains pass:
+
+```powershell
+python -m src.aeitron.learning.ablation_runner advance-7b `
+  --tokenizer-promotion TOKENIZER_EXPERIMENT\promotion_decision.json `
+  --architecture-promotion ARCHITECTURE_EXPERIMENT\promotion_decision.json `
+  --scaling-promotion SCALING_EXPERIMENT\promotion_decision.json `
+  --output artifacts\aeitron\experiments\model_progression_7b.json
+```
+
+The 7B dense and MoE training profiles reject submissions without this exact,
+hash-bound decision. No real tokenizer winner, dense/MoE winner, or 7B
+progression is currently declared; those require governed data, GPU arms, and
+executable benchmark evidence.
 
 ## Production Hardening Gates
 

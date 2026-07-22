@@ -2324,7 +2324,11 @@ promote a tokenizer, architecture, or checkpoint. The same module owns the
 authoritative `plan -> run/resume -> inspect/compare -> decide -> promote`
 scientific state machine. It binds governed data/splits, optimizer and
 evaluation policy, model contracts, seeds, token/FLOP budgets, Git/container
-identity, checkpoints, tokenizer audits, and executable evaluations.
+identity, checkpoints, tokenizer audits, and executable evaluations. The plan
+also writes `arm_execution_requests.json`: an exact scheduler-ready contract
+containing the model and dataloader seed, optimizer-step count, world size,
+tokens per optimizer step, canonical `6 * active parameters * tokens` FLOPs,
+and all immutable input hashes.
 
 Command:
 
@@ -2338,12 +2342,16 @@ python -m src.aeitron.learning.ablation_runner `
 Controlled tokenizer selection starts with:
 
 ```powershell
+python -m src.aeitron.evaluation.qualification_campaign plan `
+  --config config\defensive_checkpoint_qualification.json `
+  --output-dir artifacts\aeitron\qualification-plan
+
 python -m src.aeitron.learning.ablation_runner plan `
   --campaign tokenizer-selection-v1 `
   --dataset-manifest data\production\aeitron-foundation-v1\dataset_version_manifest.json `
   --split-manifest data\production\aeitron-foundation-v1\split_manifest.json `
   --optimizer-policy config\training_profiles.json `
-  --evaluation-manifest data\eval\protected\protected_benchmark_manifest.json `
+  --evaluation-manifest artifacts\aeitron\qualification-plan\qualification_campaign_plan.json `
   --tokenizer-manifest 32000=artifacts\aeitron\tokenizers\32k\tokenizer_manifest.json `
   --tokenizer-manifest 64000=artifacts\aeitron\tokenizers\64k\tokenizer_manifest.json `
   --tokenizer-manifest 128000=artifacts\aeitron\tokenizers\128k\tokenizer_manifest.json `
@@ -2352,12 +2360,37 @@ python -m src.aeitron.learning.ablation_runner plan `
 ```
 
 Each planned arm must be executed through the existing trainer/workspace and
-write one hash-bound arm-evidence JSON object. Missing arms remain `blocked`;
-the authority never invents a score. Tokenizer manifests bind the actual
-tokenizer and shard hashes to the same family-safe dataset. Tokenizer selection
-compares 32K, 64K, and 128K and promotes the smallest vocabulary within one
-downstream aggregate point of the best result. A larger vocabulary outside that
-boundary must also have non-overlapping downstream confidence evidence.
+must not hand-author an arm-evidence object. Run HumanEval/MBPP through the
+executable Docker benchmark authority and the governed 50-task repository pack
+through the strict agent scorecard. `assemble-evaluation` accepts them only when
+both identify the same checkpoint and tokenizer and when every task-suite hash
+matches the experiment manifest. `admit-arm` then derives all loss, score,
+FLOP, router, reload, tokenizer, and collapse fields from the bound reports:
+
+```powershell
+python -m src.aeitron.learning.ablation_runner assemble-evaluation `
+  --experiment-dir EXPERIMENT_DIR `
+  --code-benchmark-report CODE_EVAL\benchmark_suites_report.json `
+  --repository-scorecard-report SCORECARD\agent_scorecard.json `
+  --output ARM_REPORTS\scientific_evaluation_report.json
+
+python -m src.aeitron.learning.ablation_runner admit-arm `
+  --experiment-dir EXPERIMENT_DIR `
+  --arm-id ARM_ID `
+  --training-report ARM_REPORTS\training_report.json `
+  --evaluation-report ARM_REPORTS\scientific_evaluation_report.json `
+  --generation-audit ARM_REPORTS\generation_audit.json `
+  --tokenizer-audit ARM_REPORTS\tokenizer_audit_report.json
+```
+
+The experiment manifest binds the protected configuration, protected manifest,
+and each required suite file independently. Any suite drift invalidates the
+whole chain. Missing arms remain `blocked`; the authority never invents a score.
+Tokenizer manifests bind the actual tokenizer and shard hashes to the same
+family-safe dataset. Tokenizer selection compares 32K, 64K, and 128K and
+promotes the smallest vocabulary within one downstream aggregate point of the
+best result. A larger vocabulary outside that boundary must also have
+non-overlapping downstream confidence evidence.
 
 Architecture and scaling campaigns pass one
 `--tokenizer-manifest selected=<path>` argument. Model parameter accounting is
@@ -2366,6 +2399,15 @@ crossed token budgets at each model size, additive parameter/data power-law
 fitting, leave-one-shape-out error, bootstrap confidence intervals, predicted
 7B/32B FLOPs, and compute-optimal parameter/token estimates. A decision locks
 the experiment permanently; changed evidence requires a new preregistered run.
+
+After tokenizer, architecture, and scaling campaigns each produce a promoted,
+replay-valid chain, `advance-7b` checks that all three share one dataset, split,
+and evaluation lineage; that the architecture/scaling runs use the promoted
+tokenizer bytes; and that scaling explicitly selected 7B. It emits either a
+sealed `authorized` decision targeting `7b` or `7b_moe`, or a sealed `blocked`
+decision with reasons. Both 7B training profiles require the matching decision
+path and SHA-256 before job admission. This is scientific authorization only;
+production qualification remains the final release authority.
 
 Scratch-only training rule:
 
@@ -5849,6 +5891,7 @@ benchmark files fail rather than becoming synthetic passes.
 | Megatron TP/PP/DP/CP/EP adapter | `built_not_cluster_proven` | Canonical argv and topology are validated; a pinned real checkout and multi-node run are still required. |
 | 50M/100M/300M/1B scientific profiles | `built_not_gpu_proven` | Canonical iso-active contracts and immutable campaigns exist; no governed GPU A/B evidence exists yet. |
 | Evidence-selected tokenizer | `blocked_missing_artifact` | 32K/64K/128K contracts, statistical selection, and qualification replay exist; real governed arm runs have not completed. |
+| Dense/MoE and 7B progression | `blocked_missing_artifact` | Exact-compute arm requests, report-derived evidence admission, replayable promotion chains, and dense/MoE-specific 7B gates exist; no governed GPU winner or 7B authorization exists. |
 | 1M native context | `built_not_cluster_proven` | Shape/curriculum contracts exist; no 1M distributed benchmark run exists. |
 | 5M effective context | `built_not_quality_proven` | Hierarchical retrieval contract exists; end-to-end effective-context quality is not measured yet. |
 | RULER/HELMET/RepoQA-style adapters | `code_complete_local_adapter` | Governed local-format scoring exists; these are not substitutes for official full benchmark runs. |

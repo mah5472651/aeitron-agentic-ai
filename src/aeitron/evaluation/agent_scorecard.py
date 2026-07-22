@@ -112,6 +112,7 @@ class AgentScorecardReport(StrictModel):
     average_score: float
     model_backend: str = ""
     model_evidence: dict[str, str] = Field(default_factory=dict)
+    task_suite_sha256: str = ""
     tasks: list[AgentTaskScore]
     failures: list[str] = Field(default_factory=list)
     created_at_unix: float = Field(default_factory=time.time)
@@ -205,6 +206,7 @@ class AgentScorecardRunner:
             failures,
             model_backend=backend.name,
             model_evidence=model_evidence,
+            task_suite_sha256=sha256_file(tasks_path),
         )
         self._write_reports(output_dir, report)
         return report
@@ -308,6 +310,7 @@ class AgentScorecardRunner:
         *,
         model_backend: str,
         model_evidence: dict[str, str],
+        task_suite_sha256: str,
     ) -> AgentScorecardReport:
         def rate(values: list[bool]) -> float:
             return sum(1 for value in values if value) / len(values) if values else 0.0
@@ -351,6 +354,7 @@ class AgentScorecardRunner:
             average_score=average_score,
             model_backend=model_backend,
             model_evidence=model_evidence,
+            task_suite_sha256=task_suite_sha256,
             tasks=scores,
             failures=failures,
         )

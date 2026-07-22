@@ -74,7 +74,7 @@
         "1b": [7331],
         "1b_moe": [7331]
       },
-      "token_budget": 30000000000,
+      "token_budget": 29999759360,
       "required_evaluation_suites": ["HumanEval", "MBPP", "AeitronDefensiveSecurity", "AeitronRepositoryScorecard"],
       "gate": {
         "minimum_relative_validation_improvement": 0.02,
@@ -101,12 +101,12 @@
         "1b": [7331]
       },
       "profile_token_budgets": {
-        "50m": [1000000000, 3000000000, 10000000000],
-        "100m": [1000000000, 3000000000, 10000000000],
-        "300m": [1000000000, 3000000000, 10000000000],
-        "1b": [3000000000, 10000000000, 30000000000]
+        "50m": [999817216, 2999975936, 9999745024],
+        "100m": [999817216, 2999975936, 9999745024],
+        "300m": [999817216, 2999975936, 9999745024],
+        "1b": [2999975936, 9999745024, 29999759360]
       },
-      "token_budget": 30000000000,
+      "token_budget": 29999759360,
       "required_evaluation_suites": ["HumanEval", "MBPP", "AeitronDefensiveSecurity", "AeitronRepositoryScorecard"],
       "gate": {
         "maximum_scaling_holdout_mape": 0.05,

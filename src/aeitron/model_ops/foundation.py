@@ -757,6 +757,36 @@ def model_profiles() -> dict[str, ScratchDecoderConfig]:
             rope_scaling_type="yarn",
             rope_scaling_factor=4.0,
         ),
+        "7b_moe": ScratchDecoderConfig(
+            name="aeitron-7b-active-mla-moe-candidate",
+            vocab_size=128_000,
+            max_sequence_length=131_072,
+            effective_context_length=5_000_000,
+            hidden_size=4096,
+            num_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=1,
+            intermediate_size=11008,
+            attention_architecture="mla",
+            q_lora_rank=1024,
+            kv_lora_rank=256,
+            qk_nope_head_dim=96,
+            qk_rope_head_dim=32,
+            v_head_dim=128,
+            feed_forward_architecture="moe",
+            num_dense_layers=4,
+            num_routed_experts=32,
+            num_shared_experts=1,
+            experts_per_token=4,
+            moe_intermediate_size=2368,
+            router_bias_update_rate=0.001,
+            mtp_num_layers=1,
+            rope_scaling_type="yarn",
+            rope_scaling_factor=4.0,
+            gradient_checkpointing=True,
+            runtime_backend="megatron_core",
+            target_active_parameters=6_195_253_248,
+        ),
         "32b": ScratchDecoderConfig(
             name="aeitron-32b-scratch",
             vocab_size=128_000,
@@ -830,7 +860,7 @@ def architecture_presets() -> dict[str, ScratchDecoderConfig]:
     """Public compatibility view backed by the canonical model contracts."""
     return {
         f"aeitron-{key.replace('_', '-')}": model_profile(key)
-        for key in ("7b", "32b", "62b", "4t_moe")
+        for key in ("7b", "7b_moe", "32b", "62b", "4t_moe")
     }
 
 

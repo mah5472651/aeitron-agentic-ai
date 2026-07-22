@@ -12,8 +12,10 @@ from fastapi.testclient import TestClient
 
 from src.aeitron.identity.auth import AuthConfig
 from src.aeitron.learning.storage import LocalObjectStore
+from src.aeitron.learning.ablation_runner import ModelProgressionDecision
 from src.aeitron.training_client import _validate_workspace_url, format_event
 from src.aeitron.model_ops.distributed_worker import normalize_slurm_environment, parse_args
+from src.aeitron.model_ops.foundation import model_profile
 from src.aeitron.training_proofs import parse_dr_workload
 from src.aeitron.training_workspace import (
     ALLOWED_TRANSITIONS,
@@ -97,13 +99,34 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
             object_store=LocalObjectStore(self.root / "objects"),
             profiles=TrainingProfileRegistry.from_file(),
         )
+        progression = ModelProgressionDecision(
+            status="authorized",
+            selected_tokenizer_vocab_size=64_000,
+            selected_architecture="1b",
+            target_model_profile="7b",
+            target_model_contract_sha256=model_profile("7b").model_copy(
+                update={"vocab_size": 64_000}
+            ).contract_sha256(),
+            tokenizer_promotion_sha256="1" * 64,
+            architecture_promotion_sha256="2" * 64,
+            scaling_promotion_sha256="3" * 64,
+            dataset_manifest_sha256="4" * 64,
+            split_manifest_sha256="5" * 64,
+            evaluation_manifest_sha256="6" * 64,
+            selected_tokenizer_manifest_sha256="7" * 64,
+        ).sealed()
+        self.progression_path = self.root / "model_progression.json"
+        self.progression_path.write_text(
+            json.dumps(progression.model_dump(mode="json"), sort_keys=True),
+            encoding="utf-8",
+        )
+        self.progression_sha256 = hashlib.sha256(self.progression_path.read_bytes()).hexdigest()
 
     def tearDown(self) -> None:
         asyncio.run(self.service.close())
         self.temp_dir.cleanup()
 
-    @staticmethod
-    def request(**overrides: object) -> TrainingJobCreateRequest:
+    def request(self, **overrides: object) -> TrainingJobCreateRequest:
         payload = {
             "profile_id": "defensive-1k",
             "idempotency_key": "workspace-test-0001",
@@ -111,6 +134,9 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
             "container_digest": "sha256:" + ("a" * 64),
         }
         payload.update(overrides)
+        if payload["profile_id"] == "aeitron-7b-fsdp":
+            payload.setdefault("model_progression_decision_uri", str(self.progression_path))
+            payload.setdefault("model_progression_decision_sha256", self.progression_sha256)
         return TrainingJobCreateRequest.model_validate(payload)
 
     def test_registry_is_immutable_and_has_scale_profiles(self) -> None:
@@ -214,6 +240,60 @@ class AeitronTrainingWorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "immutable inputs"):
             self.service.resolve_spec(
                 self.request(profile_id="aeitron-7b-fsdp", idempotency_key="workspace-pretrain-1")
+            )
+
+    def test_7b_profile_requires_untampered_matching_model_progression(self) -> None:
+        common = {
+            "profile_id": "aeitron-7b-fsdp",
+            "dataset_manifest_uri": "/data/manifest.json",
+            "dataset_manifest_sha256": "b" * 64,
+            "tokenizer_uri": "/data/tokenizer.json",
+            "tokenizer_sha256": "c" * 64,
+        }
+        with self.assertRaisesRegex(ValueError, "model progression"):
+            self.service.resolve_spec(
+                self.request(
+                    **common,
+                    idempotency_key="progression-missing",
+                    model_progression_decision_uri=None,
+                    model_progression_decision_sha256=None,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            self.service.resolve_spec(
+                self.request(
+                    **common,
+                    idempotency_key="progression-tampered",
+                    model_progression_decision_sha256="f" * 64,
+                )
+            )
+
+        wrong = ModelProgressionDecision(
+            status="authorized",
+            selected_tokenizer_vocab_size=64_000,
+            selected_architecture="1b_moe",
+            target_model_profile="7b_moe",
+            target_model_contract_sha256=model_profile("7b_moe").model_copy(
+                update={"vocab_size": 64_000}
+            ).contract_sha256(),
+            tokenizer_promotion_sha256="1" * 64,
+            architecture_promotion_sha256="2" * 64,
+            scaling_promotion_sha256="3" * 64,
+            dataset_manifest_sha256="4" * 64,
+            split_manifest_sha256="5" * 64,
+            evaluation_manifest_sha256="6" * 64,
+            selected_tokenizer_manifest_sha256="7" * 64,
+        ).sealed()
+        wrong_path = self.root / "wrong-model-progression.json"
+        wrong_path.write_text(json.dumps(wrong.model_dump(mode="json")), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "does not authorize this model profile"):
+            self.service.resolve_spec(
+                self.request(
+                    **common,
+                    idempotency_key="progression-wrong-target",
+                    model_progression_decision_uri=str(wrong_path),
+                    model_progression_decision_sha256=hashlib.sha256(wrong_path.read_bytes()).hexdigest(),
+                )
             )
 
     def test_qualification_next_milestone_is_locked_until_previous_proof(self) -> None:

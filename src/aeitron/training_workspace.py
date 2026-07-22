@@ -613,6 +613,11 @@ class TrainingJobCreateRequest(StrictModel):
     dataset_manifest_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     tokenizer_uri: str | None = Field(default=None, max_length=2048)
     tokenizer_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    model_progression_decision_uri: str | None = Field(default=None, max_length=2048)
+    model_progression_decision_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     git_commit: str = Field(default="0000000", min_length=7, max_length=64)
     container_digest: str = Field(default="sha256:" + ("0" * 64), min_length=71, max_length=256)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -623,6 +628,10 @@ class TrainingJobCreateRequest(StrictModel):
     def validate_qualification_binding(self) -> "TrainingJobCreateRequest":
         if bool(self.qualification_campaign_id) != bool(self.qualification_milestone_id):
             raise ValueError("qualification campaign and milestone must be supplied together")
+        if bool(self.model_progression_decision_uri) != bool(
+            self.model_progression_decision_sha256
+        ):
+            raise ValueError("model progression decision URI and SHA-256 must be supplied together")
         return self
 
     @field_validator("idempotency_key")
@@ -689,6 +698,11 @@ class TrainingJobSpec(StrictModel):
     dataset_manifest_sha256: str | None = None
     tokenizer_uri: str | None = None
     tokenizer_sha256: str | None = None
+    model_progression_decision_uri: str | None = None
+    model_progression_decision_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     git_commit: str
     container_digest: str
     requirements: list[str] = Field(default_factory=list)
@@ -725,6 +739,12 @@ class TrainingJobSpec(StrictModel):
             ]
             if missing:
                 raise ValueError("pretraining job is missing immutable inputs: " + ", ".join(missing))
+        if bool(self.model_progression_decision_uri) != bool(
+            self.model_progression_decision_sha256
+        ):
+            raise ValueError("model progression decision URI and SHA-256 must be bound together")
+        if "model_progression_decision" in self.requirements and not self.model_progression_decision_uri:
+            raise ValueError("selected model profile requires an authorized model progression decision")
         data_parallel = training_data_parallel_size(
             resources=self.resources,
             distributed_strategy=self.distributed_strategy,
@@ -750,9 +770,12 @@ class TrainingJobSpec(StrictModel):
 
     def assert_current_model_contract(self) -> ScratchDecoderConfig:
         """Reject execution if the named runtime contract drifted after submission."""
-        current = get_model_profile(self.model_profile)
         if self.schema_version < 2:
             raise ValueError("legacy schema v1 jobs cannot execute without a bound model contract")
+        bound = ScratchDecoderConfig.model_validate(self.model_contract)
+        current = get_model_profile(self.model_profile).model_copy(
+            update={"vocab_size": bound.vocab_size}
+        )
         if not self.model_contract_sha256 or not hmac.compare_digest(
             current.contract_sha256(), self.model_contract_sha256
         ):
@@ -2110,7 +2133,7 @@ def build_training_command(spec: TrainingJobSpec, *, output_dir: str) -> list[st
             command.extend(["--production", "--frontier-backend", "postgres"])
         return command
     if spec.run_type == "pretrain":
-        return [
+        command = [
             sys.executable,
             "-u",
             "-m",
@@ -2177,6 +2200,8 @@ def build_training_command(spec: TrainingJobSpec, *, output_dir: str) -> list[st
             str(spec.dataloader.prefetch_batches),
             "--dataloader-seed",
             str(spec.dataloader.seed),
+            "--model-seed",
+            str(spec.dataloader.seed),
             "--expected-python-version",
             spec.runtime_image.python_version,
             "--expected-pytorch-version",
@@ -2189,6 +2214,16 @@ def build_training_command(spec: TrainingJobSpec, *, output_dir: str) -> list[st
             spec.distributed_strategy,
             "--gradient-checkpointing",
         ]
+        if spec.model_progression_decision_uri and spec.model_progression_decision_sha256:
+            command.extend(
+                [
+                    "--model-progression-decision",
+                    spec.model_progression_decision_uri,
+                    "--model-progression-decision-sha256",
+                    spec.model_progression_decision_sha256,
+                ]
+            )
+        return command
     raise ValueError(f"scheduler does not execute run_type={spec.run_type}")
 
 
@@ -3270,9 +3305,44 @@ class TrainingWorkspaceService:
                     raise ValueError(f"{name} scheme {scheme!r} is not allowed by the immutable input policy")
             if profile.immutable_inputs.require_promoted_dataset and request.metadata.get("dataset_promotion") != "promoted":
                 raise ValueError("production pretraining requires metadata.dataset_promotion='promoted'")
+        progression = None
+        if "model_progression_decision" in profile.requirements:
+            if not request.model_progression_decision_uri or not request.model_progression_decision_sha256:
+                raise ValueError(
+                    f"profile {profile.profile_id} requires an immutable model progression decision"
+                )
+            raw_decision_uri = request.model_progression_decision_uri
+            decision_uri = urlparse(raw_decision_uri)
+            windows_path = re.match(r"^[A-Za-z]:[\\/]", raw_decision_uri) is not None
+            if decision_uri.scheme not in {"", "file"} and not windows_path:
+                raise ValueError(
+                    "model progression decision must be locally mounted for semantic verification"
+                )
+            decision_path = Path(
+                decision_uri.path if decision_uri.scheme == "file" else raw_decision_uri
+            ).expanduser().resolve(strict=True)
+            if not hmac.compare_digest(
+                sha256_path(decision_path),
+                request.model_progression_decision_sha256,
+            ):
+                raise ValueError("model progression decision SHA-256 mismatch")
+            from src.aeitron.learning.ablation_runner import verify_model_progression_decision
+
+            progression = verify_model_progression_decision(decision_path)
+            if progression.status != "authorized" or progression.target_model_profile != profile.model_profile:
+                raise ValueError("model progression decision does not authorize this model profile")
         metadata = dict(request.metadata)
         metadata["requested_overrides"] = request.overrides
         canonical_model = get_model_profile(profile.model_profile)
+        if progression is not None:
+            canonical_model = canonical_model.model_copy(
+                update={"vocab_size": progression.selected_tokenizer_vocab_size}
+            )
+            if not hmac.compare_digest(
+                canonical_model.contract_sha256(),
+                str(progression.target_model_contract_sha256 or ""),
+            ):
+                raise ValueError("model progression target contract differs from the current profile")
         model_contract = canonical_model.model_dump(mode="json")
         parameter_report_sha256 = sha256_text(
             canonical_json(canonical_model.parameter_report())
@@ -3316,6 +3386,8 @@ class TrainingWorkspaceService:
             dataset_manifest_sha256=request.dataset_manifest_sha256,
             tokenizer_uri=request.tokenizer_uri,
             tokenizer_sha256=request.tokenizer_sha256,
+            model_progression_decision_uri=request.model_progression_decision_uri,
+            model_progression_decision_sha256=request.model_progression_decision_sha256,
             git_commit=git_commit,
             container_digest=container_digest,
             requirements=profile.requirements,

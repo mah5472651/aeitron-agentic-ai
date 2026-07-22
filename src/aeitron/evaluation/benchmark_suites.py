@@ -25,6 +25,7 @@ from src.aeitron.model_ops.checkpoint_compare import (
 )
 from src.aeitron.model_ops.tokenizer_pipeline import load_tokenizer
 from src.aeitron.model_ops.torch_decoder import select_torch_device
+from src.aeitron.shared.integrity import sha256_file
 from src.aeitron.shared.schemas import StrictModel
 from src.aeitron.tools.sandbox import (
     DockerSandboxRunner,
@@ -65,10 +66,15 @@ class BenchmarkSuiteResult(StrictModel):
 
 
 class BenchmarkSuitesReport(StrictModel):
+    schema_version: Literal[2] = 2
     status: str
     evaluation_mode: Literal["dataset_validation", "executable_model"] = "dataset_validation"
     suites: list[BenchmarkSuiteResult]
     aggregate_score: float
+    checkpoint_manifest_sha256: str = ""
+    tokenizer_sha256: str = ""
+    evaluation_manifest_sha256: str = ""
+    suite_artifact_sha256: dict[str, str] = Field(default_factory=dict)
     created_at_unix: float = Field(default_factory=time.time)
 
     def write(self, output_dir: str | Path) -> Path:
@@ -215,6 +221,7 @@ def load_suite_tasks(spec: BenchmarkSuiteSpec) -> list[BenchmarkTask]:
 class ExecutableBenchmarkConfig(StrictModel):
     checkpoint_manifest: str
     tokenizer_path: str
+    evaluation_manifest: str | None = None
     device: Literal["auto", "cpu", "cuda"] = "auto"
     candidates_per_task: int = Field(default=10, ge=1, le=100)
     pass_k: list[int] = Field(default_factory=lambda: [1, 5, 10], min_length=1)
@@ -605,9 +612,16 @@ def run_executable_benchmark_suites(
     pass_k = config.normalized_pass_k
     if not pass_k:
         raise ValueError("no requested pass@k value fits candidates_per_task")
+    checkpoint_path = Path(config.checkpoint_manifest).expanduser().resolve(strict=True)
+    tokenizer_path = Path(config.tokenizer_path).expanduser().resolve(strict=True)
+    evaluation_manifest_path = (
+        Path(config.evaluation_manifest).expanduser().resolve(strict=True)
+        if config.evaluation_manifest
+        else None
+    )
     device = select_torch_device(config.device)
-    model, _manifest = _load_model(config.checkpoint_manifest, device=device)
-    tokenizer = load_tokenizer(config.tokenizer_path)
+    model, _manifest = _load_model(checkpoint_path, device=device)
+    tokenizer = load_tokenizer(tokenizer_path)
     policy = HardenedSandboxPolicy(
         image=config.sandbox_image,
         timeout_ms=config.sandbox_timeout_ms,
@@ -736,6 +750,16 @@ def run_executable_benchmark_suites(
         evaluation_mode="executable_model",
         suites=suite_results,
         aggregate_score=round(aggregate, 6),
+        checkpoint_manifest_sha256=sha256_file(checkpoint_path),
+        tokenizer_sha256=sha256_file(tokenizer_path),
+        evaluation_manifest_sha256=(
+            sha256_file(evaluation_manifest_path) if evaluation_manifest_path else ""
+        ),
+        suite_artifact_sha256={
+            spec.name: sha256_file(Path(spec.path).expanduser().resolve(strict=True))
+            for spec in specs
+            if Path(spec.path).expanduser().resolve().is_file()
+        },
     )
 
 
@@ -815,6 +839,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--checkpoint-manifest")
     parser.add_argument("--tokenizer-path")
+    parser.add_argument("--evaluation-manifest")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--candidates-per-task", type=int, default=10)
     parser.add_argument("--pass-k", type=int, action="append", default=[])
@@ -861,6 +886,7 @@ def main() -> None:
                 ExecutableBenchmarkConfig(
                     checkpoint_manifest=args.checkpoint_manifest,
                     tokenizer_path=args.tokenizer_path,
+                    evaluation_manifest=args.evaluation_manifest,
                     device=args.device,
                     candidates_per_task=args.candidates_per_task,
                     pass_k=args.pass_k or [1, 5, 10],

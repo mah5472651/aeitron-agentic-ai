@@ -2,10 +2,14 @@
 
 import json
 import hashlib
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from src.aeitron.evaluation import benchmark_suites as benchmark_suites_module
+from src.aeitron.evaluation.benchmark_suites import BenchmarkSuitesReport
 from src.aeitron.evaluation.eval_runner import EvalRunReport, aggregate_scores, evaluate_checkpoint_with_schedule, regression_flags
 from src.aeitron.learning.mixer import build_mix
 from src.aeitron.learning.ablation_runner import (
@@ -14,11 +18,15 @@ from src.aeitron.learning.ablation_runner import (
     ExperimentAuthority,
     ExperimentManifest,
     StatisticalComparisonReport,
+    admit_arm_evidence_from_reports,
+    assemble_scientific_evaluation_report,
+    build_model_progression_decision,
     compare_experiment,
     create_experiment_manifest,
     decide_experiment,
     promote_experiment,
     verify_promotion_chain,
+    verify_model_progression_decision,
 )
 from src.aeitron.shared.config_contracts import (
     ScientificExperimentCampaignContract,
@@ -50,6 +58,37 @@ def write_jsonl(path: Path, rows: list[dict[str, object]]) -> Path:
 
 @unittest.skipIf(torch is None, "torch is required for Aeitron training-control tests")
 class AeitronTrainingControlTest(unittest.TestCase):
+    def test_executable_benchmark_cli_binds_evaluation_manifest_only_to_executable_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            report = BenchmarkSuitesReport(
+                status="passed",
+                evaluation_mode="executable_model",
+                suites=[],
+                aggregate_score=0.0,
+            )
+            argv = [
+                "benchmark_suites",
+                "--mode",
+                "executable-model",
+                "--output-dir",
+                str(root / "output"),
+                "--checkpoint-manifest",
+                str(root / "checkpoint.json"),
+                "--tokenizer-path",
+                str(root / "tokenizer.json"),
+                "--evaluation-manifest",
+                str(root / "evaluation.json"),
+            ]
+            with patch.object(sys, "argv", argv), patch.object(
+                benchmark_suites_module,
+                "run_executable_benchmark_suites",
+                return_value=report,
+            ) as runner:
+                benchmark_suites_module.main()
+            config = runner.call_args.args[1]
+            self.assertEqual(config.evaluation_manifest, str(root / "evaluation.json"))
+
     def scientific_campaign(self, experiment_type: str) -> ScientificExperimentCampaignContract:
         common = {
             "campaign_id": f"{experiment_type.replace('_', '-')}-test",
@@ -103,10 +142,57 @@ class AeitronTrainingControlTest(unittest.TestCase):
         self,
         root: Path,
         experiment_type: str,
+        campaign: ScientificExperimentCampaignContract | None = None,
     ) -> ExperimentManifest:
+        campaign = campaign or self.scientific_campaign(experiment_type)
         bindings = {}
-        for name in ("dataset", "split", "optimizer", "evaluation"):
+        for name in ("dataset", "split", "optimizer"):
             bindings[name] = write_json(root / f"{name}.json", {"name": name, "status": "passed"})
+        protected_config = write_json(root / "protected-config.json", {"status": "passed"})
+        protected_manifest = write_json(root / "protected-manifest.json", {"status": "passed"})
+        suites = []
+        repository_suite: Path | None = None
+        for index, name in enumerate(campaign.required_evaluation_suites):
+            if name in {"AeitronDefensiveSecurity", "AeitronRepositoryScorecard"}:
+                if repository_suite is None:
+                    repository_suite = write_jsonl(
+                        root / "repository-scorecard.jsonl",
+                        [{"task_id": f"repo-{item}", "prompt": "governed repository task"} for item in range(50)],
+                    )
+                suite_path = repository_suite
+            else:
+                suite_path = write_jsonl(
+                    root / f"suite-{index}.jsonl",
+                    [{"task_id": f"{name}-1", "prompt": "governed test task"}],
+                )
+            suites.append(
+                {
+                    "name": name,
+                    "kind": (
+                        "human_eval_style"
+                        if name == "HumanEval"
+                        else "mbpp_style"
+                        if name == "MBPP"
+                        else "custom_security"
+                    ),
+                    "path": str(suite_path.resolve()),
+                    "required": True,
+                    "sha256": hashlib.sha256(suite_path.read_bytes()).hexdigest(),
+                }
+            )
+        bindings["evaluation"] = write_json(
+            root / "evaluation.json",
+            {
+                "schema_version": 1,
+                "executable_evaluation": {
+                    "protected_config": str(protected_config.resolve()),
+                    "protected_config_sha256": hashlib.sha256(protected_config.read_bytes()).hexdigest(),
+                    "protected_manifest": str(protected_manifest.resolve()),
+                    "protected_manifest_sha256": hashlib.sha256(protected_manifest.read_bytes()).hexdigest(),
+                    "suites": suites,
+                },
+            },
+        )
         dataset_hash = hashlib.sha256(bindings["dataset"].read_bytes()).hexdigest()
         vocabularies = [32_000, 64_000, 128_000] if experiment_type == "tokenizer_selection" else [64_000]
         tokenizer_manifests: dict[str, Path] = {}
@@ -139,7 +225,7 @@ class AeitronTrainingControlTest(unittest.TestCase):
             key = str(vocab_size) if experiment_type == "tokenizer_selection" else "selected"
             tokenizer_manifests[key] = manifest_path
         return create_experiment_manifest(
-            campaign=self.scientific_campaign(experiment_type),
+            campaign=campaign,
             dataset_manifest=bindings["dataset"],
             split_manifest=bindings["split"],
             optimizer_policy=bindings["optimizer"],
@@ -193,6 +279,9 @@ class AeitronTrainingControlTest(unittest.TestCase):
                 "training_args": {
                     "step_semantics": "optimizer_update_v2",
                     "target_tokens": arm.token_budget,
+                    "model_seed": arm.seed,
+                    "runtime_seed": arm.seed,
+                    "distributed_rank": 0,
                 },
                 "trained_tokens": arm.token_budget,
                 "model_config": arm.model_contract,
@@ -212,6 +301,14 @@ class AeitronTrainingControlTest(unittest.TestCase):
             {
                 "status": "passed",
                 "evaluation_mode": "executable_model",
+                "evaluation_manifest_sha256": manifest.bindings["evaluation_manifest"].sha256,
+                "checkpoint_manifest_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                "tokenizer_sha256": tokenizer_sha256,
+                "suite_artifact_sha256": {
+                    key.removeprefix("suite:"): artifact.sha256
+                    for key, artifact in manifest.evaluation_inputs.items()
+                    if key.startswith("suite:")
+                },
                 "aggregate_score": benchmark,
                 "suites": [
                     {
@@ -412,6 +509,9 @@ class AeitronTrainingControlTest(unittest.TestCase):
             dense = model_profile(dense_name).parameter_report()["active"]
             moe = model_profile(moe_name).parameter_report()["active"]
             self.assertLessEqual(abs(moe - dense) / dense, 0.01)
+        dense_7b = model_profile("7b").parameter_report()["active"]
+        moe_7b = model_profile("7b_moe").parameter_report()["active"]
+        self.assertLessEqual(abs(moe_7b - dense_7b) / dense_7b, 0.01)
 
     def test_tokenizer_selection_uses_smallest_noninferior_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -443,6 +543,45 @@ class AeitronTrainingControlTest(unittest.TestCase):
             selected = next(item for item in report.candidate_comparisons if item.candidate == report.selected_candidate)
             best = max(item.downstream_score for item in report.candidate_comparisons)
             self.assertLessEqual(best - selected.downstream_score, 0.01)
+
+    def test_experiment_plan_emits_exact_executable_arm_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            campaign = load_scientific_experiment_registry(
+                "config/training_qualification_campaigns.json"
+            ).latest("tokenizer-selection-v1")
+            source_manifest = self.scientific_manifest(
+                root / "assets",
+                "tokenizer_selection",
+                campaign=campaign,
+            )
+            authority = ExperimentAuthority(root / "experiment")
+            planned = authority.plan(
+                campaign=campaign,
+                dataset_manifest=source_manifest.bindings["dataset_manifest"].path,
+                split_manifest=source_manifest.bindings["split_manifest"].path,
+                optimizer_policy="config/training_profiles.json",
+                evaluation_manifest=source_manifest.bindings["evaluation_manifest"].path,
+                tokenizer_manifests={
+                    key: artifact.path for key, artifact in source_manifest.tokenizers.items()
+                },
+                container_digest="sha256:" + ("b" * 64),
+            )
+            requests = json.loads(
+                (root / "experiment" / "arm_execution_requests.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(requests["arms"]), len(planned.arms))
+            self.assertTrue(all(item["optimizer_steps"] == 1000 for item in requests["arms"]))
+            self.assertTrue(
+                all(item["model_seed"] == item["dataloader_seed"] for item in requests["arms"])
+            )
+            self.assertTrue(
+                all(
+                    item["optimizer_steps"] * item["tokens_per_optimizer_step"]
+                    == item["token_budget"]
+                    for item in requests["arms"]
+                )
+            )
 
     def test_non_executable_evaluation_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -493,6 +632,136 @@ class AeitronTrainingControlTest(unittest.TestCase):
             blocked = authority.run(evidence_dir=evidence_dir)
             self.assertEqual(blocked.status, "blocked")
             self.assertTrue(any("validation loss" in item for item in blocked.blockers))
+
+    def test_arm_evidence_is_derived_from_bound_reports_and_rejects_suite_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = self.scientific_manifest(root, "tokenizer_selection")
+            write_json(root / "experiment_manifest.json", manifest.model_dump(mode="json"))
+            arm = manifest.arms[0]
+            source = self.arm_evidence(
+                root / "reports",
+                manifest,
+                arm.arm_id,
+                validation_loss=2.5,
+                benchmark=0.6,
+                security=0.7,
+                foundation=0.55,
+                tokens_per_byte=0.42,
+                training_flops=arm.canonical_training_flops,
+            )
+            admitted = admit_arm_evidence_from_reports(
+                experiment_dir=root,
+                arm_id=arm.arm_id,
+                training_report_path=source.training_report.path,
+                evaluation_report_path=source.evaluation_report.path,
+                generation_audit_path=source.generation_audit.path,
+                tokenizer_audit_path=source.tokenizer_audit.path,
+            )
+            self.assertEqual(admitted.training_flops, arm.canonical_training_flops)
+            self.assertEqual(admitted.executable_benchmark_score, 0.6)
+            self.assertTrue((root / "arm-evidence" / f"{arm.arm_id}.json").is_file())
+
+            suite = next(
+                artifact
+                for name, artifact in manifest.evaluation_inputs.items()
+                if name.startswith("suite:")
+            )
+            Path(suite.path).write_text('{"task_id":"tampered"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "bound artifact"):
+                admit_arm_evidence_from_reports(
+                    experiment_dir=root,
+                    arm_id=manifest.arms[1].arm_id,
+                    training_report_path=source.training_report.path,
+                    evaluation_report_path=source.evaluation_report.path,
+                    generation_audit_path=source.generation_audit.path,
+                    tokenizer_audit_path=source.tokenizer_audit.path,
+                )
+
+    def test_scientific_evaluation_assembles_code_and_repository_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            campaign = load_scientific_experiment_registry(
+                "config/training_qualification_campaigns.json"
+            ).latest("tokenizer-selection-v1")
+            manifest = self.scientific_manifest(
+                root,
+                "tokenizer_selection",
+                campaign=campaign,
+            )
+            write_json(root / "experiment_manifest.json", manifest.model_dump(mode="json"))
+            arm = manifest.arms[0]
+            source = self.arm_evidence(
+                root / "reports",
+                manifest,
+                arm.arm_id,
+                validation_loss=2.0,
+                benchmark=0.65,
+                security=0.8,
+                foundation=0.6,
+                tokens_per_byte=0.4,
+                training_flops=arm.canonical_training_flops,
+            )
+            code = json.loads(Path(source.evaluation_report.path).read_text(encoding="utf-8"))
+            code["suites"] = [
+                row for row in code["suites"] if row["name"] in {"HumanEval", "MBPP"}
+            ]
+            code["suite_artifact_sha256"] = {
+                name: digest
+                for name, digest in code["suite_artifact_sha256"].items()
+                if name in {"HumanEval", "MBPP"}
+            }
+            code_report = write_json(root / "code-evaluation.json", code)
+            repository_hash = manifest.evaluation_inputs[
+                "suite:AeitronRepositoryScorecard"
+            ].sha256
+            tasks = [
+                {
+                    "task_id": f"task-{index}",
+                    "category": ["coding", "debugging", "security", "patch", "long_context"][index % 5],
+                    "accepted": True,
+                    "tests_passed": True,
+                    "security_passed": True,
+                }
+                for index in range(50)
+            ]
+            scorecard = write_json(
+                root / "scorecard.json",
+                {
+                    "status": "passed",
+                    "policy_mode": "strict",
+                    "task_count": 50,
+                    "average_score": 0.75,
+                    "security_detection_fix_score": 0.9,
+                    "task_suite_sha256": repository_hash,
+                    "model_evidence": {
+                        "checkpoint_manifest_sha256": source.checkpoint_manifest.sha256,
+                        "tokenizer_sha256": source.tokenizer_sha256,
+                    },
+                    "tasks": tasks,
+                },
+            )
+            assembled = assemble_scientific_evaluation_report(
+                experiment_dir=root,
+                code_benchmark_report_path=code_report,
+                repository_scorecard_report_path=scorecard,
+                output_path=root / "assembled-evaluation.json",
+            )
+            payload = json.loads(assembled.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "passed")
+            self.assertEqual(
+                {row["name"] for row in payload["suites"]},
+                set(campaign.required_evaluation_suites),
+            )
+            admitted = admit_arm_evidence_from_reports(
+                experiment_dir=root,
+                arm_id=arm.arm_id,
+                training_report_path=source.training_report.path,
+                evaluation_report_path=assembled,
+                generation_audit_path=source.generation_audit.path,
+                tokenizer_audit_path=source.tokenizer_audit.path,
+            )
+            self.assertEqual(admitted.status, "passed")
 
     def test_scientific_manifest_rejects_tokenizer_asset_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -631,20 +900,138 @@ class AeitronTrainingControlTest(unittest.TestCase):
             comparison = compare_experiment(manifest, evidence)
             self.assertEqual(comparison.status, "passed", comparison.model_dump())
             self.assertLessEqual(comparison.scaling_law.holdout_mape, 0.05)
-            decision = decide_experiment(manifest, comparison)
-            promotion = promote_experiment(decision)
+            experiment_dir = root / "experiment"
+            evidence_dir = root / "evidence"
+            write_json(experiment_dir / "experiment_manifest.json", manifest.model_dump(mode="json"))
+            for item in evidence:
+                write_json(evidence_dir / f"{item.arm_id}.json", item.model_dump(mode="json"))
+            authority = ExperimentAuthority(experiment_dir)
+            comparison = authority.run(evidence_dir=evidence_dir)
+            decision = authority.decide()
+            promotion = authority.promote()
             self.assertEqual(promotion.status, "promoted")
-            write_json(root / "experiment_manifest.json", manifest.model_dump(mode="json"))
-            write_json(root / "statistical_comparison.json", comparison.model_dump(mode="json"))
-            write_json(root / "experiment_decision.json", decision.model_dump(mode="json"))
-            promotion_path = write_json(root / "promotion_decision.json", promotion.model_dump(mode="json"))
+            promotion_path = experiment_dir / "promotion_decision.json"
             verified = verify_promotion_chain(promotion_path)
             self.assertEqual(verified[0].promotion_sha256, promotion.promotion_sha256)
-            tampered = json.loads((root / "statistical_comparison.json").read_text(encoding="utf-8"))
+            comparison_path = experiment_dir / "statistical_comparison.json"
+            tampered = json.loads(comparison_path.read_text(encoding="utf-8"))
             tampered["selected_candidate"] = "32b"
-            write_json(root / "statistical_comparison.json", tampered)
+            write_json(comparison_path, tampered)
             with self.assertRaisesRegex(ValueError, "modified"):
                 verify_promotion_chain(promotion_path)
+
+    def test_composite_7b_progression_requires_one_verified_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shared = root / "shared"
+
+            def promote(
+                name: str,
+                manifest: ExperimentManifest,
+                evidence: list[ArmEvidence],
+            ) -> Path:
+                experiment_dir = root / name
+                evidence_dir = experiment_dir / "evidence"
+                write_json(
+                    experiment_dir / "experiment_manifest.json",
+                    manifest.model_dump(mode="json"),
+                )
+                for item in evidence:
+                    write_json(evidence_dir / f"{item.arm_id}.json", item.model_dump(mode="json"))
+                authority = ExperimentAuthority(experiment_dir)
+                self.assertEqual(authority.run(evidence_dir=evidence_dir).status, "passed")
+                self.assertEqual(authority.decide().status, "passed")
+                self.assertEqual(authority.promote().status, "promoted")
+                return experiment_dir / "promotion_decision.json"
+
+            tokenizer_manifest = self.scientific_manifest(shared, "tokenizer_selection")
+            tokenizer_evidence = []
+            for arm in tokenizer_manifest.arms:
+                score = {32_000: 0.75, 64_000: 0.82, 128_000: 0.821}[arm.vocab_size]
+                tokenizer_evidence.append(
+                    self.arm_evidence(
+                        root / "tokenizer-artifacts",
+                        tokenizer_manifest,
+                        arm.arm_id,
+                        validation_loss=4.0 - score,
+                        benchmark=score,
+                        security=score,
+                        foundation=score,
+                        tokens_per_byte={32_000: 0.24, 64_000: 0.21, 128_000: 0.20}[arm.vocab_size],
+                        training_flops=float(6 * arm.active_parameters * arm.token_budget),
+                    )
+                )
+            tokenizer_promotion = promote(
+                "tokenizer-experiment", tokenizer_manifest, tokenizer_evidence
+            )
+
+            architecture_manifest = self.scientific_manifest(shared, "architecture_ab")
+            architecture_evidence = []
+            for arm in architecture_manifest.arms:
+                is_moe = arm.model_profile.endswith("_moe")
+                architecture_evidence.append(
+                    self.arm_evidence(
+                        root / "architecture-artifacts",
+                        architecture_manifest,
+                        arm.arm_id,
+                        validation_loss=3.8 if is_moe else 4.0,
+                        benchmark=0.84 if is_moe else 0.80,
+                        security=0.82,
+                        foundation=0.82,
+                        tokens_per_byte=0.21,
+                        training_flops=float(6 * arm.active_parameters * arm.token_budget),
+                        router_ratio=1.10 if is_moe else None,
+                    )
+                )
+            architecture_promotion = promote(
+                "architecture-experiment", architecture_manifest, architecture_evidence
+            )
+
+            scaling_manifest = self.scientific_manifest(shared, "scaling_law")
+            scaling_evidence = []
+            for arm in scaling_manifest.arms:
+                loss = (
+                    1.5
+                    + 60.0 * arm.active_parameters ** -0.08
+                    + 30.0 * arm.token_budget ** -0.06
+                )
+                scaling_evidence.append(
+                    self.arm_evidence(
+                        root / "scaling-artifacts",
+                        scaling_manifest,
+                        arm.arm_id,
+                        validation_loss=loss,
+                        benchmark=0.82,
+                        security=0.82,
+                        foundation=0.82,
+                        tokens_per_byte=0.21,
+                        training_flops=float(6 * arm.active_parameters * arm.token_budget),
+                    )
+                )
+            scaling_promotion = promote(
+                "scaling-experiment", scaling_manifest, scaling_evidence
+            )
+
+            progression = build_model_progression_decision(
+                tokenizer_promotion_path=tokenizer_promotion,
+                architecture_promotion_path=architecture_promotion,
+                scaling_promotion_path=scaling_promotion,
+            )
+            self.assertEqual(progression.status, "authorized", progression.model_dump())
+            self.assertEqual(progression.selected_tokenizer_vocab_size, 64_000)
+            self.assertEqual(progression.selected_architecture, "1b_moe")
+            self.assertEqual(progression.target_model_profile, "7b_moe")
+            progression_path = write_json(root / "model_progression.json", progression.model_dump())
+            self.assertEqual(
+                verify_model_progression_decision(progression_path).decision_sha256,
+                progression.decision_sha256,
+            )
+
+            altered = json.loads(progression_path.read_text(encoding="utf-8"))
+            altered["target_model_profile"] = "7b"
+            write_json(progression_path, altered)
+            with self.assertRaises(ValueError):
+                verify_model_progression_decision(progression_path)
 
 if __name__ == "__main__":
     unittest.main()
